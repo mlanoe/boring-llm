@@ -1,0 +1,77 @@
+# Tests for src/sampling.br. Run with:
+#   boring run test/test_sampling.br
+
+use sampling
+
+def main() throws:
+    # --- sample_greedy: plain argmax ---
+    assert_eq(sample_greedy([1.0, 5.0, 3.0, -2.0], 4), 1)
+
+    # --- RNG: deterministic (same seed -> same sequence), in-range ---
+    let rng_a = seed_rng(42)
+    let rng_b = seed_rng(42)
+    let (u_a, rng_a2) = rng_next_u64(rng_a)
+    let (u_b, rng_b2) = rng_next_u64(rng_b)
+    assert_eq(u_a, u_b)
+    let (f, _rng3) = rng_next_f32(rng_a2)
+    assert(f >= 0.0 as float32 and f < 1.0 as float32, "rng_next_f32 out of [0,1): {f}")
+    # a different seed should (overwhelmingly likely) diverge immediately
+    let rng_c = seed_rng(7)
+    let (u_c, _rng_c2) = rng_next_u64(rng_c)
+    assert(u_a != u_c, "different seeds produced the same first draw")
+
+    # --- top_k_select: descending order, correct indices ---
+    let (vals, idxs) = top_k_select([1.0, 5.0, 3.0, -2.0, 9.0, 0.5], 6, 3)
+    assert_eq(vals.length, 3)
+    assert_eq(idxs[0], 4)   # 9.0
+    assert_eq(idxs[1], 1)   # 5.0
+    assert_eq(idxs[2], 2)   # 3.0
+    assert_eq(vals[0], 9.0 as float32)
+    assert_eq(vals[1], 5.0 as float32)
+    assert_eq(vals[2], 3.0 as float32)
+
+    # --- sample: temperature <= 0 behaves as greedy, RNG untouched ---
+    let rng0 = seed_rng(1)
+    let (tok0, rng0b) = sample(rng0, [1.0, 5.0, 3.0, -2.0], 4, 0.0 as float32, 0, 1.0 as float32, [], 1.0 as float32, 64)
+    assert_eq(tok0, 1)
+    let (u0_before, _) = rng_next_u64(rng0)
+    let (u0_after, _) = rng_next_u64(rng0b)
+    assert_eq(u0_before, u0_after)   # greedy path doesn't consume the RNG
+
+    # --- sample: a hugely peaked distribution should (near-certainly)
+    #     always pick the dominant token, across several different seeds ---
+    let peaked = [0.0, 0.0, 30.0, 0.0, 0.0]
+    var seed = 1
+    while seed <= 10:
+        let rng_s = seed_rng(seed)
+        let (tok, _new_rng) = sample(rng_s, peaked, 5, 1.0 as float32, 3, 1.0 as float32, [], 1.0 as float32, 64)
+        assert_eq(tok, 2)
+        seed += 1
+
+    # --- apply_repeat_penalty: penalty == 1.0 is a no-op ---
+    let unpenalized = apply_repeat_penalty([1.0, 5.0, -3.0], [1], 1.0 as float32, 64)
+    assert_eq(unpenalized[0], 1.0 as float32)
+    assert_eq(unpenalized[1], 5.0 as float32)
+    assert_eq(unpenalized[2], -3.0 as float32)
+
+    # --- apply_repeat_penalty: positive logit divided, non-positive logit
+    #     multiplied, untouched tokens left alone, duplicates in history
+    #     penalized only once ---
+    let penalized = apply_repeat_penalty([4.0, -4.0, 9.0], [0, 1, 0], 2.0 as float32, 64)
+    assert_eq(penalized[0], 2.0 as float32)    # 4.0 / 2.0, penalized once despite appearing twice
+    assert_eq(penalized[1], -8.0 as float32)   # -4.0 * 2.0
+    assert_eq(penalized[2], 9.0 as float32)    # never in history, untouched
+
+    # --- apply_repeat_penalty: repeat_last_n windows to the most recent
+    #     tokens only — a token outside the window is left alone ---
+    let windowed = apply_repeat_penalty([4.0, 4.0], [0, 1], 2.0 as float32, 1)
+    assert_eq(windowed[0], 4.0 as float32)     # token 0 is outside the last-1 window
+    assert_eq(windowed[1], 2.0 as float32)     # token 1 is the last entry, penalized
+
+    # --- sample: with greedy argmax, a repeat penalty can flip the winner
+    #     away from an already-generated token ---
+    let rng_p = seed_rng(1)
+    let (tok_p, _) = sample(rng_p, [10.0, 9.0], 2, 0.0 as float32, 0, 1.0 as float32, [0], 2.0 as float32, 64)
+    assert_eq(tok_p, 1)   # token 0's logit (10.0) halved to 5.0, now below token 1's 9.0
+
+    print "test_sampling: all assertions passed"

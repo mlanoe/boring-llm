@@ -1,0 +1,361 @@
+# boring-llm — CLI entry point
+#
+# Phase 0 usage:
+#   boring run src/main.br --gguf weights/model.gguf --dump-metadata
+#
+# Later phases add --prompt/--max-tokens for real text generation.
+
+use gguf
+use model
+use tokenizer
+use sampling
+
+def print_metadata(GgufFile file):
+    print "GGUF version: {file.version}"
+    print ""
+    print "-- metadata ({file.metadata.length} keys) --"
+    for key in file.metadata.keys():
+        match file.metadata[key]:
+            GgufValue.Str(s): print "  {key} = \"{s}\""
+            GgufValue.Bool(b): print "  {key} = {b}"
+            GgufValue.F32(v): print "  {key} = {v}"
+            GgufValue.F64(v): print "  {key} = {v}"
+            GgufValue.U8(v): print "  {key} = {v}"
+            GgufValue.I8(v): print "  {key} = {v}"
+            GgufValue.U16(v): print "  {key} = {v}"
+            GgufValue.I16(v): print "  {key} = {v}"
+            GgufValue.U32(v): print "  {key} = {v}"
+            GgufValue.I32(v): print "  {key} = {v}"
+            GgufValue.U64(v): print "  {key} = {v}"
+            GgufValue.I64(v): print "  {key} = {v}"
+            GgufValue.Arr(items): print "  {key} = [array of {items.length} items]"
+    print ""
+    print "-- tensors ({file.tensors.length}) --"
+    var bool has_output_weight = false
+    for t in file.tensors:
+        print "  {t.name}: dims={t.dims} type={ggml_type_name(t.ggml_type)} offset={t.offset}"
+        if t.name == "output.weight":
+            has_output_weight = true
+    print ""
+    let vocab = gguf_get_string_array(file.metadata, "tokenizer.ggml.tokens")
+    print "vocab size: {vocab.length}"
+    print "has separate output.weight (untied embeddings): {has_output_weight}"
+
+int parse_max_tokens(string s) throws:
+    guard let n = (s as int) else throw "invalid --max-tokens value: '{s}'"
+    n
+
+int parse_int_arg(string name, string s) throws:
+    guard let n = (s as int) else throw "invalid {name} value: '{s}'"
+    n
+
+float32 parse_float_arg(string name, string s) throws:
+    # NOTE: `(s as float32)` directly (not going through `float`/f64 first)
+    # mis-transpiles under --target metal — the parsed value comes out
+    # f64-typed regardless of the declared `float32` cast/return type
+    # (the same general "float32 string-parsing is less reliable than
+    # float64 under a GPU target" theme as elsewhere in this project).
+    guard let f = (s as float) else throw "invalid {name} value: '{s}'"
+    f as float32
+
+[int] parse_token_ids(string csv) throws:
+    var [int] result = []
+    for part in csv.split(","):
+        guard let n = (part as int) else throw "invalid token id: '{part}'"
+        result.push(n)
+    result
+
+# Phase 1 debug mode: run the CPU-only forward pass on a hand-picked token
+# ID sequence (bypassing the tokenizer entirely, per the project's own
+# README/plan — this decouples tokenizer bugs from transformer-math bugs)
+# and print each position's top-5 logits, in the same format
+# tools/reference_logits.py prints, for direct diffing against llama.cpp.
+def print_top5([float32] logits, [int] tokens, int vocab) throws:
+    var int p = 0
+    while p < tokens.length:
+        var [int] top_idx = [0, 0, 0, 0, 0]
+        var [float32] top_val = [-1.0e30 as float32, -1.0e30 as float32, -1.0e30 as float32, -1.0e30 as float32, -1.0e30 as float32]
+        var int v = 0
+        while v < vocab:
+            let val = logits[p * vocab + v]
+            if val > top_val[4]:
+                var int slot = 4
+                while slot > 0 and val > top_val[slot - 1]:
+                    top_val[slot] = top_val[slot - 1]
+                    top_idx[slot] = top_idx[slot - 1]
+                    slot -= 1
+                top_val[slot] = val
+                top_idx[slot] = v
+            v += 1
+        print "pos {p} (token {tokens[p]}): top5 = [({top_idx[0]}, {top_val[0]}), ({top_idx[1]}, {top_val[1]}), ({top_idx[2]}, {top_val[2]}), ({top_idx[3]}, {top_val[3]}), ({top_idx[4]}, {top_val[4]})]"
+        p += 1
+
+def run_forward_debug(GgufFile file, [int] tokens, bool use_gpu) throws:
+    print "[diag] loading model weights..."
+    let m = load_model(file)
+    print "[diag] model loaded (vocab={m.config.vocab_size} d_model={m.config.d_model} n_layer={m.config.n_layer} n_head={m.config.n_head} n_kv_head={m.config.n_kv_head})"
+
+    let logits = if use_gpu:
+        print "[diag] running forward_gpu (Metal kernels)..."
+        forward_gpu(m, tokens)
+    else:
+        print "[diag] running forward (CPU)..."
+        forward(m, tokens)
+    print_top5(logits, tokens, m.config.vocab_size)
+
+# Phase 2b debug mode: loads Q8_0 weight tensors as raw packed bytes (no
+# CPU-side dequantization) and runs the fused-dequant GEMM kernels.
+def run_forward_debug_quantized(GgufFile file, [int] tokens) throws:
+    print "[diag] loading model weights (Q8_0, no CPU dequant)..."
+    let m = load_model_quantized(file)
+    print "[diag] model loaded (vocab={m.config.vocab_size} d_model={m.config.d_model} n_layer={m.config.n_layer} n_head={m.config.n_head} n_kv_head={m.config.n_kv_head})"
+    print "[diag] running forward_gpu_quantized (fused Q8_0 Metal kernels)..."
+    let logits = forward_gpu_quantized(m, tokens)
+    print_top5(logits, tokens, m.config.vocab_size)
+
+# Phase 3: real end-to-end chat generation — tokenize (GGUF-embedded vocab/
+# merges, ChatML wrapping), greedy-decode via the fused-Q8_0 GPU forward
+# pass, detokenize, print. Also prints tokens/sec for the generation loop
+# (model-load time excluded — that's a one-time cost, not decode throughput).
+def run_generate(GgufFile file, string system_msg, string user_msg, int max_new_tokens,
+                  bool kv_cache, bool quantized, SamplingParams params) throws:
+    let tok = load_tokenizer(file)
+
+    if params.temperature > 0.0 as float32:
+        print "[diag] sampling: temperature={params.temperature} top_k={params.top_k} top_p={params.top_p} seed={params.seed} repeat_penalty={params.repeat_penalty} repeat_last_n={params.repeat_last_n}"
+    else:
+        print "[diag] sampling: greedy, repeat_penalty={params.repeat_penalty} repeat_last_n={params.repeat_last_n}"
+
+    let prompt_tokens = tok.encode_chat(system_msg, user_msg)
+    print "[diag] prompt: {prompt_tokens.length} tokens"
+
+    let all_tokens = if quantized:
+        print "[diag] loading model weights (fused Q8_0, no CPU dequant)..."
+        let m = load_model_quantized(file)
+        print "[diag] model loaded (vocab={m.config.vocab_size} d_model={m.config.d_model} n_layer={m.config.n_layer})"
+        if kv_cache:
+            print "[diag] decoding with KV-cache (forward_step, O(1) GEMM/step)..."
+            generate_kv(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
+        else:
+            print "[diag] decoding without KV-cache (full re-forward every step)..."
+            generate(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
+    else:
+        # Works with ANY ggml tensor format this project supports (F32,
+        # F16, Q5_0, Q8_0, Q4_K, Q6_K, ...) — every tensor dequantized to
+        # float32 once at load time (see generate_f32's own doc comment),
+        # not just a pure-Q8_0 file. No KV-cache variant yet for this path.
+        print "[diag] loading model weights (dequantizing every tensor to fp32 at load)..."
+        let m = load_model(file)
+        print "[diag] model loaded (vocab={m.config.vocab_size} d_model={m.config.d_model} n_layer={m.config.n_layer})"
+        print "[diag] decoding without KV-cache (full re-forward every step)..."
+        generate_f32(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
+
+    var [int] new_tokens = []
+    var int i = prompt_tokens.length
+    while i < all_tokens.length:
+        # Don't include the terminating EOS/<|im_end|> marker in the
+        # displayed reply text — it's a real generated token (kept in
+        # `all_tokens`/counted below), just not part of the human-readable
+        # message.
+        if all_tokens[i] != tok.eos_token_id:
+            new_tokens.push(all_tokens[i])
+        i += 1
+
+    let n_generated = all_tokens.length - prompt_tokens.length
+    let reply = tok.decode(new_tokens)
+    print ""
+    print reply
+    print ""
+    print "[diag] generated {n_generated} tokens (see shell `time` for wall-clock duration / tok/s)"
+
+# Interactive multi-turn chat (llama.cpp's own `-cnv` mode): keeps the full
+# conversation (every prior user/assistant turn) and re-encodes it as one
+# growing ChatML prompt each turn via `encode_chat_multi`. The model is
+# loaded once, up front, and reused for every turn.
+#
+# Deliberately NOT carrying the KV-cache across turns — each turn's
+# `generate`/`generate_kv` call re-prefills the WHOLE conversation-so-far
+# from scratch (the same "correct first, optimize later" tradeoff already
+# documented for generate() vs generate_kv() within a single turn). Reusing
+# the cache across turns would need forward_step's single-token-append
+# machinery generalized to append a whole new turn's worth of tokens against
+# an already-nonempty cache — a real, valuable optimization, but a separate
+# piece of work from just having multi-turn conversations at all.
+def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache,
+             bool quantized, SamplingParams params) throws:
+    let tok = load_tokenizer(file)
+
+    if params.temperature > 0.0 as float32:
+        print "[diag] sampling: temperature={params.temperature} top_k={params.top_k} top_p={params.top_p} seed={params.seed} repeat_penalty={params.repeat_penalty} repeat_last_n={params.repeat_last_n}"
+    else:
+        print "[diag] sampling: greedy, repeat_penalty={params.repeat_penalty} repeat_last_n={params.repeat_last_n}"
+
+    print ""
+    print "[chat] interactive mode — type a message and press enter, empty line or Ctrl-D to quit."
+
+    var [string] user_msgs = []
+    var [string] assistant_msgs = []
+
+    # Two near-identical branches (not one loop parameterized over "which
+    # generate function to call") because QuantModel/Qwen2Model are
+    # different types — `m` below has to resolve to a concrete type for the
+    # whole branch, same reason run_generate() above branches on `quantized`
+    # around its own single generate call rather than trying to share one
+    # model-typed local across both.
+    if quantized:
+        print "[diag] loading model weights (fused Q8_0, no CPU dequant)..."
+        let m = load_model_quantized(file)
+        print "[diag] model loaded (vocab={m.config.vocab_size} d_model={m.config.d_model} n_layer={m.config.n_layer})"
+
+        print "> "
+        var line = readLine()
+        while let line:
+            if line == "":
+                break
+            user_msgs.push(line)
+            let prompt_tokens = tok.encode_chat_multi(system_msg, user_msgs, assistant_msgs)
+
+            let all_tokens = if kv_cache:
+                generate_kv(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
+            else:
+                generate(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
+
+            var [int] new_tokens = []
+            var int i = prompt_tokens.length
+            while i < all_tokens.length:
+                if all_tokens[i] != tok.eos_token_id:
+                    new_tokens.push(all_tokens[i])
+                i += 1
+            let reply = tok.decode(new_tokens)
+            assistant_msgs.push(reply)
+            print ""
+            print reply
+            print ""
+
+            print "> "
+            line = readLine()
+    else:
+        print "[diag] loading model weights (dequantizing every tensor to fp32 at load)..."
+        let m = load_model(file)
+        print "[diag] model loaded (vocab={m.config.vocab_size} d_model={m.config.d_model} n_layer={m.config.n_layer})"
+
+        print "> "
+        var line = readLine()
+        while let line:
+            if line == "":
+                break
+            user_msgs.push(line)
+            let prompt_tokens = tok.encode_chat_multi(system_msg, user_msgs, assistant_msgs)
+            let all_tokens = generate_f32(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
+
+            var [int] new_tokens = []
+            var int i = prompt_tokens.length
+            while i < all_tokens.length:
+                if all_tokens[i] != tok.eos_token_id:
+                    new_tokens.push(all_tokens[i])
+                i += 1
+            let reply = tok.decode(new_tokens)
+            assistant_msgs.push(reply)
+            print ""
+            print reply
+            print ""
+
+            print "> "
+            line = readLine()
+
+def main() throws:
+    let [string] argv = args()
+
+    var string gguf_path = ""
+    var bool dump_metadata = false
+    var string tokens_csv = ""
+    var bool use_gpu = false
+    var bool quantized = false
+    var string prompt = ""
+    var string system_msg = "You are a helpful assistant."
+    var int max_tokens = 40
+    var bool kv_cache = false
+    var bool chat_mode = false
+    var float32 temperature = 0.0 as float32
+    var int top_k = 0
+    var float32 top_p = 1.0 as float32
+    var int seed = 0
+    var float32 repeat_penalty = 1.0 as float32
+    var int repeat_last_n = 64
+
+    var int i = 1
+    while i < argv.length:
+        let a = argv[i]
+        if a == "--gguf" and i + 1 < argv.length:
+            gguf_path = argv[i + 1]
+            i += 2
+        elif a == "--dump-metadata":
+            dump_metadata = true
+            i += 1
+        elif a == "--tokens" and i + 1 < argv.length:
+            tokens_csv = argv[i + 1]
+            i += 2
+        elif a == "--gpu":
+            use_gpu = true
+            i += 1
+        elif a == "--quantized":
+            quantized = true
+            i += 1
+        elif a == "--prompt" and i + 1 < argv.length:
+            prompt = argv[i + 1]
+            i += 2
+        elif a == "--system" and i + 1 < argv.length:
+            system_msg = argv[i + 1]
+            i += 2
+        elif a == "--max-tokens" and i + 1 < argv.length:
+            max_tokens = parse_max_tokens(argv[i + 1])
+            i += 2
+        elif a == "--kv-cache":
+            kv_cache = true
+            i += 1
+        elif a == "--chat":
+            chat_mode = true
+            i += 1
+        elif a == "--temperature" and i + 1 < argv.length:
+            temperature = parse_float_arg("--temperature", argv[i + 1])
+            i += 2
+        elif a == "--top-k" and i + 1 < argv.length:
+            top_k = parse_int_arg("--top-k", argv[i + 1])
+            i += 2
+        elif a == "--top-p" and i + 1 < argv.length:
+            top_p = parse_float_arg("--top-p", argv[i + 1])
+            i += 2
+        elif a == "--seed" and i + 1 < argv.length:
+            seed = parse_int_arg("--seed", argv[i + 1])
+            i += 2
+        elif a == "--repeat-penalty" and i + 1 < argv.length:
+            repeat_penalty = parse_float_arg("--repeat-penalty", argv[i + 1])
+            i += 2
+        elif a == "--repeat-last-n" and i + 1 < argv.length:
+            repeat_last_n = parse_int_arg("--repeat-last-n", argv[i + 1])
+            i += 2
+        else:
+            i += 1
+
+    guard gguf_path != "" else throw "usage: --gguf <path.gguf> [--dump-metadata] [--tokens 1,2,3 [--gpu|--quantized]] [--prompt \"...\"|--chat [--system \"...\"] [--max-tokens N] [--kv-cache] [--temperature T --top-k K --top-p P --seed S --repeat-penalty R --repeat-last-n N]]"
+
+    print "[diag] parsing {gguf_path}..."
+    let [uint8] bytes = fs.readBytes(gguf_path)
+    let file = parse_gguf(bytes)
+    print "[diag] parsed ({bytes.length} bytes, {file.tensors.length} tensors, {file.metadata.length} metadata keys)"
+
+    if dump_metadata:
+        print_metadata(file)
+
+    if tokens_csv != "":
+        if quantized:
+            run_forward_debug_quantized(file, parse_token_ids(tokens_csv))
+        else:
+            run_forward_debug(file, parse_token_ids(tokens_csv), use_gpu)
+
+    if chat_mode:
+        let params = SamplingParams(temperature, top_k, top_p, seed, repeat_penalty, repeat_last_n)
+        run_chat(file, system_msg, max_tokens, kv_cache, quantized, params)
+    elif prompt != "":
+        let params = SamplingParams(temperature, top_k, top_p, seed, repeat_penalty, repeat_last_n)
+        run_generate(file, system_msg, prompt, max_tokens, kv_cache, quantized, params)

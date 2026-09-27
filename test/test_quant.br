@@ -1,0 +1,36 @@
+# Tests for src/quant.br's Q8_0 dequantization. Run with:
+#   boring run test/test_quant.br
+
+use io
+use quant
+
+def main() throws:
+    # One block: scale = 1.0 (f16 bits 0x3C00), values 0..31 as signed int8
+    # (all non-negative here, so raw == q for every one of them).
+    var [uint8] bytes = [0x00 as uint8, 0x3C as uint8]  # scale = 1.0, little-endian
+    var int i = 0
+    while i < 32:
+        bytes.push(i as uint8)
+        i += 1
+
+    let out = dequantize_q8_0(bytes, 0, 32)
+    assert_eq(out.length, 32)
+    i = 0
+    while i < 32:
+        assert_eq(out[i], i as float32)
+        i += 1
+
+    # Second block with scale = 2.0 (f16 bits 0x4000) and a negative value
+    # (0xFF = -1 as signed int8) to exercise the sign-extension branch.
+    bytes.push(0x00 as uint8)
+    bytes.push(0x40 as uint8)
+    bytes.push(0xFF as uint8)   # -1
+    i = 0
+    while i < 31:
+        bytes.push(0 as uint8)
+        i += 1
+
+    let out2 = dequantize_q8_0(bytes, 34, 32)
+    assert_eq(out2[0], -2.0 as float32)   # -1 * 2.0
+
+    print "test_quant: all assertions passed"

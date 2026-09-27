@@ -1,0 +1,141 @@
+# Binary I/O utilities for parsing binary file formats (GGUF in particular).
+# All multi-byte values are little-endian. Byte buffers are [uint8] (real
+# 1-byte elements), so every byte is widened to int before being shifted
+# (uint8 can't hold a value shifted left by 8+). Ported/extended from
+# whisper-boring's src/io.br.
+
+# Read a u16 little-endian from bytes at offset.
+pub int read_u16_le([uint8] bytes, int offset):
+    int(bytes[offset]) | (int(bytes[offset + 1]) << 8)
+
+# Read a u32 little-endian from bytes at offset.
+pub int read_u32_le([uint8] bytes, int offset):
+    int(bytes[offset]) | (int(bytes[offset + 1]) << 8) | (int(bytes[offset + 2]) << 16) | (int(bytes[offset + 3]) << 24)
+
+# Read a u64 little-endian from bytes at offset. GGUF uses u64 for tensor
+# count, KV count, array lengths, tensor dims, and tensor data offsets — all
+# of these are far below 2^63 in any real model file, so widening into
+# Boring's signed 64-bit `int` never overflows in practice.
+pub int read_u64_le([uint8] bytes, int offset):
+    var int result = 0
+    var int i = 0
+    while i < 8:
+        result = result | (int(bytes[offset + i]) << (i * 8))
+        i += 1
+    result
+
+# Read an i32 little-endian (GGUF uses this for e.g. tokenizer.ggml.token_type).
+pub int read_i32_le([uint8] bytes, int offset):
+    let u = read_u32_le(bytes, offset)
+    if u > 0x7FFFFFFF:
+        u - 0x100000000
+    else:
+        u
+
+# Read a float32 little-endian from bytes at offset.
+pub float read_f32_le([uint8] bytes, int offset):
+    let int bits = read_u32_le(bytes, offset)
+    bitsToFloat(bits)
+
+# Read n bytes as a list of bytes from bytes at offset.
+pub [uint8] read_bytes([uint8] bytes, int offset, int n):
+    var [uint8] result = []
+    var int i = 0
+    while i < n:
+        result.push(bytes[offset + i])
+        i += 1
+    result
+
+# Decode a real UTF-8 byte sequence into a string. NOTE: this used to treat
+# every byte as its own Unicode codepoint (`chr(int(b))` per byte) — correct
+# only for pure ASCII (bytes 0-127, where codepoint == byte value), but
+# silently wrong for any multi-byte UTF-8 sequence (a 2/3/4-byte character
+# decoded as 2/3/4 separate garbage characters instead of one). This went
+# unnoticed through Phase 0/1/2 because every GGUF string read up to then
+# happened to be pure ASCII (architecture names, tensor names, ...) — it
+# surfaced for real once the tokenizer started reading vocab/merge strings
+# containing GPT-2's byte-level "Ġ" (U+0120, a genuine 2-byte UTF-8
+# sequence) — merges silently failed to match because the "Ġ" decoded here
+# and the "Ġ" built independently by tokenizer.br's own byte-to-unicode
+# table were two different (wrong vs. correct) strings that never compared
+# equal. Fixed with a real UTF-8 decoder (same algorithm as
+# tokenizer.br's utf8_decode_bytes, kept in sync manually — this is the
+# more foundational of the two copies, since every GGUF string read
+# anywhere in the project goes through this function).
+pub string bytes_to_str([uint8] byte_values):
+    var string out = ""
+    var int i = 0
+    while i < byte_values.length:
+        let b0 = int(byte_values[i])
+        if b0 < 0x80:
+            out = "{out}{chr(b0)}"
+            i += 1
+        elif b0 & 0xE0 == 0xC0:
+            let b1 = int(byte_values[i + 1])
+            let cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+            out = "{out}{chr(cp)}"
+            i += 2
+        elif b0 & 0xF0 == 0xE0:
+            let b1 = int(byte_values[i + 1])
+            let b2 = int(byte_values[i + 2])
+            let cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+            out = "{out}{chr(cp)}"
+            i += 3
+        else:
+            let b1 = int(byte_values[i + 1])
+            let b2 = int(byte_values[i + 2])
+            let b3 = int(byte_values[i + 3])
+            let cp = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
+            out = "{out}{chr(cp)}"
+            i += 4
+    out
+
+# Read a UTF-8 string of n bytes as a proper string.
+pub string read_utf8([uint8] bytes, int offset, int n):
+    var [uint8] buf = read_bytes(bytes, offset, n)
+    bytes_to_str(buf)
+
+# 2^e for a small integer exponent (e in roughly -14..15 — the half-precision
+# float exponent range). No builtin integer-power/exp2 in Boring, so this is
+# a plain repeated-multiplication loop rather than a library call.
+float32 pow2i(int e):
+    var float32 result = 1.0
+    if e >= 0:
+        var int i = 0
+        while i < e:
+            result = result * 2.0
+            i += 1
+    else:
+        var int i = 0
+        while i < (0 - e):
+            result = result / 2.0
+            i += 1
+    result
+
+# Decode an IEEE 754 half-precision (f16) bit pattern into a float32. Boring
+# has no native float16/bfloat16 type (see boring/docs/float-width-types.md's
+# "Explicitly out of scope" section) — GGUF's per-block quantization scales
+# are stored as f16, so this hand-rolled decode is required regardless.
+# Handles zero/subnormals, normals, and infinity/NaN (GGUF scales are always
+# finite in practice, but a truncated/corrupt file could produce anything).
+pub float32 f16_bits_to_f32(int bits):
+    let sign = (bits >> 15) & 1
+    let exp = (bits >> 10) & 0x1F
+    let frac = bits & 0x3FF
+
+    var float32 mag = 0.0
+    if exp == 0:
+        # Zero (frac == 0) or subnormal: value = frac/1024 * 2^-14, no
+        # implicit leading 1 bit.
+        mag = (frac as float32) * pow2i(-14) / 1024.0
+    elif exp == 0x1F:
+        # Inf (frac == 0) or NaN (frac != 0).
+        mag = if frac == 0: (1.0 / 0.0) else: (0.0 / 0.0)
+    else:
+        let mantissa = 1.0 + (frac as float32) / 1024.0
+        mag = mantissa * pow2i(exp - 15)
+
+    if sign == 1:
+        0.0 - mag
+    else:
+        mag

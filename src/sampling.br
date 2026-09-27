@@ -1,0 +1,189 @@
+# src/sampling.br — logit sampling: greedy argmax (used by generate()/
+# generate_kv() when temperature <= 0, matching llama.cpp's own
+# convention), plus temperature + top-k + top-p (nucleus) sampling with a
+# self-seeded PRNG.
+#
+# Boring has no builtin RNG — scratch-boring's own Rng struct is the
+# precedent (a plain xorshift64: shift/XOR only, deliberately NOT the
+# higher-quality xorshift64* variant, which multiplies its output and can
+# panic on overflow in a real `--emit-rust` build — a real, filed,
+# unrelated compiler inconsistency scratch-boring already worked around
+# the same way). This version is purely functional (`rng_next_u64` takes
+# an `Rng` and returns `(value, new_Rng)`) rather than a mutated `mut`
+# field, sidestepping any question about whether a mutation through a
+# `var`/`mut` parameter propagates back reliably — the same "return the
+# grown/updated state, caller reassigns" pattern already used throughout
+# this project's own KV-cache (`model.br`'s `GenCache`).
+
+pub struct Rng:
+    uint64 state
+
+pub Rng seed_rng(int seed):
+    # xorshift's only fixed point is state == 0 (every subsequent call
+    # would then keep returning 0 forever) — guard against a caller
+    # passing 0 by folding in a nonzero constant.
+    let s = if seed == 0: 88172645463325252 as uint64 else: (seed as uint64) ^ (88172645463325252 as uint64)
+    Rng(s)
+
+pub (uint64, Rng) rng_next_u64(Rng rng):
+    var x = rng.state
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    (x, Rng(x))
+
+# Uniform float32 in [0, 1) — next_u64()'s output divided by 2^64 (the
+# smallest value it can never reach, keeping the range half-open).
+pub (float32, Rng) rng_next_f32(Rng rng):
+    let (x, new_rng) = rng_next_u64(rng)
+    let f = (x as float32) / (18446744073709551616.0 as float32)
+    (f, new_rng)
+
+# Penalizes logits for tokens already seen in `history` (the last
+# `repeat_last_n` tokens, or the whole history when `repeat_last_n <= 0`),
+# matching llama.cpp's own repeat-penalty convention: a positive logit is
+# divided by `penalty`, a non-positive one is multiplied by it — either way
+# this pushes an already-used token's logit down. Applied once per unique
+# token in the window, not once per occurrence (a token repeated 3 times in
+# the window is still only penalized once, same as llama.cpp).
+# `penalty == 1.0` is a no-op — returns `logits` unchanged, no history scan.
+pub [float32] apply_repeat_penalty([float32] logits, [int] history, float32 penalty, int repeat_last_n):
+    if penalty == 1.0 as float32 or history.length == 0:
+        logits
+    else:
+        var [float32] out = [0.0 for i in 0..<logits.length]
+        var int i = 0
+        while i < logits.length:
+            out[i] = logits[i]
+            i += 1
+        let window = if repeat_last_n > 0 and history.length > repeat_last_n: repeat_last_n else: history.length
+        let start = history.length - window
+        var {int=bool} seen = {=}
+        var int j = start
+        while j < history.length:
+            let tok = history[j]
+            if not seen.contains(tok):
+                seen[tok] = true
+                let v = out[tok]
+                out[tok] = if v > 0.0 as float32: v / penalty else: v * penalty
+            j += 1
+        out
+
+pub int sample_greedy([float32] logits, int vocab):
+    var int best = 0
+    var float32 best_val = logits[0]
+    var int v = 1
+    while v < vocab:
+        let val = logits[v]
+        if val > best_val:
+            best_val = val
+            best = v
+        v += 1
+    best
+
+# Finds the top `k` (value, original-index) pairs from logits[0..vocab),
+# sorted descending by value — same insertion-sort selection main.br's own
+# `print_top5` already uses, just generalized to an arbitrary k instead of
+# a fixed 5. O(vocab * k), fine for k in the tens-to-low-hundreds range
+# sampling actually needs (no reason to fully sort 150k-entry logit rows).
+([float32], [int]) top_k_select([float32] logits, int vocab, int k):
+    let kk = if k > vocab: vocab else: k
+    var [float32] top_val = [-1.0e30 as float32 for i in 0..<kk]
+    var [int] top_idx = [0 for i in 0..<kk]
+    var int v = 0
+    while v < vocab:
+        let val = logits[v]
+        if val > top_val[kk - 1]:
+            var int slot = kk - 1
+            while slot > 0 and val > top_val[slot - 1]:
+                top_val[slot] = top_val[slot - 1]
+                top_idx[slot] = top_idx[slot - 1]
+                slot -= 1
+            top_val[slot] = val
+            top_idx[slot] = v
+        v += 1
+    (top_val, top_idx)
+
+# Temperature + top-k + top-p (nucleus) sampling, plus llama.cpp-style
+# repeat penalty applied first (against `history` — the tokens generated so
+# far in this call, i.e. prompt + already-generated). `temperature <= 0`
+# behaves as plain greedy argmax (ignores top_k/top_p entirely, matching
+# llama.cpp's own `--temp 0` convention) — repeat penalty still applies in
+# that case too, same as llama.cpp (it's independent of the temperature
+# sampler). `top_k <= 0` defaults to 50 — top-p alone, over the full
+# untruncated vocab, would need a full sort of 150k+ logits every step;
+# every real sampling setup bounds it with a top-k pre-filter anyway, so
+# this project does too rather than special-casing an "unbounded top-p"
+# path nothing exercises. `top_p >= 1.0` disables nucleus filtering (keeps
+# the whole top-k set). `repeat_penalty == 1.0` disables the penalty
+# entirely (this project's own default — see main.br's CLI help for why it
+# doesn't default to llama.cpp's own 1.1).
+pub (int, Rng) sample(Rng rng, [float32] logits, int vocab, float32 temperature,
+                       int top_k, float32 top_p, [int] history, float32 repeat_penalty,
+                       int repeat_last_n) throws:
+    let penalized = apply_repeat_penalty(logits, history, repeat_penalty, repeat_last_n)
+    if temperature <= 0.0 as float32:
+        (sample_greedy(penalized, vocab), rng)
+    else:
+        let k = if top_k > 0: top_k else: 50
+        let (top_val, top_idx) = top_k_select(penalized, vocab, k)
+        let n = top_val.length
+
+        var [float32] scaled = [0.0 for i in 0..<n]
+        var int i = 0
+        while i < n:
+            scaled[i] = top_val[i] / temperature
+            i += 1
+
+        # softmax over the top-k candidates (top_val/scaled are already
+        # sorted descending, so scaled[0] is the max — no separate max-scan
+        # needed).
+        var [float32] probs = [0.0 for i in 0..<n]
+        var float32 sum_exp = 0.0
+        i = 0
+        while i < n:
+            let e = (scaled[i] - scaled[0]).exp()
+            probs[i] = e
+            sum_exp += e
+            i += 1
+        i = 0
+        while i < n:
+            probs[i] = probs[i] / sum_exp
+            i += 1
+
+        # top-p (nucleus): probs is already sorted descending, so the
+        # smallest prefix whose cumulative sum reaches top_p is exactly
+        # the first `cutoff` entries.
+        var int cutoff = n
+        if top_p < 1.0 as float32:
+            var float32 cum = 0.0
+            var int j = 0
+            var bool cut_found = false
+            while j < n and not cut_found:
+                cum += probs[j]
+                j += 1
+                if cum >= top_p:
+                    cutoff = j
+                    cut_found = true
+
+        var float32 renorm_sum = 0.0
+        i = 0
+        while i < cutoff:
+            renorm_sum += probs[i]
+            i += 1
+
+        let (r01, new_rng) = rng_next_f32(rng)
+        let target = r01 * renorm_sum
+
+        var int chosen_slot = cutoff - 1
+        var float32 running = 0.0
+        var int s = 0
+        var bool slot_found = false
+        while s < cutoff and not slot_found:
+            running += probs[s]
+            if running >= target:
+                chosen_slot = s
+                slot_found = true
+            s += 1
+
+        (top_idx[chosen_slot], new_rng)

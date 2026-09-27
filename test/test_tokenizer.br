@@ -1,0 +1,53 @@
+# Tests for src/tokenizer.br's low-level pieces (UTF-8 codec, byte-to-
+# unicode table, pretokenization) that don't need the real model's vocab.
+# The full encode()/encode_chat() vs. llama-cpp-python check lives in
+# test/test_tokenizer_real.br (needs the real GGUF, compiled path).
+#
+# Run with:
+#   boring run test/test_tokenizer.br
+
+use tokenizer
+use io
+
+def main() throws:
+    # --- UTF-8 round-trip: ASCII ---
+    let a = utf8_encode_char("A")
+    assert_eq(a.length, 1)
+    assert_eq(a[0], 65)
+    assert_eq(bytes_to_str([65 as uint8]), "A")
+
+    # --- UTF-8 round-trip: 2-byte char (é = U+00E9) ---
+    let e = utf8_encode_char("é")
+    assert_eq(e.length, 2)
+    assert_eq(e[0], 0xC3)
+    assert_eq(e[1], 0xA9)
+    assert_eq(bytes_to_str([0xC3 as uint8, 0xA9 as uint8]), "é")
+
+    # --- byte-to-unicode: space (32) -> U+0120 'Ġ'; 'A' (65) -> identity ---
+    let b2u = build_byte_to_unicode()
+    assert_eq(b2u[32], "{chr(288)}")
+    assert_eq(b2u[65], "A")
+    # every one of the 256 byte values must have an entry
+    var i = 0
+    while i < 256:
+        assert(b2u.contains(i), "byte_to_unicode missing entry for byte {i}")
+        i += 1
+
+    # --- pretokenize: word boundaries, leading-space folding, punctuation ---
+    let seg1 = pretokenize("Hello world")
+    assert_eq(seg1.length, 2)
+    assert_eq(seg1[0], "Hello")
+    assert_eq(seg1[1], " world")
+
+    let seg2 = pretokenize("France?")
+    assert_eq(seg2.length, 2)
+    assert_eq(seg2[0], "France")
+    assert_eq(seg2[1], "?")
+
+    let seg3 = pretokenize("system\nYou")
+    assert_eq(seg3.length, 3)
+    assert_eq(seg3[0], "system")
+    assert_eq(seg3[1], "\n")
+    assert_eq(seg3[2], "You")
+
+    print "test_tokenizer: all assertions passed"

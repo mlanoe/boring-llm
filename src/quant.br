@@ -1,0 +1,218 @@
+# src/quant.br — GGUF quantized block formats, dequantized to flat float32.
+#
+# Q8_0 block layout (ggml's `block_q8_0`, QK8_0 = 32 elements/block):
+#   2 bytes: f16 scale `d`
+#   32 bytes: signed int8 quantized values `qs[0..32)`
+# dequantized value = qs[i] * d  (no zero-point — Q8_0 is symmetric)
+
+use io
+
+let int QK8_0 = 32
+
+pub [float32] dequantize_q8_0([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % QK8_0 == 0 else throw "dequantize_q8_0: n_elements must be a multiple of {QK8_0}, got {n_elements}"
+    var [float32] result = [0.0 for i in 0..<n_elements]
+    let n_blocks = n_elements / QK8_0
+    var int cur = offset
+    var int out_i = 0
+    var int b = 0
+    while b < n_blocks:
+        guard cur + 2 + QK8_0 <= bytes.length else throw "dequantize_q8_0: truncated block {b} at offset {cur}"
+        let scale_bits = read_u16_le(bytes, cur)
+        let scale = f16_bits_to_f32(scale_bits)
+        cur += 2
+        var int j = 0
+        while j < QK8_0:
+            let raw = int(bytes[cur])
+            let q = if raw > 127: raw - 256 else: raw
+            result[out_i] = (q as float32) * scale
+            cur += 1
+            out_i += 1
+            j += 1
+        b += 1
+    result
+
+# Q5_0 block layout (ggml's `block_q5_0`, QK5_0 = 32 elements/block, 22
+# bytes/block: 2-byte f16 scale `d` + 4-byte `qh` (the 5th/high bit of
+# every quantized value, one bit each) + 16 bytes `qs` (4-bit nibbles for
+# the low 4 bits, 2 values/byte). Reconstructed 5-bit unsigned value
+# (0..31) is offset by -16 (symmetric around 0, same idea as Q4_0/Q8_0's
+# own zero-point handling, just at 5-bit width) then scaled by `d` — no
+# separate min, unlike the K-quant formats below.
+
+let int QK5_0 = 32
+let int Q5_0_BLOCK_BYTES = 22
+
+pub [float32] dequantize_q5_0([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % QK5_0 == 0 else throw "dequantize_q5_0: n_elements must be a multiple of {QK5_0}, got {n_elements}"
+    var [float32] result = [0.0 for i in 0..<n_elements]
+    let n_blocks = n_elements / QK5_0
+    var int b = 0
+    while b < n_blocks:
+        let blk_start = offset + b * Q5_0_BLOCK_BYTES
+        guard blk_start + Q5_0_BLOCK_BYTES <= bytes.length else throw "dequantize_q5_0: truncated block {b}"
+        let d_bits = read_u16_le(bytes, blk_start)
+        let d = f16_bits_to_f32(d_bits)
+        let qh = read_u32_le(bytes, blk_start + 2)
+        let qs_base = blk_start + 6
+        let out_base = b * QK5_0
+
+        var int j = 0
+        while j < 16:
+            let byte_val = int(bytes[qs_base + j])
+            let low_nib = byte_val & 0xF
+            let high_nib = (byte_val >> 4) & 0xF
+            let xh0 = (qh >> j) & 1
+            let xh1 = (qh >> (j + 16)) & 1
+            let x0 = (low_nib | (xh0 << 4)) - 16
+            let x1 = (high_nib | (xh1 << 4)) - 16
+            result[out_base + j] = (x0 as float32) * d
+            result[out_base + 16 + j] = (x1 as float32) * d
+            j += 1
+        b += 1
+    result
+
+# ── K-quant ("superblock") formats ────────────────────────────────────────
+# Both formats below share a 256-element superblock (QK_K), subdivided into
+# smaller sub-blocks with their own quantized scale (and, for Q4_K, a
+# quantized minimum too) — denser packing than the legacy Q4_0/Q5_0/Q8_0
+# formats above, at the cost of a more involved unpacking scheme. Ported
+# directly from ggml's own `dequantize_row_q4_K`/`dequantize_row_q6_K`
+# (ggml.c) — the loop structure below deliberately mirrors the C source's
+# own nested-loop shape (superblock → sub-chunk → element) rather than
+# computing a flat per-element formula, to minimize transcription risk
+# porting bit-for-bit from a real, working reference implementation.
+
+let int QK_K = 256
+
+# Q6_K block layout (block_q6_K, 210 bytes/superblock):
+#   128 bytes `ql` (low 4 bits, 2 values/byte)
+#   64 bytes  `qh` (high 2 bits, 4 values/byte)
+#   16 bytes  `scales` (signed int8, one per 16-element sub-block, 16 of them)
+#   2 bytes   `d` (f16 super-block scale)
+# No separate min — Q6_K's own 6-bit value already spans -32..31 (unlike
+# Q4_K's 4-bit unsigned 0..15, which needs a min to shift into range).
+
+let int Q6_K_BLOCK_BYTES = 210
+
+pub [float32] dequantize_q6_k([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % QK_K == 0 else throw "dequantize_q6_k: n_elements must be a multiple of {QK_K}, got {n_elements}"
+    var [float32] result = [0.0 for i in 0..<n_elements]
+    let n_blocks = n_elements / QK_K
+    var int sb = 0
+    while sb < n_blocks:
+        let sb_start = offset + sb * Q6_K_BLOCK_BYTES
+        guard sb_start + Q6_K_BLOCK_BYTES <= bytes.length else throw "dequantize_q6_k: truncated block {sb}"
+        let d_bits = read_u16_le(bytes, sb_start + 208)
+        let d = f16_bits_to_f32(d_bits)
+        let out_base = sb * QK_K
+
+        var int n_iter = 0
+        while n_iter < 2:
+            let ql_base = sb_start + n_iter * 64
+            let qh_base = sb_start + 128 + n_iter * 32
+            let sc_base = sb_start + 192 + n_iter * 8
+            let y_base = out_base + n_iter * 128
+
+            var int l = 0
+            while l < 32:
+                let is0 = l / 16
+                let ql_l = int(bytes[ql_base + l])
+                let ql_l32 = int(bytes[ql_base + l + 32])
+                let qh_l = int(bytes[qh_base + l])
+
+                let sc0_raw = int(bytes[sc_base + is0])
+                let sc0 = if sc0_raw > 127: sc0_raw - 256 else: sc0_raw
+                let sc2_raw = int(bytes[sc_base + is0 + 2])
+                let sc2 = if sc2_raw > 127: sc2_raw - 256 else: sc2_raw
+                let sc4_raw = int(bytes[sc_base + is0 + 4])
+                let sc4 = if sc4_raw > 127: sc4_raw - 256 else: sc4_raw
+                let sc6_raw = int(bytes[sc_base + is0 + 6])
+                let sc6 = if sc6_raw > 127: sc6_raw - 256 else: sc6_raw
+
+                let q1 = ((ql_l & 0xF) | (((qh_l >> 0) & 3) << 4)) - 32
+                let q2 = ((ql_l32 & 0xF) | (((qh_l >> 2) & 3) << 4)) - 32
+                let q3 = ((ql_l >> 4) | (((qh_l >> 4) & 3) << 4)) - 32
+                let q4 = ((ql_l32 >> 4) | (((qh_l >> 6) & 3) << 4)) - 32
+
+                result[y_base + l] = d * (sc0 as float32) * (q1 as float32)
+                result[y_base + l + 32] = d * (sc2 as float32) * (q2 as float32)
+                result[y_base + l + 64] = d * (sc4 as float32) * (q3 as float32)
+                result[y_base + l + 96] = d * (sc6 as float32) * (q4 as float32)
+
+                l += 1
+            n_iter += 1
+        sb += 1
+    result
+
+# Q4_K block layout (block_q4_K, 144 bytes/superblock):
+#   2 bytes  `d`      (f16 super-block scale for the sub-block scales)
+#   2 bytes  `dmin`   (f16 super-block scale for the sub-block mins)
+#   12 bytes `scales` (8 sub-block scales + 8 sub-block mins, packed 6
+#                      bits each — see get_scale_min_k4 below)
+#   128 bytes `qs`    (4-bit nibbles, 2 values/byte)
+# dequantized value = d*scale[sub_block]*nibble - dmin*min[sub_block] — the
+# min is what lets a 4-bit *unsigned* 0..15 nibble represent a value
+# range not centered on zero, unlike Q4_0/Q5_0's fixed -8/-16 offset.
+
+let int Q4_K_BLOCK_BYTES = 144
+let int K_SCALE_SIZE = 12
+
+# Unpacks sub-block `j`'s (j in 0..7) 6-bit scale and 6-bit min from the
+# 12-byte packed `scales` field — ports ggml's own `get_scale_min_k4`
+# bit-for-bit (the packing scheme itself has no simpler description than
+# "these are the bits it uses").
+(int, int) get_scale_min_k4(int j, [uint8] bytes, int scales_base):
+    if j < 4:
+        let sc = int(bytes[scales_base + j]) & 63
+        let mn = int(bytes[scales_base + j + 4]) & 63
+        (sc, mn)
+    else:
+        let sc = (int(bytes[scales_base + j + 4]) & 0xF) | ((int(bytes[scales_base + j - 4]) >> 6) << 4)
+        let mn = (int(bytes[scales_base + j + 4]) >> 4) | ((int(bytes[scales_base + j]) >> 6) << 4)
+        (sc, mn)
+
+pub [float32] dequantize_q4_k([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % QK_K == 0 else throw "dequantize_q4_k: n_elements must be a multiple of {QK_K}, got {n_elements}"
+    var [float32] result = [0.0 for i in 0..<n_elements]
+    let n_blocks = n_elements / QK_K
+    var int sb = 0
+    while sb < n_blocks:
+        let sb_start = offset + sb * Q4_K_BLOCK_BYTES
+        guard sb_start + Q4_K_BLOCK_BYTES <= bytes.length else throw "dequantize_q4_k: truncated block {sb}"
+        let d_bits = read_u16_le(bytes, sb_start)
+        let d = f16_bits_to_f32(d_bits)
+        let dmin_bits = read_u16_le(bytes, sb_start + 2)
+        let dmin = f16_bits_to_f32(dmin_bits)
+        let scales_base = sb_start + 4
+        let qs_base = sb_start + 4 + K_SCALE_SIZE
+        let out_base = sb * QK_K
+
+        var int chunk = 0
+        while chunk < 4:
+            let j0 = chunk * 2
+            let j1 = j0 + 1
+
+            let (sc0, m0) = get_scale_min_k4(j0, bytes, scales_base)
+            let (sc1, m1) = get_scale_min_k4(j1, bytes, scales_base)
+
+            let d1 = d * (sc0 as float32)
+            let mv1 = dmin * (m0 as float32)
+            let d2 = d * (sc1 as float32)
+            let mv2 = dmin * (m1 as float32)
+
+            let qbyte_base = qs_base + chunk * 32
+            let y_base = out_base + chunk * 64
+
+            var int l = 0
+            while l < 32:
+                let byte_val = int(bytes[qbyte_base + l])
+                let lo = byte_val & 0xF
+                let hi = (byte_val >> 4) & 0xF
+                result[y_base + l] = d1 * (lo as float32) - mv1
+                result[y_base + 32 + l] = d2 * (hi as float32) - mv2
+                l += 1
+
+            chunk += 1
+        sb += 1
+    result

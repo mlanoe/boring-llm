@@ -1,0 +1,52 @@
+# Tests for src/math.br. Run with:
+#   boring run test/test_math.br
+# Small hand-computable cases only (this file runs under the interpreter,
+# not the compiled path) — the full-model, real-weights check lives in
+# test/test_forward.br and runs via `boring build` instead.
+
+use math
+
+def assert_close(float32 a, float32 b, string msg):
+    let diff = if a > b: a - b else: b - a
+    assert(diff < 0.0005 as float32, "{msg}: expected ~{b}, got {a}")
+
+def main() throws:
+    # --- rms_norm: d=4, weight=1, x=[1,2,3,4] ---
+    # mean_sq = 30/4 = 7.5, inv_rms = 1/sqrt(7.5) = 0.3651484
+    let normed = rms_norm([1.0, 2.0, 3.0, 4.0], [1.0, 1.0, 1.0, 1.0], 1, 4, 0.0 as float32)
+    assert_close(normed[0], 0.3651484 as float32, "rms_norm[0]")
+    assert_close(normed[3], 1.4605939 as float32, "rms_norm[3]")
+
+    # --- linear: d_in=2, d_out=1, w=[2,3], x=[1,1] -> 1*2 + 1*3 = 5 ---
+    let y = linear([1.0, 1.0], [2.0, 3.0], 1, 2, 1)
+    assert_eq(y.length, 1)
+    assert_close(y[0], 5.0 as float32, "linear")
+
+    # --- linear_bias: same but with bias [10] -> 15 ---
+    let yb = linear_bias([1.0, 1.0], [2.0, 3.0], [10.0], 1, 2, 1)
+    assert_close(yb[0], 15.0 as float32, "linear_bias")
+
+    # --- rope_apply: position 0 is always the identity rotation ---
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    let roped = rope_apply(x, 2, 1, 4, 10000.0 as float32)
+    assert_close(roped[0], 1.0 as float32, "rope pos0[0]")
+    assert_close(roped[1], 2.0 as float32, "rope pos0[1]")
+    assert_close(roped[2], 3.0 as float32, "rope pos0[2]")
+    assert_close(roped[3], 4.0 as float32, "rope pos0[3]")
+    # position 1 is rotated (not identity) but must preserve each pair's norm
+    let a0 = roped[4]
+    let a1 = roped[6]   # pair (0, half=2) -> indices 4 and 6 within position 1
+    let orig_norm_sq = x[4] * x[4] + x[6] * x[6]
+    let new_norm_sq = a0 * a0 + a1 * a1
+    assert_close(new_norm_sq, orig_norm_sq, "rope pos1 norm-preservation")
+
+    # --- silu(0) == 0 ---
+    assert_close(silu(0.0 as float32), 0.0 as float32, "silu(0)")
+
+    # --- gqa_attention: seq=1, softmax over a single score is always 1.0,
+    #     so output must exactly equal V regardless of Q/K ---
+    let out = gqa_attention([1.0, 0.0], [5.0, 5.0], [7.0, 9.0], 1, 1, 1, 2)
+    assert_close(out[0], 7.0 as float32, "attention seq=1 out[0]")
+    assert_close(out[1], 9.0 as float32, "attention seq=1 out[1]")
+
+    print "test_math: all assertions passed"

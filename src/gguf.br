@@ -1,0 +1,350 @@
+# src/gguf.br — GGUF file format parser (llama.cpp's model weight format).
+#
+# Format (see https://github.com/ggml-org/ggml/blob/master/docs/gguf.md):
+#   header:   magic "GGUF" (4 bytes) + version:u32 + tensor_count:u64 + kv_count:u64
+#   metadata: kv_count key-value pairs — key is a length-prefixed UTF-8 string,
+#             value is a typed scalar/string/array (13 value kinds total)
+#   tensors:  tensor_count tensor-info records — name, dims, ggml dtype, and
+#             a byte offset relative to the (alignment-padded) data section
+#   data:     raw tensor bytes, starting at the first `general.alignment`
+#             (default 32) boundary after the tensor-info list
+#
+# This is the direct generalization of whisper-boring's model.br's
+# parse_wbrf_tensors — bounds-guarded sequential binary reads into a
+# name-addressable structure — but for GGUF's much richer, self-describing
+# format (typed metadata instead of WBRF's fixed shape, and no separate
+# tokenizer export needed since GGUF embeds it in the metadata).
+
+use io
+
+# --- GGUF value-type tags (see the spec's gguf_metadata_value_type enum) ---
+
+let int GGUF_TYPE_UINT8   = 0
+let int GGUF_TYPE_INT8    = 1
+let int GGUF_TYPE_UINT16  = 2
+let int GGUF_TYPE_INT16   = 3
+let int GGUF_TYPE_UINT32  = 4
+let int GGUF_TYPE_INT32   = 5
+let int GGUF_TYPE_FLOAT32 = 6
+let int GGUF_TYPE_BOOL    = 7
+let int GGUF_TYPE_STRING  = 8
+let int GGUF_TYPE_ARRAY   = 9
+let int GGUF_TYPE_UINT64  = 10
+let int GGUF_TYPE_INT64   = 11
+let int GGUF_TYPE_FLOAT64 = 12
+
+pub enum GgufValue:
+    U8(int)
+    I8(int)
+    U16(int)
+    I16(int)
+    U32(int)
+    I32(int)
+    F32(float32)
+    Bool(bool)
+    Str(string)
+    U64(int)
+    I64(int)
+    F64(float)
+    Arr([GgufValue])
+
+pub struct GgufTensorInfo:
+    string name
+    [int] dims        # element counts per axis, outermost first
+    int ggml_type      # raw ggml dtype id — see ggml_type_name() below
+    int offset          # byte offset relative to the data section start
+
+pub struct GgufFile:
+    int version
+    {string=GgufValue} metadata
+    [GgufTensorInfo] tensors
+    int data_offset     # absolute byte offset where tensor data begins
+    [uint8] bytes        # the whole file, kept around for later tensor reads
+
+# --- low-level readers -----------------------------------------------------
+
+# A GGUF string is a u64 length prefix followed by that many UTF-8 bytes (no
+# null terminator, unlike a C string).
+(string, int) read_gguf_string([uint8] bytes, int offset) throws:
+    guard offset + 8 <= bytes.length else throw "GGUF: truncated string length at offset {offset}"
+    let len = read_u64_le(bytes, offset)
+    guard offset + 8 + len <= bytes.length else throw "GGUF: truncated string data at offset {offset} (len {len})"
+    let s = read_utf8(bytes, offset + 8, len)
+    (s, offset + 8 + len)
+
+int align_up(int offset, int alignment):
+    let rem = offset % alignment
+    if rem == 0:
+        offset
+    else:
+        offset + (alignment - rem)
+
+# 64-bit IEEE-754 double bit-decode — same reasoning as io.br's
+# f16_bits_to_f32: Boring has no way to reinterpret a u64 bit pattern as a
+# float64 directly (bitsToFloat is f32-only), and GGUF_TYPE_FLOAT64 metadata
+# values are legal even though real-world files essentially never use one
+# (rope_freq_base, epsilon, etc. are all stored as FLOAT32 in practice).
+float pow2i_f64(int e):
+    var float result = 1.0
+    if e >= 0:
+        var int i = 0
+        while i < e:
+            result = result * 2.0
+            i += 1
+    else:
+        var int i = 0
+        while i < (0 - e):
+            result = result / 2.0
+            i += 1
+    result
+
+float f64_bits_to_float(int bits):
+    let sign = (bits >> 63) & 1
+    let exp = (bits >> 52) & 0x7FF
+    let frac = bits & 0xFFFFFFFFFFFFF   # low 52 bits
+
+    var float mag = 0.0
+    if exp == 0:
+        mag = (frac as float) * pow2i_f64(-1022) / 4503599627370496.0   # 2^52
+    elif exp == 0x7FF:
+        mag = if frac == 0: (1.0 / 0.0) else: (0.0 / 0.0)
+    else:
+        let mantissa = 1.0 + (frac as float) / 4503599627370496.0
+        mag = mantissa * pow2i_f64(exp - 1023)
+
+    if sign == 1:
+        0.0 - mag
+    else:
+        mag
+
+# --- typed value parsing ----------------------------------------------------
+
+(GgufValue, int) read_gguf_scalar([uint8] bytes, int offset, int value_type) throws:
+    if value_type == GGUF_TYPE_UINT8:
+        guard offset + 1 <= bytes.length else throw "GGUF: truncated uint8 at offset {offset}"
+        (GgufValue.U8(int(bytes[offset])), offset + 1)
+    elif value_type == GGUF_TYPE_INT8:
+        guard offset + 1 <= bytes.length else throw "GGUF: truncated int8 at offset {offset}"
+        let u = int(bytes[offset])
+        # NOTE: deliberately not `let v = if u > 127: u - 256 else: u` followed
+        # by a tuple tail expression on the next line — that shape triggers a
+        # real boring parser bug (filed as task_bd2c95ab) where the tuple gets
+        # mis-parsed as a call applied to the if/else expression itself.
+        # Inlining the if/else directly into the tuple sidesteps it.
+        (GgufValue.I8(if u > 127: u - 256 else: u), offset + 1)
+    elif value_type == GGUF_TYPE_UINT16:
+        guard offset + 2 <= bytes.length else throw "GGUF: truncated uint16 at offset {offset}"
+        (GgufValue.U16(read_u16_le(bytes, offset)), offset + 2)
+    elif value_type == GGUF_TYPE_INT16:
+        guard offset + 2 <= bytes.length else throw "GGUF: truncated int16 at offset {offset}"
+        let u = read_u16_le(bytes, offset)
+        # See the INT8 branch's note above — same workaround for the same bug.
+        (GgufValue.I16(if u > 32767: u - 65536 else: u), offset + 2)
+    elif value_type == GGUF_TYPE_UINT32:
+        guard offset + 4 <= bytes.length else throw "GGUF: truncated uint32 at offset {offset}"
+        (GgufValue.U32(read_u32_le(bytes, offset)), offset + 4)
+    elif value_type == GGUF_TYPE_INT32:
+        guard offset + 4 <= bytes.length else throw "GGUF: truncated int32 at offset {offset}"
+        (GgufValue.I32(read_i32_le(bytes, offset)), offset + 4)
+    elif value_type == GGUF_TYPE_FLOAT32:
+        guard offset + 4 <= bytes.length else throw "GGUF: truncated float32 at offset {offset}"
+        (GgufValue.F32(read_f32_le(bytes, offset) as float32), offset + 4)
+    elif value_type == GGUF_TYPE_BOOL:
+        guard offset + 1 <= bytes.length else throw "GGUF: truncated bool at offset {offset}"
+        (GgufValue.Bool(int(bytes[offset]) != 0), offset + 1)
+    elif value_type == GGUF_TYPE_STRING:
+        let (s, new_offset) = read_gguf_string(bytes, offset)
+        (GgufValue.Str(s), new_offset)
+    elif value_type == GGUF_TYPE_UINT64:
+        guard offset + 8 <= bytes.length else throw "GGUF: truncated uint64 at offset {offset}"
+        (GgufValue.U64(read_u64_le(bytes, offset)), offset + 8)
+    elif value_type == GGUF_TYPE_INT64:
+        guard offset + 8 <= bytes.length else throw "GGUF: truncated int64 at offset {offset}"
+        (GgufValue.I64(read_u64_le(bytes, offset)), offset + 8)
+    elif value_type == GGUF_TYPE_FLOAT64:
+        guard offset + 8 <= bytes.length else throw "GGUF: truncated float64 at offset {offset}"
+        (GgufValue.F64(f64_bits_to_float(read_u64_le(bytes, offset))), offset + 8)
+    else:
+        throw "GGUF: unknown metadata value type {value_type} at offset {offset}"
+
+# Dispatches to read_gguf_scalar for every scalar kind, and additionally
+# handles GGUF_TYPE_ARRAY (element type:u32 + length:u64 + that many values
+# of the element type, read recursively — GGUF arrays are flat in practice,
+# but nothing here assumes that).
+(GgufValue, int) read_gguf_value([uint8] bytes, int offset, int value_type) throws:
+    if value_type == GGUF_TYPE_ARRAY:
+        guard offset + 12 <= bytes.length else throw "GGUF: truncated array header at offset {offset}"
+        let elem_type = read_u32_le(bytes, offset)
+        let count = read_u64_le(bytes, offset + 4)
+        var [GgufValue] items = []
+        var int cur = offset + 12
+        var int i = 0
+        while i < count:
+            let (item, new_offset) = read_gguf_value(bytes, cur, elem_type)
+            items.push(item)
+            cur = new_offset
+            i += 1
+        (GgufValue.Arr(items), cur)
+    else:
+        read_gguf_scalar(bytes, offset, value_type)
+
+int alignment_from_metadata({string=GgufValue} metadata):
+    if metadata.contains("general.alignment"):
+        match metadata["general.alignment"]:
+            GgufValue.U32(v): v
+            GgufValue.I32(v): v
+            _: 32
+    else:
+        32
+
+# --- top-level parse --------------------------------------------------------
+
+pub GgufFile parse_gguf([uint8] bytes) throws:
+    guard bytes.length >= 24 else throw "GGUF: file too short for header ({bytes.length} bytes)"
+    guard int(bytes[0]) == 0x47 and int(bytes[1]) == 0x47 and int(bytes[2]) == 0x55 and int(bytes[3]) == 0x46 else throw "GGUF: bad magic (not a GGUF file)"
+
+    let version = read_u32_le(bytes, 4)
+    let tensor_count = read_u64_le(bytes, 8)
+    let kv_count = read_u64_le(bytes, 16)
+
+    var {string=GgufValue} metadata = {=}
+    var int offset = 24
+    var int i = 0
+    while i < kv_count:
+        let (key, o1) = read_gguf_string(bytes, offset)
+        guard o1 + 4 <= bytes.length else throw "GGUF: truncated value type for key '{key}'"
+        let value_type = read_u32_le(bytes, o1)
+        let (value, o2) = read_gguf_value(bytes, o1 + 4, value_type)
+        metadata[key] = value
+        offset = o2
+        i += 1
+
+    var [GgufTensorInfo] tensors = []
+    i = 0
+    while i < tensor_count:
+        let (name, o1) = read_gguf_string(bytes, offset)
+        guard o1 + 4 <= bytes.length else throw "GGUF: truncated tensor info for '{name}'"
+        let n_dims = read_u32_le(bytes, o1)
+        var [int] dims = []
+        var int cur = o1 + 4
+        var int d = 0
+        while d < n_dims:
+            guard cur + 8 <= bytes.length else throw "GGUF: truncated tensor dims for '{name}'"
+            dims.push(read_u64_le(bytes, cur))
+            cur += 8
+            d += 1
+        guard cur + 12 <= bytes.length else throw "GGUF: truncated tensor type/offset for '{name}'"
+        let ggml_type = read_u32_le(bytes, cur)
+        cur += 4
+        let tensor_offset = read_u64_le(bytes, cur)
+        cur += 8
+        tensors.push(GgufTensorInfo(name, dims, ggml_type, tensor_offset))
+        offset = cur
+        i += 1
+
+    let alignment = alignment_from_metadata(metadata)
+    let data_offset = align_up(offset, alignment)
+
+    GgufFile(version, metadata, tensors, data_offset, bytes)
+
+# --- typed metadata accessors (used by main.br and later phases) -----------
+
+pub string? gguf_get_string({string=GgufValue} metadata, string key):
+    if metadata.contains(key):
+        match metadata[key]:
+            GgufValue.Str(s): s
+            _: nil
+    else:
+        nil
+
+# Covers every integer KV kind (u8/i8/u16/i16/u32/i32/u64/i64) — GGUF's
+# hyperparameters (block_count, head_count, context_length, ...) are stored
+# under a mix of these depending on the writer, so callers shouldn't need to
+# know which one a given key happens to use.
+pub int? gguf_get_int({string=GgufValue} metadata, string key):
+    if metadata.contains(key):
+        match metadata[key]:
+            GgufValue.U8(v): v
+            GgufValue.I8(v): v
+            GgufValue.U16(v): v
+            GgufValue.I16(v): v
+            GgufValue.U32(v): v
+            GgufValue.I32(v): v
+            GgufValue.U64(v): v
+            GgufValue.I64(v): v
+            _: nil
+    else:
+        nil
+
+pub float32? gguf_get_f32({string=GgufValue} metadata, string key):
+    if metadata.contains(key):
+        match metadata[key]:
+            GgufValue.F32(v): v
+            _: nil
+    else:
+        nil
+
+[GgufValue] gguf_value_as_array(GgufValue v):
+    match v:
+        GgufValue.Arr(items): items
+        _: []
+
+string? gguf_value_as_str(GgufValue v):
+    match v:
+        GgufValue.Str(s): s
+        _: nil
+
+int? gguf_value_as_int(GgufValue v):
+    match v:
+        GgufValue.U8(x): x
+        GgufValue.I8(x): x
+        GgufValue.U16(x): x
+        GgufValue.I16(x): x
+        GgufValue.U32(x): x
+        GgufValue.I32(x): x
+        GgufValue.U64(x): x
+        GgufValue.I64(x): x
+        _: nil
+
+pub [string] gguf_get_string_array({string=GgufValue} metadata, string key):
+    var [string] result = []
+    if metadata.contains(key):
+        for item in gguf_value_as_array(metadata[key]):
+            if let s = gguf_value_as_str(item):
+                result.push(s)
+    result
+
+pub [int] gguf_get_int_array({string=GgufValue} metadata, string key):
+    var [int] result = []
+    if metadata.contains(key):
+        for item in gguf_value_as_array(metadata[key]):
+            if let v = gguf_value_as_int(item):
+                result.push(v)
+    result
+
+# Human-readable name for a ggml tensor dtype id — covers the types this
+# project actually expects to see (F32/F16/BF16 plus the k-quant/legacy-quant
+# formats real GGUF files ship); anything else prints its raw numeric id
+# rather than claiming a name this project hasn't verified.
+pub string ggml_type_name(int t):
+    if t == 0: "F32"
+    elif t == 1: "F16"
+    elif t == 2: "Q4_0"
+    elif t == 3: "Q4_1"
+    elif t == 6: "Q5_0"
+    elif t == 7: "Q5_1"
+    elif t == 8: "Q8_0"
+    elif t == 9: "Q8_1"
+    elif t == 10: "Q2_K"
+    elif t == 11: "Q3_K"
+    elif t == 12: "Q4_K"
+    elif t == 13: "Q5_K"
+    elif t == 14: "Q6_K"
+    elif t == 15: "Q8_K"
+    elif t == 24: "I8"
+    elif t == 25: "I16"
+    elif t == 26: "I32"
+    elif t == 27: "I64"
+    elif t == 28: "F64"
+    elif t == 30: "BF16"
+    else: "type_{t}"

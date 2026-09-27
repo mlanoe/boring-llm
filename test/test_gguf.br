@@ -1,0 +1,65 @@
+# Tests for src/gguf.br against a real synthetic GGUF file (built by
+# tools/make_test_gguf.py using the real Python `gguf` package as ground
+# truth, so this test is independent of any bug this project's own writer —
+# there is no writer — might have shared with its reader). Run with:
+#   boring run test/test_gguf.br
+
+use io
+use gguf
+
+def main() throws:
+    let [uint8] bytes = fs.readBytes("test/fixtures/tiny.gguf")
+    let file = parse_gguf(bytes)
+
+    assert_eq(file.version, 3)
+
+    assert_eq(gguf_get_string(file.metadata, "general.architecture") else "", "tinytest")
+    assert_eq(gguf_get_int(file.metadata, "tinytest.block_count") else -1, 3)
+    # negative int8/int16 sign-extension — see gguf.br's read_gguf_scalar
+    # workaround note (task_bd2c95ab) for why this is written the way it is.
+    assert_eq(gguf_get_int(file.metadata, "tinytest.neg_i8") else 0, -5)
+    assert_eq(gguf_get_int(file.metadata, "tinytest.neg_i16") else 0, -1000)
+    let eps = gguf_get_f32(file.metadata, "tinytest.attention.layer_norm_rms_epsilon") else (0.0 as float32)
+    assert(eps > 0.0000009 as float32 and eps < 0.0000011 as float32, "rms epsilon should round-trip to ~1e-6, got {eps}")
+    assert_eq(gguf_get_string(file.metadata, "tinytest.description") else "", "hello gguf")
+
+    let tokens = gguf_get_string_array(file.metadata, "tinytest.token_list")
+    assert_eq(tokens.length, 3)
+    assert_eq(tokens[0], "<pad>")
+    assert_eq(tokens[1], "hi")
+    assert_eq(tokens[2], "there")
+
+    let token_types = gguf_get_int_array(file.metadata, "tinytest.token_type")
+    assert_eq(token_types.length, 3)
+    assert_eq(token_types[0], 1)
+    assert_eq(token_types[1], 2)
+    assert_eq(token_types[2], 2)
+
+    # bool metadata isn't covered by gguf_get_int/gguf_get_string — read it
+    # directly through the raw metadata dict to also exercise GgufValue.Bool.
+    match file.metadata["tinytest.flag"]:
+        GgufValue.Bool(v): assert(v, "tinytest.flag should be true")
+        _: assert(false, "tinytest.flag should decode as GgufValue.Bool")
+
+    assert_eq(file.tensors.length, 1)
+    let t = file.tensors[0]
+    assert_eq(t.name, "weight.0")
+    assert_eq(ggml_type_name(t.ggml_type), "F32")
+    # numpy's (2, 3) row-major shape becomes ggml's reversed ne = [3, 2]
+    # (ne[0] is the fastest-varying/innermost axis).
+    assert_eq(t.dims.length, 2)
+    assert_eq(t.dims[0], 3)
+    assert_eq(t.dims[1], 2)
+
+    # Read the tensor's raw data back out and check it matches the source
+    # array [[1,2,3],[4,5,6]] flattened in C (row-major) order — this
+    # exercises data_offset + per-tensor offset resolution together.
+    let data_start = file.data_offset + t.offset
+    var i = 0
+    let expected = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    while i < 6:
+        let v = read_f32_le(file.bytes, data_start + i * 4)
+        assert_eq(v, expected[i])
+        i += 1
+
+    print "test_gguf: all assertions passed"

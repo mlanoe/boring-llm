@@ -1,0 +1,53 @@
+# Real (compiled) tokenizer test against the actual Qwen2.5-0.5B-Instruct
+# vocab/merges (151936 tokens, 151387 merges — too large to build under
+# boring run's interpreter in reasonable time; loads and asserts via the
+# same fs.readBytes + parse_gguf path Phase 0 already validated). Verified
+# against llama-cpp-python's own .tokenize() for the identical strings.
+#
+# Build + run:
+#   boring build --target metal test/test_tokenizer_real.br
+#   cd test/test_tokenizer_real_metal && cargo build --release
+#   ./target/release/test_tokenizer_real ../../weights/qwen2.5-0.5b-instruct-q8_0.gguf
+
+use gguf
+use tokenizer
+
+def main() throws:
+    let [string] argv = args()
+    guard argv.length > 1 else throw "usage: test_tokenizer_real <path.gguf>"
+    let [uint8] bytes = fs.readBytes(argv[1])
+    let file = parse_gguf(bytes)
+    let tok = load_tokenizer(file)
+
+    # llama-cpp-python: llm.tokenize("The capital of France is".encode(), add_bos=False)
+    #   -> [785, 6722, 315, 9625, 374]
+    let ids1 = tok.encode("The capital of France is")
+    assert_eq(ids1.length, 5)
+    assert_eq(ids1[0], 785)
+    assert_eq(ids1[1], 6722)
+    assert_eq(ids1[2], 315)
+    assert_eq(ids1[3], 9625)
+    assert_eq(ids1[4], 374)
+    print "encode (plain prompt): OK ({ids1[0]}, {ids1[1]}, {ids1[2]}, {ids1[3]}, {ids1[4]})"
+
+    # decode round-trip
+    let text_back = tok.decode(ids1)
+    assert_eq(text_back, "The capital of France is" as string)
+    print "decode round-trip: OK"
+
+    # llama-cpp-python's own tokenize() of the full ChatML-wrapped prompt:
+    # [151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198,
+    #  151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30, 151645, 198,
+    #  151644, 77091, 198]
+    let expected = [151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198,
+                    151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30, 151645, 198,
+                    151644, 77091, 198]
+    let ids2 = tok.encode_chat("You are a helpful assistant.", "What is the capital of France?")
+    assert_eq(ids2.length, expected.length)
+    var i = 0
+    while i < expected.length:
+        assert_eq(ids2[i], expected[i])
+        i += 1
+    print "encode_chat (ChatML prompt): OK, {ids2.length} tokens matching llama-cpp-python exactly"
+
+    print "test_tokenizer_real: all assertions passed"

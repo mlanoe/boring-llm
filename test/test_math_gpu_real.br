@@ -1,0 +1,134 @@
+# Real (compiled, --target metal) counterpart to test_math_gpu.br — covers
+# the two kernels the interpreter can't currently simulate correctly
+# (RopeApplyKernel: task_cc223e5c: .powf() fails under simulation; and, as
+# of this file, LinearKernel: task_88105830, a literal-0.0-into-a-float32-
+# array-slot type bug that also blocks simulation) plus a full small-scale
+# sanity check of every kernel against math.br's CPU reference values.
+#
+# Build + run:
+#   boring build --target metal test/test_math_gpu_real.br
+#   cd test/test_math_gpu_real_metal && cargo build --release
+#   ./target/release/test_math_gpu_real
+
+use io
+use math
+use math_gpu
+use quant
+
+def assert_close(float32 a, float32 b, string msg):
+    let diff = if a > b: a - b else: b - a
+    assert(diff < 0.001 as float32, "{msg}: expected ~{b}, got {a}")
+
+def main() throws:
+    # --- linear_gpu vs. CPU linear_bias, d_in=3, d_out=2, seq=2 ---
+    let x = [1.0, 2.0, 3.0,  4.0, 5.0, 6.0]
+    let w = [1.0, 0.0, 0.0,  0.0, 1.0, 0.0]   # row0 picks x[0], row1 picks x[1]
+    let b = [10.0, 20.0]
+    let cpu_lin = linear_bias(x, w, b, 2, 3, 2)
+    let gpu_lin_raw = linear_gpu(x, w, b, 2, 3, 2)
+    let gpu_lin = passthrough(gpu_lin_raw)
+    var i = 0
+    while i < cpu_lin.length:
+        assert_close(gpu_lin[i], cpu_lin[i], "linear_gpu[{i}]")
+        i += 1
+    print "linear_gpu: OK ({gpu_lin[0]} {gpu_lin[1]} {gpu_lin[2]} {gpu_lin[3]})"
+
+    # --- linear_warp_gpu (warp-shuffle reduction) vs. the same CPU reference ---
+    let warp_lin_raw = linear_warp_gpu(x, w, b, 2, 3, 2)
+    let warp_lin = passthrough(warp_lin_raw)
+    i = 0
+    while i < cpu_lin.length:
+        assert_close(warp_lin[i], cpu_lin[i], "linear_warp_gpu[{i}]")
+        i += 1
+    print "linear_warp_gpu (small): OK ({warp_lin[0]} {warp_lin[1]} {warp_lin[2]} {warp_lin[3]})"
+
+    # --- linear_warp_gpu with d_in=100 (spans multiple warp-stride rounds,
+    #     since 100 > warp size) and seq=3, d_out=5 (exercises the
+    #     block/warp/grid index arithmetic beyond a single trivial warp) ---
+    var [float32] big_x = [0.0 for i in 0..<300]
+    var [float32] big_w = [0.0 for i in 0..<500]
+    var [float32] big_b = [1.0, 2.0, 3.0, 4.0, 5.0]
+    i = 0
+    while i < 300:
+        let xv = (i % 7) as float32
+        big_x[i] = xv * (0.1 as float32)
+        i += 1
+    i = 0
+    while i < 500:
+        let wv = (i % 5) as float32
+        big_w[i] = wv * (0.2 as float32)
+        i += 1
+    let cpu_big = linear_bias(big_x, big_w, big_b, 3, 100, 5)
+    let warp_big_raw = linear_warp_gpu(big_x, big_w, big_b, 3, 100, 5)
+    let warp_big = passthrough(warp_big_raw)
+    i = 0
+    while i < cpu_big.length:
+        assert_close(warp_big[i], cpu_big[i], "linear_warp_gpu(big)[{i}]")
+        i += 1
+    print "linear_warp_gpu (d_in=100, seq=3, d_out=5): OK (15/15 values match)"
+
+    # --- rope_apply_gpu vs. CPU rope_apply, seq=2, n_heads=1, d_head=4 ---
+    let rx = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    let cpu_rope = rope_apply(rx, 2, 1, 4, 10000.0 as float32)
+    let gpu_rope_raw = rope_apply_gpu(rx, 2, 1, 4, 10000.0 as float32)
+    let gpu_rope = passthrough(gpu_rope_raw)
+    i = 0
+    while i < cpu_rope.length:
+        assert_close(gpu_rope[i], cpu_rope[i], "rope_apply_gpu[{i}]")
+        i += 1
+    print "rope_apply_gpu: OK"
+
+    # --- attention_gqa_gpu vs. CPU gqa_attention, seq=3, n_head=2, n_kv_head=1, d_head=2 ---
+    let aq = [1.0, 0.0, 0.5, 0.5,  0.0, 1.0, 1.0, 0.0,  0.2, 0.8, 0.3, 0.7]
+    let ak = [1.0, 0.0,  0.0, 1.0,  0.5, 0.5]
+    let av = [1.0, 2.0,  3.0, 4.0,  5.0, 6.0]
+    let cpu_attn = gqa_attention(aq, ak, av, 3, 2, 1, 2)
+    let gpu_attn_raw = attention_gqa_gpu(aq, ak, av, 3, 3, 2, 1, 2, true)
+    let gpu_attn = passthrough(gpu_attn_raw)
+    i = 0
+    while i < cpu_attn.length:
+        assert_close(gpu_attn[i], cpu_attn[i], "attention_gqa_gpu[{i}]")
+        i += 1
+    print "attention_gqa_gpu: OK"
+
+    # --- q8_linear_gpu vs. CPU dequantize_q8_0 + linear_bias ---
+    # d_in=32 (exactly one Q8_0 block per row), d_out=2, seq=1.
+    # NOTE: passes on `--target metal`, but `--target wgpu` now correctly
+    # REJECTS this kernel at compile time (task_0bd1e42a's fix landed):
+    # Q8LinearKernel's `w_packed` field is `[uint8]'global`, and WGSL has no
+    # 8-bit storage-buffer element type — `boring` used to silently declare
+    # the buffer as `array<u32>` while the host still uploaded/sized it at
+    # true byte granularity (every read past the first element landing 4x
+    # too far in), but now gives a clear compile-time error instead. This is
+    # a real WGSL limitation, not a bug — Q8LinearKernel stays Metal-only
+    # until it's reworked to pack 4 bytes per `uint32` storage slot and
+    # unpack via bit-shifts (not attempted here). See README.md's Phase 4
+    # wgpu section for the full writeup.
+    var [uint8] w_packed = []
+    # row0: scale=1.0 (f16 bits 0x3C00), all 32 quantized values = 1
+    w_packed.push(0x00 as uint8)
+    w_packed.push(0x3C as uint8)
+    var qi = 0
+    while qi < 32:
+        w_packed.push(1 as uint8)
+        qi += 1
+    # row1: scale=2.0 (f16 bits 0x4000), values = [1, 0, 0, ..., 0]
+    w_packed.push(0x00 as uint8)
+    w_packed.push(0x40 as uint8)
+    w_packed.push(1 as uint8)
+    qi = 0
+    while qi < 31:
+        w_packed.push(0 as uint8)
+        qi += 1
+
+    let cpu_w = dequantize_q8_0(w_packed, 0, 64)
+    let qx = [1.0 for i in 0..<32]
+    let qb = [100.0, 200.0]
+    let cpu_q8 = linear_bias(qx, cpu_w, qb, 1, 32, 2)
+    let gpu_q8_raw = q8_linear_gpu(qx, w_packed, qb, 1, 32, 2)
+    let gpu_q8 = passthrough(gpu_q8_raw)
+    assert_close(gpu_q8[0], cpu_q8[0], "q8_linear_gpu[0]")
+    assert_close(gpu_q8[1], cpu_q8[1], "q8_linear_gpu[1]")
+    print "q8_linear_gpu: OK ({gpu_q8[0]} {gpu_q8[1]}, expected ~132 ~202)"
+
+    print "test_math_gpu_real: all assertions passed"

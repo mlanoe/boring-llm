@@ -1,0 +1,172 @@
+# src/math.br — CPU-only reference transformer math (Phase 1): RMSNorm,
+# RoPE, naive grouped-query attention, SwiGLU MLP. No KV-cache, no GPU —
+# full re-forward every position, deliberately, to get the transformer math
+# provably right before adding kernel-qualifier plumbing (Phase 2).
+#
+# Layout convention (matches whisper-boring's math.br/math_gpu.br): every
+# [float32] here is a flat, row-major (position outer, feature dim inner)
+# buffer — x[p * d + i] is position p's i-th feature.
+
+pub [float32] vec_add([float32] a, [float32] b):
+    var [float32] result = [0.0 for i in 0..<a.length]
+    var int i = 0
+    while i < a.length:
+        result[i] = a[i] + b[i]
+        i += 1
+    result
+
+pub [float32] rms_norm([float32] x, [float32] weight, int seq, int d, float32 eps):
+    var [float32] result = [0.0 for i in 0..<(seq * d)]
+    var int p = 0
+    while p < seq:
+        var float32 ss = 0.0
+        var int i = 0
+        while i < d:
+            let v = x[p * d + i]
+            ss = ss + v * v
+            i += 1
+        let mean_sq = ss / (d as float32)
+        let inv_rms = 1.0 / (mean_sq + eps).sqrt()
+        i = 0
+        while i < d:
+            result[p * d + i] = x[p * d + i] * inv_rms * weight[i]
+            i += 1
+        p += 1
+    result
+
+# y = x @ W^T, W stored (d_out rows x d_in cols) row-major — GGUF/ggml's own
+# convention for a Linear weight tensor (ne = [d_in, d_out], row length d_in).
+pub [float32] linear([float32] x, [float32] w, int seq, int d_in, int d_out):
+    var [float32] result = [0.0 for i in 0..<(seq * d_out)]
+    var int p = 0
+    while p < seq:
+        var int o = 0
+        while o < d_out:
+            var float32 sum = 0.0
+            var int i = 0
+            while i < d_in:
+                sum = sum + x[p * d_in + i] * w[o * d_in + i]
+                i += 1
+            result[p * d_out + o] = sum
+            o += 1
+        p += 1
+    result
+
+pub [float32] linear_bias([float32] x, [float32] w, [float32] b, int seq, int d_in, int d_out):
+    var [float32] result = linear(x, w, seq, d_in, d_out)
+    var int p = 0
+    while p < seq:
+        var int o = 0
+        while o < d_out:
+            result[p * d_out + o] = result[p * d_out + o] + b[o]
+            o += 1
+        p += 1
+    result
+
+# NEOX-style ("rotate-half") RoPE — Qwen2 (like Llama/GPT-NeoX) rotates the
+# full head_dim, splitting it into two halves and rotating them as pairs
+# (j, j + d_head/2), NOT the interleaved GPT-J style (adjacent pairs
+# (2j, 2j+1)). x is (seq x n_heads*d_head), same position index applies to
+# every head.
+pub [float32] rope_apply([float32] x, int seq, int n_heads, int d_head, float32 freq_base):
+    rope_apply_at(x, seq, n_heads, d_head, freq_base, 0)
+
+# Same rotation, but position `p` in the angle computation is offset by
+# `start_pos` — needed for KV-cache incremental decode, where a single new
+# token's ABSOLUTE position in the sequence (prompt length + steps taken so
+# far) is not the same as its LOCAL row index (always 0) within this one
+# call's (seq x ...) buffer.
+pub [float32] rope_apply_at([float32] x, int seq, int n_heads, int d_head, float32 freq_base, int start_pos):
+    let half_dim = d_head / 2
+    var [float32] result = [0.0 for i in 0..<x.length]
+    var int p = 0
+    while p < seq:
+        let abs_pos = p + start_pos
+        var int h = 0
+        while h < n_heads:
+            let base_idx = p * n_heads * d_head + h * d_head
+            var int j = 0
+            while j < half_dim:
+                let freq_exp = (2.0 * (j as float32)) / (d_head as float32)
+                let theta = 1.0 / freq_base.powf(freq_exp)
+                let angle = (abs_pos as float32) * theta
+                let cos_a = angle.cos()
+                let sin_a = angle.sin()
+                let x0 = x[base_idx + j]
+                let x1 = x[base_idx + j + half_dim]
+                result[base_idx + j] = x0 * cos_a - x1 * sin_a
+                result[base_idx + j + half_dim] = x0 * sin_a + x1 * cos_a
+                j += 1
+            h += 1
+        p += 1
+    result
+
+pub float32 silu(float32 x):
+    x / (1.0 + (0.0 - x).exp())
+
+pub [float32] swiglu_ffn([float32] x, [float32] gate_w, [float32] up_w, [float32] down_w,
+                          int seq, int d_model, int ffn_dim):
+    let gate = linear(x, gate_w, seq, d_model, ffn_dim)
+    let up = linear(x, up_w, seq, d_model, ffn_dim)
+    var [float32] hidden = [0.0 for i in 0..<(seq * ffn_dim)]
+    var int idx = 0
+    while idx < seq * ffn_dim:
+        hidden[idx] = silu(gate[idx]) * up[idx]
+        idx += 1
+    linear(hidden, down_w, seq, ffn_dim, d_model)
+
+# Naive O(seq^2) causal grouped-query attention. q is (seq x n_head*d_head);
+# k/v are (seq x n_kv_head*d_head) — n_head query heads share n_kv_head
+# key/value heads via integer-divide head mapping (kv_h = h / group).
+pub [float32] gqa_attention([float32] q, [float32] k, [float32] v,
+                             int seq, int n_head, int n_kv_head, int d_head):
+    let scale = 1.0 / (d_head as float32).sqrt()
+    let group = n_head / n_kv_head
+    var [float32] out = [0.0 for i in 0..<(seq * n_head * d_head)]
+    var int h = 0
+    while h < n_head:
+        let kv_h = h / group
+        var int i = 0
+        while i < seq:
+            var [float32] scores = [0.0 for jj in 0..<(i + 1)]
+            var int j = 0
+            while j <= i:
+                var float32 dot = 0.0
+                var int d = 0
+                while d < d_head:
+                    dot = dot + q[i * n_head * d_head + h * d_head + d] * k[j * n_kv_head * d_head + kv_h * d_head + d]
+                    d += 1
+                scores[j] = dot * scale
+                j += 1
+
+            var float32 mx = scores[0]
+            j = 1
+            while j <= i:
+                if scores[j] > mx:
+                    mx = scores[j]
+                j += 1
+
+            var float32 sum_exp = 0.0
+            j = 0
+            while j <= i:
+                let e = (scores[j] - mx).exp()
+                scores[j] = e
+                sum_exp = sum_exp + e
+                j += 1
+            j = 0
+            while j <= i:
+                scores[j] = scores[j] / sum_exp
+                j += 1
+
+            var int d = 0
+            while d < d_head:
+                var float32 acc = 0.0
+                j = 0
+                while j <= i:
+                    acc = acc + scores[j] * v[j * n_kv_head * d_head + kv_h * d_head + d]
+                    j += 1
+                out[i * n_head * d_head + h * d_head + d] = acc
+                d += 1
+            i += 1
+        h += 1
+    out

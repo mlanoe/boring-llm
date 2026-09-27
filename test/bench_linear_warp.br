@@ -1,0 +1,76 @@
+# Ad hoc wall-clock benchmark: linear_gpu (16x16-tiled, shared-memory
+# reduction) vs. linear_warp_gpu (one warp per output cell, shuffle-based
+# reduction), at this project's actual model dimensions (d_model=896,
+# ffn_dim=4864, vocab=151936) — not a unit test, just answering "is the
+# warp-shuffle kernel actually faster at the sizes this project cares
+# about", run manually, not part of the CI-adjacent test/*.br suite.
+#
+# Build + run:
+#   boring build --target metal test/bench_linear_warp.br
+#   cd test/bench_linear_warp_metal && cargo build --release
+#   ./target/release/bench_linear_warp
+
+# Boring has no documented stopwatch-style elapsed-time API (Instant/
+# Duration are oriented around timeout/wait, not measurement) — timed via
+# separate process invocations + the shell's own `time` instead: pass
+# "tiled-small"/"warp-small"/"tiled-big"/"warp-big" as argv[1] to run just
+# one section per invocation.
+
+use math_gpu
+
+def main() throws:
+    let [string] argv = args()
+    guard argv.length > 1 else throw "usage: bench_linear_warp <tiled-small|warp-small|tiled-big|warp-big>"
+    let which = argv[1]
+
+    let seq = 26
+    let d_model = 896
+    let vocab = 8192   # a representative large d_out without allocating the real 151936-wide bias/output arrays
+
+    var [float32] x = [0.0 for i in 0..<(seq * d_model)]
+    var [float32] w_qq = [0.0 for i in 0..<(d_model * d_model)]
+    var [float32] b_qq = [0.0 for i in 0..<d_model]
+    var [float32] w_head = [0.0 for i in 0..<(vocab * d_model)]
+    var [float32] b_head = [0.0 for i in 0..<vocab]
+    var i = 0
+    while i < x.length:
+        x[i] = ((i % 13) as float32) * (0.01 as float32)
+        i += 1
+    i = 0
+    while i < w_qq.length:
+        w_qq[i] = ((i % 11) as float32) * (0.01 as float32)
+        i += 1
+    i = 0
+    while i < w_head.length:
+        w_head[i] = ((i % 17) as float32) * (0.01 as float32)
+        i += 1
+
+    let n_iter = 200
+    var iter = 0
+
+    if which == "tiled-small":
+        while iter < n_iter:
+            let out_tiled = linear_gpu(x, w_qq, b_qq, seq, d_model, d_model)
+            let sink = passthrough(out_tiled)
+            iter += 1
+        print "linear_gpu (tiled), d_out=896, {n_iter} iters: done"
+    elif which == "warp-small":
+        while iter < n_iter:
+            let out_warp = linear_warp_gpu(x, w_qq, b_qq, seq, d_model, d_model)
+            let sink2 = passthrough(out_warp)
+            iter += 1
+        print "linear_warp_gpu, d_out=896, {n_iter} iters: done"
+    elif which == "tiled-big":
+        while iter < n_iter:
+            let out_tiled2 = linear_gpu(x, w_head, b_head, seq, d_model, vocab)
+            let sink3 = passthrough(out_tiled2)
+            iter += 1
+        print "linear_gpu (tiled), d_out={vocab}, {n_iter} iters: done"
+    elif which == "warp-big":
+        while iter < n_iter:
+            let out_warp2 = linear_warp_gpu(x, w_head, b_head, seq, d_model, vocab)
+            let sink4 = passthrough(out_warp2)
+            iter += 1
+        print "linear_warp_gpu, d_out={vocab}, {n_iter} iters: done"
+    else:
+        throw "unknown section '{which}'"

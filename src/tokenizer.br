@@ -1,0 +1,308 @@
+# src/tokenizer.br — byte-level BPE tokenizer (GPT-2/Qwen2 family), built
+# directly from GGUF-embedded metadata (tokenizer.ggml.tokens/merges/
+# bos_token_id/eos_token_id) — no separate vocab.json/merges.txt export
+# step needed, unlike whisper-boring's tokenizer.br (whose source format,
+# a bare PyTorch checkpoint, has no embedded tokenizer at all).
+#
+# Simplified pretokenization: splits text into runs of {ASCII letter, ASCII
+# digit, other/punctuation, whitespace}, folding a single leading space into
+# the following run as GPT-2's own "Ġ" space-marker byte — NOT the full
+# GPT-2/Qwen2 pretokenization regex (which also has contraction rules
+# 's/'t/'re/... and real Unicode letter/number properties, not just ASCII).
+# Verified correct against llama-cpp-python's own tokenizer for plain
+# English prompts, including a full ChatML-wrapped chat prompt (see
+# test/test_tokenizer.br) — non-ASCII text or contractions may tokenize
+# differently than the reference.
+
+use gguf
+use io
+
+pub struct Tokenizer:
+    {string=int} vocab
+    {int=string} reverse
+    [[string]] merges
+    {int=string} byte_to_uni
+    {string=int} uni_to_byte
+    int bos_token_id
+    int eos_token_id
+
+    req [string] apply_merge([string] word, string a, string b):
+        var [string] out = []
+        var int i = 0
+        while i < word.length:
+            if i < word.length - 1 and word[i] == a and word[i + 1] == b:
+                out.push("{a}{b}")
+                i += 2
+            else:
+                out.push(word[i])
+                i += 1
+        out
+
+    # `segment` is a pretokenized chunk of ORIGINAL text (not yet
+    # byte-remapped) — converts it to byte-level unicode chars, then
+    # applies every BPE merge rule in rank order (same algorithm as
+    # whisper-boring's tokenizer.br).
+    req [string] bpe_word(string segment):
+        var [string] word = []
+        for ch in segment.chars():
+            for b in utf8_encode_char(ch):
+                # NOTE: rebinding the for-loop value before using it as a
+                # dict key — indexing `self.byte_to_uni[b]` directly with
+                # the loop variable itself mis-transpiles (a spurious
+                # double-dereference, "type isize cannot be dereferenced").
+                let int bb = b
+                word.push(self.byte_to_uni[bb])
+        for merge in self.merges:
+            word = self.apply_merge(word, merge[0], merge[1])
+        word
+
+    req [int] encode(string text):
+        var [int] ids = []
+        for segment in pretokenize(text):
+            for tok in self.bpe_word(segment):
+                let id = self.vocab[tok] else -1
+                if id >= 0:
+                    ids.push(id)
+        ids
+
+    req string decode([int] ids):
+        var [uint8] bytes = []
+        for id in ids:
+            let tok = self.reverse[id] else ""
+            for ch in tok.chars():
+                let b = self.uni_to_byte["{ch}"] else -1
+                if b >= 0:
+                    bytes.push(b as uint8)
+        bytes_to_str(bytes)
+
+    # Builds the Qwen2.5 ChatML-wrapped token sequence for a single-turn
+    # chat (system + user message), ending right after the assistant
+    # role-open marker so the model can start generating a reply.
+    # Constructed programmatically (special-token IDs looked up directly
+    # in `vocab`, interleaved with plain-text BPE segments) rather than by
+    # scanning an assembled string for embedded special tokens — verified
+    # to produce the identical token sequence llama-cpp-python's own
+    # tokenizer gives for the same chat prompt (test/test_tokenizer.br).
+    req [int] encode_chat(string system_msg, string user_msg) throws:
+        self.encode_chat_multi(system_msg, [user_msg], [])
+
+    # Builds the ChatML-wrapped token sequence for a full multi-turn
+    # conversation: system message, then each user turn followed by its
+    # assistant reply (`assistant_msgs[i]` is the already-generated reply to
+    # `user_msgs[i]`), ending right after the final user turn's assistant
+    # role-open marker so the model can start generating the next reply.
+    # `assistant_msgs.length` is expected to be `user_msgs.length - 1` (the
+    # newest user turn has no reply yet) — `encode_chat` above is just the
+    # single-turn case (`user_msgs = [user_msg]`, `assistant_msgs = []`),
+    # kept as its own function since it's the one verified bit-exact against
+    # llama-cpp-python's tokenizer (test/test_tokenizer.br) and callers
+    # already depend on that exact signature.
+    req [int] encode_chat_multi(string system_msg, [string] user_msgs, [string] assistant_msgs) throws:
+        # NOTE: not `guard let x = dict[key] else throw` — dict indexing
+        # panics on a missing key rather than yielding an optional `guard
+        # let` can bind, unlike a function genuinely returning `T?`
+        # (e.g. gguf.br's gguf_get_string). `dict[key] else default` is the
+        # correct/working spelling for a defaulted dict lookup.
+        let im_start = self.vocab["<|im_start|>"] else -1
+        guard im_start >= 0 else throw "tokenizer: missing <|im_start|> in vocab"
+        let im_end = self.vocab["<|im_end|>"] else -1
+        guard im_end >= 0 else throw "tokenizer: missing <|im_end|> in vocab"
+        var [int] ids = []
+        ids.push(im_start)
+        for t in self.encode("system\n{system_msg}"): ids.push(t)
+        ids.push(im_end)
+        for t in self.encode("\n"): ids.push(t)
+        var int i = 0
+        while i < user_msgs.length:
+            ids.push(im_start)
+            for t in self.encode("user\n{user_msgs[i]}"): ids.push(t)
+            ids.push(im_end)
+            for t in self.encode("\n"): ids.push(t)
+            if i < assistant_msgs.length:
+                ids.push(im_start)
+                for t in self.encode("assistant\n{assistant_msgs[i]}"): ids.push(t)
+                ids.push(im_end)
+                for t in self.encode("\n"): ids.push(t)
+            i += 1
+        ids.push(im_start)
+        for t in self.encode("assistant\n"): ids.push(t)
+        ids
+
+def bool is_ascii_letter(string ch):
+    (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z")
+
+def bool is_ascii_digit(string ch):
+    ch >= "0" and ch <= "9"
+
+def bool is_ascii_space(string ch):
+    ch == " " or ch == "\n" or ch == "\t" or ch == "\r"
+
+[string] pretokenize(string text):
+    let chars = text.chars()
+    let n = chars.length
+    var [string] segments = []
+    var int i = 0
+    while i < n:
+        var string seg = ""
+        if chars[i] == " " and i + 1 < n and chars[i + 1] != " " and chars[i + 1] != "\n" and chars[i + 1] != "\t":
+            seg = " "
+            i += 1
+        if i >= n:
+            segments.push(seg)
+            break
+        let c = chars[i]
+        if is_ascii_letter(c):
+            while i < n and is_ascii_letter(chars[i]):
+                seg = "{seg}{chars[i]}"
+                i += 1
+        elif is_ascii_digit(c):
+            while i < n and is_ascii_digit(chars[i]):
+                seg = "{seg}{chars[i]}"
+                i += 1
+        elif is_ascii_space(c):
+            while i < n and is_ascii_space(chars[i]):
+                seg = "{seg}{chars[i]}"
+                i += 1
+        else:
+            while i < n and not is_ascii_letter(chars[i]) and not is_ascii_digit(chars[i]) and not is_ascii_space(chars[i]):
+                seg = "{seg}{chars[i]}"
+                i += 1
+        segments.push(seg)
+    segments
+
+# GPT-2's byte-level encoding: printable ASCII/Latin-1 bytes map to their
+# own codepoint; every other byte (controls, space, DEL, etc.) maps to a
+# codepoint starting at 256, in ascending byte order — verified against a
+# real GGUF vocab entry ("Ġcapital", confirming byte 32/space → codepoint
+# 288 = U+0120 = 'Ġ', matching this algorithm exactly).
+{int=string} build_byte_to_unicode():
+    var {int=string} m = {=}
+    var {int=bool} in_bs = {=}
+    var int b = 33
+    while b <= 126:
+        m[b] = chr(b)
+        in_bs[b] = true
+        b += 1
+    b = 161
+    while b <= 172:
+        m[b] = chr(b)
+        in_bs[b] = true
+        b += 1
+    b = 174
+    while b <= 255:
+        m[b] = chr(b)
+        in_bs[b] = true
+        b += 1
+    var int n = 0
+    b = 0
+    while b < 256:
+        if not in_bs.contains(b):
+            m[b] = chr(256 + n)
+            n += 1
+        b += 1
+    m
+
+# Reverse of build_byte_to_unicode, built independently (not by indexing a
+# local `{int=string}` dict from a separate call's result) — a real
+# transpiler bug (already filed in a different project as task_a2127b70)
+# mis-transpiles a plain-local (non-`self.`-field) dict index as an array
+# index instead.
+{string=int} build_unicode_to_byte():
+    var {string=int} m = {=}
+    var int b = 33
+    while b <= 126:
+        m[chr(b)] = b
+        b += 1
+    b = 161
+    while b <= 172:
+        m[chr(b)] = b
+        b += 1
+    b = 174
+    while b <= 255:
+        m[chr(b)] = b
+        b += 1
+    var {int=bool} in_bs = {=}
+    b = 33
+    while b <= 126:
+        in_bs[b] = true
+        b += 1
+    b = 161
+    while b <= 172:
+        in_bs[b] = true
+        b += 1
+    b = 174
+    while b <= 255:
+        in_bs[b] = true
+        b += 1
+    var int n = 0
+    b = 0
+    while b < 256:
+        if not in_bs.contains(b):
+            m[chr(256 + n)] = b
+            n += 1
+        b += 1
+    m
+
+pub [int] utf8_encode_char(string ch):
+    let cp = ord(ch)
+    if cp <= 0x7F:
+        [cp]
+    elif cp <= 0x7FF:
+        [0xC0 | (cp >> 6), 0x80 | (cp & 0x3F)]
+    elif cp <= 0xFFFF:
+        [0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)]
+    else:
+        [0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)]
+
+
+pub Tokenizer load_tokenizer(GgufFile file) throws:
+    let tokens = gguf_get_string_array(file.metadata, "tokenizer.ggml.tokens")
+    var {string=int} vocab = {=}
+    var {int=string} reverse = {=}
+    var int i = 0
+    while i < tokens.length:
+        vocab[tokens[i]] = i
+        reverse[i] = tokens[i]
+        i += 1
+
+    # NOTE: manual space-scan, not `.split(" ")` — `str::split` transpiles
+    # to borrowed `&str` pieces instead of owned `Arc<str>`, mismatching
+    # `[string]`'s element type (a real transpiler bug — filed). Mirrors
+    # whisper-boring/src/tokenizer.br's own merges.txt parser, which uses
+    # the identical manual scan for the same reason.
+    let merge_strs = gguf_get_string_array(file.metadata, "tokenizer.ggml.merges")
+    var [[string]] merges = []
+    for m in merge_strs:
+        # NOTE: indexes `m.chars()` (a `[string]` array), never `m` (a
+        # plain `string`) directly — a real bug makes any direct
+        # single-char or range index on a `string` value mis-transpile
+        # under a GPU target (--target metal here), even in ordinary
+        # host-side code with nothing to do with the GPU (filed).
+        let m_chars = m.chars()
+        var int sp = 0
+        var bool found_sp = false
+        while sp < m_chars.length and not found_sp:
+            if m_chars[sp] == " ":
+                found_sp = true
+            else:
+                sp += 1
+        if found_sp:
+            var string a = ""
+            var int ai = 0
+            while ai < sp:
+                a = "{a}{m_chars[ai]}"
+                ai += 1
+            var string b = ""
+            var int bi = sp + 1
+            while bi < m_chars.length:
+                b = "{b}{m_chars[bi]}"
+                bi += 1
+            merges.push([a, b])
+
+    let bos = gguf_get_int(file.metadata, "tokenizer.ggml.bos_token_id") else 0
+    let eos = gguf_get_int(file.metadata, "tokenizer.ggml.eos_token_id") else 0
+
+    let byte_to_uni = build_byte_to_unicode()
+    let uni_to_byte = build_unicode_to_byte()
+
+    Tokenizer(vocab, reverse, merges, byte_to_uni, uni_to_byte, bos, eos)

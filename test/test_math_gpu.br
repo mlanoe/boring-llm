@@ -1,0 +1,32 @@
+# Tests for src/math_gpu.br against math.br's already-verified CPU reference
+# values (see test/test_math.br), run through boring run's kernel-simulation
+# path. Only covers kernels that path currently handles correctly:
+#   - RmsNormKernel, SwigluCombineKernel: fine.
+#   - RopeApplyKernel: `.powf()` fails under simulation only, correct in a
+#     real build (task_cc223e5c).
+#   - LinearKernel, MatMulBTHeadsKernel (used by attention_gqa_gpu): a
+#     literal `0.0` written into a float32 tile-padding slot loses its type
+#     under simulation only, correct in a real build (task_88105830).
+# linear_gpu/rope_apply_gpu/attention_gqa_gpu are verified instead in
+# test/test_math_gpu_real.br, a real `--target metal` build.
+#
+# Run with:
+#   boring run test/test_math_gpu.br
+
+use math_gpu
+
+def assert_close(float32 a, float32 b, string msg):
+    let diff = if a > b: a - b else: b - a
+    assert(diff < 0.0005 as float32, "{msg}: expected ~{b}, got {a}")
+
+def main() throws:
+    # --- rms_norm_gpu: d=4, weight=1, x=[1,2,3,4] --- (matches test_math.br)
+    let normed = rms_norm_gpu([1.0, 2.0, 3.0, 4.0], [1.0, 1.0, 1.0, 1.0], 1, 4, 0.0 as float32)
+    assert_close(normed[0], 0.3651484 as float32, "rms_norm_gpu[0]")
+    assert_close(normed[3], 1.4605939 as float32, "rms_norm_gpu[3]")
+
+    # --- swiglu_combine_gpu: silu(0) * anything == 0 ---
+    let combined = swiglu_combine_gpu([0.0, 1.0], [5.0, 5.0])
+    assert_close(combined[0], 0.0 as float32, "swiglu_combine_gpu silu(0)")
+
+    print "test_math_gpu: all assertions passed (see test_math_gpu_real.br for the rest)"

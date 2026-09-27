@@ -1,0 +1,54 @@
+# Cross-checks src/quant.br's Q5_0/Q6_K/Q4_K dequantization against real
+# superblock bytes extracted directly from the real Qwen2.5-0.5B-Instruct
+# Q4_K_M GGUF file (via Python's `gguf` package's own `dequantize()` as
+# ground truth — see the plan's own convention of using that package as an
+# independent oracle, not a from-scratch reimplementation sharing any code
+# with this project's parser). Much stronger than a hand-built synthetic
+# block alone (also present in test_quant.br for the simpler Q8_0 format):
+# this proves the bit-unpacking matches real, production-quantized data,
+# not just an internally-consistent round-trip.
+#
+# Run with:
+#   boring run test/test_quant_kquant.br
+
+use quant
+
+def assert_close(float32 a, float32 b, string msg):
+    let diff = if a > b: a - b else: b - a
+    assert(diff < 0.001 as float32, "{msg}: expected ~{b}, got {a}")
+
+def main() throws:
+    # --- Q5_0: first block of token_embd.weight ---
+    let q5_bytes = [0x38 as uint8, 0x99 as uint8, 0xF9 as uint8, 0xEE as uint8, 0x11 as uint8, 0x8C as uint8, 0x84 as uint8, 0x90 as uint8, 0xFC as uint8, 0xF0 as uint8, 0x5B as uint8, 0xE1 as uint8, 0xC0 as uint8, 0x68 as uint8, 0x75 as uint8, 0xA3 as uint8, 0x93 as uint8, 0x56 as uint8, 0x9A as uint8, 0x60 as uint8, 0xDB as uint8, 0x11 as uint8]
+    let q5_expected = [-0.010193, 0.040771, 0.010193, -0.0, -0.02803, -0.002548, -0.0, -0.020386, 0.02803, -0.007645, -0.007645, -0.015289, 0.015289, -0.0, -0.02803, -0.002548, -0.020386, 0.017838, 0.002548, 0.002548, -0.012741, 0.005096, 0.010193, 0.025482, 0.022934, 0.015289, -0.022934, -0.012741, 0.017838, 0.025482, 0.007645, -0.002548]
+    let q5_out = dequantize_q5_0(q5_bytes, 0, 32)
+    assert_eq(q5_out.length, 32)
+    var i = 0
+    while i < q5_expected.length:
+        assert_close(q5_out[i], q5_expected[i] as float32, "q5_0[{i}]")
+        i += 1
+    print "dequantize_q5_0: OK (32/32 values match real GGUF data)"
+
+    # --- Q6_K: first block of blk.0.ffn_down.weight (first 40 of 256) ---
+    let q6_bytes = [0x27 as uint8, 0x79 as uint8, 0x30 as uint8, 0xFB as uint8, 0x06 as uint8, 0xD8 as uint8, 0x15 as uint8, 0xAD as uint8, 0x9B as uint8, 0xED as uint8, 0x79 as uint8, 0xC3 as uint8, 0x97 as uint8, 0xDD as uint8, 0x1C as uint8, 0x7A as uint8, 0x10 as uint8, 0xF1 as uint8, 0x75 as uint8, 0xBD as uint8, 0x78 as uint8, 0x50 as uint8, 0x8D as uint8, 0x65 as uint8, 0xA7 as uint8, 0x1E as uint8, 0xBB as uint8, 0x10 as uint8, 0x48 as uint8, 0x4A as uint8, 0xFC as uint8, 0x71 as uint8, 0x87 as uint8, 0xEC as uint8, 0x41 as uint8, 0x36 as uint8, 0x55 as uint8, 0x60 as uint8, 0xEF as uint8, 0xF0 as uint8, 0xFC as uint8, 0x04 as uint8, 0xDE as uint8, 0xE1 as uint8, 0x79 as uint8, 0x0A as uint8, 0x59 as uint8, 0xB6 as uint8, 0x16 as uint8, 0x8B as uint8, 0xB1 as uint8, 0x6D as uint8, 0xA0 as uint8, 0x4D as uint8, 0xC9 as uint8, 0x12 as uint8, 0x6A as uint8, 0x10 as uint8, 0x92 as uint8, 0xD4 as uint8, 0x17 as uint8, 0x93 as uint8, 0xBB as uint8, 0xE4 as uint8, 0xFE as uint8, 0xF1 as uint8, 0xC1 as uint8, 0x10 as uint8, 0x26 as uint8, 0x0A as uint8, 0x98 as uint8, 0xEF as uint8, 0xDE as uint8, 0x18 as uint8, 0x2B as uint8, 0xC4 as uint8, 0x3D as uint8, 0x8B as uint8, 0xA9 as uint8, 0x32 as uint8, 0xF6 as uint8, 0x12 as uint8, 0x01 as uint8, 0x52 as uint8, 0x1B as uint8, 0x56 as uint8, 0x89 as uint8, 0x7D as uint8, 0x1D as uint8, 0x6F as uint8, 0x33 as uint8, 0x26 as uint8, 0x5E as uint8, 0xA1 as uint8, 0xF9 as uint8, 0xAF as uint8, 0xD8 as uint8, 0x4A as uint8, 0x10 as uint8, 0x93 as uint8, 0xDD as uint8, 0x31 as uint8, 0xCB as uint8, 0xEC as uint8, 0xFB as uint8, 0xB7 as uint8, 0x3A as uint8, 0xC8 as uint8, 0x39 as uint8, 0x7E as uint8, 0x4A as uint8, 0x08 as uint8, 0x4E as uint8, 0xAB as uint8, 0x57 as uint8, 0xFE as uint8, 0x90 as uint8, 0xDA as uint8, 0x90 as uint8, 0xD4 as uint8, 0x31 as uint8, 0xFD as uint8, 0xCE as uint8, 0x0B as uint8, 0x6F as uint8, 0xF6 as uint8, 0x7E as uint8, 0x07 as uint8, 0xAA as uint8, 0x61 as uint8, 0xA8 as uint8, 0x89 as uint8, 0x6A as uint8, 0x96 as uint8, 0x4B as uint8, 0x59 as uint8, 0x61 as uint8, 0x15 as uint8, 0x65 as uint8, 0x50 as uint8, 0x56 as uint8, 0x95 as uint8, 0xA6 as uint8, 0xAC as uint8, 0x86 as uint8, 0x5B as uint8, 0x67 as uint8, 0xA4 as uint8, 0x6D as uint8, 0xA5 as uint8, 0x44 as uint8, 0xAD as uint8, 0x49 as uint8, 0x61 as uint8, 0xB9 as uint8, 0x43 as uint8, 0x22 as uint8, 0xA2 as uint8, 0x5C as uint8, 0x40 as uint8, 0x49 as uint8, 0xD6 as uint8, 0x92 as uint8, 0x04 as uint8, 0x27 as uint8, 0x65 as uint8, 0x92 as uint8, 0x55 as uint8, 0x4A as uint8, 0xA9 as uint8, 0x6A as uint8, 0x56 as uint8, 0x59 as uint8, 0x92 as uint8, 0x96 as uint8, 0x29 as uint8, 0x9A as uint8, 0xC6 as uint8, 0x6B as uint8, 0x96 as uint8, 0x4A as uint8, 0xD6 as uint8, 0x51 as uint8, 0xE9 as uint8, 0xE9 as uint8, 0xB4 as uint8, 0x15 as uint8, 0xA6 as uint8, 0xA6 as uint8, 0x28 as uint8, 0xD5 as uint8, 0x25 as uint8, 0x31 as uint8, 0xDA as uint8, 0xBC as uint8, 0x1B as uint8, 0x91 as uint8, 0xCE as uint8, 0x6C as uint8, 0x4B as uint8, 0x50 as uint8, 0x3B as uint8, 0xD5 as uint8, 0x80 as uint8, 0xAD as uint8, 0xAA as uint8, 0xCA as uint8, 0x26 as uint8, 0x2B as uint8, 0x81 as uint8]
+    let q6_expected = [-0.006113, 0.006113, 0.027945, 0.004366, -0.00524, -0.006986, -0.018339, 0.00262, 0.004366, 0.00262, 0.006113, 0.025325, -0.006113, 0.00262, -0.010479, 0.019212, 0.0, 0.011513, 0.014222, -0.012867, -0.005418, -0.010836, -0.012867, -0.00745, -0.006095, -0.001354, -0.003386, 0.010836, 0.005418, 0.006772, -0.013545, -0.020994, 0.008483, -0.024238, 0.001212, 0.007271, 0.006059, -0.01939, 0.018178, 0.0]
+    let q6_out = dequantize_q6_k(q6_bytes, 0, 256)
+    assert_eq(q6_out.length, 256)
+    i = 0
+    while i < q6_expected.length:
+        assert_close(q6_out[i], q6_expected[i] as float32, "q6_k[{i}]")
+        i += 1
+    print "dequantize_q6_k: OK (first 40/256 values match real GGUF data)"
+
+    # --- Q4_K: first block of blk.11.ffn_down.weight (first 40 of 256) ---
+    let q4_bytes = [0x72 as uint8, 0x01 as uint8, 0x64 as uint8, 0x09 as uint8, 0xBA as uint8, 0xFF as uint8, 0xF4 as uint8, 0xF3 as uint8, 0xBE as uint8, 0xFF as uint8, 0xE2 as uint8, 0xF5 as uint8, 0x8D as uint8, 0x55 as uint8, 0x54 as uint8, 0x62 as uint8, 0x8A as uint8, 0x96 as uint8, 0x50 as uint8, 0x79 as uint8, 0x78 as uint8, 0xA6 as uint8, 0x97 as uint8, 0xC5 as uint8, 0x76 as uint8, 0xBB as uint8, 0x2D as uint8, 0x98 as uint8, 0xD5 as uint8, 0x96 as uint8, 0x93 as uint8, 0xC0 as uint8, 0xA7 as uint8, 0x56 as uint8, 0xBF as uint8, 0x48 as uint8, 0xED as uint8, 0x58 as uint8, 0x89 as uint8, 0xA9 as uint8, 0xE6 as uint8, 0xAC as uint8, 0x09 as uint8, 0x96 as uint8, 0xCC as uint8, 0x74 as uint8, 0xDB as uint8, 0x38 as uint8, 0x41 as uint8, 0xC4 as uint8, 0x02 as uint8, 0xC5 as uint8, 0x83 as uint8, 0xF5 as uint8, 0x96 as uint8, 0xC7 as uint8, 0x86 as uint8, 0x5B as uint8, 0x64 as uint8, 0x95 as uint8, 0xDC as uint8, 0x90 as uint8, 0xC7 as uint8, 0x62 as uint8, 0x84 as uint8, 0x42 as uint8, 0x47 as uint8, 0x5E as uint8, 0x3B as uint8, 0x65 as uint8, 0x70 as uint8, 0xA4 as uint8, 0x43 as uint8, 0x96 as uint8, 0xE9 as uint8, 0x22 as uint8, 0xB0 as uint8, 0xE1 as uint8, 0xB8 as uint8, 0x70 as uint8, 0x83 as uint8, 0xF6 as uint8, 0x49 as uint8, 0x93 as uint8, 0x96 as uint8, 0xD2 as uint8, 0x84 as uint8, 0x4A as uint8, 0x74 as uint8, 0x7F as uint8, 0x59 as uint8, 0x68 as uint8, 0x92 as uint8, 0x62 as uint8, 0x94 as uint8, 0x33 as uint8, 0xC9 as uint8, 0x5B as uint8, 0x59 as uint8, 0x37 as uint8, 0x70 as uint8, 0xFD as uint8, 0x91 as uint8, 0x96 as uint8, 0x84 as uint8, 0x6B as uint8, 0x85 as uint8, 0x01 as uint8, 0x59 as uint8, 0xD3 as uint8, 0xB3 as uint8, 0xB8 as uint8, 0xCB as uint8, 0x87 as uint8, 0xD5 as uint8, 0x66 as uint8, 0x97 as uint8, 0x48 as uint8, 0x80 as uint8, 0x05 as uint8, 0xD4 as uint8, 0x4B as uint8, 0xF4 as uint8, 0x8F as uint8, 0xF9 as uint8, 0xDB as uint8, 0xF5 as uint8, 0xC8 as uint8, 0xB7 as uint8, 0x95 as uint8, 0xD8 as uint8, 0x77 as uint8, 0x68 as uint8, 0x0C as uint8, 0xA8 as uint8, 0x76 as uint8, 0xCA as uint8, 0x59 as uint8, 0x81 as uint8, 0xA7 as uint8, 0x42 as uint8, 0xA1 as uint8, 0x39 as uint8, 0xA8 as uint8]
+    let q4_expected = [0.002592, -0.002525, -0.0102, 0.001312, 3.3e-05, -0.002525, -0.001246, -0.003804, -0.002525, 0.003871, 0.006429, 3.3e-05, -0.003804, -0.002525, -0.006362, -0.0102, -0.001246, -0.002525, 0.008987, 3.3e-05, 0.006429, 3.3e-05, 0.001312, 0.001312, -0.002525, 0.00515, 0.001312, -0.002525, 0.00515, -0.005083, 0.003871, 3.3e-05, 0.000751, 0.00214, -0.003417, -0.000638, -0.000638, 0.00353, 0.00214, 0.006309]
+    let q4_out = dequantize_q4_k(q4_bytes, 0, 256)
+    assert_eq(q4_out.length, 256)
+    i = 0
+    while i < q4_expected.length:
+        assert_close(q4_out[i], q4_expected[i] as float32, "q4_k[{i}]")
+        i += 1
+    print "dequantize_q4_k: OK (first 40/256 values match real GGUF data)"
+
+    print "test_quant_kquant: all assertions passed"

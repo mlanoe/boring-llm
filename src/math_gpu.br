@@ -1,0 +1,646 @@
+# src/math_gpu.br — GPU-accelerated transformer math (Phase 2a): tiled GEMM,
+# RMSNorm, RoPE, GQA attention, SwiGLU — fp32 throughout (dequantization
+# still happens on the CPU at load time in this phase; Phase 2b fuses it
+# into the GEMM kernel itself instead).
+#
+# Adapted from whisper-boring/src/math_gpu.br's kernel-design pattern
+# (TransposeKernel/LinearKernel/MatMulBTHeadsKernel/SoftmaxRowsKernel/
+# MatMulHeadsKernel), generalized in two ways that project didn't need:
+#   - float32 instead of float64 throughout (real GPUs are far faster at
+#     fp32, and quantized-weight inference is a fp32-native domain in
+#     practice — whisper-boring's f64 choice was inherited from its CPU
+#     math.br default, not a deliberate GPU-precision decision).
+#   - grouped-query attention: n_head query heads share n_kv_head key/value
+#     heads (kv_h = h / (n_head / n_kv_head)), since Qwen2 (like most modern
+#     GGUF-family models) uses GQA, unlike whisper-boring's plain MHA.
+#
+# Build targets:
+#   boring build --target metal   # primary, actively verified
+#   boring build --target cuda / rocm / wgpu   # same qualified source, unverified
+#
+# Interpreter simulation (sequential, for development):
+#   boring run test/test_math_gpu.br
+# NOTE: RopeApplyKernel's `.powf()` call is currently NOT verifiable this way
+# — a real boring interpreter bug (kernel-body `.powf()` errors under
+# simulation but is correct in a real compiled build, filed as
+# task_cc223e5c) — so RoPE is verified via a real `--target metal` build
+# instead (see test/test_forward_gpu.br's doc comment).
+
+use math
+use io
+
+# Identity function used purely as a workaround for a real boring transpiler
+# bug (filed as task_63a8da7f): a GPU host-function parameter passed
+# directly to a `kernel` struct constructor needs an explicit `'global`
+# qualifier or its Rust element type gets silently mis-inferred as f64
+# instead of f32 — but once a parameter IS `'global`-qualified, chaining
+# another GPU call's `[float32]'gpu'unified` result straight into it emits
+# an extra, wrongly-typed `&` at the call site (`expected Vec<f32>, found
+# &Vec<f32>`). Routing the value through this ordinary (non-kernel-touching)
+# function first forces the correct by-value host materialization — the
+# same "one level of indirection infers correctly" pattern that already
+# made `linear_nobias_gpu` (which never constructs a kernel directly) work
+# without needing this at all. Every kernel-chaining call site in
+# model.br's `forward_gpu` uses this on its GPU-resident argument.
+[float32] passthrough([float32] x):
+    x
+
+# ── Kernel: matrix transpose ──────────────────────────────────────────────
+# Same as whisper-boring's TransposeKernel (see its doc comment for the
+# memory-coalescing rationale), float32 instead of float64.
+
+kernel TransposeKernel:
+    let  [float32, col, row]'global   src      # (rows × cols)
+    mut  [float32, col, row]'unified  dst      # output: (cols × rows)
+
+    init([float32]'global s, int rows, int cols):
+        src = s.reshape(col = cols, row = rows)
+        dst = [0.0 for col = rows, row = cols]
+
+    def ():
+        let block_idx = gpu.block.x + gpu.block.y * gpu.grid_dim.x
+        let cell = gpu.thread.x + block_idx * gpu.block_dim.x
+        if cell < src.col * src.row:
+            let i = cell / src.col
+            let j = cell % src.col
+            dst[col = i, row = j] = src[col = j, row = i]
+
+pub req [float32]'gpu'unified transpose_gpu([float32]'global src, int rows, int cols) throws:
+    let int n_cells = rows * cols
+    let int blocks  = (n_cells + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = TransposeKernel(src, rows, cols)
+    kernel:
+        k(block = 256, grid = (gx, gy))
+    k.dst
+
+# ── Kernel: linear layer (y = x·Wᵀ + b) ────────────────────────────────────
+# `w` is read in GGUF's own native (d_out × d_in) tensor layout directly —
+# each output row is a contiguous d_in-length dot-product vector, matching
+# math.br's CPU `linear`/`linear_bias` exactly, so no pre-transpose step is
+# needed at load time (unlike whisper-boring's LinearKernel, which requires
+# a caller-side pre-transpose to (d_in × d_out) for a coalesced tile load —
+# a real perf difference deferred here in favor of matching GGUF's layout
+# directly, since Phase 2b's fused-dequant kernel will need its own
+# tile-loading logic over raw quantized bytes regardless, making the
+# pre-transpose optimization moot for that kernel anyway). Bias is always
+# present here (callers with no real bias pass a zero-filled array —
+# linear_nobias_gpu below does this for them) rather than a second no-bias
+# kernel variant.
+
+kernel LinearKernel:
+    let [float32]'global  x         # (seq × d_in)
+    let [float32]'global  w         # (d_out × d_in) — GGUF's native layout
+    let [float32]'global  bv        # (d_out,)
+    mut [float32]'unified y         # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    mut [float32, width = 16, height = 16]'actor tile_x
+    mut [float32, width = 16, height = 16]'actor tile_w
+
+    init([float32]'global xi, [float32]'global wi, [float32]'global bi,
+         int s, int din, int dout):
+        x     = xi
+        w     = wi
+        bv    = bi
+        seq   = s
+        d_in  = din
+        d_out = dout
+        y     = [0.0 for ..<s * dout]
+
+    def ():
+        let tx = gpu.thread.x
+        let ty = gpu.thread.y
+        let row = gpu.block.y * gpu.block_dim.y + ty
+        let col = gpu.block.x * gpu.block_dim.x + tx
+        var float32 acc = 0.0
+        let num_tiles = (d_in + 15) / 16
+        for t in 0..<num_tiles:
+            let x_col = t * 16 + tx
+            let w_row = t * 16 + ty
+            if row < seq and x_col < d_in:
+                tile_x[width = tx, height = ty] = x[row * d_in + x_col]
+            else:
+                tile_x[width = tx, height = ty] = 0.0
+            if w_row < d_in and col < d_out:
+                tile_w[width = tx, height = ty] = w[col * d_in + w_row]
+            else:
+                tile_w[width = tx, height = ty] = 0.0
+            sync
+            for kk in 0..<16:
+                acc += tile_x[width = kk, height = ty] * tile_w[width = tx, height = kk]
+            sync
+        if row < seq and col < d_out:
+            y[row * d_out + col] = acc + bv[col]
+
+pub req [float32]'gpu'unified linear_gpu([float32]'global x, [float32]'global w, [float32]'global bv,
+                       int seq, int d_in, int d_out) throws:
+    let int gx = (d_out + 15) / 16
+    let int gy = (seq + 15) / 16
+    mut k = LinearKernel(x, w, bv, seq, d_in, d_out)
+    kernel:
+        k(block = (16, 16), grid = (gx, gy))
+    k.y
+
+pub req [float32]'gpu'unified linear_nobias_gpu([float32] x, [float32] w,
+                       int seq, int d_in, int d_out) throws:
+    let [float32] zero_bias = [0.0 for i in 0..<d_out]
+    linear_gpu(x, w, zero_bias, seq, d_in, d_out)
+
+# ── Kernel: linear layer, warp-shuffle reduction (Phase 4 stretch) ───────
+# `LinearKernel` above (and `Q8LinearKernel`) reduce over `d_in` through
+# `'actor` shared-memory tiles plus a full BLOCK barrier (`sync`) at every
+# 16-wide step — correct, but every one of those barriers is block-wide
+# even for the parts of the reduction that are, in this design, actually
+# confined to far fewer threads (see boring/docs/warp-level-primitives.md's
+# own "Problem Statement", which names this exact kernel shape as the
+# motivating case for `gpu.warp.*`).
+#
+# This kernel takes a genuinely different approach instead of retrofitting
+# the tiled design: ONE WARP computes ONE output cell — each of the warp's
+# `gpu.warp.size` lanes strides over `d_in` (stride = warp size) computing
+# a partial dot-product sum, then a standard warp-shuffle butterfly
+# reduction (`shuffle_xor` at descending powers-of-two offsets, the classic
+# warp-reduce idiom) combines all lanes' partial sums with ZERO shared
+# memory and ZERO block-wide barriers — only `gpu.warp.*`'s own implicit
+# lockstep guarantee, which needs no barrier instruction at all on real
+# hardware. Verified against `linear_gpu`'s own (tiled, shared-memory)
+# output — see test/test_math_gpu_real.br.
+#
+# Not a wholesale replacement for `linear_gpu`/`q8_linear_gpu` in this
+# project's own model.br (that would be a separate, riskier change to
+# every call site in an already fully-verified pipeline) — added
+# alongside them as a second, independently-verified implementation of the
+# same operation, which is what this Phase 4 stretch item's own plan entry
+# asked for: demonstrate + verify the primitive on this project's real
+# GEMM shape, not necessarily migrate the whole project to it.
+#
+# HONEST PERFORMANCE RESULT (test/bench_linear_warp.br, real Metal
+# hardware, this model's actual dimensions): this kernel is SLOWER than
+# `linear_gpu`, not faster — at d_in=896/d_out=896/seq=26 (~1.5x slower),
+# and the gap widens at LM-head scale, d_in=896/d_out=8192/seq=26 (~2.4x
+# slower). Root cause: removing the barrier was never this workload's
+# bottleneck — `linear_gpu`'s shared-memory tile is a genuine DATA-REUSE
+# mechanism (each `x`/`w` element loaded from global memory once, reused
+# by every thread in the 16x16 block), which this kernel has none of —
+# every warp independently re-reads its own full `x` row and `w` row from
+# global memory with zero cross-warp sharing, so far more redundant global
+# memory bandwidth is spent than barriers were ever costing. Same lesson
+# already learned the hard way with this project's own KV-cache work
+# (model.br's `prefill_gpu_quantized`): always measure wall-clock at this
+# project's real sizes before assuming an optimization helps — algorithmic
+# "fewer barriers" doesn't automatically mean "faster" once memory reuse
+# is the actual bottleneck. A design that keeps the tiled shared-memory
+# structure AND uses `gpu.warp.*` only for the final in-tile reduction
+# (rather than replacing tiling outright) would need a tile shape aligned
+# to warp boundaries — this kernel's simpler "one warp, one output, no
+# shared memory at all" approach was chosen to unambiguously demonstrate
+# and verify the primitive itself first; a properly warp-aligned tiled
+# hybrid is a real, distinct follow-up, not attempted here.
+
+kernel LinearWarpKernel:
+    let [float32]'global  x                # (seq × d_in)
+    let [float32]'global  w                # (d_out × d_in) — GGUF's native layout
+    let [float32]'global  bv               # (d_out,)
+    mut [float32]'unified y                # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    let int               warps_per_block
+
+    init([float32]'global xi, [float32]'global wi, [float32]'global bi,
+         int s, int din, int dout, int wpb):
+        x               = xi
+        w               = wi
+        bv              = bi
+        seq             = s
+        d_in            = din
+        d_out           = dout
+        warps_per_block = wpb
+        y               = [0.0 for ..<s * dout]
+
+    def ():
+        let lane = gpu.warp.lane
+        let warp_in_block = gpu.thread.y
+        let block_idx = gpu.block.x + gpu.block.y * gpu.grid_dim.x
+        let global_warp = block_idx * warps_per_block + warp_in_block
+        let total = seq * d_out
+        if global_warp < total:
+            let row = global_warp / d_out
+            let col = global_warp % d_out
+            var float32 partial = 0.0
+            var int i = lane
+            while i < d_in:
+                partial += x[row * d_in + i] * w[col * d_in + i]
+                i += gpu.warp.size
+            var int offset = gpu.warp.size / 2
+            while offset > 0:
+                partial += gpu.warp.shuffle_xor(partial, offset)
+                offset = offset / 2
+            if lane == 0:
+                y[row * d_out + col] = partial + bv[col]
+
+pub req [float32]'gpu'unified linear_warp_gpu([float32]'global x, [float32]'global w,
+                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+    let int warps_per_block = 8
+    let int total_warps = seq * d_out
+    let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = LinearWarpKernel(x, w, bv, seq, d_in, d_out, warps_per_block)
+    kernel:
+        k(block = (32, warps_per_block), grid = (gx, gy))
+    k.y
+
+# ── Kernel: Q8_0 fused-dequant linear layer (Phase 2b) ───────────────────
+# Same 16x16-tiled GEMM as LinearKernel, but `w` arrives as RAW Q8_0-packed
+# bytes (GGUF's block_q8_0: 2-byte f16 scale + 32 signed int8 values per
+# block, 34 bytes/block, QK8_0=32 — see quant.br's CPU dequantize_q8_0,
+# which this mirrors) instead of an already-dequantized `[float32]` array.
+# Each thread's tile-load step dequantizes its own (row, col) weight element
+# on the fly instead of the caller ever materializing a full fp32 copy of
+# the weight matrix — the whole point of fusing dequant into the kernel:
+# for the LM head alone (151936 x 896), a pre-dequantized fp32 copy would
+# be ~544MB versus the packed Q8_0 bytes' ~146MB.
+#
+# Requires d_in % 32 == 0 (every real GGUF Q8_0 tensor's row length is a
+# multiple of the block size in practice — Qwen2.5-0.5B's every relevant
+# dimension, 896/128/4864, divides evenly).
+#
+# The dequantization logic below is inlined directly into the kernel's
+# `def ()` body (its tile-load step) rather than factored into a helper —
+# two independent real Metal-backend bugs (both filed as tasks) block every
+# other way of factoring it out: a kernel struct's own HELPER method (`def
+# <T> name(...)`) mis-emits both bare and `self.`-prefixed field reads
+# (task — generated MSL never dereferences the field's pointer parameter,
+# unlike the main `def ()` body, where the identical access pattern works
+# correctly); and a plain FREE function taking a `[T]'global`-qualified
+# array parameter, called from a kernel body, emits an MSL pointer
+# parameter with no address-space qualifier (task_25840979 — a real MSL
+# shader-compile error, not a `cargo build` error). Only scalar-only free
+# functions (e.g. `f16_bits_to_f32`, no array params) are safe to factor
+# out and call from a kernel body today.
+
+kernel Q8LinearKernel:
+    let [float32]'global  x           # (seq × d_in)
+    let [uint8]'global    w_packed    # (d_out × d_in) Q8_0-packed, GGUF's native layout
+    let [float32]'global  bv          # (d_out,)
+    mut [float32]'unified y           # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    mut [float32, width = 16, height = 16]'actor tile_x
+    mut [float32, width = 16, height = 16]'actor tile_w
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout):
+        x        = xi
+        w_packed = wi
+        bv       = bi
+        seq      = s
+        d_in     = din
+        d_out    = dout
+        y        = [0.0 for ..<s * dout]
+
+    def ():
+        let tx = gpu.thread.x
+        let ty = gpu.thread.y
+        let row = gpu.block.y * gpu.block_dim.y + ty
+        let col = gpu.block.x * gpu.block_dim.x + tx
+        var float32 acc = 0.0
+        let num_tiles = (d_in + 15) / 16
+        for t in 0..<num_tiles:
+            let x_col = t * 16 + tx
+            let w_row = t * 16 + ty
+            if row < seq and x_col < d_in:
+                tile_x[width = tx, height = ty] = x[row * d_in + x_col]
+            else:
+                tile_x[width = tx, height = ty] = 0.0
+            if w_row < d_in and col < d_out:
+                # Dequantize element (col, w_row) of the (d_out × d_in)
+                # logical weight matrix directly from the packed Q8_0
+                # bytes — col*d_in+w_row is the same flat index the F32
+                # case would use, just block-quantized in place.
+                let flat_idx = col * d_in + w_row
+                let block_idx = flat_idx / 32
+                let offset_in_block = flat_idx % 32
+                let block_byte = block_idx * 34
+                let scale_bits = int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8)
+                let w_scale = f16_bits_to_f32(scale_bits)
+                let raw = int(w_packed[block_byte + 2 + offset_in_block])
+                # Split across three statements — see math_gpu.br's earlier
+                # note on task_bd2c95ab / task_1b6aa1d3, the two real parser/
+                # cast bugs this dodges.
+                let q = if raw > 127: raw - 256 else: raw
+                let qf = q as float32
+                tile_w[width = tx, height = ty] = qf * w_scale
+            else:
+                tile_w[width = tx, height = ty] = 0.0
+            sync
+            for kk in 0..<16:
+                acc += tile_x[width = kk, height = ty] * tile_w[width = tx, height = kk]
+            sync
+        if row < seq and col < d_out:
+            y[row * d_out + col] = acc + bv[col]
+
+pub req [float32]'gpu'unified q8_linear_gpu([float32]'global x, [uint8]'global w_packed,
+                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 32 == 0 else throw "q8_linear_gpu: d_in ({d_in}) must be a multiple of 32"
+    let int gx = (d_out + 15) / 16
+    let int gy = (seq + 15) / 16
+    mut k = Q8LinearKernel(x, w_packed, bv, seq, d_in, d_out)
+    kernel:
+        k(block = (16, 16), grid = (gx, gy))
+    k.y
+
+pub req [float32]'gpu'unified q8_linear_nobias_gpu([float32] x, [uint8] w_packed,
+                       int seq, int d_in, int d_out) throws:
+    let [float32] zero_bias = [0.0 for i in 0..<d_out]
+    q8_linear_gpu(x, w_packed, zero_bias, seq, d_in, d_out)
+
+# ── Kernel: RMSNorm (row-wise) ───────────────────────────────────────────
+# One thread per row (position) — no bias, no mean subtraction (simpler
+# than whisper-boring's LayerNormSeqKernel).
+
+kernel RmsNormKernel:
+    let [float32]'global   x
+    let [float32]'global   w
+    mut [float32]'unified  out
+    let int                seq
+    let int                d
+    let float32            eps
+
+    init([float32]'global xi, [float32]'global wi, int s, int dd, float32 e):
+        x   = xi
+        w   = wi
+        seq = s
+        d   = dd
+        eps = e
+        out = [0.0 for ..<s * dd]
+
+    def ():
+        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if i < seq:
+            let base = i * d
+            var float32 ss = 0.0
+            for j in 0..<d:
+                let v = x[base + j]
+                ss += v * v
+            let mean_sq = ss / (d as float32)
+            let inv_rms = 1.0 / (mean_sq + eps).sqrt()
+            for j in 0..<d:
+                out[base + j] = x[base + j] * inv_rms * w[j]
+
+pub req [float32]'gpu'unified rms_norm_gpu([float32]'global x, [float32]'global w,
+                       int seq, int d, float32 eps) throws:
+    let int blocks = (seq + 255) / 256
+    mut k = RmsNormKernel(x, w, seq, d, eps)
+    kernel:
+        k(block = 256, grid = blocks)
+    k.out
+
+# ── Kernel: RoPE (NEOX-style rotate-half) ────────────────────────────────
+# One thread per (position, head, half-dim-pair) cell — see math.br's
+# rope_apply doc comment for the rotation itself (identical math, just
+# flattened into a 1D grid instead of math.br's nested loops).
+
+kernel RopeApplyKernel:
+    let [float32]'global   x
+    mut [float32]'unified  out
+    let int                seq
+    let int                n_heads
+    let int                d_head
+    let int                half_dim
+    let float32            freq_base
+    let int                start_pos   # KV-cache step: absolute position offset (0 for a full batch)
+
+    init([float32]'global xi, int s, int nh, int dh, float32 fb, int sp):
+        x         = xi
+        seq       = s
+        n_heads   = nh
+        d_head    = dh
+        half_dim  = dh / 2
+        freq_base = fb
+        start_pos = sp
+        out       = [0.0 for ..<s * nh * dh]
+
+    def ():
+        let cell = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        let total = seq * n_heads * half_dim
+        if cell < total:
+            let p = cell / (n_heads * half_dim)
+            let rem = cell % (n_heads * half_dim)
+            let h = rem / half_dim
+            let j = rem % half_dim
+            let base_idx = p * n_heads * d_head + h * d_head
+            let abs_pos = p + start_pos
+            let freq_exp = (2.0 * (j as float32)) / (d_head as float32)
+            let theta = 1.0 / freq_base.powf(freq_exp)
+            let angle = (abs_pos as float32) * theta
+            let cos_a = angle.cos()
+            let sin_a = angle.sin()
+            let x0 = x[base_idx + j]
+            let x1 = x[base_idx + j + half_dim]
+            out[base_idx + j] = x0 * cos_a - x1 * sin_a
+            out[base_idx + j + half_dim] = x0 * sin_a + x1 * cos_a
+
+pub req [float32]'gpu'unified rope_apply_gpu([float32]'global x, int seq, int n_heads,
+                       int d_head, float32 freq_base) throws:
+    rope_apply_at_gpu(x, seq, n_heads, d_head, freq_base, 0)
+
+pub req [float32]'gpu'unified rope_apply_at_gpu([float32]'global x, int seq, int n_heads,
+                       int d_head, float32 freq_base, int start_pos) throws:
+    let int half_dim = d_head / 2
+    let int total = seq * n_heads * half_dim
+    let int blocks = (total + 255) / 256
+    mut k = RopeApplyKernel(x, seq, n_heads, d_head, freq_base, start_pos)
+    kernel:
+        k(block = 256, grid = blocks)
+    k.out
+
+# ── Kernel: SwiGLU combine (elementwise silu(gate) * up) ─────────────────
+
+kernel SwigluCombineKernel:
+    let [float32]'global   gate
+    let [float32]'global   up
+    mut [float32]'unified  out
+    let int                n
+
+    init([float32]'global g, [float32]'global u, int nn):
+        gate = g
+        up   = u
+        n    = nn
+        out  = [0.0 for ..<nn]
+
+    def ():
+        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if i < n:
+            let g = gate[i]
+            let silu_g = g / (1.0 + (0.0 - g).exp())
+            out[i] = silu_g * up[i]
+
+pub req [float32]'gpu'unified swiglu_combine_gpu([float32]'global gate, [float32]'global up) throws:
+    let int n = gate.length
+    let int blocks = (n + 255) / 256
+    mut k = SwigluCombineKernel(gate, up, n)
+    kernel:
+        k(block = 256, grid = blocks)
+    k.out
+
+# ── Kernel: attention scores, ALL HEADS in one dispatch, GQA-aware ───────
+# `q` is (seq_q × n_head*d_head); `k` (pre-transposed by attention_gqa_gpu)
+# is (n_kv_head*d_head × seq_k). grid.z selects the QUERY head `h`; the key
+# read maps it down to its shared KV head via `kv_h = h / group`
+# (group = n_head / n_kv_head) — the one real structural change from
+# whisper-boring's MatMulBTHeadsKernel (which assumed n_head == n_kv_head).
+
+kernel MatMulBTHeadsKernel:
+    let  [float32, col, row]'global   q          # (seq_q × n_head*d_head)
+    let  [float32, col, row]'global   k          # (n_kv_head*d_head × seq_k) — pre-transposed
+    mut  [float32, j, i, h]'unified   c          # output: (n_head × seq_q × seq_k)
+    let int             seq_q
+    let int             seq_k
+    let int             d_head
+    let int             n_head
+    let int             group      # n_head / n_kv_head
+    let float32         scale
+    let int             causal     # 0 = off, 1 = causal mask
+    mut [float32, width = 16, height = 16]'actor tile_q
+    mut [float32, width = 16, height = 16]'actor tile_k
+
+    init([float32]'global qi, [float32]'global ki,
+         int sq, int sk, int d_q, int d_kv, int dh, int nh, int grp, float32 sc, int caus):
+        q      = qi.reshape(col = d_q, row = sq)
+        k      = ki.reshape(col = sk, row = d_kv)
+        seq_q  = sq
+        seq_k  = sk
+        d_head = dh
+        n_head = nh
+        group  = grp
+        scale  = sc
+        causal = caus
+        c      = [0.0 for j = sk, i = sq, h = nh]
+
+    def ():
+        let tx  = gpu.thread.x
+        let ty  = gpu.thread.y
+        let h   = gpu.block.z
+        let i   = gpu.block.y * gpu.block_dim.y + ty
+        let j   = gpu.block.x * gpu.block_dim.x + tx
+        let q_off = h * d_head
+        let kv_h = h / group
+        let k_off = kv_h * d_head
+        var float32 s = 0.0
+        let num_tiles = (d_head + 15) / 16
+        for t in 0..<num_tiles:
+            let p = t * 16
+            if i < seq_q and (p + tx) < d_head:
+                tile_q[width = tx, height = ty] = q[col = q_off + p + tx, row = i]
+            else:
+                tile_q[width = tx, height = ty] = 0.0
+            if j < seq_k and (p + ty) < d_head:
+                tile_k[width = tx, height = ty] = k[col = j, row = k_off + p + ty]
+            else:
+                tile_k[width = tx, height = ty] = 0.0
+            sync
+            for kk in 0..<16:
+                s += tile_q[width = kk, height = ty] * tile_k[width = tx, height = kk]
+            sync
+        s = s * scale
+        if causal == 1 and j > i:
+            s = -1.0e9 as float32
+        if i < seq_q and j < seq_k:
+            c[j = j, i = i, h = h] = s
+
+# ── Kernel: row-wise softmax — identical to whisper-boring's, float32 ────
+
+kernel SoftmaxRowsKernel:
+    let  [float32, col, row]'global   scores_in
+    mut  [float32, col, row]'unified  probs
+
+    init([float32]'global s, int r, int c):
+        scores_in = s.reshape(col = c, row = r)
+        probs     = [0.0 for col = c, row = r]
+
+    def ():
+        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if i < probs.row:
+            var float32 mx = scores_in[col = 0, row = i]
+            for j in 0..<probs.col:
+                if scores_in[col = j, row = i] > mx: mx = scores_in[col = j, row = i]
+            var float32 total = 0.0
+            for j in 0..<probs.col:
+                let e = (scores_in[col = j, row = i] - mx).exp()
+                probs[col = j, row = i] = e
+                total += e
+            for j in 0..<probs.col:
+                probs[col = j, row = i] = probs[col = j, row = i] / total
+
+# ── Kernel: attention output, ALL HEADS in one dispatch, GQA-aware ───────
+# `v` is (seq_k × n_kv_head*d_head) — narrower than `probs`' n_head, so the
+# same `kv_h = h / group` mapping applies here too.
+
+kernel MatMulHeadsKernel:
+    let  [float32, p, i, h]'global   probs      # (n_head × seq_q × seq_k)
+    let  [float32, col, row]'global  v          # (seq_k × n_kv_head*d_head)
+    mut  [float32, col, row]'unified c          # output: (seq_q × n_head*d_head)
+    let int             d_head
+    let int             n_head
+    let int             group
+
+    init([float32]'global pi, [float32]'global vi,
+         int sq, int sk, int d_q, int d_kv, int dh, int nh, int grp):
+        probs  = pi.reshape(p = sk, i = sq, h = nh)
+        v      = vi.reshape(col = d_kv, row = sk)
+        c      = [0.0 for col = d_q, row = sq]
+        d_head = dh
+        n_head = nh
+        group  = grp
+
+    def ():
+        let cell = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if cell < c.row * c.col:
+            let i   = cell / c.col
+            let col = cell % c.col
+            let h   = col / d_head
+            let jl  = col % d_head
+            let kv_h = h / group
+            var float32 s = 0.0
+            for p in 0..<v.row:
+                s += probs[p = p, i = i, h = h] * v[col = kv_h * d_head + jl, row = p]
+            c[col = col, row = i] = s
+
+# Grouped-query multi-head attention (GPU), all heads in one dispatch per
+# stage. `q` is (seq_q × n_head*d_head); `k`/`v` are (seq_k × n_kv_head*d_head).
+pub req [float32]'gpu'unified attention_gqa_gpu([float32]'global q, [float32]'global k, [float32]'global v,
+                          int seq_q, int seq_k, int n_head, int n_kv_head, int d_head,
+                          bool causal) throws:
+    let int d_q     = n_head * d_head
+    let int d_kv    = n_kv_head * d_head
+    let int group   = n_head / n_kv_head
+    let float32 scale = 1.0 / (d_head as float32).sqrt()
+    let int causal_i = if causal: 1 else: 0
+
+    let [float32]'gpu'unified k_t = transpose_gpu(k, seq_k, d_kv)
+
+    let int score_gx = (seq_k + 15) / 16
+    let int score_gy = (seq_q + 15) / 16
+    mut k_scores = MatMulBTHeadsKernel(q, k_t, seq_q, seq_k, d_q, d_kv, d_head, n_head, group, scale, causal_i)
+    kernel:
+        k_scores(block = (16, 16), grid = (score_gx, score_gy, n_head))
+
+    let int soft_rows  = n_head * seq_q
+    let int row_blocks = (soft_rows + 255) / 256
+    mut k_soft = SoftmaxRowsKernel(k_scores.c, soft_rows, seq_k)
+    kernel:
+        k_soft(block = 256, grid = row_blocks)
+
+    let int out_cells  = seq_q * d_q
+    let int out_blocks = (out_cells + 255) / 256
+    mut k_ctx = MatMulHeadsKernel(k_soft.probs, v, seq_q, seq_k, d_q, d_kv, d_head, n_head, group)
+    kernel:
+        k_ctx(block = 256, grid = out_blocks)
+
+    k_ctx.c

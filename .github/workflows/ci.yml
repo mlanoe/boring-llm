@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: Check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install boring
+        run: cargo install --git https://github.com/mlanoe/boring
+
+      - name: Run tests
+        run: |
+          # test_math_gpu_real.br needs a real --target metal build + a real
+          # GPU (see its own header comment) — GH Actions macOS runners
+          # don't reliably expose one, so it's excluded from this loop, same
+          # limitation whisper-boring's CI already accepts for its own GPU code.
+          # test_tokenizer_real.br needs the real (gitignored, not present in
+          # CI) downloaded GGUF file and a compiled build, for the same reason.
+          # bench_linear_warp.br isn't a test at all — it's a manual wall-clock
+          # benchmark tool that requires a CLI argument (see its own header
+          # comment) and throws with none given; excluded so `test/*.br`'s glob
+          # doesn't sweep it in and fail every run before any real test executes.
+          for f in test/*.br; do
+            if [ "$f" = "test/test_math_gpu_real.br" ]; then continue; fi
+            if [ "$f" = "test/test_tokenizer_real.br" ]; then continue; fi
+            if [ "$f" = "test/bench_linear_warp.br" ]; then continue; fi
+            echo "=== $f ==="
+            boring run "$f"
+          done
