@@ -50,4 +50,38 @@ def main() throws:
     assert_eq(seg3[1], "\n")
     assert_eq(seg3[2], "You")
 
+    # --- encode_with_specials: a tiny synthetic vocab (no real GGUF needed,
+    # see test_tokenizer_real.br for the full real-vocab verification) to
+    # exercise the special-token partitioning in isolation: plain-text spans
+    # go through ordinary BPE, special-token spans become a single atomic id.
+    let byte_to_uni = build_byte_to_unicode()
+    let uni_to_byte = build_unicode_to_byte()
+    var {string=int} vocab = {=}
+    vocab["h"] = 1
+    vocab["i"] = 2
+    vocab["b"] = 3
+    vocab["y"] = 4
+    vocab["e"] = 5
+    var {string=int} special = {=}
+    special["<SPECIAL>"] = 999
+    let tok = Tokenizer(vocab, {=}, [], byte_to_uni, uni_to_byte, 0, 0, false, [], [], special)
+    let ids = tok.encode_with_specials("hi<SPECIAL>bye")
+    assert_eq(ids.length, 6)
+    assert_eq(ids[0], 1)
+    assert_eq(ids[1], 2)
+    assert_eq(ids[2], 999)
+    assert_eq(ids[3], 3)
+    assert_eq(ids[4], 4)
+    assert_eq(ids[5], 5)
+
+    # Longest-match preference: "<ab>" must win over the shorter "<a>" even
+    # though both match starting at the same position.
+    var {string=int} overlapping = {=}
+    overlapping["<a>"] = 900
+    overlapping["<ab>"] = 901
+    let tok2 = Tokenizer({=}, {=}, [], byte_to_uni, uni_to_byte, 0, 0, false, [], [], overlapping)
+    let ids2 = tok2.encode_with_specials("<ab>")
+    assert_eq(ids2.length, 1)
+    assert_eq(ids2[0], 901)
+
     print "test_tokenizer: all assertions passed"

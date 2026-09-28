@@ -1,0 +1,794 @@
+# src/jinja.br — a from-scratch interpreter for the subset of Jinja2 real
+# GGUF chat templates actually use (verified against two real ones: Qwen2.5's
+# own tool-calling-capable template and TinyLlama/Llama's simpler one — see
+# test/test_jinja_real.br). Not a general Jinja implementation: no macros,
+# no includes, no arithmetic beyond `+`/`-`, no membership (`in`) tests
+# inside expressions, no dict/list literals, no `{% raise %}`. What IS
+# supported, because both real templates above need it: `{% if/elif/else/
+# endif %}`, `{% for x in y %}...{% endfor %}` with `loop.first/last/index/
+# index0`, `{% set x = expr %}`, `{{ expr }}` output, `and`/`or`/`not`,
+# `==`/`!=`, string concatenation via `+`, attribute access (`msg.role` and
+# `msg['role']` are the same operation), `is defined`, and the `trim`/
+# `tojson` filters. `{%-`/`-%}`/`{{-`/`-}}` whitespace-trim markers are
+# fully handled (every real template found in the wild leans on them
+# heavily for readable source with no stray blank lines in the rendered
+# output).
+#
+# Two-level grammar, matching how Jinja itself works: a TEMPLATE-level
+# lexer/parser splits the raw template text into Text/If/For/Set/Output
+# nodes (treating whatever's between `{{ }}`/`{% %}` as an opaque source
+# string at this level), then a separate EXPRESSION-level lexer/parser
+# parses each of those opaque strings into a small AST once, at template-
+# load time (not per-render).
+#
+# Evaluation threads the variable environment through explicitly via
+# return values (`(String, {string=JValue})`), never by mutating a shared
+# `var` dict in place — this project's own established idiom for anything
+# that needs "new state, old state kept around" (same shape as the KV-cache
+# work's `(logits, new_cache)` and the sampler's `(token, new_rng)`). Kept
+# even after task_c44f5882 (a real boring interpreter bug where a same-scope
+# `var copy = original; ...; original = copy` write-back was wrongly
+# rejected as "cannot assign to immutable variable" — fixed upstream,
+# `Env::set_moved` no longer revokes rebind permission) landed and was
+# confirmed fixed, since this threading style is this project's own
+# preferred idiom independent of that bug, not just a workaround for it.
+
+use gguf
+
+# ── Values ───────────────────────────────────────────────────────────────
+
+pub enum JValue:
+    JStr(string s)
+    JInt(int n)
+    JBool(bool b)
+    JList([JValue] items)
+    JDict({string=JValue} fields)
+    JUndefined
+
+pub bool jv_truthy(JValue v):
+    match v:
+        JStr(s): s.length > 0
+        JInt(n): n != 0
+        JBool(b): b
+        JList(items): items.length > 0
+        JDict(fields): true
+        JUndefined: false
+
+bool jv_is_undefined(JValue v):
+    match v:
+        JUndefined: true
+        _: false
+
+bool jv_eq(JValue l, JValue r):
+    match l:
+        JStr(a):
+            match r:
+                JStr(b): a == b
+                _: false
+        JInt(a):
+            match r:
+                JInt(b): a == b
+                _: false
+        JBool(a):
+            match r:
+                JBool(b): a == b
+                _: false
+        _: false
+
+string jv_to_str(JValue v):
+    match v:
+        JStr(s): s
+        JInt(n): "{n}"
+        JBool(b): if b: "True" else: "False"
+        JUndefined: ""
+        _: ""
+
+string json_escape(string s):
+    var string out = ""
+    for ch in s.chars():
+        if ch == "\"":
+            out = "{out}\\\""
+        elif ch == "\\":
+            out = "{out}\\\\"
+        elif ch == "\n":
+            out = "{out}\\n"
+        else:
+            out = "{out}{ch}"
+    out
+
+# Only ever reached inside a real template's tool-calling branches, which
+# this project always steers around (`tools`/`message.tool_calls` are
+# always empty in the environment this project builds — see
+# build_chat_env in model-facing code) — implemented anyway for
+# completeness, not exercised by test_jinja_real.br's own assertions.
+string jv_to_json(JValue v):
+    match v:
+        JStr(s): "\"{json_escape(s)}\""
+        JInt(n): "{n}"
+        JBool(b): if b: "true" else: "false"
+        JUndefined: "null"
+        JList(items):
+            var string out = "["
+            var int i = 0
+            while i < items.length:
+                if i > 0:
+                    out = "{out},"
+                out = "{out}{jv_to_json(items[i])}"
+                i += 1
+            "{out}]"
+        JDict(fields):
+            "{{}}"
+
+string strip_ws(string s):
+    let chars = s.chars()
+    var int a = 0
+    var int b = chars.length
+    while a < b and is_ws_char(chars[a]):
+        a += 1
+    while b > a and is_ws_char(chars[b - 1]):
+        b -= 1
+    var string out = ""
+    var int i = a
+    while i < b:
+        out = "{out}{chars[i]}"
+        i += 1
+    out
+
+bool is_ws_char(string ch):
+    ch == " " or ch == "\n" or ch == "\t" or ch == "\r"
+
+# ── Expression AST ───────────────────────────────────────────────────────
+
+pub enum JExpr:
+    ELit(JValue v)
+    EVar(string name)
+    EAttr(JExpr base, string name)
+    EIndex(JExpr base, JExpr idx)
+    EBinOp(string op, JExpr left, JExpr right)
+    ENot(JExpr e)
+    EIsDefined(JExpr e)
+    EFilter(JExpr base, string name)
+
+JValue jv_get_attr(JValue base, string name):
+    match base:
+        JDict(fields): fields[name] else JValue.JUndefined
+        _: JValue.JUndefined
+
+JValue jv_get_index(JValue base, JValue idx):
+    match base:
+        JList(items):
+            match idx:
+                JInt(n):
+                    if n >= 0 and n < items.length:
+                        items[n]
+                    else:
+                        JValue.JUndefined
+                _: JValue.JUndefined
+        JDict(fields):
+            match idx:
+                JStr(k): fields[k] else JValue.JUndefined
+                _: JValue.JUndefined
+        _: JValue.JUndefined
+
+JValue apply_filter(string name, JValue v) throws:
+    if name == "trim":
+        match v:
+            JStr(s): JValue.JStr(strip_ws(s))
+            _: v
+    elif name == "tojson":
+        JValue.JStr(jv_to_json(v))
+    else:
+        throw "jinja: unsupported filter '{name}'"
+
+JValue eval_binop(string op, JValue l, JValue r) throws:
+    if op == "+":
+        JValue.JStr("{jv_to_str(l)}{jv_to_str(r)}")
+    elif op == "-":
+        match l:
+            JInt(a):
+                match r:
+                    JInt(b): JValue.JInt(a - b)
+                    _: throw "jinja: '-' requires ints"
+            _: throw "jinja: '-' requires ints"
+    elif op == "==":
+        JValue.JBool(jv_eq(l, r))
+    elif op == "!=":
+        JValue.JBool(not jv_eq(l, r))
+    else:
+        throw "jinja: unsupported operator '{op}'"
+
+pub JValue eval_expr(JExpr e, {string=JValue} env) throws:
+    match e:
+        ELit(v): v
+        EVar(name): env[name] else JValue.JUndefined
+        EAttr(base, name): jv_get_attr(eval_expr(base, env), name)
+        EIndex(base, idxe): jv_get_index(eval_expr(base, env), eval_expr(idxe, env))
+        ENot(e2): JValue.JBool(not jv_truthy(eval_expr(e2, env)))
+        EIsDefined(e2): JValue.JBool(not jv_is_undefined(eval_expr(e2, env)))
+        EFilter(base, name): apply_filter(name, eval_expr(base, env))
+        EBinOp(op, l, r):
+            if op == "and":
+                let lv = eval_expr(l, env)
+                if not jv_truthy(lv):
+                    JValue.JBool(false)
+                else:
+                    JValue.JBool(jv_truthy(eval_expr(r, env)))
+            elif op == "or":
+                let lv = eval_expr(l, env)
+                if jv_truthy(lv):
+                    JValue.JBool(true)
+                else:
+                    JValue.JBool(jv_truthy(eval_expr(r, env)))
+            else:
+                eval_binop(op, eval_expr(l, env), eval_expr(r, env))
+
+# ── Expression lexer ─────────────────────────────────────────────────────
+
+pub struct EToken:
+    string kind    # "ident" | "str" | "int" | "op"
+    string text
+
+bool is_ident_start(string ch):
+    (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z") or ch == "_"
+
+bool is_ident_char(string ch):
+    is_ident_start(ch) or (ch >= "0" and ch <= "9")
+
+bool is_digit_char(string ch):
+    ch >= "0" and ch <= "9"
+
+pub [EToken] lex_expr_tokens(string src) throws:
+    let chars = src.chars()
+    let n = chars.length
+    var [EToken] toks = []
+    var int i = 0
+    while i < n:
+        let c = chars[i]
+        if is_ws_char(c):
+            i += 1
+        elif c == "'" or c == "\"":
+            let quote = c
+            var string s = ""
+            i += 1
+            while i < n and chars[i] != quote:
+                if chars[i] == "\\" and i + 1 < n:
+                    let nc = chars[i + 1]
+                    if nc == "n":
+                        s = "{s}\n"
+                    elif nc == "t":
+                        s = "{s}\t"
+                    else:
+                        s = "{s}{nc}"
+                    i += 2
+                else:
+                    s = "{s}{chars[i]}"
+                    i += 1
+            guard i < n else throw "jinja: unterminated string literal in expression '{src}'"
+            i += 1
+            toks.push(EToken("str", s))
+        elif is_ident_start(c):
+            var string id = ""
+            while i < n and is_ident_char(chars[i]):
+                id = "{id}{chars[i]}"
+                i += 1
+            toks.push(EToken("ident", id))
+        elif is_digit_char(c):
+            var string num = ""
+            while i < n and is_digit_char(chars[i]):
+                num = "{num}{chars[i]}"
+                i += 1
+            toks.push(EToken("int", num))
+        elif c == "=" and i + 1 < n and chars[i + 1] == "=":
+            toks.push(EToken("op", "=="))
+            i += 2
+        elif c == "!" and i + 1 < n and chars[i + 1] == "=":
+            toks.push(EToken("op", "!="))
+            i += 2
+        else:
+            toks.push(EToken("op", c))
+            i += 1
+    toks
+
+bool tok_is_op(EToken t, string s):
+    t.kind == "op" and t.text == s
+
+bool tok_is_ident(EToken t, string s):
+    t.kind == "ident" and t.text == s
+
+# ── Expression parser (recursive descent, lowest to highest precedence:
+#    or, and, ==/!=, not, +/-, postfix .attr/[idx]/|filter/is defined) ───
+
+(JExpr, int) parse_primary([EToken] toks, int i) throws:
+    guard i < toks.length else throw "jinja: unexpected end of expression"
+    let t = toks[i]
+    if t.kind == "str":
+        (JExpr.ELit(JValue.JStr(t.text)), i + 1)
+    elif t.kind == "int":
+        guard let n = (t.text as int) else throw "jinja: invalid integer literal '{t.text}'"
+        (JExpr.ELit(JValue.JInt(n)), i + 1)
+    elif t.kind == "ident":
+        if t.text == "true" or t.text == "True":
+            (JExpr.ELit(JValue.JBool(true)), i + 1)
+        elif t.text == "false" or t.text == "False":
+            (JExpr.ELit(JValue.JBool(false)), i + 1)
+        else:
+            (JExpr.EVar(t.text), i + 1)
+    elif tok_is_op(t, "("):
+        let (e, j) = parse_or(toks, i + 1)
+        guard j < toks.length and tok_is_op(toks[j], ")") else throw "jinja: expected ')' in expression"
+        (e, j + 1)
+    else:
+        throw "jinja: unexpected token '{t.text}' in expression"
+
+(JExpr, int) parse_postfix([EToken] toks, int i) throws:
+    let (e0, i0) = parse_primary(toks, i)
+    var JExpr e = e0
+    var int j = i0
+    var bool cont = true
+    while cont and j < toks.length:
+        if tok_is_op(toks[j], "."):
+            guard j + 1 < toks.length and toks[j + 1].kind == "ident" else throw "jinja: expected identifier after '.'"
+            e = JExpr.EAttr(e, toks[j + 1].text)
+            j += 2
+        elif tok_is_op(toks[j], "["):
+            let (idx_e, j2) = parse_or(toks, j + 1)
+            guard j2 < toks.length and tok_is_op(toks[j2], "]") else throw "jinja: expected ']'"
+            e = JExpr.EIndex(e, idx_e)
+            j = j2 + 1
+        elif tok_is_op(toks[j], "|"):
+            guard j + 1 < toks.length and toks[j + 1].kind == "ident" else throw "jinja: expected filter name after '|'"
+            e = JExpr.EFilter(e, toks[j + 1].text)
+            j += 2
+        elif tok_is_ident(toks[j], "is"):
+            var int k = j + 1
+            var bool negate = false
+            if k < toks.length and tok_is_ident(toks[k], "not"):
+                negate = true
+                k += 1
+            guard k < toks.length and tok_is_ident(toks[k], "defined") else throw "jinja: expected 'defined' after 'is'"
+            if negate:
+                e = JExpr.ENot(JExpr.EIsDefined(e))
+            else:
+                e = JExpr.EIsDefined(e)
+            j = k + 1
+        else:
+            cont = false
+    (e, j)
+
+(JExpr, int) parse_add([EToken] toks, int i) throws:
+    let (e0, i0) = parse_postfix(toks, i)
+    var JExpr e = e0
+    var int j = i0
+    var bool cont = true
+    while cont and j < toks.length and (tok_is_op(toks[j], "+") or tok_is_op(toks[j], "-")):
+        let op = toks[j].text
+        let (rhs, j2) = parse_postfix(toks, j + 1)
+        e = JExpr.EBinOp(op, e, rhs)
+        j = j2
+    (e, j)
+
+(JExpr, int) parse_not([EToken] toks, int i) throws:
+    if i < toks.length and tok_is_ident(toks[i], "not"):
+        let (e, j) = parse_not(toks, i + 1)
+        (JExpr.ENot(e), j)
+    else:
+        parse_add(toks, i)
+
+(JExpr, int) parse_cmp([EToken] toks, int i) throws:
+    let (lhs, j0) = parse_not(toks, i)
+    if j0 < toks.length and (tok_is_op(toks[j0], "==") or tok_is_op(toks[j0], "!=")):
+        let op = toks[j0].text
+        let (rhs, j1) = parse_not(toks, j0 + 1)
+        (JExpr.EBinOp(op, lhs, rhs), j1)
+    else:
+        (lhs, j0)
+
+(JExpr, int) parse_and([EToken] toks, int i) throws:
+    let (e0, i0) = parse_cmp(toks, i)
+    var JExpr e = e0
+    var int j = i0
+    var bool cont = true
+    while cont and j < toks.length and tok_is_ident(toks[j], "and"):
+        let (rhs, j2) = parse_cmp(toks, j + 1)
+        e = JExpr.EBinOp("and", e, rhs)
+        j = j2
+    (e, j)
+
+pub (JExpr, int) parse_or([EToken] toks, int i) throws:
+    let (e0, i0) = parse_and(toks, i)
+    var JExpr e = e0
+    var int j = i0
+    var bool cont = true
+    while cont and j < toks.length and tok_is_ident(toks[j], "or"):
+        let (rhs, j2) = parse_and(toks, j + 1)
+        e = JExpr.EBinOp("or", e, rhs)
+        j = j2
+    (e, j)
+
+pub JExpr parse_expr_str(string s) throws:
+    let toks = lex_expr_tokens(s)
+    let (e, j) = parse_or(toks, 0)
+    guard j == toks.length else throw "jinja: trailing tokens in expression '{s}'"
+    e
+
+# ── Template-level lexer (text / {{ expr }} / {% stmt %}, with `-` trim
+#    markers stripping adjacent whitespace) ───────────────────────────────
+
+struct RawTok:
+    int kind    # 0 = text, 1 = expr, 2 = stmt
+    string content
+    bool trim_left
+    bool trim_right
+
+[RawTok] scan_raw(string src) throws:
+    let chars = src.chars()
+    let n = chars.length
+    var [RawTok] toks = []
+    var string buf = ""
+    var int i = 0
+    while i < n:
+        if chars[i] == "{{" and i + 1 < n and (chars[i + 1] == "{{" or chars[i + 1] == "%"):
+            if buf.length > 0:
+                toks.push(RawTok(0, buf, false, false))
+                buf = ""
+            let is_stmt = chars[i + 1] == "%"
+            var int j = i + 2
+            var bool trim_left = false
+            if j < n and chars[j] == "-":
+                trim_left = true
+                j += 1
+            var string content = ""
+            var bool trim_right = false
+            var bool closed = false
+            # A real template's `{{ "...{{\"key\": val}}..." }}` shape (a
+            # JSON-literal string inside the Jinja expression itself, seen
+            # verbatim in Qwen2.5's own tool-calling template) means a bare
+            # `}}`/`%}` scan would close the tag early on the FIRST `}}`
+            # that happens to appear inside a quoted string. Track quote
+            # state (with backslash-escape skipping) so a close delimiter
+            # is only ever recognized outside any open string literal.
+            var string quote_char = ""
+            while j < n and not closed:
+                if quote_char != "":
+                    if chars[j] == "\\" and j + 1 < n:
+                        content = "{content}{chars[j]}{chars[j + 1]}"
+                        j += 2
+                    else:
+                        if chars[j] == quote_char:
+                            quote_char = ""
+                        content = "{content}{chars[j]}"
+                        j += 1
+                elif chars[j] == "'" or chars[j] == "\"":
+                    quote_char = chars[j]
+                    content = "{content}{chars[j]}"
+                    j += 1
+                else:
+                    let at_dash_close = chars[j] == "-" and j + 2 < n and ((is_stmt and chars[j + 1] == "%" and chars[j + 2] == "}}") or (not is_stmt and chars[j + 1] == "}}" and chars[j + 2] == "}}"))
+                    let at_plain_close = j + 1 < n and ((is_stmt and chars[j] == "%" and chars[j + 1] == "}}") or (not is_stmt and chars[j] == "}}" and chars[j + 1] == "}}"))
+                    if at_dash_close:
+                        trim_right = true
+                        j += 3
+                        closed = true
+                    elif at_plain_close:
+                        j += 2
+                        closed = true
+                    else:
+                        content = "{content}{chars[j]}"
+                        j += 1
+            guard closed else throw "jinja: unterminated tag in template"
+            toks.push(RawTok(if is_stmt: 2 else: 1, content, trim_left, trim_right))
+            i = j
+        else:
+            buf = "{buf}{chars[i]}"
+            i += 1
+    if buf.length > 0:
+        toks.push(RawTok(0, buf, false, false))
+    toks
+
+[RawTok] apply_trim([RawTok] toks):
+    var [RawTok] out = []
+    for t in toks:
+        out.push(t)
+    var int i = 0
+    while i < out.length:
+        if out[i].kind != 0 and out[i].trim_left and i > 0 and out[i - 1].kind == 0:
+            out[i - 1] = RawTok(0, rstrip_ws(out[i - 1].content), false, false)
+        if out[i].kind != 0 and out[i].trim_right and i + 1 < out.length and out[i + 1].kind == 0:
+            out[i + 1] = RawTok(0, lstrip_ws(out[i + 1].content), false, false)
+        i += 1
+    out
+
+string rstrip_ws(string s):
+    let chars = s.chars()
+    var int b = chars.length
+    while b > 0 and is_ws_char(chars[b - 1]):
+        b -= 1
+    var string out = ""
+    var int i = 0
+    while i < b:
+        out = "{out}{chars[i]}"
+        i += 1
+    out
+
+string lstrip_ws(string s):
+    let chars = s.chars()
+    var int a = 0
+    while a < chars.length and is_ws_char(chars[a]):
+        a += 1
+    var string out = ""
+    var int i = a
+    while i < chars.length:
+        out = "{out}{chars[i]}"
+        i += 1
+    out
+
+# ── Statement AST + parser ───────────────────────────────────────────────
+
+pub enum JStmt:
+    SText(string text)
+    SOutput(JExpr expr)
+    SIf(JExpr cond, [JStmt] then_body, [JStmt] else_body)
+    SFor(string var_name, JExpr iterable, [JStmt] body)
+    SSet(string var_name, JExpr expr)
+
+string first_word(string s):
+    let chars = s.chars()
+    var string w = ""
+    var int i = 0
+    while i < chars.length and is_ws_char(chars[i]):
+        i += 1
+    while i < chars.length and not is_ws_char(chars[i]):
+        w = "{w}{chars[i]}"
+        i += 1
+    w
+
+# Everything after the first whitespace-delimited word, trimmed.
+string rest_after_word(string s):
+    let chars = s.chars()
+    var int i = 0
+    while i < chars.length and is_ws_char(chars[i]):
+        i += 1
+    while i < chars.length and not is_ws_char(chars[i]):
+        i += 1
+    var string rest = ""
+    var int j = i
+    while j < chars.length:
+        rest = "{rest}{chars[j]}"
+        j += 1
+    strip_ws(rest)
+
+(string, string) split_for_header(string s) throws:
+    let chars = s.chars()
+    let n = chars.length
+    var int i = 0
+    var int found = -1
+    while i + 3 < n and found < 0:
+        if chars[i] == " " and chars[i + 1] == "i" and chars[i + 2] == "n" and chars[i + 3] == " ":
+            found = i
+        i += 1
+    guard found >= 0 else throw "jinja: malformed 'for' header '{s}'"
+    var string var_name = ""
+    var int a = 0
+    while a < found:
+        var_name = "{var_name}{chars[a]}"
+        a += 1
+    var string iter_src = ""
+    var int b = found + 4
+    while b < n:
+        iter_src = "{iter_src}{chars[b]}"
+        b += 1
+    (strip_ws(var_name), strip_ws(iter_src))
+
+(string, string) split_set(string s) throws:
+    let chars = s.chars()
+    let n = chars.length
+    var int i = 0
+    var int found = -1
+    while i < n and found < 0:
+        if chars[i] == "=" and (i + 1 >= n or chars[i + 1] != "=") and (i == 0 or chars[i - 1] != "="):
+            found = i
+        i += 1
+    guard found >= 0 else throw "jinja: malformed 'set' statement '{s}'"
+    var string name = ""
+    var int a = 0
+    while a < found:
+        name = "{name}{chars[a]}"
+        a += 1
+    var string expr_src = ""
+    var int b = found + 1
+    while b < n:
+        expr_src = "{expr_src}{chars[b]}"
+        b += 1
+    (strip_ws(name), strip_ws(expr_src))
+
+bool str_in_list(string s, [string] list):
+    var bool found = false
+    for x in list:
+        if x == s:
+            found = true
+    found
+
+([JStmt], int) parse_block([RawTok] toks, int start, [string] stop_words) throws:
+    var [JStmt] stmts = []
+    var int i = start
+    var bool stop = false
+    while i < toks.length and not stop:
+        let t = toks[i]
+        if t.kind == 0:
+            stmts.push(JStmt.SText(t.content))
+            i += 1
+        elif t.kind == 1:
+            stmts.push(JStmt.SOutput(parse_expr_str(t.content)))
+            i += 1
+        else:
+            let word = first_word(t.content)
+            if str_in_list(word, stop_words):
+                stop = true
+            elif word == "if":
+                let (node, next_i) = parse_if_like(toks, i, "if")
+                stmts.push(node)
+                i = next_i
+            elif word == "for":
+                let (node, next_i) = parse_for(toks, i)
+                stmts.push(node)
+                i = next_i
+            elif word == "set":
+                let (name, expr_src) = split_set(rest_after_word(t.content))
+                stmts.push(JStmt.SSet(name, parse_expr_str(expr_src)))
+                i += 1
+            else:
+                throw "jinja: unsupported statement '{word}' in '{t.content}'"
+    (stmts, i)
+
+(JStmt, int) parse_if_like([RawTok] toks, int i, string keyword) throws:
+    let cond_src = rest_after_word(toks[i].content)
+    let cond = parse_expr_str(cond_src)
+    let (then_body, j) = parse_block(toks, i + 1, ["elif", "else", "endif"])
+    guard j < toks.length else throw "jinja: unterminated 'if' (missing endif)"
+    let word = first_word(toks[j].content)
+    if word == "elif":
+        let (else_node, next_i) = parse_if_like(toks, j, "elif")
+        (JStmt.SIf(cond, then_body, [else_node]), next_i)
+    elif word == "else":
+        let (else_body, k) = parse_block(toks, j + 1, ["endif"])
+        guard k < toks.length else throw "jinja: unterminated 'if' (missing endif after else)"
+        (JStmt.SIf(cond, then_body, else_body), k + 1)
+    else:
+        (JStmt.SIf(cond, then_body, []), j + 1)
+
+(JStmt, int) parse_for([RawTok] toks, int i) throws:
+    let (var_name, iter_src) = split_for_header(rest_after_word(toks[i].content))
+    let iter_expr = parse_expr_str(iter_src)
+    let (body, j) = parse_block(toks, i + 1, ["endfor"])
+    guard j < toks.length else throw "jinja: unterminated 'for' (missing endfor)"
+    (JStmt.SFor(var_name, iter_expr, body), j + 1)
+
+# Real Jinja2 (`keep_trailing_newline=False`, its own default — used by
+# every real chat-template consumer, including `transformers`'
+# `apply_chat_template`) unconditionally drops exactly one trailing
+# newline from the raw template source before parsing, independent of any
+# `-`/trim-marker on the last tag. Real GGUF `tokenizer.chat_template`
+# strings always end with a newline after their final `{% endif %}` (a
+# plain text editor's own convention, not something the template author
+# writes deliberately) — without this, this project's own rendering
+# always has one extra trailing "\n" that real Jinja's output doesn't,
+# confirmed against Qwen2.5's real template + real `jinja2`.
+string strip_one_trailing_newline(string s):
+    let chars = s.chars()
+    let n = chars.length
+    if n > 0 and chars[n - 1] == "\n":
+        var string out = ""
+        var int i = 0
+        while i < n - 1:
+            out = "{out}{chars[i]}"
+            i += 1
+        out
+    else:
+        s
+
+pub [JStmt] parse_template(string src) throws:
+    let raw = apply_trim(scan_raw(strip_one_trailing_newline(src)))
+    let (stmts, end_i) = parse_block(raw, 0, [])
+    guard end_i == raw.length else throw "jinja: unexpected trailing tag in template (stray elif/else/endif/endfor?)"
+    stmts
+
+# ── Rendering (env threaded via return values — see this file's own
+#    header comment for why) ──────────────────────────────────────────────
+
+JValue build_loop_value(int idx, int count):
+    var {string=JValue} fields = {=}
+    fields["index0"] = JValue.JInt(idx)
+    fields["index"] = JValue.JInt(idx + 1)
+    fields["first"] = JValue.JBool(idx == 0)
+    fields["last"] = JValue.JBool(idx == count - 1)
+    JValue.JDict(fields)
+
+(string, {string=JValue}) render_for_step(JValue item, int idx, int count, string varname, [JStmt] body, {string=JValue} env) throws:
+    var {string=JValue} loop_env = env
+    loop_env[varname] = item
+    loop_env["loop"] = build_loop_value(idx, count)
+    render_stmts(body, loop_env)
+
+pub (string, {string=JValue}) render_stmt(JStmt s, {string=JValue} env) throws:
+    match s:
+        SText(t): (t, env)
+        SOutput(e): (jv_to_str(eval_expr(e, env)), env)
+        SSet(name, e):
+            let v = eval_expr(e, env)
+            var {string=JValue} env2 = env
+            env2[name] = v
+            ("", env2)
+        SIf(cond, then_body, else_body):
+            if jv_truthy(eval_expr(cond, env)):
+                render_stmts(then_body, env)
+            else:
+                render_stmts(else_body, env)
+        SFor(varname, iter_e, body):
+            let iter_v = eval_expr(iter_e, env)
+            match iter_v:
+                JList(items):
+                    var string out = ""
+                    var {string=JValue} cur_env = env
+                    var int idx = 0
+                    let count = items.length
+                    while idx < count:
+                        let (piece, new_env) = render_for_step(items[idx], idx, count, varname, body, cur_env)
+                        out = "{out}{piece}"
+                        cur_env = new_env
+                        idx += 1
+                    (out, cur_env)
+                _:
+                    ("", env)
+
+pub (string, {string=JValue}) render_stmts([JStmt] stmts, {string=JValue} env0) throws:
+    var string out = ""
+    var {string=JValue} env = env0
+    for s in stmts:
+        let (piece, new_env) = render_stmt(s, env)
+        out = "{out}{piece}"
+        env = new_env
+    (out, env)
+
+# Parses and renders `template_src` in one call — the entry point
+# model.br/main.br actually use (a chat template is only ever rendered
+# once per turn; there's no benefit to this project from caching the
+# parsed AST across calls).
+pub string render_jinja(string template_src, {string=JValue} env) throws:
+    let stmts = parse_template(template_src)
+    let (out, _) = render_stmts(stmts, env)
+    out
+
+# ── Chat-template env building (used by tokenizer.br's generic
+# render_chat_prompt to feed any GGUF's own tokenizer.chat_template, not
+# just Qwen2.5's hardcoded ChatML shape) ────────────────────────────────
+
+pub JValue jv_chat_message(string role, string content):
+    var {string=JValue} fields = {=}
+    fields["role"] = JValue.JStr(role)
+    fields["content"] = JValue.JStr(content)
+    JValue.JDict(fields)
+
+# `system_msg == ""` omits the system message entirely (some templates,
+# e.g. TinyLlama's, render differently — or throw via a real Jinja
+# `{% raise %}` we don't implement anyway — when messages[0].role isn't
+# actually "system"; an empty system prompt is the caller's way of opting
+# out rather than sending a blank one).
+pub [JValue] build_chat_messages(string system_msg, [string] user_msgs, [string] assistant_msgs):
+    var [JValue] messages = []
+    if system_msg != "":
+        messages.push(jv_chat_message("system", system_msg))
+    var int i = 0
+    while i < user_msgs.length:
+        messages.push(jv_chat_message("user", user_msgs[i]))
+        if i < assistant_msgs.length:
+            messages.push(jv_chat_message("assistant", assistant_msgs[i]))
+        i += 1
+    messages
+
+pub {string=JValue} build_chat_env([JValue] messages, bool add_generation_prompt, string bos_token, string eos_token):
+    var {string=JValue} env = {=}
+    env["messages"] = JValue.JList(messages)
+    env["add_generation_prompt"] = JValue.JBool(add_generation_prompt)
+    env["bos_token"] = JValue.JStr(bos_token)
+    env["eos_token"] = JValue.JStr(eos_token)
+    env

@@ -1,0 +1,85 @@
+# Real (compiled, --target metal) cross-check of every fused-dequant GPU
+# linear kernel (Q5_0/Q6_K/Q4_K — Q8_0 already covered by
+# test_math_gpu_real.br) against real tensor bytes from a real downloaded
+# Q4_K_M GGUF file, comparing against the CPU dequantize_*/linear_bias
+# reference with a non-trivial (non-uniform) input vector.
+#
+# This exists because test_math_gpu_real.br's own Q5_0/Q6_K/Q4_K unit tests
+# use small hand-crafted, deliberately uniform byte patterns (to keep the
+# expected output computable by hand) — which turned out to NOT be
+# sufficient: a real, confirmed Metal kernel-body codegen bug
+# (task_37bf65aa: a chained if/elif/elif/else EXPRESSION collapses into a
+# 2-way ternary, silently dropping every elif branch) passed those uniform
+# tests by coincidence (every branch's expected value happened to be
+# forced to the same constant) while producing wrong output on 880/896
+# real values from Q6KLinearKernel. Real, non-uniform tensor data is what
+# actually caught it — kept as a permanent regression test for exactly
+# that class of bug.
+#
+# Build + run:
+#   boring build --target metal test/test_quant_kernels_real.br
+#   cd test/test_quant_kernels_real_metal && cargo build --release
+#   ./target/release/test_quant_kernels_real ../../weights/qwen2.5-0.5b-instruct-q4_k_m.gguf
+
+use io
+use gguf
+use quant
+use math
+use math_gpu
+
+def assert_close(float32 a, float32 b, string msg):
+    let diff = if a > b: a - b else: b - a
+    assert(diff < 0.01 as float32, "{msg}: expected ~{b}, got {a}")
+
+GgufTensorInfo find_tensor([GgufTensorInfo] tensors, string name) throws:
+    for t in tensors:
+        if t.name == name:
+            return t
+    throw "tensor not found: {name}"
+
+# Runs a fused kernel against a real tensor's real bytes, comparing every
+# output element against the CPU dequant + linear_bias reference.
+def check_tensor(GgufFile file, string tensor_name, int expected_type) throws:
+    let t = find_tensor(file.tensors, tensor_name)
+    guard t.ggml_type == expected_type else throw "{tensor_name}: expected type {expected_type}, got {ggml_type_name(t.ggml_type)} (real GGUF quantization choices can shift between re-quantizations — update the test if this fires)"
+    let d_in = t.dims[0]
+    let d_out = t.dims[1]
+    let n = d_in * d_out
+    let n_bytes = quantized_row_bytes(expected_type, n)
+    let start = file.data_offset + t.offset
+    let w_bytes = read_bytes(file.bytes, start, n_bytes)
+
+    let cpu_w = dequantize_row(expected_type, w_bytes, 0, n)
+
+    var [float32] x = [0.0 for i in 0..<d_in]
+    var int i = 0
+    while i < d_in:
+        x[i] = ((i % 13) as float32) * (0.1 as float32)
+        i += 1
+    let zero_bias = [0.0 for i in 0..<d_out]
+
+    let cpu_out = linear_bias(x, cpu_w, zero_bias, 1, d_in, d_out)
+    let gpu_out_raw = fused_linear_nobias_gpu(x, w_bytes, expected_type, 1, d_in, d_out)
+    let gpu_out = passthrough(gpu_out_raw)
+
+    var int j = 0
+    while j < d_out:
+        assert_close(gpu_out[j], cpu_out[j], "{tensor_name}[{j}]")
+        j += 1
+    print "{tensor_name} ({ggml_type_name(expected_type)}, d_in={d_in} d_out={d_out}): OK, {d_out}/{d_out} values match"
+
+def main() throws:
+    let [string] argv = args()
+    guard argv.length > 1 else throw "usage: test_quant_kernels_real <path.gguf>"
+    let [uint8] bytes = fs.readBytes(argv[1])
+    let file = parse_gguf(bytes)
+
+    # blk.0.attn_q.weight: Q5_0 in the real downloaded Q4_K_M file.
+    check_tensor(file, "blk.0.attn_q.weight", 6)
+    # blk.0.ffn_down.weight: Q6_K in the real downloaded Q4_K_M file (ffn_down
+    # alternates Q4_K/Q6_K by layer in this quantization).
+    check_tensor(file, "blk.0.ffn_down.weight", 14)
+    # blk.11.ffn_down.weight: Q4_K in the real downloaded Q4_K_M file.
+    check_tensor(file, "blk.11.ffn_down.weight", 12)
+
+    print "test_quant_kernels_real: all assertions passed"

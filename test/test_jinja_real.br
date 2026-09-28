@@ -1,0 +1,79 @@
+# Real (compiled) test of the Jinja-subset evaluator (src/jinja.br) against
+# two real GGUF-embedded chat templates: Qwen2.5's own (tool-calling-capable,
+# heavy `{%- -%}` whitespace-trim usage) and TinyLlama/Llama's (plain,
+# untrimmed `{% %}` tags — deliberately messier whitespace, a good stress
+# test for the *default*, no-trim-marker code path). Verified against real
+# `jinja2`'s own rendering of the identical template + message list (see the
+# ad-hoc oracle script used to derive the exact strings below).
+#
+# Build + run:
+#   boring build --target metal test/test_jinja_real.br
+#   cd test/test_jinja_real_metal && cargo build --release
+#   ./target/release/test_jinja_real ../../weights/qwen2.5-0.5b-instruct-q8_0.gguf ../../weights/tinyllama-1.1b-chat-v1.0-q8_0.gguf
+
+use gguf
+use jinja
+
+JValue make_message(string role, string content) throws:
+    var {string=JValue} fields = {=}
+    fields["role"] = JValue.JStr(role)
+    fields["content"] = JValue.JStr(content)
+    JValue.JDict(fields)
+
+{string=JValue} build_env([JValue] messages, bool add_gen_prompt, string bos, string eos) throws:
+    var {string=JValue} env = {=}
+    env["messages"] = JValue.JList(messages)
+    env["add_generation_prompt"] = JValue.JBool(add_gen_prompt)
+    env["bos_token"] = JValue.JStr(bos)
+    env["eos_token"] = JValue.JStr(eos)
+    env
+
+def check(string got, string expected, string label) throws:
+    assert_eq(got, expected as string)
+    print "  {label}: OK"
+
+def main() throws:
+    let [string] argv = args()
+    guard argv.length > 2 else throw "usage: test_jinja_real <qwen.gguf> <tinyllama.gguf>"
+
+    let qwen_bytes = fs.readBytes(argv[1])
+    let qwen_file = parse_gguf(qwen_bytes)
+    guard let qwen_tmpl = gguf_get_string(qwen_file.metadata, "tokenizer.chat_template") else throw "qwen GGUF has no chat_template"
+
+    var [JValue] single = []
+    single.push(make_message("system", "You are a helpful assistant."))
+    single.push(make_message("user", "What is the capital of France?"))
+    let qwen_env1 = build_env(single, true, "", "<|im_end|>")
+    let qwen_out1 = render_jinja(qwen_tmpl, qwen_env1)
+    check(qwen_out1,
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+        "qwen single-turn")
+
+    var [JValue] multi = []
+    multi.push(make_message("system", "You are a helpful assistant."))
+    multi.push(make_message("user", "What is the capital of France?"))
+    multi.push(make_message("assistant", "Paris."))
+    multi.push(make_message("user", "And of Germany?"))
+    let qwen_env2 = build_env(multi, true, "", "<|im_end|>")
+    let qwen_out2 = render_jinja(qwen_tmpl, qwen_env2)
+    check(qwen_out2,
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\nParis.<|im_end|>\n<|im_start|>user\nAnd of Germany?<|im_end|>\n<|im_start|>assistant\n",
+        "qwen multi-turn")
+
+    let tiny_bytes = fs.readBytes(argv[2])
+    let tiny_file = parse_gguf(tiny_bytes)
+    guard let tiny_tmpl = gguf_get_string(tiny_file.metadata, "tokenizer.chat_template") else throw "tinyllama GGUF has no chat_template"
+
+    let tiny_env1 = build_env(single, true, "<s>", "</s>")
+    let tiny_out1 = render_jinja(tiny_tmpl, tiny_env1)
+    check(tiny_out1,
+        "\n\n<|system|>\nYou are a helpful assistant.</s>\n\n\n\n\n<|user|>\nWhat is the capital of France?</s>\n\n\n<|assistant|>\n\n",
+        "tinyllama single-turn (untrimmed template, exact whitespace)")
+
+    let tiny_env2 = build_env(multi, true, "<s>", "</s>")
+    let tiny_out2 = render_jinja(tiny_tmpl, tiny_env2)
+    check(tiny_out2,
+        "\n\n<|system|>\nYou are a helpful assistant.</s>\n\n\n\n\n<|user|>\nWhat is the capital of France?</s>\n\n\n\n\n<|assistant|>\nParis.</s>\n\n\n\n\n<|user|>\nAnd of Germany?</s>\n\n\n<|assistant|>\n\n",
+        "tinyllama multi-turn (untrimmed template, exact whitespace)")
+
+    print "test_jinja_real: all assertions passed"

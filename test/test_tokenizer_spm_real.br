@@ -1,0 +1,50 @@
+# Real (compiled) tokenizer test against a real downloaded TinyLlama-1.1B-
+# Chat vocab (SentencePiece, "tokenizer.ggml.model = llama" — the Llama/
+# Mistral family's tokenizer, distinct from Qwen2's GPT-2-style byte-level
+# BPE already covered by test_tokenizer_real.br). Verified against
+# llama-cpp-python's own .tokenize()/.detokenize() for the identical
+# strings, mirroring test_tokenizer_real.br's own methodology.
+#
+# Build + run:
+#   boring build --target metal test/test_tokenizer_spm_real.br
+#   cd test/test_tokenizer_spm_real_metal && cargo build --release
+#   ./target/release/test_tokenizer_spm_real ../../weights/tinyllama-1.1b-chat-v1.0-q8_0.gguf
+
+use gguf
+use tokenizer
+
+def check_prompt(Tokenizer tok, string prompt, [int] expected, string expected_decoded) throws:
+    let ids = tok.encode(prompt)
+    assert_eq(ids.length, expected.length)
+    var int i = 0
+    while i < expected.length:
+        assert_eq(ids[i], expected[i])
+        i += 1
+    let back = tok.decode(ids)
+    assert_eq(back, expected_decoded as string)
+    print "  \"{prompt}\": OK ({ids.length} tokens)"
+
+def main() throws:
+    let [string] argv = args()
+    guard argv.length > 1 else throw "usage: test_tokenizer_spm_real <path.gguf>"
+    let [uint8] bytes = fs.readBytes(argv[1])
+    let file = parse_gguf(bytes)
+    let tok = load_tokenizer(file)
+    guard tok.is_spm else throw "expected a SentencePiece ('llama') GGUF, got a BPE ('gpt2') one"
+
+    # llama-cpp-python: llm.tokenize(s.encode(), add_bos=False) on each prompt.
+    # decode() always keeps the leading space encode_spm prepends (matches
+    # llama.cpp's own add_space_prefix behavior exactly — not stripped).
+    check_prompt(tok, "The capital of France is", [450, 7483, 310, 3444, 338], " The capital of France is")
+    check_prompt(tok, "Hello, world! 123", [15043, 29892, 3186, 29991, 29871, 29896, 29906, 29941], " Hello, world! 123")
+    check_prompt(tok, "What is the tallest mountain?", [1724, 338, 278, 15655, 342, 14378, 29973], " What is the tallest mountain?")
+    # Consecutive spaces: SentencePiece vocabs carry dedicated multi-space
+    # tokens (e.g. "▁▁" for a run of 2) rather than falling back to
+    # single-space repeats — stresses that the merge algorithm actually
+    # picks them up rather than only ever merging single "▁"-prefixed words.
+    check_prompt(tok, "one  two   three", [697, 259, 10184, 1678, 17536], " one  two   three")
+    # Non-ASCII (accented Latin-1 characters) — stresses the byte-fallback
+    # path for codepoints with no single dedicated vocab entry.
+    check_prompt(tok, "café résumé", [5777, 29888, 29948, 6896, 398, 29948], " café résumé")
+
+    print "test_tokenizer_spm_real: all assertions passed"

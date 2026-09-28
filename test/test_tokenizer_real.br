@@ -35,19 +35,65 @@ def main() throws:
     assert_eq(text_back, "The capital of France is" as string)
     print "decode round-trip: OK"
 
-    # llama-cpp-python's own tokenize() of the full ChatML-wrapped prompt:
+    # llama-cpp-python's own tokenize() of the full ChatML-wrapped prompt,
+    # this time produced via the GENERIC render_chat_prompt path (renders
+    # Qwen2.5's own real tokenizer.chat_template through src/jinja.br, then
+    # partitions on special-token text via encode_with_specials) instead of
+    # the old Qwen2.5-hardcoded ChatML construction — same expected token
+    # ids either way, but this path also works for any other architecture's
+    # own chat_template (see test_tokenizer_spm_real.br's SentencePiece
+    # counterpart):
     # [151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198,
     #  151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30, 151645, 198,
     #  151644, 77091, 198]
     let expected = [151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198,
                     151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30, 151645, 198,
                     151644, 77091, 198]
-    let ids2 = tok.encode_chat("You are a helpful assistant.", "What is the capital of France?")
+    let ids2 = render_chat_prompt(file, tok, "You are a helpful assistant.", ["What is the capital of France?"], [], true)
     assert_eq(ids2.length, expected.length)
     var i = 0
     while i < expected.length:
         assert_eq(ids2[i], expected[i])
         i += 1
-    print "encode_chat (ChatML prompt): OK, {ids2.length} tokens matching llama-cpp-python exactly"
+    print "render_chat_prompt (Jinja-rendered ChatML): OK, {ids2.length} tokens matching llama-cpp-python exactly"
+
+    # KV-cache multi-turn continuation: main.br's run_chat computes each new
+    # turn's incremental tokens as full_ids[all_tokens.length..] — a fresh
+    # full render+encode of the WHOLE conversation, sliced from wherever the
+    # existing KV-cache already leaves off — rather than deriving a
+    # per-architecture "just this turn's own text" shape the way the old
+    # hardcoded encode_chat_turn did. This is only correct if a prior turn's
+    # own token ids never change once more text is appended after them,
+    # which holds here because a rendered turn always ends on a special-
+    # token boundary (<|im_end|>, matched atomically by encode_with_specials,
+    # never merged with anything that follows) — verified here against real
+    # vocab data, not just the two small hand-built templates in
+    # test_jinja.br.
+    let system_msg = "You are a helpful assistant."
+    let msg1 = "What is the capital of France?"
+    let reply1_text = "Paris."
+    let msg2 = "And of Germany?"
+
+    let turn1 = render_chat_prompt(file, tok, system_msg, [msg1], [], true)
+    var simulated_reply_tokens = tok.encode(reply1_text)
+    simulated_reply_tokens.push(tok.eos_token_id)
+
+    var all_tokens = []
+    for t in turn1: all_tokens.push(t)
+    for t in simulated_reply_tokens: all_tokens.push(t)
+
+    let full_turn2 = render_chat_prompt(file, tok, system_msg, [msg1, msg2], [reply1_text], true)
+    let new_tokens = full_turn2[all_tokens.length..]
+
+    var incremental = []
+    for t in all_tokens: incremental.push(t)
+    for t in new_tokens: incremental.push(t)
+
+    assert_eq(incremental.length, full_turn2.length)
+    var j = 0
+    while j < full_turn2.length:
+        assert_eq(incremental[j], full_turn2[j])
+        j += 1
+    print "KV-cache incremental slicing: OK, matches full re-render exactly ({incremental.length} tokens)"
 
     print "test_tokenizer_real: all assertions passed"

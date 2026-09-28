@@ -1,21 +1,32 @@
-# src/tokenizer.br — byte-level BPE tokenizer (GPT-2/Qwen2 family), built
-# directly from GGUF-embedded metadata (tokenizer.ggml.tokens/merges/
-# bos_token_id/eos_token_id) — no separate vocab.json/merges.txt export
-# step needed, unlike whisper-boring's tokenizer.br (whose source format,
-# a bare PyTorch checkpoint, has no embedded tokenizer at all).
+# src/tokenizer.br — two tokenizer families, both built directly from
+# GGUF-embedded metadata (no separate vocab.json/merges.txt/tokenizer.model
+# export step needed, unlike whisper-boring's tokenizer.br, whose source
+# format — a bare PyTorch checkpoint — has no embedded tokenizer at all):
 #
-# Simplified pretokenization: splits text into runs of {ASCII letter, ASCII
-# digit, other/punctuation, whitespace}, folding a single leading space into
-# the following run as GPT-2's own "Ġ" space-marker byte — NOT the full
-# GPT-2/Qwen2 pretokenization regex (which also has contraction rules
-# 's/'t/'re/... and real Unicode letter/number properties, not just ASCII).
-# Verified correct against llama-cpp-python's own tokenizer for plain
-# English prompts, including a full ChatML-wrapped chat prompt (see
-# test/test_tokenizer.br) — non-ASCII text or contractions may tokenize
-# differently than the reference.
+# - GPT-2/Qwen2-style byte-level BPE (`tokenizer.ggml.model = "gpt2"`):
+#   simplified pretokenization, splitting text into runs of {ASCII letter,
+#   ASCII digit, other/punctuation, whitespace}, folding a single leading
+#   space into the following run as GPT-2's own "Ġ" space-marker byte — NOT
+#   the full GPT-2/Qwen2 pretokenization regex (which also has contraction
+#   rules 's/'t/'re/... and real Unicode letter/number properties, not just
+#   ASCII). Verified correct against llama-cpp-python's own tokenizer for
+#   plain English prompts, including a full ChatML-wrapped chat prompt (see
+#   test/test_tokenizer.br) — non-ASCII text or contractions may tokenize
+#   differently than the reference.
+# - SentencePiece BPE (`tokenizer.ggml.model = "llama"`, the Llama/Mistral
+#   family): a from-scratch greedy highest-score-first bigram merge over
+#   GGUF's own `tokenizer.ggml.scores`, byte-fallback via the vocab's own
+#   `<0xXX>` tokens for anything unmapped — see encode_spm's own doc
+#   comment for the algorithm and its relationship to llama.cpp's real
+#   `llm_tokenizer_spm_session`. Verified against llama-cpp-python on a
+#   real downloaded TinyLlama-1.1B-Chat GGUF (test/test_tokenizer_spm_real.br)
+#   — plain-text encode/decode only; SentencePiece-vocab models still can't
+#   run through this project's ChatML-hardcoded chat wrapping (separately
+#   tracked, needs real Jinja chat-template evaluation).
 
 use gguf
 use io
+use jinja
 
 pub struct Tokenizer:
     {string=int} vocab
@@ -25,6 +36,13 @@ pub struct Tokenizer:
     {string=int} uni_to_byte
     int bos_token_id
     int eos_token_id
+    bool is_spm             # true = SentencePiece (Llama/Mistral), false = GPT-2/Qwen2 BPE
+    [float32] scores        # SentencePiece per-token merge priority (empty when is_spm is false)
+    [int] byte_token_id     # SentencePiece byte-fallback: raw byte value -> "<0xXX>" token id (-1 if absent)
+    {string=int} special_tokens  # "special" vocab entries (GGUF token_type CONTROL) -> id, e.g.
+                                  # "<|im_start|>"/"<s>" — matched atomically against rendered
+                                  # chat-template text instead of going through ordinary BPE/SPM
+                                  # merging (llama.cpp's own `tokenizer_st_partition` concept)
 
     req [string] apply_merge([string] word, string a, string b):
         var [string] out = []
@@ -57,6 +75,69 @@ pub struct Tokenizer:
         word
 
     req [int] encode(string text):
+        if self.is_spm:
+            self.encode_spm(text)
+        else:
+            self.encode_bpe(text)
+
+    req string decode([int] ids):
+        if self.is_spm:
+            self.decode_spm(ids)
+        else:
+            self.decode_bpe(ids)
+
+    # Splits `text` on any literal occurrence of a special token's own
+    # string (e.g. "<|im_start|>", "<s>") and encodes each such span as
+    # that single atomic vocab id, running ordinary encode() (BPE or SPM,
+    # per is_spm) only over the plain-text spans between them — mirrors
+    # llama.cpp's own `tokenizer_st_partition`, needed because a
+    # Jinja-rendered chat-template prompt embeds these special-token
+    # strings directly as plain text, and neither BPE nor SPM merging on
+    # its own would ever reconstruct them as a single token (e.g. SPM would
+    # merge "<" + "|" + "i" + "m" + ... byte-by-byte instead).
+    #
+    # Finds the longest special token matching at position `i` in `chars`
+    # (length `n`), or (-1, 0) when none matches.
+    req (int, int) match_special_at([string] chars, int i, int n):
+        var int best_id = -1
+        var int best_len = 0
+        for tok in self.special_tokens.keys():
+            let tok_chars = tok.chars()
+            let tlen = tok_chars.length
+            if tlen > best_len and i + tlen <= n:
+                var bool ok = true
+                var int j = 0
+                while j < tlen and ok:
+                    if chars[i + j] != tok_chars[j]:
+                        ok = false
+                    j += 1
+                if ok:
+                    best_len = tlen
+                    best_id = self.special_tokens[tok]
+        (best_id, best_len)
+
+    req [int] encode_with_specials(string text):
+        var [int] ids = []
+        var string plain = ""
+        let chars = text.chars()
+        let n = chars.length
+        var int i = 0
+        while i < n:
+            let (best_id, best_len) = self.match_special_at(chars, i, n)
+            if best_id >= 0:
+                if plain != "":
+                    for t in self.encode(plain): ids.push(t)
+                    plain = ""
+                ids.push(best_id)
+                i += best_len
+            else:
+                plain = "{plain}{chars[i]}"
+                i += 1
+        if plain != "":
+            for t in self.encode(plain): ids.push(t)
+        ids
+
+    req [int] encode_bpe(string text):
         var [int] ids = []
         for segment in pretokenize(text):
             for tok in self.bpe_word(segment):
@@ -65,7 +146,7 @@ pub struct Tokenizer:
                     ids.push(id)
         ids
 
-    req string decode([int] ids):
+    req string decode_bpe([int] ids):
         var [uint8] bytes = []
         for id in ids:
             let tok = self.reverse[id] else ""
@@ -75,58 +156,110 @@ pub struct Tokenizer:
                     bytes.push(b as uint8)
         bytes_to_str(bytes)
 
-    # Builds the Qwen2.5 ChatML-wrapped token sequence for a single-turn
-    # chat (system + user message), ending right after the assistant
-    # role-open marker so the model can start generating a reply.
-    # Constructed programmatically (special-token IDs looked up directly
-    # in `vocab`, interleaved with plain-text BPE segments) rather than by
-    # scanning an assembled string for embedded special tokens — verified
-    # to produce the identical token sequence llama-cpp-python's own
-    # tokenizer gives for the same chat prompt (test/test_tokenizer.br).
-    req [int] encode_chat(string system_msg, string user_msg) throws:
-        self.encode_chat_multi(system_msg, [user_msg], [])
+    # SentencePiece BPE (Llama/Mistral): a from-scratch, greedy
+    # highest-score-first bigram merge, mirroring llama.cpp's own
+    # `llm_tokenizer_spm_session::tokenize` (src/llama-vocab.cpp) but with a
+    # plain O(n^2) rescan per merge instead of a priority queue — this
+    # project only ever tokenizes short, interactive prompts, so the
+    # asymptotics don't matter, and a rescan is much simpler to get right in
+    # Boring than reimplementing a heap. Always prepends one leading space
+    # before escaping (llama.cpp's own `add_space_prefix`/`is_prev_special`
+    # default for a fresh, non-continuation prompt — see llama-vocab.cpp's
+    # `tokenize()` SPM branch).
+    #
+    # Algorithm: split the (space-prepended, whitespace-escaped-to-"▁") text
+    # into one symbol per Unicode character, then repeatedly find the
+    # currently-adjacent pair whose concatenation is itself a valid vocab
+    # entry with the highest `scores` value (ties broken toward the
+    # leftmost pair, matching llama.cpp's own comparator), merge it, and
+    # repeat until no adjacent pair concatenates into a known token. Unlike
+    # llama.cpp's `resegment`, this doesn't need a separate `rev_merge`
+    # fallback: a symbol only ever gets merged when the merged span is
+    # already confirmed to be a valid vocab entry, so every symbol that
+    # underwent at least one merge is *already* guaranteed to look itself
+    # up successfully — only a symbol that was NEVER merged (i.e. still a
+    # single original character) can miss the vocab and fall back to
+    # per-byte `<0xXX>` tokens.
+    req [int] encode_spm(string text):
+        var string escaped = ""
+        for ch in " {text}".chars():
+            if ch == " ":
+                escaped = "{escaped}{chr(9601)}"
+            else:
+                escaped = "{escaped}{ch}"
+        var [string] sym = escaped.chars()
+        let n = sym.length
+        var [bool] active = [true for i in 0..<n]
+        var [int] nexts = [0 for i in 0..<n]
+        var int ni = 0
+        while ni < n:
+            nexts[ni] = if ni + 1 < n: ni + 1 else: -1
+            ni += 1
 
-    # Builds the ChatML-wrapped token sequence for a full multi-turn
-    # conversation: system message, then each user turn followed by its
-    # assistant reply (`assistant_msgs[i]` is the already-generated reply to
-    # `user_msgs[i]`), ending right after the final user turn's assistant
-    # role-open marker so the model can start generating the next reply.
-    # `assistant_msgs.length` is expected to be `user_msgs.length - 1` (the
-    # newest user turn has no reply yet) — `encode_chat` above is just the
-    # single-turn case (`user_msgs = [user_msg]`, `assistant_msgs = []`),
-    # kept as its own function since it's the one verified bit-exact against
-    # llama-cpp-python's tokenizer (test/test_tokenizer.br) and callers
-    # already depend on that exact signature.
-    req [int] encode_chat_multi(string system_msg, [string] user_msgs, [string] assistant_msgs) throws:
-        # NOTE: not `guard let x = dict[key] else throw` — dict indexing
-        # panics on a missing key rather than yielding an optional `guard
-        # let` can bind, unlike a function genuinely returning `T?`
-        # (e.g. gguf.br's gguf_get_string). `dict[key] else default` is the
-        # correct/working spelling for a defaulted dict lookup.
-        let im_start = self.vocab["<|im_start|>"] else -1
-        guard im_start >= 0 else throw "tokenizer: missing <|im_start|> in vocab"
-        let im_end = self.vocab["<|im_end|>"] else -1
-        guard im_end >= 0 else throw "tokenizer: missing <|im_end|> in vocab"
+        var bool merged_any = true
+        while merged_any:
+            merged_any = false
+            var int best_left = -1
+            var int best_right = -1
+            var float32 best_score = -1.0e30 as float32
+            var int cur = 0
+            while cur < n and not active[cur]:
+                cur += 1
+            while cur >= 0 and cur < n:
+                let nxt = nexts[cur]
+                if nxt >= 0:
+                    let cand = "{sym[cur]}{sym[nxt]}"
+                    let tid = self.vocab[cand] else -1
+                    if tid >= 0:
+                        let score = self.scores[tid]
+                        if score > best_score:
+                            best_score = score
+                            best_left = cur
+                            best_right = nxt
+                cur = nxt
+            if best_left >= 0:
+                sym[best_left] = "{sym[best_left]}{sym[best_right]}"
+                active[best_right] = false
+                let after = nexts[best_right]
+                nexts[best_left] = after
+                merged_any = true
+
         var [int] ids = []
-        ids.push(im_start)
-        for t in self.encode("system\n{system_msg}"): ids.push(t)
-        ids.push(im_end)
-        for t in self.encode("\n"): ids.push(t)
         var int i = 0
-        while i < user_msgs.length:
-            ids.push(im_start)
-            for t in self.encode("user\n{user_msgs[i]}"): ids.push(t)
-            ids.push(im_end)
-            for t in self.encode("\n"): ids.push(t)
-            if i < assistant_msgs.length:
-                ids.push(im_start)
-                for t in self.encode("assistant\n{assistant_msgs[i]}"): ids.push(t)
-                ids.push(im_end)
-                for t in self.encode("\n"): ids.push(t)
+        while i < n:
+            if active[i]:
+                let tid = self.vocab[sym[i]] else -1
+                if tid >= 0:
+                    ids.push(tid)
+                else:
+                    for ch in sym[i].chars():
+                        for b in utf8_encode_char(ch):
+                            let bb = b
+                            let btid = self.byte_token_id[bb]
+                            if btid >= 0:
+                                ids.push(btid)
             i += 1
-        ids.push(im_start)
-        for t in self.encode("assistant\n"): ids.push(t)
         ids
+
+    req string decode_spm([int] ids):
+        var [uint8] bytes = []
+        for id in ids:
+            let piece = self.reverse[id] else ""
+            let fallback = byte_fallback_value(piece)
+            if fallback >= 0:
+                bytes.push(fallback as uint8)
+            else:
+                for ch in piece.chars():
+                    for b in utf8_encode_char(ch):
+                        bytes.push(b as uint8)
+        let raw = bytes_to_str(bytes)
+        var string out = ""
+        for ch in raw.chars():
+            if ch == chr(9601):
+                out = "{out} "
+            else:
+                out = "{out}{ch}"
+        out
 
 def bool is_ascii_letter(string ch):
     (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z")
@@ -254,6 +387,50 @@ pub [int] utf8_encode_char(string ch):
     else:
         [0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)]
 
+int hex_digit_value(string ch):
+    if ch >= "0" and ch <= "9":
+        ord(ch) - ord("0")
+    elif ch >= "A" and ch <= "F":
+        ord(ch) - ord("A") + 10
+    elif ch >= "a" and ch <= "f":
+        ord(ch) - ord("a") + 10
+    else:
+        -1
+
+string hex2(int b):
+    let digits = "0123456789ABCDEF".chars()
+    "{digits[b / 16]}{digits[b % 16]}"
+
+# Parses a SentencePiece byte-fallback token's own piece string (e.g.
+# "<0x0A>") back into its raw byte value, or -1 if `piece` isn't in that
+# exact shape — real GGUF SPM vocabs always spell it as 2 UPPERCASE hex
+# digits (verified directly against a real downloaded TinyLlama GGUF), but
+# lowercase is accepted too since it costs nothing extra here.
+int byte_fallback_value(string piece):
+    let chars = piece.chars()
+    if chars.length != 6 or chars[0] != "<" or chars[1] != "0" or chars[2] != "x" or chars[5] != ">":
+        -1
+    else:
+        let hi = hex_digit_value(chars[3])
+        let lo = hex_digit_value(chars[4])
+        if hi < 0 or lo < 0:
+            -1
+        else:
+            hi * 16 + lo
+
+# One entry per raw byte value (0-255): the vocab id of that byte's own
+# `<0xXX>` fallback token, or -1 if the vocab doesn't have one (shouldn't
+# happen for a real SentencePiece GGUF — llama.cpp's own conversion always
+# emits full byte coverage — but encode_spm/decode_spm treat -1 as "skip"
+# rather than throwing, since a missing single byte token is recoverable
+# information loss, not a fatal error).
+[int] build_byte_token_id({string=int} vocab):
+    var [int] result = [0 for i in 0..<256]
+    var int b = 0
+    while b < 256:
+        result[b] = vocab["<0x{hex2(b)}>"] else -1
+        b += 1
+    result
 
 pub Tokenizer load_tokenizer(GgufFile file) throws:
     let tokens = gguf_get_string_array(file.metadata, "tokenizer.ggml.tokens")
@@ -305,4 +482,50 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
     let byte_to_uni = build_byte_to_unicode()
     let uni_to_byte = build_unicode_to_byte()
 
-    Tokenizer(vocab, reverse, merges, byte_to_uni, uni_to_byte, bos, eos)
+    let tokenizer_model = gguf_get_string(file.metadata, "tokenizer.ggml.model") else "gpt2"
+    let is_spm = tokenizer_model == "llama"
+    let scores = gguf_get_f32_array(file.metadata, "tokenizer.ggml.scores")
+    var [int] byte_token_id = []
+    if is_spm:
+        byte_token_id = build_byte_token_id(vocab)
+
+    # "special" tokens (llama.cpp's GGUF token_type == 3, CONTROL — e.g.
+    # "<|im_start|>"/"<|im_end|>" for Qwen2, "<s>"/"</s>" for Llama/Mistral)
+    # are the ones a Jinja-rendered chat template embeds as literal text
+    # but that must be encoded as a single atomic vocab id rather than run
+    # through ordinary BPE/SPM merging — see encode_with_specials.
+    let token_types = gguf_get_int_array(file.metadata, "tokenizer.ggml.token_type")
+    var {string=int} special_tokens = {=}
+    var int ti = 0
+    while ti < token_types.length:
+        if token_types[ti] == 3:
+            special_tokens[tokens[ti]] = ti
+        ti += 1
+
+    Tokenizer(vocab, reverse, merges, byte_to_uni, uni_to_byte, bos, eos, is_spm, scores, byte_token_id, special_tokens)
+
+# Builds the full prompt token sequence for a chat turn using the GGUF's
+# own embedded `tokenizer.chat_template` (any architecture, any template —
+# Qwen2.5's ChatML, Llama/Mistral's, or anything else src/jinja.br's subset
+# can render), instead of this project's earlier Qwen2.5-only hardcoded
+# ChatML construction. Renders the conversation to plain text via
+# jinja.build_chat_messages/build_chat_env + render_jinja, then encodes
+# that text with encode_with_specials so the template's own literal
+# special-token strings become single atomic vocab ids. Verified
+# byte-for-byte equivalent to the old hardcoded ChatML path's own
+# llama-cpp-python-checked output on Qwen2.5 (test/test_tokenizer_real.br).
+#
+# `add_generation_prompt=true` is what every caller here wants — the
+# rendered prompt should always end right after the assistant role-open
+# marker so the model can start generating a reply (the flag still exists
+# as a parameter, matching real Jinja chat templates' own convention,
+# rather than being hardcoded to `true` inside this function).
+pub [int] render_chat_prompt(GgufFile file, Tokenizer tok, string system_msg, [string] user_msgs,
+                              [string] assistant_msgs, bool add_generation_prompt) throws:
+    guard let template = gguf_get_string(file.metadata, "tokenizer.chat_template") else throw "tokenizer: GGUF has no tokenizer.chat_template"
+    let messages = build_chat_messages(system_msg, user_msgs, assistant_msgs)
+    let bos = tok.reverse[tok.bos_token_id] else ""
+    let eos = tok.reverse[tok.eos_token_id] else ""
+    let env = build_chat_env(messages, add_generation_prompt, bos, eos)
+    let prompt_text = render_jinja(template, env)
+    tok.encode_with_specials(prompt_text)

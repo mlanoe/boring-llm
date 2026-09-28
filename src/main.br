@@ -126,7 +126,7 @@ def run_generate(GgufFile file, string system_msg, string user_msg, int max_new_
     else:
         print "[diag] sampling: greedy, repeat_penalty={params.repeat_penalty} repeat_last_n={params.repeat_last_n}"
 
-    let prompt_tokens = tok.encode_chat(system_msg, user_msg)
+    let prompt_tokens = render_chat_prompt(file, tok, system_msg, [user_msg], [], true)
     print "[diag] prompt: {prompt_tokens.length} tokens"
 
     let all_tokens = if quantized:
@@ -169,9 +169,10 @@ def run_generate(GgufFile file, string system_msg, string user_msg, int max_new_
     print "[diag] generated {n_generated} tokens (see shell `time` for wall-clock duration / tok/s)"
 
 # Interactive multi-turn chat (llama.cpp's own `-cnv` mode): keeps the full
-# conversation (every prior user/assistant turn) and re-encodes it as one
-# growing ChatML prompt each turn via `encode_chat_multi`. The model is
-# loaded once, up front, and reused for every turn.
+# conversation (every prior user/assistant turn) and re-renders it as one
+# growing prompt each turn via `render_chat_prompt` (the GGUF's own
+# embedded chat template, any architecture). The model is loaded once, up
+# front, and reused for every turn.
 #
 # Deliberately NOT carrying the KV-cache across turns — each turn's
 # `generate`/`generate_kv` call re-prefills the WHOLE conversation-so-far
@@ -197,7 +198,7 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
     var [string] assistant_msgs = []
 
     # Two near-identical branches (not one loop parameterized over "which
-    # generate function to call") because QuantModel/Qwen2Model are
+    # generate function to call") because QuantModel/Model are
     # different types — `m` below has to resolve to a concrete type for the
     # whole branch, same reason run_generate() above branches on `quantized`
     # around its own single generate call rather than trying to share one
@@ -207,33 +208,94 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
         let m = load_model_quantized(file)
         print "[diag] model loaded (vocab={m.config.vocab_size} d_model={m.config.d_model} n_layer={m.config.n_layer})"
 
-        print "> "
-        var line = readLine()
-        while let line:
-            if line == "":
-                break
-            user_msgs.push(line)
-            let prompt_tokens = tok.encode_chat_multi(system_msg, user_msgs, assistant_msgs)
-
-            let all_tokens = if kv_cache:
-                generate_kv(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
-            else:
-                generate(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
-
-            var [int] new_tokens = []
-            var int i = prompt_tokens.length
-            while i < all_tokens.length:
-                if all_tokens[i] != tok.eos_token_id:
-                    new_tokens.push(all_tokens[i])
-                i += 1
-            let reply = tok.decode(new_tokens)
-            assistant_msgs.push(reply)
-            print ""
-            print reply
-            print ""
-
+        if kv_cache:
+            # Reuses the KV-cache across turns instead of re-prefilling the
+            # whole conversation every turn: the first turn calls
+            # generate_kv_chat_first (full prefill from empty, same cost as
+            # generate_kv), every later turn calls generate_kv_chat_continue
+            # with only that turn's own new tokens — see model.br's own doc
+            # comment on both for why this needed prefill_step_gpu_quantized
+            # (append-to-existing-cache) and a causal_offset on
+            # attention_gqa_gpu (math_gpu.br) that plain from-scratch
+            # prefill never needed.
+            #
+            # "Only that turn's own new tokens" is computed generically as
+            # full_ids[all_tokens.length..] — a fresh full render+encode of
+            # the WHOLE conversation-so-far (any architecture's own chat
+            # template, via render_chat_prompt), sliced at wherever the
+            # existing KV-cache already leaves off — rather than trying to
+            # derive a per-architecture "just this turn's own text" shape
+            # (the old Qwen2.5-hardcoded encode_chat_turn did exactly that,
+            # and only that). This slice is safe because every turn boundary
+            # in a rendered chat template sits right after a special token
+            # (`<|im_end|>`, `</s>`, ...), which encode_with_specials always
+            # matches atomically — so a prior turn's own token ids can never
+            # change just because more text was appended after it.
             print "> "
-            line = readLine()
+            var line = readLine()
+            var bool first_turn = true
+            var cache = empty_cache(m.config.n_layer)
+            var [int] all_tokens = []
+            while let line:
+                if line == "":
+                    break
+                user_msgs.push(line)
+
+                let full_ids = render_chat_prompt(file, tok, system_msg, user_msgs, assistant_msgs, true)
+                let new_tokens = full_ids[all_tokens.length..]
+
+                let (turn_tokens, next_cache) = if first_turn:
+                    generate_kv_chat_first(m, full_ids, max_new_tokens, tok.eos_token_id, params)
+                else:
+                    generate_kv_chat_continue(m, cache, new_tokens, all_tokens, max_new_tokens, tok.eos_token_id, params)
+
+                # `all_tokens` here is still last turn's value (reassigned
+                # below) — exactly "history before this turn", so adding
+                # this turn's own new prompt tokens gives the index where
+                # the reply starts in `turn_tokens`.
+                let reply_start = all_tokens.length + new_tokens.length
+                all_tokens = turn_tokens
+                cache = next_cache
+                first_turn = false
+
+                var [int] reply_tokens = []
+                var int i = reply_start
+                while i < all_tokens.length:
+                    if all_tokens[i] != tok.eos_token_id:
+                        reply_tokens.push(all_tokens[i])
+                    i += 1
+                let reply = tok.decode(reply_tokens)
+                assistant_msgs.push(reply)
+                print ""
+                print reply
+                print ""
+
+                print "> "
+                line = readLine()
+        else:
+            print "> "
+            var line = readLine()
+            while let line:
+                if line == "":
+                    break
+                user_msgs.push(line)
+                let prompt_tokens = render_chat_prompt(file, tok, system_msg, user_msgs, assistant_msgs, true)
+                let all_tokens = generate(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
+
+                var [int] new_tokens = []
+                var int i = prompt_tokens.length
+                while i < all_tokens.length:
+                    if all_tokens[i] != tok.eos_token_id:
+                        new_tokens.push(all_tokens[i])
+                    i += 1
+                let reply = tok.decode(new_tokens)
+                assistant_msgs.push(reply)
+                print ""
+                print reply
+                print ""
+
+                print "> "
+                line = readLine()
     else:
         print "[diag] loading model weights (dequantizing every tensor to fp32 at load)..."
         let m = load_model(file)
@@ -245,7 +307,7 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
             if line == "":
                 break
             user_msgs.push(line)
-            let prompt_tokens = tok.encode_chat_multi(system_msg, user_msgs, assistant_msgs)
+            let prompt_tokens = render_chat_prompt(file, tok, system_msg, user_msgs, assistant_msgs, true)
             let all_tokens = generate_f32(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
 
             var [int] new_tokens = []

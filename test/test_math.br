@@ -28,7 +28,7 @@ def main() throws:
 
     # --- rope_apply: position 0 is always the identity rotation ---
     let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
-    let roped = rope_apply(x, 2, 1, 4, 10000.0 as float32)
+    let roped = rope_apply(x, 2, 1, 4, 10000.0 as float32, 1)
     assert_close(roped[0], 1.0 as float32, "rope pos0[0]")
     assert_close(roped[1], 2.0 as float32, "rope pos0[1]")
     assert_close(roped[2], 3.0 as float32, "rope pos0[2]")

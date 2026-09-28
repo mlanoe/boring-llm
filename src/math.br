@@ -63,20 +63,24 @@ pub [float32] linear_bias([float32] x, [float32] w, [float32] b, int seq, int d_
         p += 1
     result
 
-# NEOX-style ("rotate-half") RoPE — Qwen2 (like Llama/GPT-NeoX) rotates the
-# full head_dim, splitting it into two halves and rotating them as pairs
-# (j, j + d_head/2), NOT the interleaved GPT-J style (adjacent pairs
-# (2j, 2j+1)). x is (seq x n_heads*d_head), same position index applies to
-# every head.
-pub [float32] rope_apply([float32] x, int seq, int n_heads, int d_head, float32 freq_base):
-    rope_apply_at(x, seq, n_heads, d_head, freq_base, 0)
+# RoPE, in either of the two rotation conventions the Llama/Mistral/Qwen2
+# GGUF family needs (see model.br's rope_style_for_arch doc comment for
+# which architecture needs which — GGUF has no metadata key for this,
+# llama.cpp hardcodes it per architecture and so do we): `neox == 1` is
+# NEOX-style "rotate-half" (Qwen2, GPT-NeoX) — split the full head_dim into
+# two halves and rotate them as pairs (j, j + d_head/2); `neox == 0` is the
+# original/NORM "interleaved" GPT-J style (Llama, Mistral) — rotate
+# adjacent pairs (2j, 2j+1) instead. x is (seq x n_heads*d_head), same
+# position index applies to every head.
+pub [float32] rope_apply([float32] x, int seq, int n_heads, int d_head, float32 freq_base, int neox):
+    rope_apply_at(x, seq, n_heads, d_head, freq_base, 0, neox)
 
 # Same rotation, but position `p` in the angle computation is offset by
 # `start_pos` — needed for KV-cache incremental decode, where a single new
 # token's ABSOLUTE position in the sequence (prompt length + steps taken so
 # far) is not the same as its LOCAL row index (always 0) within this one
 # call's (seq x ...) buffer.
-pub [float32] rope_apply_at([float32] x, int seq, int n_heads, int d_head, float32 freq_base, int start_pos):
+pub [float32] rope_apply_at([float32] x, int seq, int n_heads, int d_head, float32 freq_base, int start_pos, int neox):
     let half_dim = d_head / 2
     var [float32] result = [0.0 for i in 0..<x.length]
     var int p = 0
@@ -92,10 +96,15 @@ pub [float32] rope_apply_at([float32] x, int seq, int n_heads, int d_head, float
                 let angle = (abs_pos as float32) * theta
                 let cos_a = angle.cos()
                 let sin_a = angle.sin()
-                let x0 = x[base_idx + j]
-                let x1 = x[base_idx + j + half_dim]
-                result[base_idx + j] = x0 * cos_a - x1 * sin_a
-                result[base_idx + j + half_dim] = x0 * sin_a + x1 * cos_a
+                var int idx0 = base_idx + j
+                var int idx1 = base_idx + j + half_dim
+                if neox == 0:
+                    idx0 = base_idx + 2 * j
+                    idx1 = base_idx + 2 * j + 1
+                let x0 = x[idx0]
+                let x1 = x[idx1]
+                result[idx0] = x0 * cos_a - x1 * sin_a
+                result[idx1] = x0 * sin_a + x1 * cos_a
                 j += 1
             h += 1
         p += 1

@@ -1,0 +1,73 @@
+# Interpreter-speed unit tests for src/jinja.br's core constructs, using
+# small hand-written templates (no real GGUF file needed — see
+# test_jinja_real.br for verification against the two real chat templates
+# this project actually targets). Every literal `{`/`}` character below is
+# built via chr(123)/chr(125) interpolation rather than written directly,
+# since a literal single brace in a Boring string is itself the start of
+# Boring's OWN string-interpolation syntax (book.md: "use `{{` for a
+# literal `{`") — this sidesteps needing to hand-count brace-doubling for
+# every Jinja delimiter.
+
+use jinja
+
+def main() throws:
+    let ob = chr(123)
+    let cb = chr(125)
+
+    var {string=JValue} env = {=}
+    env["name"] = JValue.JStr("World")
+    let out1 = render_jinja("Hello, {ob}{ob} name {cb}{cb}!", env)
+    assert_eq(out1, "Hello, World!" as string)
+
+    var {string=JValue} env2 = {=}
+    env2["show"] = JValue.JBool(true)
+    let out2 = render_jinja("{ob}%- if show -%{cb}yes{ob}%- else -%{cb}no{ob}%- endif -%{cb}", env2)
+    assert_eq(out2, "yes" as string)
+
+    var {string=JValue} env3 = {=}
+    env3["show"] = JValue.JBool(false)
+    let out3 = render_jinja("{ob}%- if show -%{cb}yes{ob}%- else -%{cb}no{ob}%- endif -%{cb}", env3)
+    assert_eq(out3, "no" as string)
+
+    var {string=JValue} env4 = {=}
+    var [JValue] items = []
+    items.push(JValue.JStr("a"))
+    items.push(JValue.JStr("b"))
+    items.push(JValue.JStr("c"))
+    env4["items"] = JValue.JList(items)
+    let tmpl4 = "{ob}%- for x in items -%{cb}[{ob}{ob} x {cb}{cb}:{ob}{ob} loop.index0 {cb}{cb}:{ob}{ob} loop.first {cb}{cb}:{ob}{ob} loop.last {cb}{cb}]{ob}%- endfor -%{cb}"
+    let out4 = render_jinja(tmpl4, env4)
+    assert_eq(out4, "[a:0:True:False][b:1:False:False][c:2:False:True]" as string)
+
+    # attribute access, index access, string concat, == / and / not
+    var {string=JValue} msg = {=}
+    msg["role"] = JValue.JStr("user")
+    msg["content"] = JValue.JStr("hi")
+    var [JValue] messages = []
+    messages.push(JValue.JDict(msg))
+    var {string=JValue} env5 = {=}
+    env5["messages"] = JValue.JList(messages)
+    let tmpl5 = "{ob}%- if messages[0]['role'] == \"user\" and not (messages[0].role == \"system\") -%{cb}{ob}{ob} messages[0].role {cb}{cb}:{ob}{ob} messages[0]['content'] {cb}{cb}{ob}%- endif -%{cb}"
+    let out5 = render_jinja(tmpl5, env5)
+    assert_eq(out5, "user:hi" as string)
+
+    # is defined + set
+    var {string=JValue} env6 = {=}
+    let tmpl6 = "{ob}%- set greeting = 'hi' -%{cb}{ob}%- if missing is defined -%{cb}yes{ob}%- else -%{cb}no{ob}%- endif -%{cb}:{ob}{ob} greeting {cb}{cb}"
+    let out6 = render_jinja(tmpl6, env6)
+    assert_eq(out6, "no:hi" as string)
+
+    # tojson filter
+    var {string=JValue} env7 = {=}
+    env7["x"] = JValue.JStr("a\"b")
+    let out7 = render_jinja("{ob}{ob} x | tojson {cb}{cb}", env7)
+    assert_eq(out7, "\"a\\\"b\"" as string)
+
+    # a real Jinja quirk: exactly one trailing newline in the raw template
+    # source is always dropped (keep_trailing_newline=False, real Jinja2's
+    # own default) — verified separately against Qwen2.5's real template in
+    # test_jinja_real.br; this is the minimal, GGUF-independent repro.
+    let out8 = render_jinja("a\n\n", env)
+    assert_eq(out8, "a\n" as string)
+
+    print "test_jinja: all assertions passed"

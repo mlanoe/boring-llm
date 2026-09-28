@@ -322,6 +322,21 @@ pub [int] gguf_get_int_array({string=GgufValue} metadata, string key):
                 result.push(v)
     result
 
+float32? gguf_value_as_f32(GgufValue v):
+    match v:
+        GgufValue.F32(x): x
+        _: nil
+
+# Used for `tokenizer.ggml.scores` (SentencePiece per-token merge priority) —
+# GGUF's own writer always stores these as F32.
+pub [float32] gguf_get_f32_array({string=GgufValue} metadata, string key):
+    var [float32] result = []
+    if metadata.contains(key):
+        for item in gguf_value_as_array(metadata[key]):
+            if let v = gguf_value_as_f32(item):
+                result.push(v)
+    result
+
 # Human-readable name for a ggml tensor dtype id — covers the types this
 # project actually expects to see (F32/F16/BF16 plus the k-quant/legacy-quant
 # formats real GGUF files ship); anything else prints its raw numeric id
