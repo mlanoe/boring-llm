@@ -20,7 +20,8 @@
 #   boring build --target metal test/bench_linear_warp.br
 #   cd test/bench_linear_warp_metal && cargo build --release
 #   ./target/release/bench_linear_warp <kernel> <shape>
-#     kernel: tiled | warp | warpshared | q8 | q8warp | q8warpbcast
+#     kernel: tiled | warp | warpshared | q8 | q8warp | q8warpbcast |
+#             q5 | q5bcast | q4 | q4bcast | q4nl | q4nlbcast
 #     shape:  small-seq26 | big-seq26 | small-seq1 | big-seq1
 
 # Boring has no documented stopwatch-style elapsed-time API (Instant/
@@ -73,6 +74,40 @@ def main() throws:
                 qj += 1
             b += 1
 
+    # Synthetic Q5_0-packed bytes (22 bytes/block: 2-byte scale + 4-byte
+    # qh + 16 bytes nibbles), same d_model-multiple-of-32 shape as above.
+    var [uint8] w5_packed = []
+    if kernel_name == "q5" or kernel_name == "q5bcast":
+        let n_blocks5 = (d_out * d_model) / 32
+        var b5 = 0
+        while b5 < n_blocks5:
+            w5_packed.push(0x00 as uint8)
+            w5_packed.push(0x3C as uint8)   # f16 1.0 scale
+            w5_packed.push(0xFF as uint8)
+            w5_packed.push(0xFF as uint8)
+            w5_packed.push(0xFF as uint8)
+            w5_packed.push(0xFF as uint8)   # qh = all-1s
+            var qj5 = 0
+            while qj5 < 16:
+                w5_packed.push(((qj5 + b5) % 16) as uint8)
+                qj5 += 1
+            b5 += 1
+
+    # Synthetic Q4_0-packed bytes (18 bytes/block: 2-byte scale + 16 bytes
+    # nibbles) — same layout shape as IQ4_NL (reused for both below).
+    var [uint8] w4_packed = []
+    if kernel_name == "q4" or kernel_name == "q4bcast" or kernel_name == "q4nl" or kernel_name == "q4nlbcast":
+        let n_blocks4 = (d_out * d_model) / 32
+        var b4 = 0
+        while b4 < n_blocks4:
+            w4_packed.push(0x00 as uint8)
+            w4_packed.push(0x3C as uint8)   # f16 1.0 scale
+            var qj4 = 0
+            while qj4 < 16:
+                w4_packed.push((((qj4 + b4) % 16) | (((qj4 + b4 + 1) % 16) << 4)) as uint8)
+                qj4 += 1
+            b4 += 1
+
     let n_iter = 200
     var iter = 0
 
@@ -112,5 +147,41 @@ def main() throws:
             let sink = passthrough(out)
             iter += 1
         print "q8_linear_warp_broadcast_gpu (warp-shuffle + scale-broadcast, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
+    elif kernel_name == "q5":
+        while iter < n_iter:
+            let out = q5_linear_gpu(x, w5_packed, bv, seq, d_model, d_out)
+            let sink = passthrough(out)
+            iter += 1
+        print "q5_linear_gpu (tiled, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
+    elif kernel_name == "q5bcast":
+        while iter < n_iter:
+            let out = q5_linear_warp_broadcast_gpu(x, w5_packed, bv, seq, d_model, d_out)
+            let sink = passthrough(out)
+            iter += 1
+        print "q5_linear_warp_broadcast_gpu (warp-shuffle + scale-broadcast, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
+    elif kernel_name == "q4":
+        while iter < n_iter:
+            let out = q4_linear_gpu(x, w4_packed, bv, seq, d_model, d_out)
+            let sink = passthrough(out)
+            iter += 1
+        print "q4_linear_gpu (tiled, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
+    elif kernel_name == "q4bcast":
+        while iter < n_iter:
+            let out = q4_linear_warp_broadcast_gpu(x, w4_packed, bv, seq, d_model, d_out)
+            let sink = passthrough(out)
+            iter += 1
+        print "q4_linear_warp_broadcast_gpu (warp-shuffle + scale-broadcast, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
+    elif kernel_name == "q4nl":
+        while iter < n_iter:
+            let out = q4nl_linear_gpu(x, w4_packed, bv, seq, d_model, d_out)
+            let sink = passthrough(out)
+            iter += 1
+        print "q4nl_linear_gpu (tiled, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
+    elif kernel_name == "q4nlbcast":
+        while iter < n_iter:
+            let out = q4nl_linear_warp_broadcast_gpu(x, w4_packed, bv, seq, d_model, d_out)
+            let sink = passthrough(out)
+            iter += 1
+        print "q4nl_linear_warp_broadcast_gpu (warp-shuffle + scale-broadcast, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
     else:
         throw "unknown kernel '{kernel_name}'"

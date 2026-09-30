@@ -778,6 +778,94 @@ pub req [float32]'gpu'unified q5_linear_nobias_gpu([float32] x, [uint8] w_packed
     let [float32] zero_bias = [0.0 for i in 0..<d_out]
     q5_linear_gpu(x, w_packed, zero_bias, seq, d_in, d_out)
 
+# ── Kernel: Q5_0 fused-dequant linear layer, warp-shuffle + scale/qh
+# broadcast (same follow-up idea as Q8LinearWarpBroadcastKernel above) ────
+# Q5_0's block size (32) equals this hardware's warp size, same alignment
+# `Q8LinearWarpBroadcastKernel`'s own doc comment relies on: every stride
+# round has all 32 lanes jointly decoding one shared block. Q5_0 has TWO
+# per-block fields every lane would otherwise redundantly re-read — the
+# 2-byte f16 scale AND the 4-byte `qh` high-bit field. Only the SCALE is
+# actually broadcast here, though: `gpu.warp.shuffle` on a boring `int`
+# value fails to compile on the Metal backend (a real, confirmed `boring`
+# limitation — Metal's `simd_shuffle` intrinsic isn't valid for 64-bit
+# integer types, which is what boring's `int` transpiles to — filed as
+# `task_a374ff68`), so `qh` stays a per-lane redundant read for now,
+# same as `Q8LinearWarpKernel`'s original (non-broadcast) design paid for
+# its own per-lane scale reads before broadcasting fixed that. Only the
+# scale's real win is captured here until that's fixed upstream.
+kernel Q5LinearWarpBroadcastKernel:
+    let [float32]'global  x                # (seq × d_in)
+    let [uint8]'global    w_packed         # (d_out × d_in) Q5_0-packed, GGUF's native layout
+    let [float32]'global  bv               # (d_out,)
+    mut [float32]'unified y                # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    let int               warps_per_block
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout, int wpb):
+        x               = xi
+        w_packed        = wi
+        bv              = bi
+        seq             = s
+        d_in            = din
+        d_out           = dout
+        warps_per_block = wpb
+        y               = [0.0 for ..<s * dout]
+
+    def ():
+        let lane = gpu.warp.lane
+        let warp_in_block = gpu.thread.y
+        let block_idx = gpu.block.x + gpu.block.y * gpu.grid_dim.x
+        let global_warp = block_idx * warps_per_block + warp_in_block
+        let total = seq * d_out
+        if global_warp < total:
+            let row = global_warp / d_out
+            let col = global_warp % d_out
+            var float32 partial = 0.0
+            var int i = lane
+            while i < d_in:
+                let flat_idx = col * d_in + i
+                let q5_block = flat_idx / 32
+                let block_byte = q5_block * 22
+                var float32 w_scale = 0.0
+                if lane == 0:
+                    let scale_bits = int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8)
+                    w_scale = f16_bits_to_f32(scale_bits)
+                w_scale = gpu.warp.shuffle(w_scale, 0)
+                let qh_base = block_byte + 2
+                let qh = int(w_packed[qh_base]) | (int(w_packed[qh_base + 1]) << 8) | (int(w_packed[qh_base + 2]) << 16) | (int(w_packed[qh_base + 3]) << 24)
+                let qs_base = block_byte + 6
+                let j = if lane < 16: lane else: lane - 16
+                let byte_val = int(w_packed[qs_base + j])
+                let nib = if lane < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
+                let hbit_shift = if lane < 16: j else: j + 16
+                let hbit = (qh >> hbit_shift) & 1
+                let qv = (nib | (hbit << 4)) - 16
+                let qf = qv as float32
+                partial += x[row * d_in + i] * (qf * w_scale)
+                i += gpu.warp.size
+            var int offset = gpu.warp.size / 2
+            while offset > 0:
+                partial += gpu.warp.shuffle_xor(partial, offset)
+                offset = offset / 2
+            if lane == 0:
+                y[row * d_out + col] = partial + bv[col]
+
+pub req [float32]'gpu'unified q5_linear_warp_broadcast_gpu([float32]'global x, [uint8]'global w_packed,
+                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 32 == 0 else throw "q5_linear_warp_broadcast_gpu: d_in ({d_in}) must be a multiple of 32"
+    let int warps_per_block = 8
+    let int total_warps = seq * d_out
+    let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = Q5LinearWarpBroadcastKernel(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    kernel:
+        k(block = (32, warps_per_block), grid = (gx, gy))
+    k.y
+
 # ── Kernel: Q6_K fused-dequant linear layer ──────────────────────────────
 # Same 16x16-tiled GEMM shape as Q8LinearKernel/Q5LinearKernel, weight
 # arrives as raw Q6_K-packed bytes (GGUF's block_q6_K superblock: 256
@@ -1086,6 +1174,84 @@ pub req [float32]'gpu'unified q4_linear_nobias_gpu([float32] x, [uint8] w_packed
                        int seq, int d_in, int d_out) throws:
     let [float32] zero_bias = [0.0 for i in 0..<d_out]
     q4_linear_gpu(x, w_packed, zero_bias, seq, d_in, d_out)
+
+# ── Kernel: Q4_0 fused-dequant linear layer, warp-shuffle + scale
+# broadcast (same follow-up idea as Q8LinearWarpBroadcastKernel above) ────
+# Q4_0's block size (32) equals this hardware's warp size, same alignment
+# every other warp-broadcast kernel here relies on. Simplest of the three
+# broadcast variants: Q4_0 has only the one per-block field (the 2-byte f16
+# scale, no `qh`/codebook to also broadcast), so lane 0 reads+decodes it
+# and broadcasts via `gpu.warp.shuffle`; the per-lane nibble read stays
+# per-lane, same reasoning as every other fused kernel's unavoidable
+# per-lane quantized-value read.
+kernel Q4LinearWarpBroadcastKernel:
+    let [float32]'global  x                # (seq × d_in)
+    let [uint8]'global    w_packed         # (d_out × d_in) Q4_0-packed, GGUF's native layout
+    let [float32]'global  bv               # (d_out,)
+    mut [float32]'unified y                # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    let int               warps_per_block
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout, int wpb):
+        x               = xi
+        w_packed        = wi
+        bv              = bi
+        seq             = s
+        d_in            = din
+        d_out           = dout
+        warps_per_block = wpb
+        y               = [0.0 for ..<s * dout]
+
+    def ():
+        let lane = gpu.warp.lane
+        let warp_in_block = gpu.thread.y
+        let block_idx = gpu.block.x + gpu.block.y * gpu.grid_dim.x
+        let global_warp = block_idx * warps_per_block + warp_in_block
+        let total = seq * d_out
+        if global_warp < total:
+            let row = global_warp / d_out
+            let col = global_warp % d_out
+            var float32 partial = 0.0
+            var int i = lane
+            while i < d_in:
+                let flat_idx = col * d_in + i
+                let q4_block = flat_idx / 32
+                let block_byte = q4_block * 18
+                var float32 w_scale = 0.0
+                if lane == 0:
+                    let scale_bits = int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8)
+                    w_scale = f16_bits_to_f32(scale_bits)
+                w_scale = gpu.warp.shuffle(w_scale, 0)
+                let qs_base = block_byte + 2
+                let j = if lane < 16: lane else: lane - 16
+                let byte_val = int(w_packed[qs_base + j])
+                let nib = if lane < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
+                let qv = nib - 8
+                let qf = qv as float32
+                partial += x[row * d_in + i] * (qf * w_scale)
+                i += gpu.warp.size
+            var int offset = gpu.warp.size / 2
+            while offset > 0:
+                partial += gpu.warp.shuffle_xor(partial, offset)
+                offset = offset / 2
+            if lane == 0:
+                y[row * d_out + col] = partial + bv[col]
+
+pub req [float32]'gpu'unified q4_linear_warp_broadcast_gpu([float32]'global x, [uint8]'global w_packed,
+                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 32 == 0 else throw "q4_linear_warp_broadcast_gpu: d_in ({d_in}) must be a multiple of 32"
+    let int warps_per_block = 8
+    let int total_warps = seq * d_out
+    let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = Q4LinearWarpBroadcastKernel(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    kernel:
+        k(block = (32, warps_per_block), grid = (gx, gy))
+    k.y
 
 # ── Kernel: Q2_K fused-dequant linear layer ──────────────────────────────
 # Same 16x16-tiled GEMM shape as Q4K/Q6K above, weight arrives as raw
@@ -1449,6 +1615,115 @@ pub req [float32]'gpu'unified q4nl_linear_nobias_gpu([float32] x, [uint8] w_pack
     let [float32] zero_bias = [0.0 for i in 0..<d_out]
     q4nl_linear_gpu(x, w_packed, zero_bias, seq, d_in, d_out)
 
+# ── Kernel: IQ4_NL fused-dequant linear layer, warp-shuffle + scale
+# broadcast (same follow-up idea as Q8LinearWarpBroadcastKernel above) ────
+# IQ4_NL's block size (32) equals this hardware's warp size, same
+# alignment every other warp-broadcast kernel here relies on. Same shape
+# as `Q4LinearWarpBroadcastKernel` (one per-block field, the f16 scale, to
+# broadcast) but with the codebook lookup in place of `nibble - 8` — same
+# inline 16-way if/elif chain `Q4NLLinearKernel` above uses, for the same
+# reason (indexing a local array from inside a kernel body is untested
+# territory here, unlike inline scalar arithmetic).
+kernel Q4NLLinearWarpBroadcastKernel:
+    let [float32]'global  x                # (seq × d_in)
+    let [uint8]'global    w_packed         # (d_out × d_in) IQ4_NL-packed, GGUF's native layout
+    let [float32]'global  bv               # (d_out,)
+    mut [float32]'unified y                # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    let int               warps_per_block
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout, int wpb):
+        x               = xi
+        w_packed        = wi
+        bv              = bi
+        seq             = s
+        d_in            = din
+        d_out           = dout
+        warps_per_block = wpb
+        y               = [0.0 for ..<s * dout]
+
+    def ():
+        let lane = gpu.warp.lane
+        let warp_in_block = gpu.thread.y
+        let block_idx = gpu.block.x + gpu.block.y * gpu.grid_dim.x
+        let global_warp = block_idx * warps_per_block + warp_in_block
+        let total = seq * d_out
+        if global_warp < total:
+            let row = global_warp / d_out
+            let col = global_warp % d_out
+            var float32 partial = 0.0
+            var int i = lane
+            while i < d_in:
+                let flat_idx = col * d_in + i
+                let q4nl_block = flat_idx / 32
+                let block_byte = q4nl_block * 18
+                var float32 w_scale = 0.0
+                if lane == 0:
+                    let scale_bits = int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8)
+                    w_scale = f16_bits_to_f32(scale_bits)
+                w_scale = gpu.warp.shuffle(w_scale, 0)
+                let qs_base = block_byte + 2
+                let j = if lane < 16: lane else: lane - 16
+                let byte_val = int(w_packed[qs_base + j])
+                let nib = if lane < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
+                let cv = if nib == 0:
+                    -127
+                elif nib == 1:
+                    -104
+                elif nib == 2:
+                    -83
+                elif nib == 3:
+                    -65
+                elif nib == 4:
+                    -49
+                elif nib == 5:
+                    -35
+                elif nib == 6:
+                    -22
+                elif nib == 7:
+                    -10
+                elif nib == 8:
+                    1
+                elif nib == 9:
+                    13
+                elif nib == 10:
+                    25
+                elif nib == 11:
+                    38
+                elif nib == 12:
+                    53
+                elif nib == 13:
+                    69
+                elif nib == 14:
+                    89
+                else:
+                    113
+                let cf = cv as float32
+                partial += x[row * d_in + i] * (cf * w_scale)
+                i += gpu.warp.size
+            var int offset = gpu.warp.size / 2
+            while offset > 0:
+                partial += gpu.warp.shuffle_xor(partial, offset)
+                offset = offset / 2
+            if lane == 0:
+                y[row * d_out + col] = partial + bv[col]
+
+pub req [float32]'gpu'unified q4nl_linear_warp_broadcast_gpu([float32]'global x, [uint8]'global w_packed,
+                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 32 == 0 else throw "q4nl_linear_warp_broadcast_gpu: d_in ({d_in}) must be a multiple of 32"
+    let int warps_per_block = 8
+    let int total_warps = seq * d_out
+    let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = Q4NLLinearWarpBroadcastKernel(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    kernel:
+        k(block = (32, warps_per_block), grid = (gx, gy))
+    k.y
+
 # ── Fused-dequant linear dispatch, by ggml type ──────────────────────────
 # A real quantized GGUF file mixes formats across tensors (e.g. a typical
 # "Q4_K_M" file: attention/FFN-gate/FFN-up projections in Q5_0, attn_v in
@@ -1460,17 +1735,23 @@ pub req [float32]'gpu'unified q4nl_linear_nobias_gpu([float32] x, [uint8] w_pack
 # gguf.br's ggml_type_name (2=Q4_0, 6=Q5_0, 8=Q8_0, 10=Q2_K, 11=Q3_K,
 # 12=Q4_K, 14=Q6_K, 20=IQ4_NL).
 #
-# Q8_0 is additionally SHAPE-aware: `q8_linear_warp_broadcast_gpu` is the
-# first warp-shuffle GEMM variant in this project's whole investigation
-# (see its own doc comment above) to actually beat the tiled kernel it was
-# built to challenge — but only at seq=1 (single-token decode, the
-# dominant real workload once `--kv-cache` is in use), and it still loses
+# Q8_0/Q5_0/Q4_0/IQ4_NL are additionally SHAPE-aware: each has a
+# warp-shuffle-plus-broadcast counterpart (`q8_linear_warp_broadcast_gpu`
+# was the first warp-shuffle GEMM variant in this project's whole
+# investigation to actually beat the tiled kernel it was built to
+# challenge — see its own doc comment above for why; the other three share
+# the identical alignment, one warp decoding one shared block per stride
+# round, since all four formats use a 32-element block matching this
+# hardware's warp size) that wins at seq=1 (single-token decode, the
+# dominant real workload once `--kv-cache` is in use) but still loses
 # badly to the tiled kernel at prefill shapes (seq>1) — see
-# test/bench_linear_warp.br's own real measurements. Every real call site
-# in model.br already passes its own true `seq` (1 for a decode step, the
-# prompt/turn length for a prefill), so this dispatch needs no new
-# parameter or a decode-specific entry point — it reads `seq` off the same
-# call every other format's branch below ignores.
+# test/bench_linear_warp.br's own real measurements. Q2_K/Q3_K/Q4_K/Q6_K's
+# 256-element superblocks don't share this alignment (a 256-wide block
+# spans 8 warps, not 1), so no analogous broadcast variant exists for them
+# yet. Every real call site in model.br already passes its own true `seq`
+# (1 for a decode step, the prompt/turn length for a prefill), so this
+# dispatch needs no new parameter or a decode-specific entry point — it
+# reads `seq` off the same call every other format's branch below ignores.
 pub req [float32]'gpu'unified fused_linear_gpu([float32]'global x, [uint8]'global w_packed, int w_type,
                        [float32]'global bv, int seq, int d_in, int d_out) throws:
     if w_type == 8:
@@ -1479,19 +1760,28 @@ pub req [float32]'gpu'unified fused_linear_gpu([float32]'global x, [uint8]'globa
         else:
             q8_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 6:
-        q5_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
+        if seq == 1:
+            q5_linear_warp_broadcast_gpu(x, w_packed, bv, seq, d_in, d_out)
+        else:
+            q5_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 12:
         q4k_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 14:
         q6k_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 2:
-        q4_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
+        if seq == 1:
+            q4_linear_warp_broadcast_gpu(x, w_packed, bv, seq, d_in, d_out)
+        else:
+            q4_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 10:
         q2k_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 11:
         q3k_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 20:
-        q4nl_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
+        if seq == 1:
+            q4nl_linear_warp_broadcast_gpu(x, w_packed, bv, seq, d_in, d_out)
+        else:
+            q4nl_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     else:
         throw "fused_linear_gpu: unsupported ggml type id {w_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
 

@@ -245,6 +245,16 @@ def main() throws:
     assert_close(gpu_q5[1], cpu_q5[1], "q5_linear_gpu[1]")
     print "q5_linear_gpu: OK ({gpu_q5[0]} {gpu_q5[1]}, expected ~132 ~202)"
 
+    # --- q5_linear_warp_broadcast_gpu vs. the same CPU reference, same
+    # two-row synthetic Q5_0 bytes as q5_linear_gpu above (2 distinct rows
+    # is what would catch a wrong-block indexing bug, same class of bug
+    # q8_linear_warp_broadcast_gpu's own first draft had) ---
+    let gpu_q5_bcast_raw = q5_linear_warp_broadcast_gpu(qx, w5_packed, qb, 1, 32, 2)
+    let gpu_q5_bcast = passthrough(gpu_q5_bcast_raw)
+    assert_close(gpu_q5_bcast[0], cpu_q5[0], "q5_linear_warp_broadcast_gpu[0]")
+    assert_close(gpu_q5_bcast[1], cpu_q5[1], "q5_linear_warp_broadcast_gpu[1]")
+    print "q5_linear_warp_broadcast_gpu: OK ({gpu_q5_bcast[0]} {gpu_q5_bcast[1]}, expected ~132 ~202)"
+
     # --- q6k_linear_gpu vs. CPU dequantize_q6_k + linear_bias ---
     # d_in=256 (one Q6_K superblock per row), d_out=2, seq=1. `qh`=0xAA
     # (binary 10101010) everywhere so every 2-bit high-field the kernel
@@ -380,6 +390,14 @@ def main() throws:
     assert_close(gpu_q4_0[1], cpu_q4_0[1], "q4_linear_gpu[1]")
     print "q4_linear_gpu: OK ({gpu_q4_0[0]} {gpu_q4_0[1]})"
 
+    # --- q4_linear_warp_broadcast_gpu vs. the same CPU reference, same
+    # patterned two-row/two-block Q4_0 bytes as q4_linear_gpu above ---
+    let gpu_q4_0_bcast_raw = q4_linear_warp_broadcast_gpu(x4_0, w4_0_packed, b4_0, 1, 64, 2)
+    let gpu_q4_0_bcast = passthrough(gpu_q4_0_bcast_raw)
+    assert_close(gpu_q4_0_bcast[0], cpu_q4_0[0], "q4_linear_warp_broadcast_gpu[0]")
+    assert_close(gpu_q4_0_bcast[1], cpu_q4_0[1], "q4_linear_warp_broadcast_gpu[1]")
+    print "q4_linear_warp_broadcast_gpu: OK ({gpu_q4_0_bcast[0]} {gpu_q4_0_bcast[1]})"
+
     # --- q2k_linear_gpu vs. CPU dequantize_q2_k + linear_bias ---
     # d_in=256 (one Q2_K superblock per row), d_out=2, seq=1. Same
     # patterned-bytes approach as q4_linear_gpu above — dequantize_q2_k was
@@ -497,5 +515,13 @@ def main() throws:
     assert_close(gpu_q4nl[0], cpu_q4nl[0], "q4nl_linear_gpu[0]")
     assert_close(gpu_q4nl[1], cpu_q4nl[1], "q4nl_linear_gpu[1]")
     print "q4nl_linear_gpu: OK ({gpu_q4nl[0]} {gpu_q4nl[1]})"
+
+    # --- q4nl_linear_warp_broadcast_gpu vs. the same CPU reference, same
+    # nibble-cycling two-row/two-block IQ4_NL bytes as q4nl_linear_gpu above ---
+    let gpu_q4nl_bcast_raw = q4nl_linear_warp_broadcast_gpu(x4nl, w4nl_packed, b4nl, 1, 64, 2)
+    let gpu_q4nl_bcast = passthrough(gpu_q4nl_bcast_raw)
+    assert_close(gpu_q4nl_bcast[0], cpu_q4nl[0], "q4nl_linear_warp_broadcast_gpu[0]")
+    assert_close(gpu_q4nl_bcast[1], cpu_q4nl[1], "q4nl_linear_warp_broadcast_gpu[1]")
+    print "q4nl_linear_warp_broadcast_gpu: OK ({gpu_q4nl_bcast[0]} {gpu_q4nl_bcast[1]})"
 
     print "test_math_gpu_real: all assertions passed"
