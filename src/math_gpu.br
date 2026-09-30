@@ -750,7 +750,11 @@ kernel Q5LinearKernel:
                 let byte_val = int(w_packed[qs_base + j])
                 let nib = if offset_in_block < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
                 let hbit_shift = if offset_in_block < 16: j else: j + 16
-                let hbit = (qh >> hbit_shift) & 1
+                # `as uint32`: works around a real wgpu-backend bug (WGSL's
+                # `>>` requires a u32 shift amount; boring emits a variable
+                # int shift amount as i32 with no auto-cast — filed as
+                # task_23fdd781; harmless no-op on Metal/CUDA/ROCm).
+                let hbit = (qh >> (hbit_shift as uint32)) & 1
                 let qv = (nib | (hbit << 4)) - 16
                 let qf = qv as float32
                 tile_w[width = tx, height = ty] = qf * w_scale
@@ -784,15 +788,35 @@ pub req [float32]'gpu'unified q5_linear_nobias_gpu([float32] x, [uint8] w_packed
 # `Q8LinearWarpBroadcastKernel`'s own doc comment relies on: every stride
 # round has all 32 lanes jointly decoding one shared block. Q5_0 has TWO
 # per-block fields every lane would otherwise redundantly re-read — the
-# 2-byte f16 scale AND the 4-byte `qh` high-bit field. Only the SCALE is
-# actually broadcast here, though: `gpu.warp.shuffle` on a boring `int`
-# value fails to compile on the Metal backend (a real, confirmed `boring`
-# limitation — Metal's `simd_shuffle` intrinsic isn't valid for 64-bit
-# integer types, which is what boring's `int` transpiles to — filed as
-# `task_a374ff68`), so `qh` stays a per-lane redundant read for now,
-# same as `Q8LinearWarpKernel`'s original (non-broadcast) design paid for
-# its own per-lane scale reads before broadcasting fixed that. Only the
-# scale's real win is captured here until that's fixed upstream.
+# 2-byte f16 scale AND the 4-byte `qh` high-bit field — so lane 0 reads and
+# decodes both, then broadcasts each via its own `gpu.warp.shuffle(_, 0)`
+# call. `qh`'s broadcast depends on a real `boring` Metal-backend fix
+# (`task_a374ff68`: `gpu.warp.shuffle` on a boring `int` used to fail to
+# compile — Metal's `simd_shuffle` intrinsic rejects 64-bit integer types,
+# which is what boring's `int` transpiles to on Metal — fixed upstream by
+# round-tripping the shuffled value through `int32_t` internally; verified
+# fixed and reinstalled before restoring this). The per-lane `qs` nibble
+# read (and the bit-shift picking this lane's own bit out of the broadcast
+# `qh`) stays per-lane, same reasoning as Q8_0's unavoidable per-lane
+# quantized-value read.
+#
+# METAL-ONLY FOR NOW: shuffling two differently-typed values (`w_scale`,
+# a `float32`, and `qh`, an `int`) in the same kernel body currently fails
+# on the wgpu backend — its warp-shuffle emulation allocates ONE scratch
+# buffer per kernel, typed from whichever shuffled value its type-inference
+# pass sees first (here, `w_scale`'s `float32`), so writing `qh` through
+# that same `float32`-typed buffer produces a real WGSL shader-validation
+# error at runtime (`boring build`/`cargo build` both succeed; only the
+# first real kernel dispatch panics) — a different bug from
+# `task_23fdd781`'s shift-amount issue, not yet filed as its own task since
+# `boring`'s own repo already has unfinished, uncommitted work in exactly
+# this area (per-local-variable shuffle-type tracking for the wgpu
+# backend) that looks aimed at this same class of gap. Metal is this
+# project's primary GPU target and gets the full scale+qh broadcast; wgpu
+# falls back to `q5_linear_gpu` (tiled, unaffected) for prefill as usual,
+# but a real `--quantized --gpu` run on `--target wgpu` with Q5_0 weights
+# at seq=1 will currently panic rather than silently miscompute — revisit
+# once the upstream wgpu shuffle-type-inference work lands.
 kernel Q5LinearWarpBroadcastKernel:
     let [float32]'global  x                # (seq × d_in)
     let [uint8]'global    w_packed         # (d_out × d_in) Q5_0-packed, GGUF's native layout
@@ -830,18 +854,22 @@ kernel Q5LinearWarpBroadcastKernel:
                 let q5_block = flat_idx / 32
                 let block_byte = q5_block * 22
                 var float32 w_scale = 0.0
+                var int qh = 0
                 if lane == 0:
                     let scale_bits = int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8)
                     w_scale = f16_bits_to_f32(scale_bits)
+                    let qh_base = block_byte + 2
+                    qh = int(w_packed[qh_base]) | (int(w_packed[qh_base + 1]) << 8) | (int(w_packed[qh_base + 2]) << 16) | (int(w_packed[qh_base + 3]) << 24)
                 w_scale = gpu.warp.shuffle(w_scale, 0)
-                let qh_base = block_byte + 2
-                let qh = int(w_packed[qh_base]) | (int(w_packed[qh_base + 1]) << 8) | (int(w_packed[qh_base + 2]) << 16) | (int(w_packed[qh_base + 3]) << 24)
+                qh = gpu.warp.shuffle(qh, 0)
                 let qs_base = block_byte + 6
                 let j = if lane < 16: lane else: lane - 16
                 let byte_val = int(w_packed[qs_base + j])
                 let nib = if lane < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
                 let hbit_shift = if lane < 16: j else: j + 16
-                let hbit = (qh >> hbit_shift) & 1
+                # `as uint32`: same wgpu-backend workaround as
+                # `Q5LinearKernel` above (task_23fdd781).
+                let hbit = (qh >> (hbit_shift as uint32)) & 1
                 let qv = (nib | (hbit << 4)) - 16
                 let qf = qv as float32
                 partial += x[row * d_in + i] * (qf * w_scale)
@@ -1332,7 +1360,11 @@ kernel Q2KLinearKernel:
                 let q_base = qs_base + outer * 32
                 let shift = j * 2
                 let byte_pos = q_base + sub * 16 + l
-                let qv = (int(w_packed[byte_pos]) >> shift) & 3
+                # `as uint32`: works around a real wgpu-backend bug (WGSL's
+                # `>>` requires a u32 shift amount; boring emits a variable
+                # int shift amount as i32 with no auto-cast — filed as
+                # task_23fdd781; harmless no-op on Metal/CUDA/ROCm).
+                let qv = (int(w_packed[byte_pos]) >> (shift as uint32)) & 3
 
                 let wf = dl * (qv as float32) - ml
                 tile_w[width = tx, height = ty] = wf
@@ -1457,16 +1489,31 @@ kernel Q3KLinearKernel:
                     ((aux0_in >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4)
                 else:
                     ((aux1_in >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4)
-                let raw = (word >> (8 * sbp)) & 0xFF
+                # `as uint32` on both shift amounts below: works around a
+                # real wgpu-backend bug (WGSL's `>>` requires a u32 shift
+                # amount; boring emits a variable int shift amount as i32
+                # with no auto-cast — filed as task_23fdd781; harmless
+                # no-op on Metal/CUDA/ROCm).
+                let raw = (word >> ((8 * sbp) as uint32)) & 0xFF
                 let sc = if raw > 127: raw - 256 else: raw
                 let dl = d_all * ((sc - 32) as float32)
 
                 let q_base = qs_base + outer * 32
                 let shift = j * 2
                 let byte_pos = q_base + sub * 16 + l
-                let qv = (int(w_packed[byte_pos]) >> shift) & 3
+                let qv = (int(w_packed[byte_pos]) >> (shift as uint32)) & 3
 
-                let m = 1 << (outer * 4 + j)
+                # `as uint32`: same wgpu-backend `<<`/`>>` workaround as
+                # above (task_23fdd781) — applies to left-shift too. The
+                # literal `1` is routed through a `let int one = 1` first
+                # rather than written inline (`1 << (... as uint32)`) —
+                # WGSL's abstract-int literal type inference can't
+                # concretize an inline `1` as the left operand of a shift
+                # whose right operand is an explicit `u32` cast; binding it
+                # to an `int`-typed local first forces concretization
+                # before the shift, sidestepping the same naga/WGSL quirk.
+                let int one = 1
+                let m = one << ((outer * 4 + j) as uint32)
                 let hmask_byte_pos = hmask_base + sub * 16 + l
                 let hbit = int(w_packed[hmask_byte_pos]) & m
                 let hi_off = if hbit != 0: 0 else: 4

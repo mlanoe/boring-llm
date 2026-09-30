@@ -433,14 +433,8 @@ pub [float32] dequantize_iq4_nl([uint8] bytes, int offset, int n_elements) throw
 # goes through these dispatchers instead of assuming a fixed format. Type
 # ids match gguf.br's ggml_type_name (2=Q4_0, 6=Q5_0, 8=Q8_0, 10=Q2_K,
 # 11=Q3_K, 12=Q4_K, 14=Q6_K, 20=IQ4_NL).
-#
-# NOTE: the "supported formats" list is duplicated as a literal in both
-# throw messages below rather than factored into a shared top-level
-# `let string` constant — a real, confirmed Metal-target transpiler bug
-# (task_1ca9aa9e) drops a top-level `let string` constant from the
-# generated Rust entirely (unlike `let int`, which works), so any later
-# reference to it fails `cargo build` with "cannot find value ... in this
-# scope", invisible from `boring build`'s own output.
+
+let string QUANT_ROW_SUPPORTED = "Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20"
 
 pub int quantized_row_bytes(int ggml_type, int n_elements) throws:
     if ggml_type == 2:
@@ -460,7 +454,7 @@ pub int quantized_row_bytes(int ggml_type, int n_elements) throws:
     elif ggml_type == 20:
         (n_elements / QK4_NL) * IQ4_NL_BLOCK_BYTES
     else:
-        throw "quantized_row_bytes: unsupported ggml type id {ggml_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
+        throw "quantized_row_bytes: unsupported ggml type id {ggml_type} (supported: {QUANT_ROW_SUPPORTED})"
 
 pub [float32] dequantize_row(int ggml_type, [uint8] bytes, int offset, int n_elements) throws:
     if ggml_type == 2:
@@ -480,7 +474,7 @@ pub [float32] dequantize_row(int ggml_type, [uint8] bytes, int offset, int n_ele
     elif ggml_type == 20:
         dequantize_iq4_nl(bytes, offset, n_elements)
     else:
-        throw "dequantize_row: unsupported ggml type id {ggml_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
+        throw "dequantize_row: unsupported ggml type id {ggml_type} (supported: {QUANT_ROW_SUPPORTED})"
 
 pub [float32] dequantize_q4_k([uint8] bytes, int offset, int n_elements) throws:
     guard n_elements % QK_K == 0 else throw "dequantize_q4_k: n_elements must be a multiple of {QK_K}, got {n_elements}"

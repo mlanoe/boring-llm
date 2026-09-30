@@ -9,6 +9,15 @@
 #   boring build --target metal test/test_math_gpu_real.br
 #   cd test/test_math_gpu_real_metal && cargo build --release
 #   ./target/release/test_math_gpu_real
+#
+# Also builds and mostly passes under `--target wgpu` (same source, no
+# target-conditional code) — EXCEPT `q5_linear_warp_broadcast_gpu`'s own
+# test case below, which currently panics partway through the run on wgpu
+# (a real wgpu-backend gap in `boring`'s warp-shuffle emulation when a
+# kernel shuffles two differently-typed values — see that kernel's own doc
+# comment in math_gpu.br for the full writeup). Every test before it in
+# file order still runs and passes; everything after it doesn't get a
+# chance to run under `--target wgpu` until that's fixed upstream.
 
 use io
 use math
@@ -111,17 +120,13 @@ def main() throws:
 
     # --- q8_linear_gpu vs. CPU dequantize_q8_0 + linear_bias ---
     # d_in=32 (exactly one Q8_0 block per row), d_out=2, seq=1.
-    # NOTE: passes on `--target metal`, but `--target wgpu` now correctly
-    # REJECTS this kernel at compile time (task_0bd1e42a's fix landed):
-    # Q8LinearKernel's `w_packed` field is `[uint8]'global`, and WGSL has no
-    # 8-bit storage-buffer element type — `boring` used to silently declare
-    # the buffer as `array<u32>` while the host still uploaded/sized it at
-    # true byte granularity (every read past the first element landing 4x
-    # too far in), but now gives a clear compile-time error instead. This is
-    # a real WGSL limitation, not a bug — Q8LinearKernel stays Metal-only
-    # until it's reworked to pack 4 bytes per `uint32` storage slot and
-    # unpack via bit-shifts (not attempted here). See README.md's Phase 4
-    # wgpu section for the full writeup.
+    # Passes on both `--target metal` and `--target wgpu` — Q8LinearKernel's
+    # `w_packed` field is `[uint8]'global`, and WGSL has no 8-bit
+    # storage-buffer element type, but `boring`'s wgpu backend now packs
+    # 4 bytes per `uint32` storage slot transparently and unpacks via
+    # bit-shifts under the hood (this used to be a real, documented
+    # Metal-only gap — task_0bd1e42a's own follow-up fix closed it; see
+    # `docs/development-log.md`'s wgpu Phase 4 entries for the history).
     var [uint8] w_packed = []
     # row0: scale=1.0 (f16 bits 0x3C00), all 32 quantized values = 1
     w_packed.push(0x00 as uint8)
