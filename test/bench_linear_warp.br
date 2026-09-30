@@ -3,22 +3,24 @@
 # reduction, zero shared memory) vs. linear_warp_shared_gpu (one warp per
 # output cell, shuffle-based reduction, PLUS a shared x-row cache reused
 # by every warp in a block) — plus the same three kernels' Q8_0
-# fused-dequant counterparts (q8_linear_gpu / q8_linear_warp_gpu — no
-# shared-cache Q8_0 variant exists, `linear_warp_shared_gpu` never won
-# against plain `linear_warp_gpu` so it wasn't worth porting) — at this
-# project's actual model dimensions (d_model up to 2048, ffn up to 5632,
-# vocab up to 151936) and at BOTH the prefill shape (seq=26, a real prompt
-# length) and the decode-step shape (seq=1 — the dominant real workload
-# once `--kv-cache` is in use, since every token after the first prefill
-# is a single-row matvec) — not a unit test, just answering "which kernel
-# is actually faster at the sizes this project cares about", run manually,
-# not part of the CI-adjacent test/*.br suite.
+# fused-dequant counterparts (q8_linear_gpu / q8_linear_warp_gpu /
+# q8_linear_warp_broadcast_gpu — no shared-x-cache Q8_0 variant exists,
+# `linear_warp_shared_gpu` never won against plain `linear_warp_gpu` so it
+# wasn't worth porting; `q8_linear_warp_broadcast_gpu` targets a different,
+# more specific cost instead — see its own doc comment in math_gpu.br) —
+# at this project's actual model dimensions (d_model up to 2048, ffn up to
+# 5632, vocab up to 151936) and at BOTH the prefill shape (seq=26, a real
+# prompt length) and the decode-step shape (seq=1 — the dominant real
+# workload once `--kv-cache` is in use, since every token after the first
+# prefill is a single-row matvec) — not a unit test, just answering "which
+# kernel is actually faster at the sizes this project cares about", run
+# manually, not part of the CI-adjacent test/*.br suite.
 #
 # Build + run:
 #   boring build --target metal test/bench_linear_warp.br
 #   cd test/bench_linear_warp_metal && cargo build --release
 #   ./target/release/bench_linear_warp <kernel> <shape>
-#     kernel: tiled | warp | warpshared | q8 | q8warp
+#     kernel: tiled | warp | warpshared | q8 | q8warp | q8warpbcast
 #     shape:  small-seq26 | big-seq26 | small-seq1 | big-seq1
 
 # Boring has no documented stopwatch-style elapsed-time API (Instant/
@@ -59,7 +61,7 @@ def main() throws:
     # real 34-byte blocks (2-byte f16 scale + 32 signed int8 values), same
     # shape real GGUF Q8_0 tensors use.
     var [uint8] w_packed = []
-    if kernel_name == "q8" or kernel_name == "q8warp":
+    if kernel_name == "q8" or kernel_name == "q8warp" or kernel_name == "q8warpbcast":
         let n_blocks = (d_out * d_model) / 32
         var b = 0
         while b < n_blocks:
@@ -104,5 +106,11 @@ def main() throws:
             let sink = passthrough(out)
             iter += 1
         print "q8_linear_warp_gpu (warp-shuffle, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
+    elif kernel_name == "q8warpbcast":
+        while iter < n_iter:
+            let out = q8_linear_warp_broadcast_gpu(x, w_packed, bv, seq, d_model, d_out)
+            let sink = passthrough(out)
+            iter += 1
+        print "q8_linear_warp_broadcast_gpu (warp-shuffle + scale-broadcast, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
     else:
         throw "unknown kernel '{kernel_name}'"

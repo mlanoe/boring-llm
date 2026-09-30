@@ -585,6 +585,112 @@ pub req [float32]'gpu'unified q8_linear_warp_gpu([float32]'global x, [uint8]'glo
         k(block = (32, warps_per_block), grid = (gx, gy))
     k.y
 
+# ── Kernel: Q8_0 fused-dequant linear layer, warp-shuffle reduction +
+# scale-broadcast (follow-up to Q8LinearWarpKernel above) ────────────────
+# `Q8LinearWarpKernel`'s own doc comment diagnosed its actual bottleneck:
+# a byte-granular global load per lane every stride round, PLUS every lane
+# in the warp redundantly re-reading the SAME 2-byte f16 scale header —
+# real, wasted memory traffic `Q8LinearKernel`'s cooperative shared-memory
+# tile load never pays. This kernel targets exactly that second cost,
+# leaving the first (the per-element byte-granular quantized-value load,
+# inherent to reading packed sub-byte data at all) untouched: since Q8_0's
+# block size (32) equals this hardware's warp size, every stride round has
+# all 32 lanes decoding one shared block (`offset_in_block == lane`,
+# `block_idx` identical across the whole warp — the same alignment
+# `Q8LinearWarpKernel`'s own comment already names), so only ONE lane
+# needs to actually read+decode the block's scale header — lane 0 does it,
+# then `gpu.warp.shuffle(w_scale, 0)` broadcasts the decoded f32 value to
+# every other lane in the warp via a register-to-register shuffle instead
+# of 31 redundant global-memory reads. The quantized-value read itself is
+# unavoidably per-lane (each lane needs its own distinct byte) and stays
+# unchanged from `Q8LinearWarpKernel`.
+#
+# HONEST PERFORMANCE RESULT (test/bench_linear_warp.br, real Metal
+# hardware): the first warp-shuffle variant in this project's whole
+# investigation to actually beat the tiled kernel it was built to
+# challenge — at seq=1 (decode-step shape), ~20-33% faster than
+# `q8_linear_gpu` (d_out=896: ~0.6-0.9s vs. ~0.9-1.4s/200 iters; d_out=8192:
+# ~3.1s vs. ~4.6-5.0s), consistent across repeated runs. Still loses badly
+# at prefill shapes (seq=26) — d_out=8192: ~17-18s vs. `q8_linear_gpu`'s
+# ~5-6s — the tiled kernel's shared-memory data reuse across many rows
+# still dominates once seq>1, same conclusion every earlier warp-shuffle
+# variant reached for that shape. **Adopted for the decode case only**:
+# `fused_linear_gpu` below dispatches Q8_0 to this kernel when `seq == 1`
+# and to `q8_linear_gpu` otherwise, so `model.br`'s real per-token decode
+# path (every call after the initial prompt prefill) now runs measurably
+# faster while prefill is unaffected.
+kernel Q8LinearWarpBroadcastKernel:
+    let [float32]'global  x                # (seq × d_in)
+    let [uint8]'global    w_packed         # (d_out × d_in) Q8_0-packed, GGUF's native layout
+    let [float32]'global  bv               # (d_out,)
+    mut [float32]'unified y                # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    let int               warps_per_block
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout, int wpb):
+        x               = xi
+        w_packed        = wi
+        bv              = bi
+        seq             = s
+        d_in            = din
+        d_out           = dout
+        warps_per_block = wpb
+        y               = [0.0 for ..<s * dout]
+
+    def ():
+        let lane = gpu.warp.lane
+        let warp_in_block = gpu.thread.y
+        let block_idx = gpu.block.x + gpu.block.y * gpu.grid_dim.x
+        let global_warp = block_idx * warps_per_block + warp_in_block
+        let total = seq * d_out
+        if global_warp < total:
+            let row = global_warp / d_out
+            let col = global_warp % d_out
+            var float32 partial = 0.0
+            var int i = lane
+            while i < d_in:
+                # flat_idx = col*d_in + i is the same flat index every other
+                # fused kernel uses. d_in % 32 == 0 and i steps by warp size
+                # (32) starting at `lane`, so col*d_in + i is always a
+                # multiple of 32 plus `lane` — flat_idx/32 (this row's own
+                # block within this round) is the SAME value for every lane
+                # in the warp, and flat_idx%32 == lane always.
+                let flat_idx = col * d_in + i
+                let q8_block = flat_idx / 32
+                let block_byte = q8_block * 34
+                var float32 w_scale = 0.0
+                if lane == 0:
+                    let scale_bits = int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8)
+                    w_scale = f16_bits_to_f32(scale_bits)
+                w_scale = gpu.warp.shuffle(w_scale, 0)
+                let raw = int(w_packed[block_byte + 2 + lane])
+                let q = if raw > 127: raw - 256 else: raw
+                let qf = q as float32
+                partial += x[row * d_in + i] * (qf * w_scale)
+                i += gpu.warp.size
+            var int offset = gpu.warp.size / 2
+            while offset > 0:
+                partial += gpu.warp.shuffle_xor(partial, offset)
+                offset = offset / 2
+            if lane == 0:
+                y[row * d_out + col] = partial + bv[col]
+
+pub req [float32]'gpu'unified q8_linear_warp_broadcast_gpu([float32]'global x, [uint8]'global w_packed,
+                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 32 == 0 else throw "q8_linear_warp_broadcast_gpu: d_in ({d_in}) must be a multiple of 32"
+    let int warps_per_block = 8
+    let int total_warps = seq * d_out
+    let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = Q8LinearWarpBroadcastKernel(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    kernel:
+        k(block = (32, warps_per_block), grid = (gx, gy))
+    k.y
+
 # ── Kernel: Q5_0 fused-dequant linear layer ──────────────────────────────
 # Same 16x16-tiled GEMM shape as Q8LinearKernel, weight arrives as raw
 # Q5_0-packed bytes (GGUF's block_q5_0: 2-byte f16 scale `d` + 4-byte `qh`
@@ -1353,10 +1459,25 @@ pub req [float32]'gpu'unified q4nl_linear_nobias_gpu([float32] x, [uint8] w_pack
 # dispatcher instead of hardcoding q8_linear_gpu. ggml type ids match
 # gguf.br's ggml_type_name (2=Q4_0, 6=Q5_0, 8=Q8_0, 10=Q2_K, 11=Q3_K,
 # 12=Q4_K, 14=Q6_K, 20=IQ4_NL).
+#
+# Q8_0 is additionally SHAPE-aware: `q8_linear_warp_broadcast_gpu` is the
+# first warp-shuffle GEMM variant in this project's whole investigation
+# (see its own doc comment above) to actually beat the tiled kernel it was
+# built to challenge — but only at seq=1 (single-token decode, the
+# dominant real workload once `--kv-cache` is in use), and it still loses
+# badly to the tiled kernel at prefill shapes (seq>1) — see
+# test/bench_linear_warp.br's own real measurements. Every real call site
+# in model.br already passes its own true `seq` (1 for a decode step, the
+# prompt/turn length for a prefill), so this dispatch needs no new
+# parameter or a decode-specific entry point — it reads `seq` off the same
+# call every other format's branch below ignores.
 pub req [float32]'gpu'unified fused_linear_gpu([float32]'global x, [uint8]'global w_packed, int w_type,
                        [float32]'global bv, int seq, int d_in, int d_out) throws:
     if w_type == 8:
-        q8_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
+        if seq == 1:
+            q8_linear_warp_broadcast_gpu(x, w_packed, bv, seq, d_in, d_out)
+        else:
+            q8_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 6:
         q5_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 12:

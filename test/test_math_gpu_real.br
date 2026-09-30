@@ -184,6 +184,26 @@ def main() throws:
         i += 1
     print "q8_linear_warp_gpu (d_in=64, seq=2, d_out=3): OK (6/6 values match)"
 
+    # --- q8_linear_warp_broadcast_gpu (fused-dequant + warp-shuffle +
+    # scale-broadcast) vs. the same CPU reference, same synthetic Q8_0
+    # bytes as q8_linear_gpu/q8_linear_warp_gpu above ---
+    let gpu_q8_bcast_raw = q8_linear_warp_broadcast_gpu(qx, w_packed, qb, 1, 32, 2)
+    let gpu_q8_bcast = passthrough(gpu_q8_bcast_raw)
+    assert_close(gpu_q8_bcast[0], cpu_q8[0], "q8_linear_warp_broadcast_gpu[0]")
+    assert_close(gpu_q8_bcast[1], cpu_q8[1], "q8_linear_warp_broadcast_gpu[1]")
+    print "q8_linear_warp_broadcast_gpu: OK ({gpu_q8_bcast[0]} {gpu_q8_bcast[1]}, expected ~132 ~202)"
+
+    # --- q8_linear_warp_broadcast_gpu with d_in=64 (2 blocks per row,
+    # exercises the scale-broadcast happening once per round for TWO
+    # different rounds/blocks, not just one) and seq=2, d_out=3 ---
+    let gpu_q8w_bcast_raw = q8_linear_warp_broadcast_gpu(x8w, w8w_packed, b8w, 2, 64, 3)
+    let gpu_q8w_bcast = passthrough(gpu_q8w_bcast_raw)
+    i = 0
+    while i < cpu_q8w.length:
+        assert_close(gpu_q8w_bcast[i], cpu_q8w[i], "q8_linear_warp_broadcast_gpu(d_in=64)[{i}]")
+        i += 1
+    print "q8_linear_warp_broadcast_gpu (d_in=64, seq=2, d_out=3): OK (6/6 values match)"
+
     # --- q5_linear_gpu vs. CPU dequantize_q5_0 + linear_bias ---
     # d_in=32 (one Q5_0 block per row), d_out=2, seq=1. qh set to all-1s for
     # both rows so xh contributes a constant +16 that the -16 offset exactly
