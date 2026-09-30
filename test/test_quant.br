@@ -33,4 +33,85 @@ def main() throws:
     let out2 = dequantize_q8_0(bytes, 34, 32)
     assert_eq(out2[0], -2.0 as float32)   # -1 * 2.0
 
+    # --- Q4_0: one block, scale = 1.0, every nibble byte = 0x98 (low
+    # nibble 8 -> x0 = 0, high nibble 9 -> x1 = 1), so the first 16 output
+    # values are all 0 and the last 16 are all 1 ---
+    var [uint8] q4_bytes = [0x00 as uint8, 0x3C as uint8]
+    var int qi4 = 0
+    while qi4 < 16:
+        q4_bytes.push(0x98 as uint8)
+        qi4 += 1
+    let q4_out = dequantize_q4_0(q4_bytes, 0, 32)
+    assert_eq(q4_out.length, 32)
+    var int qj4 = 0
+    while qj4 < 16:
+        assert_eq(q4_out[qj4], 0.0 as float32)
+        assert_eq(q4_out[16 + qj4], 1.0 as float32)
+        qj4 += 1
+
+    # Second Q4_0 block, scale = 2.0, nibble 0 -> x = -8, scaled = -16.
+    q4_bytes.push(0x00 as uint8)
+    q4_bytes.push(0x40 as uint8)
+    qi4 = 0
+    while qi4 < 16:
+        q4_bytes.push(0x00 as uint8)
+        qi4 += 1
+    let q4_out2 = dequantize_q4_0(q4_bytes, 18, 32)
+    assert_eq(q4_out2[0], -16.0 as float32)
+
+    # --- Q2_K / Q3_K: one full 256-element random synthetic superblock
+    # each, cross-checked against an independent Python port of ggml's own
+    # dequantize_row_q2_K/q3_K (byte-for-byte, not a re-derivation) —
+    # checking the first/last 8 of 256 values is enough to catch an
+    # indexing or bit-packing mistake without hand-computing all 256.
+    let b2 = [57 as uint8, 12 as uint8, 140 as uint8, 125 as uint8, 114 as uint8, 71 as uint8, 52 as uint8, 44 as uint8, 216 as uint8, 16 as uint8, 15 as uint8, 47 as uint8, 111 as uint8, 119 as uint8, 13 as uint8, 101 as uint8, 214 as uint8, 112 as uint8, 229 as uint8, 142 as uint8, 3 as uint8, 81 as uint8, 216 as uint8, 174 as uint8, 142 as uint8, 79 as uint8, 110 as uint8, 172 as uint8, 52 as uint8, 47 as uint8, 194 as uint8, 49 as uint8, 183 as uint8, 176 as uint8, 135 as uint8, 22 as uint8, 235 as uint8, 63 as uint8, 193 as uint8, 40 as uint8, 150 as uint8, 185 as uint8, 98 as uint8, 35 as uint8, 23 as uint8, 116 as uint8, 148 as uint8, 40 as uint8, 119 as uint8, 51 as uint8, 194 as uint8, 142 as uint8, 232 as uint8, 186 as uint8, 83 as uint8, 189 as uint8, 181 as uint8, 107 as uint8, 136 as uint8, 36 as uint8, 87 as uint8, 125 as uint8, 83 as uint8, 236 as uint8, 194 as uint8, 138 as uint8, 112 as uint8, 166 as uint8, 28 as uint8, 117 as uint8, 16 as uint8, 161 as uint8, 205 as uint8, 137 as uint8, 33 as uint8, 108 as uint8, 161 as uint8, 108 as uint8, 255 as uint8, 202 as uint8, 0 as uint8, 62 as uint8, 0 as uint8, 56 as uint8]
+    let expected2_first8 = [25.5 as float32, -1.5 as float32, 12.0 as float32, 25.5 as float32, 39.0 as float32, 12.0 as float32, -1.5 as float32, 25.5 as float32]
+    let expected2_last8 = [19.5 as float32, 12.0 as float32, -3.0 as float32, 4.5 as float32, 12.0 as float32, 4.5 as float32, 19.5 as float32, 19.5 as float32]
+    let q2_out = dequantize_q2_k(b2, 0, 256)
+    assert_eq(q2_out.length, 256)
+    var int k2 = 0
+    while k2 < 8:
+        assert_eq(q2_out[k2], expected2_first8[k2])
+        assert_eq(q2_out[248 + k2], expected2_last8[k2])
+        k2 += 1
+
+    let b3 = [234 as uint8, 73 as uint8, 135 as uint8, 71 as uint8, 126 as uint8, 134 as uint8, 219 as uint8, 204 as uint8, 185 as uint8, 112 as uint8, 70 as uint8, 252 as uint8, 46 as uint8, 24 as uint8, 56 as uint8, 78 as uint8, 81 as uint8, 216 as uint8, 32 as uint8, 197 as uint8, 195 as uint8, 239 as uint8, 128 as uint8, 5 as uint8, 58 as uint8, 136 as uint8, 174 as uint8, 57 as uint8, 150 as uint8, 222 as uint8, 80 as uint8, 232 as uint8, 1 as uint8, 134 as uint8, 91 as uint8, 54 as uint8, 152 as uint8, 101 as uint8, 78 as uint8, 191 as uint8, 82 as uint8, 0 as uint8, 165 as uint8, 250 as uint8, 9 as uint8, 57 as uint8, 185 as uint8, 157 as uint8, 122 as uint8, 29 as uint8, 123 as uint8, 40 as uint8, 43 as uint8, 248 as uint8, 35 as uint8, 64 as uint8, 65 as uint8, 243 as uint8, 84 as uint8, 135 as uint8, 216 as uint8, 108 as uint8, 102 as uint8, 159 as uint8, 204 as uint8, 191 as uint8, 224 as uint8, 231 as uint8, 61 as uint8, 126 as uint8, 115 as uint8, 32 as uint8, 173 as uint8, 10 as uint8, 117 as uint8, 112 as uint8, 3 as uint8, 36 as uint8, 30 as uint8, 117 as uint8, 34 as uint8, 16 as uint8, 169 as uint8, 36 as uint8, 121 as uint8, 142 as uint8, 248 as uint8, 109 as uint8, 67 as uint8, 242 as uint8, 124 as uint8, 242 as uint8, 208 as uint8, 97 as uint8, 48 as uint8, 49 as uint8, 220 as uint8, 181 as uint8, 216 as uint8, 210 as uint8, 239 as uint8, 27 as uint8, 50 as uint8, 31 as uint8, 206 as uint8, 173 as uint8, 55 as uint8, 127 as uint8, 0 as uint8, 52 as uint8]
+    let expected3_first8 = [-9.0 as float32, 6.0 as float32, 9.0 as float32, 6.0 as float32, -12.0 as float32, -9.0 as float32, 6.0 as float32, -3.0 as float32]
+    let expected3_last8 = [11.25 as float32, -11.25 as float32, -3.75 as float32, 3.75 as float32, -11.25 as float32, -3.75 as float32, 15.0 as float32, 0.0 as float32]
+    let q3_out = dequantize_q3_k(b3, 0, 256)
+    assert_eq(q3_out.length, 256)
+    var int k3 = 0
+    while k3 < 8:
+        assert_eq(q3_out[k3], expected3_first8[k3])
+        assert_eq(q3_out[248 + k3], expected3_last8[k3])
+        k3 += 1
+
+    # --- IQ4_NL: one block, scale = 1.0, every qs byte = 0x80 (low nibble 0
+    # -> codebook[0] = -127, high nibble 8 -> codebook[8] = 1), so the
+    # first 16 output values are all -127.0 and the last 16 are all 1.0 ---
+    var [uint8] iq4nl_bytes = [0x00 as uint8, 0x3C as uint8]
+    var int qi_nl = 0
+    while qi_nl < 16:
+        iq4nl_bytes.push(0x80 as uint8)
+        qi_nl += 1
+    let iq4nl_out = dequantize_iq4_nl(iq4nl_bytes, 0, 32)
+    assert_eq(iq4nl_out.length, 32)
+    var int qj_nl = 0
+    while qj_nl < 16:
+        assert_eq(iq4nl_out[qj_nl], -127.0 as float32)
+        assert_eq(iq4nl_out[16 + qj_nl], 1.0 as float32)
+        qj_nl += 1
+
+    # Second IQ4_NL block, scale = 2.0, qs[0] low nibble = 1 -> codebook[1]
+    # = -104, scaled = -208.
+    iq4nl_bytes.push(0x00 as uint8)
+    iq4nl_bytes.push(0x40 as uint8)
+    iq4nl_bytes.push(0x01 as uint8)
+    qi_nl = 0
+    while qi_nl < 15:
+        iq4nl_bytes.push(0x00 as uint8)
+        qi_nl += 1
+    let iq4nl_out2 = dequantize_iq4_nl(iq4nl_bytes, 18, 32)
+    assert_eq(iq4nl_out2[0], -208.0 as float32)
+
     print "test_quant: all assertions passed"

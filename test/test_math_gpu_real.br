@@ -325,4 +325,157 @@ def main() throws:
     assert_close(gpu_q4[1], cpu_q4[1], "q4k_linear_gpu[1]")
     print "q4k_linear_gpu: OK ({gpu_q4[0]} {gpu_q4[1]}, expected ~356 ~202)"
 
+    # --- q4_linear_gpu vs. CPU dequantize_q4_0 + linear_bias ---
+    # d_in=64 (2 Q4_0 blocks per row), d_out=2, seq=1. Patterned (not
+    # constant) packed bytes, unlike the "cancel out to a constant" trick
+    # used for Q5_0/Q6_K/Q4_K above — dequantize_q4_0 was already verified
+    # against real ggml source and real downloaded weights
+    # (test/test_quant.br, test_quant_kquant.br), so it's a trustworthy
+    # oracle here; this test's job is only to confirm the kernel's
+    # flat-index-to-(block,nibble) inverse mapping agrees with the CPU's
+    # sequential one, which a varied bit pattern actually exercises.
+    var [uint8] w4_0_packed = []
+    var int row4 = 0
+    while row4 < 2:
+        var int blk4 = 0
+        while blk4 < 2:
+            let scale_bits4 = if row4 == 0: 0x3C00 else: 0x4000  # 1.0 / 2.0
+            w4_0_packed.push((scale_bits4 & 0xFF) as uint8)
+            w4_0_packed.push(((scale_bits4 >> 8) & 0xFF) as uint8)
+            var int nb = 0
+            while nb < 16:
+                let v = (nb * 7 + blk4 * 13 + row4 * 29) % 256
+                w4_0_packed.push(v as uint8)
+                nb += 1
+            blk4 += 1
+        row4 += 1
+
+    let cpu_w4_0 = dequantize_q4_0(w4_0_packed, 0, 128)
+    let x4_0 = [0.5 for i in 0..<64]
+    let b4_0 = [10.0, 20.0]
+    let cpu_q4_0 = linear_bias(x4_0, cpu_w4_0, b4_0, 1, 64, 2)
+    let gpu_q4_0_raw = q4_linear_gpu(x4_0, w4_0_packed, b4_0, 1, 64, 2)
+    let gpu_q4_0 = passthrough(gpu_q4_0_raw)
+    assert_close(gpu_q4_0[0], cpu_q4_0[0], "q4_linear_gpu[0]")
+    assert_close(gpu_q4_0[1], cpu_q4_0[1], "q4_linear_gpu[1]")
+    print "q4_linear_gpu: OK ({gpu_q4_0[0]} {gpu_q4_0[1]})"
+
+    # --- q2k_linear_gpu vs. CPU dequantize_q2_k + linear_bias ---
+    # d_in=256 (one Q2_K superblock per row), d_out=2, seq=1. Same
+    # patterned-bytes approach as q4_linear_gpu above — dequantize_q2_k was
+    # already verified against a from-scratch Python oracle and real
+    # downloaded weights (test/test_quant.br, test_quant_kquant.br).
+    var [uint8] w2k_packed = []
+    var int row2k = 0
+    while row2k < 2:
+        var int sc2 = 0
+        while sc2 < 16:
+            let v = (sc2 * 11 + row2k * 37) % 256
+            w2k_packed.push(v as uint8)
+            sc2 += 1
+        var int qb2 = 0
+        while qb2 < 64:
+            let v = (qb2 * 17 + row2k * 53) % 256
+            w2k_packed.push(v as uint8)
+            qb2 += 1
+        let d_bits2 = if row2k == 0: 0x3C00 else: 0x4000  # 1.0 / 2.0
+        w2k_packed.push((d_bits2 & 0xFF) as uint8)
+        w2k_packed.push(((d_bits2 >> 8) & 0xFF) as uint8)
+        let dmin_bits2 = 0x3800  # 0.5
+        w2k_packed.push((dmin_bits2 & 0xFF) as uint8)
+        w2k_packed.push(((dmin_bits2 >> 8) & 0xFF) as uint8)
+        row2k += 1
+
+    let cpu_w2k = dequantize_q2_k(w2k_packed, 0, 512)
+    let x2k = [0.5 for i in 0..<256]
+    let b2k = [10.0, 20.0]
+    let cpu_q2k = linear_bias(x2k, cpu_w2k, b2k, 1, 256, 2)
+    let gpu_q2k_raw = q2k_linear_gpu(x2k, w2k_packed, b2k, 1, 256, 2)
+    let gpu_q2k = passthrough(gpu_q2k_raw)
+    assert_close(gpu_q2k[0], cpu_q2k[0], "q2k_linear_gpu[0]")
+    assert_close(gpu_q2k[1], cpu_q2k[1], "q2k_linear_gpu[1]")
+    print "q2k_linear_gpu: OK ({gpu_q2k[0]} {gpu_q2k[1]})"
+
+    # --- q3k_linear_gpu vs. CPU dequantize_q3_k + linear_bias ---
+    # d_in=256 (one Q3_K superblock per row), d_out=2, seq=1. Same
+    # patterned-bytes approach as above — dequantize_q3_k was already
+    # verified against a from-scratch Python oracle and real downloaded
+    # weights (test/test_quant.br, test_quant_kquant.br). This is also the
+    # kernel with the most involved inline logic (re-deriving
+    # q3k_unpack_scales' kmask1/kmask2 bit-twiddling per element instead of
+    # calling it), so a varied byte pattern across hmask/qs/scales matters
+    # most here.
+    var [uint8] w3k_packed = []
+    var int row3k = 0
+    while row3k < 2:
+        var int hm3 = 0
+        while hm3 < 32:
+            let v = (hm3 * 23 + row3k * 41) % 256
+            w3k_packed.push(v as uint8)
+            hm3 += 1
+        var int qb3 = 0
+        while qb3 < 64:
+            let v = (qb3 * 19 + row3k * 61) % 256
+            w3k_packed.push(v as uint8)
+            qb3 += 1
+        var int sb3 = 0
+        while sb3 < 12:
+            let v = (sb3 * 31 + row3k * 71) % 256
+            w3k_packed.push(v as uint8)
+            sb3 += 1
+        let d_bits3 = if row3k == 0: 0x3C00 else: 0x4000  # 1.0 / 2.0
+        w3k_packed.push((d_bits3 & 0xFF) as uint8)
+        w3k_packed.push(((d_bits3 >> 8) & 0xFF) as uint8)
+        row3k += 1
+
+    let cpu_w3k = dequantize_q3_k(w3k_packed, 0, 512)
+    let x3k = [0.5 for i in 0..<256]
+    let b3k = [10.0, 20.0]
+    let cpu_q3k = linear_bias(x3k, cpu_w3k, b3k, 1, 256, 2)
+    let gpu_q3k_raw = q3k_linear_gpu(x3k, w3k_packed, b3k, 1, 256, 2)
+    let gpu_q3k = passthrough(gpu_q3k_raw)
+    assert_close(gpu_q3k[0], cpu_q3k[0], "q3k_linear_gpu[0]")
+    assert_close(gpu_q3k[1], cpu_q3k[1], "q3k_linear_gpu[1]")
+    print "q3k_linear_gpu: OK ({gpu_q3k[0]} {gpu_q3k[1]})"
+
+    # --- q4nl_linear_gpu vs. CPU dequantize_iq4_nl + linear_bias ---
+    # d_in=64 (2 IQ4_NL blocks per row), d_out=2, seq=1. Patterned bytes,
+    # same rationale as q4_linear_gpu's own test above — dequantize_iq4_nl
+    # was already verified against real ggml source in test/test_quant.br,
+    # so it's a trustworthy oracle here; this test's job is to confirm the
+    # kernel's inline 16-way codebook if/elif chain (rather than indexing a
+    # local array from inside the kernel body, an untested pattern here)
+    # agrees with the CPU version element-for-element across every nibble
+    # value 0..15, not just a few hand-picked ones.
+    var [uint8] w4nl_packed = []
+    var int row4nl = 0
+    while row4nl < 2:
+        var int blk4nl = 0
+        while blk4nl < 2:
+            let scale_bits4nl = if row4nl == 0: 0x3C00 else: 0x4000  # 1.0 / 2.0
+            w4nl_packed.push((scale_bits4nl & 0xFF) as uint8)
+            w4nl_packed.push(((scale_bits4nl >> 8) & 0xFF) as uint8)
+            var int nb4nl = 0
+            while nb4nl < 16:
+                # Cycle every nibble value 0..15 through both the low and
+                # high nibble of each byte, offset by block/row so the two
+                # blocks/rows don't repeat the same byte sequence.
+                let lo_nib = (nb4nl + blk4nl * 3 + row4nl * 7) % 16
+                let hi_nib = (nb4nl + blk4nl * 5 + row4nl * 11 + 8) % 16
+                let byte_val = lo_nib | (hi_nib << 4)
+                w4nl_packed.push(byte_val as uint8)
+                nb4nl += 1
+            blk4nl += 1
+        row4nl += 1
+
+    let cpu_w4nl = dequantize_iq4_nl(w4nl_packed, 0, 128)
+    let x4nl = [0.5 for i in 0..<64]
+    let b4nl = [10.0, 20.0]
+    let cpu_q4nl = linear_bias(x4nl, cpu_w4nl, b4nl, 1, 64, 2)
+    let gpu_q4nl_raw = q4nl_linear_gpu(x4nl, w4nl_packed, b4nl, 1, 64, 2)
+    let gpu_q4nl = passthrough(gpu_q4nl_raw)
+    assert_close(gpu_q4nl[0], cpu_q4nl[0], "q4nl_linear_gpu[0]")
+    assert_close(gpu_q4nl[1], cpu_q4nl[1], "q4nl_linear_gpu[1]")
+    print "q4nl_linear_gpu: OK ({gpu_q4nl[0]} {gpu_q4nl[1]})"
+
     print "test_math_gpu_real: all assertions passed"

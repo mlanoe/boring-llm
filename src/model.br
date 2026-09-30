@@ -155,14 +155,22 @@ pub [float32] load_tensor_f32(GgufFile file, string name) throws:
             result[i] = f16_bits_to_f32(read_u16_le(file.bytes, start + i * 2))
             i += 1
         result
+    elif t.ggml_type == 2:
+        dequantize_q4_0(file.bytes, start, n)
     elif t.ggml_type == 6:
         dequantize_q5_0(file.bytes, start, n)
     elif t.ggml_type == 8:
         dequantize_q8_0(file.bytes, start, n)
+    elif t.ggml_type == 10:
+        dequantize_q2_k(file.bytes, start, n)
+    elif t.ggml_type == 11:
+        dequantize_q3_k(file.bytes, start, n)
     elif t.ggml_type == 12:
         dequantize_q4_k(file.bytes, start, n)
     elif t.ggml_type == 14:
         dequantize_q6_k(file.bytes, start, n)
+    elif t.ggml_type == 20:
+        dequantize_iq4_nl(file.bytes, start, n)
     else:
         throw "load_tensor_f32: unsupported ggml type {ggml_type_name(t.ggml_type)} for tensor '{name}'"
 

@@ -356,6 +356,7 @@ pub string ggml_type_name(int t):
     elif t == 13: "Q5_K"
     elif t == 14: "Q6_K"
     elif t == 15: "Q8_K"
+    elif t == 20: "IQ4_NL"
     elif t == 24: "I8"
     elif t == 25: "I16"
     elif t == 26: "I32"

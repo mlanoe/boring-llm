@@ -1,12 +1,20 @@
-# Cross-checks src/quant.br's Q5_0/Q6_K/Q4_K dequantization against real
-# superblock bytes extracted directly from the real Qwen2.5-0.5B-Instruct
-# Q4_K_M GGUF file (via Python's `gguf` package's own `dequantize()` as
-# ground truth — see the plan's own convention of using that package as an
-# independent oracle, not a from-scratch reimplementation sharing any code
-# with this project's parser). Much stronger than a hand-built synthetic
-# block alone (also present in test_quant.br for the simpler Q8_0 format):
-# this proves the bit-unpacking matches real, production-quantized data,
-# not just an internally-consistent round-trip.
+# Cross-checks src/quant.br's Q5_0/Q6_K/Q4_K/Q3_K/IQ4_NL dequantization
+# against real superblock/block bytes extracted directly from real
+# Qwen2.5-0.5B-Instruct GGUF files (Q5_0/Q6_K/Q4_K from the Q4_K_M file,
+# Q3_K and IQ4_NL from the Q2_K file's own real `blk.0.ffn_down.weight`/
+# `blk.0.ffn_gate.weight` tensors — llama.cpp's own quantization
+# heuristics for this small model turn out not to use any pure Q2_K-typed
+# tensor at all in the "Q2_K" preset, only Q3_K/Q5_0/IQ4_NL/Q8_0/F32; see
+# quant.br's own Q2_K doc note on this) via Python's `gguf` package's own
+# `dequantize()` as ground truth — see the plan's own convention of using
+# that package as an independent oracle, not a from-scratch
+# reimplementation sharing any code with this project's parser. Much
+# stronger than a hand-built synthetic block alone (also present in
+# test_quant.br for Q8_0/Q4_0/IQ4_NL, and for Q2_K/Q3_K cross-checked
+# against an independent Python port instead, since no real Q2_K-typed
+# tensor was found to extract): this proves the bit-unpacking matches
+# real, production-quantized data, not just an internally-consistent
+# round-trip.
 #
 # Run with:
 #   boring run test/test_quant_kquant.br
@@ -18,6 +26,17 @@ def assert_close(float32 a, float32 b, string msg):
     assert(diff < 0.001 as float32, "{msg}: expected ~{b}, got {a}")
 
 def main() throws:
+    # --- Q4_0: first block of token_embd.weight, real Q4_0-preset file ---
+    let q4_0_bytes = [0x38 as uint8, 0x9D as uint8, 0xCA as uint8, 0x50 as uint8, 0x76 as uint8, 0x78 as uint8, 0xAD as uint8, 0x79 as uint8, 0x68 as uint8, 0x3C as uint8, 0x42 as uint8, 0x59 as uint8, 0xD9 as uint8, 0xAB as uint8, 0x55 as uint8, 0x38 as uint8, 0x7E as uint8, 0x89 as uint8]
+    let q4_0_expected = [-0.010193, 0.040771, 0.010193, -0.0, -0.025482, -0.005096, -0.0, -0.020386, 0.030579, -0.005096, -0.005096, -0.015289, 0.015289, -0.0, -0.030579, -0.005096, -0.020386, 0.015289, 0.005096, 0.005096, -0.010193, 0.005096, 0.010193, 0.025482, 0.020386, 0.015289, -0.025482, -0.010193, 0.015289, 0.025482, 0.005096, -0.0]
+    let q4_0_out = dequantize_q4_0(q4_0_bytes, 0, 32)
+    assert_eq(q4_0_out.length, 32)
+    var i4 = 0
+    while i4 < q4_0_expected.length:
+        assert_close(q4_0_out[i4], q4_0_expected[i4] as float32, "q4_0[{i4}]")
+        i4 += 1
+    print "dequantize_q4_0: OK (32/32 values match real GGUF data)"
+
     # --- Q5_0: first block of token_embd.weight ---
     let q5_bytes = [0x38 as uint8, 0x99 as uint8, 0xF9 as uint8, 0xEE as uint8, 0x11 as uint8, 0x8C as uint8, 0x84 as uint8, 0x90 as uint8, 0xFC as uint8, 0xF0 as uint8, 0x5B as uint8, 0xE1 as uint8, 0xC0 as uint8, 0x68 as uint8, 0x75 as uint8, 0xA3 as uint8, 0x93 as uint8, 0x56 as uint8, 0x9A as uint8, 0x60 as uint8, 0xDB as uint8, 0x11 as uint8]
     let q5_expected = [-0.010193, 0.040771, 0.010193, -0.0, -0.02803, -0.002548, -0.0, -0.020386, 0.02803, -0.007645, -0.007645, -0.015289, 0.015289, -0.0, -0.02803, -0.002548, -0.020386, 0.017838, 0.002548, 0.002548, -0.012741, 0.005096, 0.010193, 0.025482, 0.022934, 0.015289, -0.022934, -0.012741, 0.017838, 0.025482, 0.007645, -0.002548]
@@ -50,5 +69,31 @@ def main() throws:
         assert_close(q4_out[i], q4_expected[i] as float32, "q4_k[{i}]")
         i += 1
     print "dequantize_q4_k: OK (first 40/256 values match real GGUF data)"
+
+    # --- Q3_K: first block of blk.0.ffn_down.weight, real Q2_K-preset file
+    # (first 40 of 256) ---
+    let q3_bytes = [0xBF as uint8, 0xDC as uint8, 0x9E as uint8, 0x0A as uint8, 0x77 as uint8, 0x4D as uint8, 0x9B as uint8, 0xDB as uint8, 0xBC as uint8, 0xE5 as uint8, 0x7E as uint8, 0x18 as uint8, 0x31 as uint8, 0x9D as uint8, 0x9D as uint8, 0x6E as uint8, 0xF9 as uint8, 0x97 as uint8, 0x75 as uint8, 0xBE as uint8, 0x36 as uint8, 0x9E as uint8, 0x00 as uint8, 0xFE as uint8, 0xF2 as uint8, 0xE5 as uint8, 0x2E as uint8, 0xD9 as uint8, 0xF5 as uint8, 0x6D as uint8, 0xE6 as uint8, 0x58 as uint8, 0x45 as uint8, 0x17 as uint8, 0x00 as uint8, 0x27 as uint8, 0xC5 as uint8, 0x49 as uint8, 0x0B as uint8, 0x30 as uint8, 0x17 as uint8, 0x08 as uint8, 0x13 as uint8, 0x30 as uint8, 0xFD as uint8, 0x0C as uint8, 0x4E as uint8, 0x5D as uint8, 0x0C as uint8, 0xC6 as uint8, 0xDB as uint8, 0x51 as uint8, 0xDB as uint8, 0x52 as uint8, 0xDE as uint8, 0x1B as uint8, 0xD7 as uint8, 0x80 as uint8, 0x73 as uint8, 0x06 as uint8, 0x15 as uint8, 0x55 as uint8, 0xCD as uint8, 0x14 as uint8, 0x24 as uint8, 0xCC as uint8, 0x30 as uint8, 0x48 as uint8, 0x83 as uint8, 0x8B as uint8, 0xB5 as uint8, 0x0C as uint8, 0x26 as uint8, 0x47 as uint8, 0x85 as uint8, 0xFD as uint8, 0xA4 as uint8, 0x79 as uint8, 0x3D as uint8, 0x06 as uint8, 0x09 as uint8, 0xCC as uint8, 0xC6 as uint8, 0xB0 as uint8, 0xC1 as uint8, 0xFD as uint8, 0xF3 as uint8, 0xD0 as uint8, 0x80 as uint8, 0xB2 as uint8, 0xA2 as uint8, 0x0D as uint8, 0x52 as uint8, 0x94 as uint8, 0xC3 as uint8, 0x1C as uint8, 0x4C as uint8, 0xE7 as uint8, 0x50 as uint8, 0x07 as uint8, 0xB5 as uint8, 0xB4 as uint8, 0x3B as uint8, 0xA2 as uint8, 0x32 as uint8, 0x25 as uint8, 0x5D as uint8, 0x8E as uint8, 0xA3 as uint8, 0x90 as uint8]
+    let q3_expected = [-0.006792, 0.006792, 0.027168, 0.006792, -0.006792, -0.006792, -0.020376, -0.0, 0.006792, -0.0, 0.006792, 0.027168, -0.006792, -0.0, -0.013584, 0.020376, 0.0, 0.010188, 0.015282, -0.015282, -0.005094, -0.010188, -0.010188, -0.005094, -0.005094, 0.0, -0.005094, 0.010188, 0.005094, 0.005094, -0.015282, -0.020376, 0.009056, -0.027168, 0.0, 0.009056, 0.009056, -0.018112, 0.018112, 0.0]
+    let q3_out = dequantize_q3_k(q3_bytes, 0, 256)
+    assert_eq(q3_out.length, 256)
+    i = 0
+    while i < q3_expected.length:
+        assert_close(q3_out[i], q3_expected[i] as float32, "q3_k[{i}]")
+        i += 1
+    print "dequantize_q3_k: OK (first 40/256 values match real GGUF data)"
+
+    # --- IQ4_NL: first two blocks of blk.0.ffn_gate.weight, real Q2_K-preset
+    # file (first 8 of block 0, first 8 of block 1) ---
+    let iq4nl_bytes = [0x06 as uint8, 0x8B as uint8, 0x7D as uint8, 0x04 as uint8, 0xB9 as uint8, 0xC3 as uint8, 0x16 as uint8, 0x63 as uint8, 0x54 as uint8, 0x49 as uint8, 0x9B as uint8, 0xB8 as uint8, 0x66 as uint8, 0x84 as uint8, 0xE4 as uint8, 0x6A as uint8, 0xC5 as uint8, 0xB2 as uint8, 0x7C as uint8, 0x8D as uint8, 0x86 as uint8, 0x67 as uint8, 0xD9 as uint8, 0x50 as uint8, 0x83 as uint8, 0xAB as uint8, 0x44 as uint8, 0xA4 as uint8, 0x48 as uint8, 0x9A as uint8, 0xD5 as uint8, 0xA6 as uint8, 0x8A as uint8, 0x42 as uint8, 0xA8 as uint8, 0xAB as uint8]
+    let iq4nl_expected_first8 = [-0.014789, 0.010503, -0.002786, 0.013932, 0.004715, 0.013932, 0.010503, -0.002786]
+    let iq4nl_expected_second8 = [0.007364, 0.003347, -0.004352, 0.042512, 0.021758, -0.012720, 0.016402, 0.016402]
+    let iq4nl_out = dequantize_iq4_nl(iq4nl_bytes, 0, 64)
+    assert_eq(iq4nl_out.length, 64)
+    i = 0
+    while i < 8:
+        assert_close(iq4nl_out[i], iq4nl_expected_first8[i] as float32, "iq4_nl[{i}]")
+        assert_close(iq4nl_out[32 + i], iq4nl_expected_second8[i] as float32, "iq4_nl[{32 + i}]")
+        i += 1
+    print "dequantize_iq4_nl: OK (first 8/32 of 2 real blocks match real GGUF data)"
 
     print "test_quant_kquant: all assertions passed"

@@ -896,6 +896,453 @@ pub req [float32]'gpu'unified q4k_linear_nobias_gpu([float32] x, [uint8] w_packe
     let [float32] zero_bias = [0.0 for i in 0..<d_out]
     q4k_linear_gpu(x, w_packed, zero_bias, seq, d_in, d_out)
 
+# ── Kernel: Q4_0 fused-dequant linear layer ──────────────────────────────
+# Same 16x16-tiled GEMM shape as the other fused kernels above, weight
+# arrives as raw Q4_0-packed bytes (GGUF's block_q4_0: 2-byte f16 scale `d`
+# + 16 bytes `qs` 4-bit unsigned nibbles, 2 values/byte, low nibble first,
+# 18 bytes/block, QK4_0=32 — mirrors quant.br's CPU dequantize_q4_0
+# element-for-element). Reconstructed value is the nibble offset by -8
+# (symmetric around 0, no separate min) then scaled by `d` — the simplest
+# of the fused kernels here, same shape as Q5LinearKernel's own but with no
+# `qh` high-bit field to unpack. Dequant inlined directly in the tile-load
+# step, same reason as every other fused kernel here (kernel-body helper
+# methods and array-param free functions both mis-emit on the Metal
+# backend today).
+kernel Q4LinearKernel:
+    let [float32]'global  x           # (seq × d_in)
+    let [uint8]'global    w_packed    # (d_out × d_in) Q4_0-packed, GGUF's native layout
+    let [float32]'global  bv          # (d_out,)
+    mut [float32]'unified y           # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    mut [float32, width = 16, height = 16]'actor tile_x
+    mut [float32, width = 16, height = 16]'actor tile_w
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout):
+        x        = xi
+        w_packed = wi
+        bv       = bi
+        seq      = s
+        d_in     = din
+        d_out    = dout
+        y        = [0.0 for ..<s * dout]
+
+    def ():
+        let tx = gpu.thread.x
+        let ty = gpu.thread.y
+        let row = gpu.block.y * gpu.block_dim.y + ty
+        let col = gpu.block.x * gpu.block_dim.x + tx
+        var float32 acc = 0.0
+        let num_tiles = (d_in + 15) / 16
+        for t in 0..<num_tiles:
+            let x_col = t * 16 + tx
+            let w_row = t * 16 + ty
+            if row < seq and x_col < d_in:
+                tile_x[width = tx, height = ty] = x[row * d_in + x_col]
+            else:
+                tile_x[width = tx, height = ty] = 0.0
+            if w_row < d_in and col < d_out:
+                let flat_idx = col * d_in + w_row
+                let block_idx = flat_idx / 32
+                let offset_in_block = flat_idx % 32
+                let block_byte = block_idx * 18
+                let scale_bits = int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8)
+                let w_scale = f16_bits_to_f32(scale_bits)
+                let qs_base = block_byte + 2
+                let j = if offset_in_block < 16: offset_in_block else: offset_in_block - 16
+                let byte_val = int(w_packed[qs_base + j])
+                let nib = if offset_in_block < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
+                let qv = nib - 8
+                let qf = qv as float32
+                tile_w[width = tx, height = ty] = qf * w_scale
+            else:
+                tile_w[width = tx, height = ty] = 0.0
+            sync
+            for kk in 0..<16:
+                acc += tile_x[width = kk, height = ty] * tile_w[width = tx, height = kk]
+            sync
+        if row < seq and col < d_out:
+            y[row * d_out + col] = acc + bv[col]
+
+pub req [float32]'gpu'unified q4_linear_gpu([float32]'global x, [uint8]'global w_packed,
+                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 32 == 0 else throw "q4_linear_gpu: d_in ({d_in}) must be a multiple of 32"
+    let int gx = (d_out + 15) / 16
+    let int gy = (seq + 15) / 16
+    mut k = Q4LinearKernel(x, w_packed, bv, seq, d_in, d_out)
+    kernel:
+        k(block = (16, 16), grid = (gx, gy))
+    k.y
+
+pub req [float32]'gpu'unified q4_linear_nobias_gpu([float32] x, [uint8] w_packed,
+                       int seq, int d_in, int d_out) throws:
+    let [float32] zero_bias = [0.0 for i in 0..<d_out]
+    q4_linear_gpu(x, w_packed, zero_bias, seq, d_in, d_out)
+
+# ── Kernel: Q2_K fused-dequant linear layer ──────────────────────────────
+# Same 16x16-tiled GEMM shape as Q4K/Q6K above, weight arrives as raw
+# Q2_K-packed bytes (GGUF's block_q2_K superblock: 256 elements/superblock,
+# 84 bytes — 16 bytes `scales` (one byte per 16-element sub-block, low
+# nibble = 4-bit scale, high nibble = 4-bit min) + 64 bytes `qs` (2-bit
+# values, 4/byte) + 2-byte f16 super-block scale `d` + 2-byte f16
+# super-block min `dmin`). For a single arbitrary flat element index, this
+# re-derives which of the 16 sub-blocks (and which bit-shift within its
+# packed 2-bit `qs` byte) it falls in — the inverse of quant.br's CPU
+# dequantize_q2_k, which instead walks every element of a superblock in its
+# own nested-loop order (2 halves × 4 sub-block-pairs × 16 elements); both
+# must agree element-for-element (verified in test/test_math_gpu_real.br).
+# Dequant inlined directly in the tile-load step, same reason as every
+# other fused kernel here.
+kernel Q2KLinearKernel:
+    let [float32]'global  x           # (seq × d_in)
+    let [uint8]'global    w_packed    # (d_out × d_in) Q2_K-packed, GGUF's native layout
+    let [float32]'global  bv          # (d_out,)
+    mut [float32]'unified y           # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    mut [float32, width = 16, height = 16]'actor tile_x
+    mut [float32, width = 16, height = 16]'actor tile_w
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout):
+        x        = xi
+        w_packed = wi
+        bv       = bi
+        seq      = s
+        d_in     = din
+        d_out    = dout
+        y        = [0.0 for ..<s * dout]
+
+    def ():
+        let tx = gpu.thread.x
+        let ty = gpu.thread.y
+        let row = gpu.block.y * gpu.block_dim.y + ty
+        let col = gpu.block.x * gpu.block_dim.x + tx
+        var float32 acc = 0.0
+        let num_tiles = (d_in + 15) / 16
+        for t in 0..<num_tiles:
+            let x_col = t * 16 + tx
+            let w_row = t * 16 + ty
+            if row < seq and x_col < d_in:
+                tile_x[width = tx, height = ty] = x[row * d_in + x_col]
+            else:
+                tile_x[width = tx, height = ty] = 0.0
+            if w_row < d_in and col < d_out:
+                let flat_idx = col * d_in + w_row
+                let sb = flat_idx / 256
+                let pos = flat_idx % 256
+                let sb_start = sb * 84
+                # (outer, j, sub, l) is the inverse of the CPU loop's
+                # half/j/sub0-or-sub1/l nesting: pos == outer*128 + j*32 +
+                # sub*16 + l.
+                let outer = pos / 128
+                let rem = pos % 128
+                let j = rem / 32
+                let l32 = rem % 32
+                let sub = l32 / 16
+                let l = l32 % 16
+
+                let scales_base = sb_start
+                let qs_base = sb_start + 16
+                let d_bits = int(w_packed[sb_start + 80]) | (int(w_packed[sb_start + 81]) << 8)
+                let d_scale = f16_bits_to_f32(d_bits)
+                let dmin_bits = int(w_packed[sb_start + 82]) | (int(w_packed[sb_start + 83]) << 8)
+                let d_min = f16_bits_to_f32(dmin_bits)
+
+                let scale_idx = outer * 8 + j * 2 + sub
+                let sc_byte = int(w_packed[scales_base + scale_idx])
+                let dl = d_scale * ((sc_byte & 0xF) as float32)
+                let ml = d_min * ((sc_byte >> 4) as float32)
+
+                let q_base = qs_base + outer * 32
+                let shift = j * 2
+                let byte_pos = q_base + sub * 16 + l
+                let qv = (int(w_packed[byte_pos]) >> shift) & 3
+
+                let wf = dl * (qv as float32) - ml
+                tile_w[width = tx, height = ty] = wf
+            else:
+                tile_w[width = tx, height = ty] = 0.0
+            sync
+            for kk in 0..<16:
+                acc += tile_x[width = kk, height = ty] * tile_w[width = tx, height = kk]
+            sync
+        if row < seq and col < d_out:
+            y[row * d_out + col] = acc + bv[col]
+
+pub req [float32]'gpu'unified q2k_linear_gpu([float32]'global x, [uint8]'global w_packed,
+                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 256 == 0 else throw "q2k_linear_gpu: d_in ({d_in}) must be a multiple of 256"
+    let int gx = (d_out + 15) / 16
+    let int gy = (seq + 15) / 16
+    mut k = Q2KLinearKernel(x, w_packed, bv, seq, d_in, d_out)
+    kernel:
+        k(block = (16, 16), grid = (gx, gy))
+    k.y
+
+pub req [float32]'gpu'unified q2k_linear_nobias_gpu([float32] x, [uint8] w_packed,
+                       int seq, int d_in, int d_out) throws:
+    let [float32] zero_bias = [0.0 for i in 0..<d_out]
+    q2k_linear_gpu(x, w_packed, zero_bias, seq, d_in, d_out)
+
+# ── Kernel: Q3_K fused-dequant linear layer ──────────────────────────────
+# Same 16x16-tiled GEMM shape as the other superblock kernels above, weight
+# arrives as raw Q3_K-packed bytes (GGUF's block_q3_K superblock: 256
+# elements/superblock, 110 bytes — 32 bytes `hmask` (high 3rd bit, 1
+# bit/element) + 64 bytes `qs` (low 2 bits, 4/byte) + 12 bytes packed
+# `scales` (16 signed 6-bit sub-block scales) + 2-byte f16 super-block
+# scale `d`). Uses the same (outer, j, sub, l) flat-index decomposition as
+# Q2KLinearKernel above for the `qs`/`hmask` bit position and sub-block
+# index, and re-derives quant.br's `q3k_unpack_scales` bit-twiddling
+# (`kmask1`/`kmask2`) inline for the single scale index this element needs
+# — kernel bodies can't call the array-param/array-return helper directly
+# (same constraint as every other fused kernel here), so all 12 scale bytes
+# are re-read and re-decoded per element rather than cached. Verified
+# element-for-element against quant.br's CPU dequantize_q3_k in
+# test/test_math_gpu_real.br.
+kernel Q3KLinearKernel:
+    let [float32]'global  x           # (seq × d_in)
+    let [uint8]'global    w_packed    # (d_out × d_in) Q3_K-packed, GGUF's native layout
+    let [float32]'global  bv          # (d_out,)
+    mut [float32]'unified y           # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    mut [float32, width = 16, height = 16]'actor tile_x
+    mut [float32, width = 16, height = 16]'actor tile_w
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout):
+        x        = xi
+        w_packed = wi
+        bv       = bi
+        seq      = s
+        d_in     = din
+        d_out    = dout
+        y        = [0.0 for ..<s * dout]
+
+    def ():
+        let tx = gpu.thread.x
+        let ty = gpu.thread.y
+        let row = gpu.block.y * gpu.block_dim.y + ty
+        let col = gpu.block.x * gpu.block_dim.x + tx
+        var float32 acc = 0.0
+        let num_tiles = (d_in + 15) / 16
+        for t in 0..<num_tiles:
+            let x_col = t * 16 + tx
+            let w_row = t * 16 + ty
+            if row < seq and x_col < d_in:
+                tile_x[width = tx, height = ty] = x[row * d_in + x_col]
+            else:
+                tile_x[width = tx, height = ty] = 0.0
+            if w_row < d_in and col < d_out:
+                let flat_idx = col * d_in + w_row
+                let sb = flat_idx / 256
+                let pos = flat_idx % 256
+                let sb_start = sb * 110
+                let outer = pos / 128
+                let rem = pos % 128
+                let j = rem / 32
+                let l32 = rem % 32
+                let sub = l32 / 16
+                let l = l32 % 16
+
+                let hmask_base = sb_start
+                let qs_base = sb_start + 32
+                let scales_base = sb_start + 96
+                let d_bits = int(w_packed[sb_start + 108]) | (int(w_packed[sb_start + 109]) << 8)
+                let d_all = f16_bits_to_f32(d_bits)
+
+                let a0 = int(w_packed[scales_base])
+                let a1 = int(w_packed[scales_base + 1])
+                let a2 = int(w_packed[scales_base + 2])
+                let a3 = int(w_packed[scales_base + 3])
+                let aux0_in = a0 | (a1 << 8) | (a2 << 16) | (a3 << 24)
+                let b0 = int(w_packed[scales_base + 4])
+                let b1 = int(w_packed[scales_base + 5])
+                let b2 = int(w_packed[scales_base + 6])
+                let b3 = int(w_packed[scales_base + 7])
+                let aux1_in = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+                let c0 = int(w_packed[scales_base + 8])
+                let c1 = int(w_packed[scales_base + 9])
+                let c2 = int(w_packed[scales_base + 10])
+                let c3 = int(w_packed[scales_base + 11])
+                let tmp = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24)
+                let kmask1 = 0x03030303
+                let kmask2 = 0x0f0f0f0f
+
+                let scale_idx = outer * 8 + j * 2 + sub
+                let sw = scale_idx / 4
+                let sbp = scale_idx % 4
+                let word = if sw == 0:
+                    (aux0_in & kmask2) | (((tmp >> 0) & kmask1) << 4)
+                elif sw == 1:
+                    (aux1_in & kmask2) | (((tmp >> 2) & kmask1) << 4)
+                elif sw == 2:
+                    ((aux0_in >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4)
+                else:
+                    ((aux1_in >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4)
+                let raw = (word >> (8 * sbp)) & 0xFF
+                let sc = if raw > 127: raw - 256 else: raw
+                let dl = d_all * ((sc - 32) as float32)
+
+                let q_base = qs_base + outer * 32
+                let shift = j * 2
+                let byte_pos = q_base + sub * 16 + l
+                let qv = (int(w_packed[byte_pos]) >> shift) & 3
+
+                let m = 1 << (outer * 4 + j)
+                let hmask_byte_pos = hmask_base + sub * 16 + l
+                let hbit = int(w_packed[hmask_byte_pos]) & m
+                let hi_off = if hbit != 0: 0 else: 4
+
+                let wf = dl * ((qv - hi_off) as float32)
+                tile_w[width = tx, height = ty] = wf
+            else:
+                tile_w[width = tx, height = ty] = 0.0
+            sync
+            for kk in 0..<16:
+                acc += tile_x[width = kk, height = ty] * tile_w[width = tx, height = kk]
+            sync
+        if row < seq and col < d_out:
+            y[row * d_out + col] = acc + bv[col]
+
+pub req [float32]'gpu'unified q3k_linear_gpu([float32]'global x, [uint8]'global w_packed,
+                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 256 == 0 else throw "q3k_linear_gpu: d_in ({d_in}) must be a multiple of 256"
+    let int gx = (d_out + 15) / 16
+    let int gy = (seq + 15) / 16
+    mut k = Q3KLinearKernel(x, w_packed, bv, seq, d_in, d_out)
+    kernel:
+        k(block = (16, 16), grid = (gx, gy))
+    k.y
+
+pub req [float32]'gpu'unified q3k_linear_nobias_gpu([float32] x, [uint8] w_packed,
+                       int seq, int d_in, int d_out) throws:
+    let [float32] zero_bias = [0.0 for i in 0..<d_out]
+    q3k_linear_gpu(x, w_packed, zero_bias, seq, d_in, d_out)
+
+# ── Kernel: IQ4_NL fused-dequant linear layer ────────────────────────────
+# Same 16x16-tiled GEMM shape and block size as Q4LinearKernel above (GGUF's
+# block_iq4_nl: 2-byte f16 scale `d` + 16 bytes `qs` 4-bit nibbles, 18
+# bytes/block, QK4_NL=32 — mirrors quant.br's CPU dequantize_iq4_nl
+# element-for-element), but the 4-bit value is a CODEBOOK INDEX rather than
+# a linear offset — it looks up one of 16 fixed, non-linearly-spaced
+# values (ggml's own `kvalues_iq4nl` table) instead of computing
+# `nibble - 8`. `dequantize_iq4_nl`'s CPU version holds that table as a
+# `let [int]` local array, but this kernel inlines it as a 16-way
+# if/elif chain instead of indexing a local array from inside the kernel
+# body — an untested pattern here, unlike every other fused kernel's
+# inline scalar arithmetic (already known-safe); the if/elif chain stays
+# within the same "scalar-only logic inlined in the tile-load step"
+# territory the other kernels already rely on.
+kernel Q4NLLinearKernel:
+    let [float32]'global  x           # (seq × d_in)
+    let [uint8]'global    w_packed    # (d_out × d_in) IQ4_NL-packed, GGUF's native layout
+    let [float32]'global  bv          # (d_out,)
+    mut [float32]'unified y           # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    mut [float32, width = 16, height = 16]'actor tile_x
+    mut [float32, width = 16, height = 16]'actor tile_w
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout):
+        x        = xi
+        w_packed = wi
+        bv       = bi
+        seq      = s
+        d_in     = din
+        d_out    = dout
+        y        = [0.0 for ..<s * dout]
+
+    def ():
+        let tx = gpu.thread.x
+        let ty = gpu.thread.y
+        let row = gpu.block.y * gpu.block_dim.y + ty
+        let col = gpu.block.x * gpu.block_dim.x + tx
+        var float32 acc = 0.0
+        let num_tiles = (d_in + 15) / 16
+        for t in 0..<num_tiles:
+            let x_col = t * 16 + tx
+            let w_row = t * 16 + ty
+            if row < seq and x_col < d_in:
+                tile_x[width = tx, height = ty] = x[row * d_in + x_col]
+            else:
+                tile_x[width = tx, height = ty] = 0.0
+            if w_row < d_in and col < d_out:
+                let flat_idx = col * d_in + w_row
+                let block_idx = flat_idx / 32
+                let offset_in_block = flat_idx % 32
+                let block_byte = block_idx * 18
+                let scale_bits = int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8)
+                let w_scale = f16_bits_to_f32(scale_bits)
+                let qs_base = block_byte + 2
+                let j = if offset_in_block < 16: offset_in_block else: offset_in_block - 16
+                let byte_val = int(w_packed[qs_base + j])
+                let nib = if offset_in_block < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
+                let cv = if nib == 0:
+                    -127
+                elif nib == 1:
+                    -104
+                elif nib == 2:
+                    -83
+                elif nib == 3:
+                    -65
+                elif nib == 4:
+                    -49
+                elif nib == 5:
+                    -35
+                elif nib == 6:
+                    -22
+                elif nib == 7:
+                    -10
+                elif nib == 8:
+                    1
+                elif nib == 9:
+                    13
+                elif nib == 10:
+                    25
+                elif nib == 11:
+                    38
+                elif nib == 12:
+                    53
+                elif nib == 13:
+                    69
+                elif nib == 14:
+                    89
+                else:
+                    113
+                let cf = cv as float32
+                tile_w[width = tx, height = ty] = cf * w_scale
+            else:
+                tile_w[width = tx, height = ty] = 0.0
+            sync
+            for kk in 0..<16:
+                acc += tile_x[width = kk, height = ty] * tile_w[width = tx, height = kk]
+            sync
+        if row < seq and col < d_out:
+            y[row * d_out + col] = acc + bv[col]
+
+pub req [float32]'gpu'unified q4nl_linear_gpu([float32]'global x, [uint8]'global w_packed,
+                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 32 == 0 else throw "q4nl_linear_gpu: d_in ({d_in}) must be a multiple of 32"
+    let int gx = (d_out + 15) / 16
+    let int gy = (seq + 15) / 16
+    mut k = Q4NLLinearKernel(x, w_packed, bv, seq, d_in, d_out)
+    kernel:
+        k(block = (16, 16), grid = (gx, gy))
+    k.y
+
+pub req [float32]'gpu'unified q4nl_linear_nobias_gpu([float32] x, [uint8] w_packed,
+                       int seq, int d_in, int d_out) throws:
+    let [float32] zero_bias = [0.0 for i in 0..<d_out]
+    q4nl_linear_gpu(x, w_packed, zero_bias, seq, d_in, d_out)
+
 # ── Fused-dequant linear dispatch, by ggml type ──────────────────────────
 # A real quantized GGUF file mixes formats across tensors (e.g. a typical
 # "Q4_K_M" file: attention/FFN-gate/FFN-up projections in Q5_0, attn_v in
@@ -904,7 +1351,8 @@ pub req [float32]'gpu'unified q4k_linear_nobias_gpu([float32] x, [uint8] w_packe
 # QuantLayer/QuantModel carry each weight's own ggml type tag alongside its
 # packed bytes, and every linear-layer call site goes through this
 # dispatcher instead of hardcoding q8_linear_gpu. ggml type ids match
-# gguf.br's ggml_type_name (6=Q5_0, 8=Q8_0, 12=Q4_K, 14=Q6_K).
+# gguf.br's ggml_type_name (2=Q4_0, 6=Q5_0, 8=Q8_0, 10=Q2_K, 11=Q3_K,
+# 12=Q4_K, 14=Q6_K, 20=IQ4_NL).
 pub req [float32]'gpu'unified fused_linear_gpu([float32]'global x, [uint8]'global w_packed, int w_type,
                        [float32]'global bv, int seq, int d_in, int d_out) throws:
     if w_type == 8:
@@ -915,8 +1363,16 @@ pub req [float32]'gpu'unified fused_linear_gpu([float32]'global x, [uint8]'globa
         q4k_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 14:
         q6k_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
+    elif w_type == 2:
+        q4_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
+    elif w_type == 10:
+        q2k_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
+    elif w_type == 11:
+        q3k_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
+    elif w_type == 20:
+        q4nl_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     else:
-        throw "fused_linear_gpu: unsupported ggml type id {w_type} (supported: Q5_0=6, Q8_0=8, Q4_K=12, Q6_K=14)"
+        throw "fused_linear_gpu: unsupported ggml type id {w_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
 
 pub req [float32]'gpu'unified fused_linear_nobias_gpu([float32] x, [uint8] w_packed, int w_type,
                        int seq, int d_in, int d_out) throws:

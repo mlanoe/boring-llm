@@ -32,6 +32,42 @@ pub [float32] dequantize_q8_0([uint8] bytes, int offset, int n_elements) throws:
         b += 1
     result
 
+# Q4_0 block layout (ggml's `block_q4_0`, QK4_0 = 32 elements/block, 18
+# bytes/block: 2-byte f16 scale `d` + 16 bytes `qs` (4-bit unsigned
+# nibbles, 2 values/byte, low nibble first). Reconstructed value is the
+# nibble offset by -8 (symmetric around 0, same idea as Q5_0/Q8_0's own
+# zero-point handling at 4-bit width) then scaled by `d` — no separate
+# min. Ported bit-for-bit from ggml's own `dequantize_row_q4_0`
+# (ggml-quants.c): read directly rather than guessed, same as every other
+# format in this file.
+
+let int QK4_0 = 32
+let int Q4_0_BLOCK_BYTES = 18
+
+pub [float32] dequantize_q4_0([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % QK4_0 == 0 else throw "dequantize_q4_0: n_elements must be a multiple of {QK4_0}, got {n_elements}"
+    var [float32] result = [0.0 for i in 0..<n_elements]
+    let n_blocks = n_elements / QK4_0
+    var int b = 0
+    while b < n_blocks:
+        let blk_start = offset + b * Q4_0_BLOCK_BYTES
+        guard blk_start + Q4_0_BLOCK_BYTES <= bytes.length else throw "dequantize_q4_0: truncated block {b}"
+        let d_bits = read_u16_le(bytes, blk_start)
+        let d = f16_bits_to_f32(d_bits)
+        let qs_base = blk_start + 2
+        let out_base = b * QK4_0
+
+        var int j = 0
+        while j < 16:
+            let byte_val = int(bytes[qs_base + j])
+            let x0 = (byte_val & 0xF) - 8
+            let x1 = (byte_val >> 4) - 8
+            result[out_base + j] = (x0 as float32) * d
+            result[out_base + 16 + j] = (x1 as float32) * d
+            j += 1
+        b += 1
+    result
+
 # Q5_0 block layout (ggml's `block_q5_0`, QK5_0 = 32 elements/block, 22
 # bytes/block: 2-byte f16 scale `d` + 4-byte `qh` (the 5th/high bit of
 # every quantized value, one bit each) + 16 bytes `qs` (4-bit nibbles for
@@ -84,6 +120,184 @@ pub [float32] dequantize_q5_0([uint8] bytes, int offset, int n_elements) throws:
 # porting bit-for-bit from a real, working reference implementation.
 
 let int QK_K = 256
+
+# Q2_K block layout (block_q2_K, 84 bytes/superblock):
+#   16 bytes `scales` (one byte per 16-element sub-block, 16 of them —
+#              low nibble = 4-bit scale, high nibble = 4-bit min)
+#   64 bytes `qs`     (2-bit values, 4/byte)
+#   2 bytes  `d`      (f16 super-block scale for the sub-block scales)
+#   2 bytes  `dmin`   (f16 super-block scale for the sub-block mins)
+# dequantized value = d*scale[sub_block]*qs - dmin*min[sub_block] — same
+# scale/min shape as Q4_K, just 2-bit values and a coarser (4-bit instead
+# of 6-bit) packed scale/min. Ported bit-for-bit from ggml's own
+# `dequantize_row_q2_K` (ggml-quants.c), including its own nested loop
+# shape (two 128-element halves, each split into 4 sub-chunks of 2×16
+# elements) — not simplified to a flat formula, same reasoning as Q6_K/
+# Q4_K above.
+
+let int Q2_K_BLOCK_BYTES = 84
+
+pub [float32] dequantize_q2_k([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % QK_K == 0 else throw "dequantize_q2_k: n_elements must be a multiple of {QK_K}, got {n_elements}"
+    var [float32] result = [0.0 for i in 0..<n_elements]
+    let n_blocks = n_elements / QK_K
+    var int sb = 0
+    while sb < n_blocks:
+        let sb_start = offset + sb * Q2_K_BLOCK_BYTES
+        guard sb_start + Q2_K_BLOCK_BYTES <= bytes.length else throw "dequantize_q2_k: truncated block {sb}"
+        let scales_base = sb_start
+        let qs_base = sb_start + 16
+        let d_bits = read_u16_le(bytes, sb_start + 80)
+        let d = f16_bits_to_f32(d_bits)
+        let dmin_bits = read_u16_le(bytes, sb_start + 82)
+        let dmin = f16_bits_to_f32(dmin_bits)
+        let out_base = sb * QK_K
+
+        var int scale_idx = 0
+        var int half = 0
+        while half < 2:
+            let q_base = qs_base + half * 32
+            var int shift = 0
+            var int j = 0
+            while j < 4:
+                let sc0 = int(bytes[scales_base + scale_idx])
+                scale_idx += 1
+                let dl0 = d * ((sc0 & 0xF) as float32)
+                let ml0 = dmin * ((sc0 >> 4) as float32)
+                var int l = 0
+                while l < 16:
+                    let qv = (int(bytes[q_base + l]) >> shift) & 3
+                    result[out_base + half * 128 + j * 32 + l] = dl0 * (qv as float32) - ml0
+                    l += 1
+
+                let sc1 = int(bytes[scales_base + scale_idx])
+                scale_idx += 1
+                let dl1 = d * ((sc1 & 0xF) as float32)
+                let ml1 = dmin * ((sc1 >> 4) as float32)
+                l = 0
+                while l < 16:
+                    let qv = (int(bytes[q_base + 16 + l]) >> shift) & 3
+                    result[out_base + half * 128 + j * 32 + 16 + l] = dl1 * (qv as float32) - ml1
+                    l += 1
+
+                shift += 2
+                j += 1
+            half += 1
+        sb += 1
+    result
+
+# Q3_K block layout (block_q3_K, 110 bytes/superblock):
+#   32 bytes `hmask`  (high (3rd) bit of every 3-bit value, 1 bit/element)
+#   64 bytes `qs`     (low 2 bits of every value, 4/byte)
+#   12 bytes `scales` (16 sub-block signed 6-bit scales, packed — see
+#              `q3k_unpack_scales` below)
+#   2 bytes  `d`      (f16 super-block scale)
+# dequantized value = d*(scale[sub_block]-32)*(3-bit signed value), where
+# the 3-bit value reassembles the 2 `qs` bits plus `hmask`'s inverted high
+# bit: `((qs>>shift)&3) - (0 if hmask bit set else 4)` — ggml's own
+# convention (no separate min; the 3-bit range is made signed via this
+# fixed -4 offset instead). Ported bit-for-bit from ggml's own
+# `dequantize_row_q3_K` (ggml-quants.c).
+
+let int Q3_K_BLOCK_BYTES = 110
+
+# Unpacks the 12-byte packed `scales` field into 16 signed 6-bit scales
+# (still offset by +32, per ggml's own convention — the caller subtracts
+# 32). Ports ggml's own 32-bit-word bit-twiddling (`kmask1`/`kmask2`)
+# byte-for-byte: reconstructs the same 4 little-endian 32-bit words ggml
+# computes from the 12 raw bytes, then reads back each of their 16
+# constituent bytes as a signed int8 — no simpler byte-level formula
+# exists for this packing scheme, ported directly rather than guessed at.
+[int] q3k_unpack_scales([uint8] bytes, int scales_base):
+    let a0 = int(bytes[scales_base])
+    let a1 = int(bytes[scales_base + 1])
+    let a2 = int(bytes[scales_base + 2])
+    let a3 = int(bytes[scales_base + 3])
+    let aux0_in = a0 | (a1 << 8) | (a2 << 16) | (a3 << 24)
+    let b0 = int(bytes[scales_base + 4])
+    let b1 = int(bytes[scales_base + 5])
+    let b2 = int(bytes[scales_base + 6])
+    let b3 = int(bytes[scales_base + 7])
+    let aux1_in = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    let c0 = int(bytes[scales_base + 8])
+    let c1 = int(bytes[scales_base + 9])
+    let c2 = int(bytes[scales_base + 10])
+    let c3 = int(bytes[scales_base + 11])
+    let tmp = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24)
+
+    let kmask1 = 0x03030303
+    let kmask2 = 0x0f0f0f0f
+
+    let aux0 = (aux0_in & kmask2) | (((tmp >> 0) & kmask1) << 4)
+    let aux1 = (aux1_in & kmask2) | (((tmp >> 2) & kmask1) << 4)
+    let aux2 = ((aux0_in >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4)
+    let aux3 = ((aux1_in >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4)
+
+    var [int] scales = [0 for i in 0..<16]
+    var int w = 0
+    while w < 4:
+        let word = if w == 0: aux0 elif w == 1: aux1 elif w == 2: aux2 else: aux3
+        var int bp = 0
+        while bp < 4:
+            let raw = (word >> (8 * bp)) & 0xFF
+            scales[w * 4 + bp] = if raw > 127: raw - 256 else: raw
+            bp += 1
+        w += 1
+    scales
+
+pub [float32] dequantize_q3_k([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % QK_K == 0 else throw "dequantize_q3_k: n_elements must be a multiple of {QK_K}, got {n_elements}"
+    var [float32] result = [0.0 for i in 0..<n_elements]
+    let n_blocks = n_elements / QK_K
+    var int sb = 0
+    while sb < n_blocks:
+        let sb_start = offset + sb * Q3_K_BLOCK_BYTES
+        guard sb_start + Q3_K_BLOCK_BYTES <= bytes.length else throw "dequantize_q3_k: truncated block {sb}"
+        let hmask_base = sb_start
+        let qs_base = sb_start + 32
+        let scales_base = sb_start + 96
+        let d_bits = read_u16_le(bytes, sb_start + 108)
+        let d_all = f16_bits_to_f32(d_bits)
+        let out_base = sb * QK_K
+
+        let scales = q3k_unpack_scales(bytes, scales_base)
+
+        var int scale_idx = 0
+        var int half = 0
+        while half < 2:
+            let q_base = qs_base + half * 32
+            var int shift = 0
+            var int j = 0
+            while j < 4:
+                let m = 1 << (half * 4 + j)
+
+                let sc0 = scales[scale_idx]
+                scale_idx += 1
+                let dl0 = d_all * ((sc0 - 32) as float32)
+                var int l = 0
+                while l < 16:
+                    let qv = (int(bytes[q_base + l]) >> shift) & 3
+                    let hbit = int(bytes[hmask_base + l]) & m
+                    let hi_off = if hbit != 0: 0 else: 4
+                    result[out_base + half * 128 + j * 32 + l] = dl0 * ((qv - hi_off) as float32)
+                    l += 1
+
+                let sc1 = scales[scale_idx]
+                scale_idx += 1
+                let dl1 = d_all * ((sc1 - 32) as float32)
+                l = 0
+                while l < 16:
+                    let qv = (int(bytes[q_base + 16 + l]) >> shift) & 3
+                    let hbit = int(bytes[hmask_base + 16 + l]) & m
+                    let hi_off = if hbit != 0: 0 else: 4
+                    result[out_base + half * 128 + j * 32 + 16 + l] = dl1 * ((qv - hi_off) as float32)
+                    l += 1
+
+                shift += 2
+                j += 1
+            half += 1
+        sb += 1
+    result
 
 # Q6_K block layout (block_q6_K, 210 bytes/superblock):
 #   128 bytes `ql` (low 4 bits, 2 values/byte)
@@ -172,37 +386,101 @@ let int K_SCALE_SIZE = 12
         let mn = (int(bytes[scales_base + j + 4]) >> 4) | ((int(bytes[scales_base + j]) >> 6) << 4)
         (sc, mn)
 
+# IQ4_NL block layout (block_iq4_nl, 18 bytes/block, QK4_NL = 32 elements —
+# same size as Q4_0, but a fundamentally different encoding): 2-byte f16
+# scale `d` + 16 bytes `qs` (4-bit codebook INDICES, 2/byte, low nibble
+# first). Unlike every other format above, the 4-bit value isn't a linear
+# offset (nibble - 8, nibble*scale, ...) — it indexes a fixed 16-entry
+# non-linear codebook (`kvalues_iq4nl` in ggml's own `ggml-common.h`,
+# hand-tuned to minimize quantization error, not derived from a formula).
+# Ported bit-for-bit from ggml's own `dequantize_row_iq4_nl`
+# (ggml-quants.c) and its codebook table (ggml-common.h).
+
+let int QK4_NL = 32
+let int IQ4_NL_BLOCK_BYTES = 18
+
+pub [float32] dequantize_iq4_nl([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % QK4_NL == 0 else throw "dequantize_iq4_nl: n_elements must be a multiple of {QK4_NL}, got {n_elements}"
+    let [int] codebook = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
+    var [float32] result = [0.0 for i in 0..<n_elements]
+    let n_blocks = n_elements / QK4_NL
+    var int b = 0
+    while b < n_blocks:
+        let blk_start = offset + b * IQ4_NL_BLOCK_BYTES
+        guard blk_start + IQ4_NL_BLOCK_BYTES <= bytes.length else throw "dequantize_iq4_nl: truncated block {b}"
+        let d_bits = read_u16_le(bytes, blk_start)
+        let d = f16_bits_to_f32(d_bits)
+        let qs_base = blk_start + 2
+        let out_base = b * QK4_NL
+
+        var int j = 0
+        while j < 16:
+            let byte_val = int(bytes[qs_base + j])
+            let lo = byte_val & 0xF
+            let hi = (byte_val >> 4) & 0xF
+            result[out_base + j] = (codebook[lo] as float32) * d
+            result[out_base + 16 + j] = (codebook[hi] as float32) * d
+            j += 1
+        b += 1
+    result
+
 # ── Generic dispatch, by ggml type id ────────────────────────────────────
 # A real quantized GGUF file mixes formats across tensors — model.br reads
 # each tensor's own ggml_type and stores it alongside its packed bytes, and
 # every CPU-side dequant call site (the per-token embedding-row lookup;
-# math_gpu.br's own fused_linear_gpu has the GPU-kernel-side equivalent)
+# math_gpu.br's own fused_linear_gpu has the GPU-kernel-side equivalent —
+# CPU-only for now for the 3 formats added here, see model.br's own note)
 # goes through these dispatchers instead of assuming a fixed format. Type
-# ids match gguf.br's ggml_type_name (6=Q5_0, 8=Q8_0, 12=Q4_K, 14=Q6_K).
+# ids match gguf.br's ggml_type_name (2=Q4_0, 6=Q5_0, 8=Q8_0, 10=Q2_K,
+# 11=Q3_K, 12=Q4_K, 14=Q6_K, 20=IQ4_NL).
+#
+# NOTE: the "supported formats" list is duplicated as a literal in both
+# throw messages below rather than factored into a shared top-level
+# `let string` constant — a real, confirmed Metal-target transpiler bug
+# (task_1ca9aa9e) drops a top-level `let string` constant from the
+# generated Rust entirely (unlike `let int`, which works), so any later
+# reference to it fails `cargo build` with "cannot find value ... in this
+# scope", invisible from `boring build`'s own output.
 
 pub int quantized_row_bytes(int ggml_type, int n_elements) throws:
-    if ggml_type == 6:
+    if ggml_type == 2:
+        (n_elements / QK4_0) * Q4_0_BLOCK_BYTES
+    elif ggml_type == 6:
         (n_elements / QK5_0) * Q5_0_BLOCK_BYTES
     elif ggml_type == 8:
         (n_elements / QK8_0) * 34
+    elif ggml_type == 10:
+        (n_elements / QK_K) * Q2_K_BLOCK_BYTES
+    elif ggml_type == 11:
+        (n_elements / QK_K) * Q3_K_BLOCK_BYTES
     elif ggml_type == 12:
         (n_elements / QK_K) * Q4_K_BLOCK_BYTES
     elif ggml_type == 14:
         (n_elements / QK_K) * Q6_K_BLOCK_BYTES
+    elif ggml_type == 20:
+        (n_elements / QK4_NL) * IQ4_NL_BLOCK_BYTES
     else:
-        throw "quantized_row_bytes: unsupported ggml type id {ggml_type} (supported: Q5_0=6, Q8_0=8, Q4_K=12, Q6_K=14)"
+        throw "quantized_row_bytes: unsupported ggml type id {ggml_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
 
 pub [float32] dequantize_row(int ggml_type, [uint8] bytes, int offset, int n_elements) throws:
-    if ggml_type == 6:
+    if ggml_type == 2:
+        dequantize_q4_0(bytes, offset, n_elements)
+    elif ggml_type == 6:
         dequantize_q5_0(bytes, offset, n_elements)
     elif ggml_type == 8:
         dequantize_q8_0(bytes, offset, n_elements)
+    elif ggml_type == 10:
+        dequantize_q2_k(bytes, offset, n_elements)
+    elif ggml_type == 11:
+        dequantize_q3_k(bytes, offset, n_elements)
     elif ggml_type == 12:
         dequantize_q4_k(bytes, offset, n_elements)
     elif ggml_type == 14:
         dequantize_q6_k(bytes, offset, n_elements)
+    elif ggml_type == 20:
+        dequantize_iq4_nl(bytes, offset, n_elements)
     else:
-        throw "dequantize_row: unsupported ggml type id {ggml_type} (supported: Q5_0=6, Q8_0=8, Q4_K=12, Q6_K=14)"
+        throw "dequantize_row: unsupported ggml type id {ggml_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
 
 pub [float32] dequantize_q4_k([uint8] bytes, int offset, int n_elements) throws:
     guard n_elements % QK_K == 0 else throw "dequantize_q4_k: n_elements must be a multiple of {QK_K}, got {n_elements}"
