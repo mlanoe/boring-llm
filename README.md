@@ -121,7 +121,7 @@ The core pipeline — GGUF parsing, tokenizer, forward pass, sampling, generatio
 **Perf opportunity investigated — retained as a baseline.** The fp32 warp-shuffle GEMM kernel (`math_gpu.br`'s `linear_warp_gpu`) beats the tiled GEMM by ~1.4-1.8x at the single-token decode-step shape (`seq=1`, the dominant real workload once `--kv-cache` is in use) — but the first fused-dequant Q8_0 counterpart (`q8_linear_warp_gpu`) was slower than the tiled `q8_linear_gpu`. A follow-up (`q8_linear_warp_broadcast_gpu`) broadcasts the shared scale header with `gpu.warp.shuffle` and wins by ~20-33% at `seq=1`; equivalent Q5_0, Q4_0, and IQ4_NL variants win by roughly 30-40%. The legacy `fused_linear_gpu` dispatcher still selects these variants by shape and remains available for benchmarking. Production inference now uses `gpu.tensor.linear`, so reproducing those shape-specific wins in the portable tensor scheduler is the next performance target. See `docs/development-log.md` for the full benchmark matrix.
 
 Tensor scheduling is selected in `boring.toml`. The project currently requests
-the Q8_0 warp schedule for single-row decode and the scalar schedule for
+the Q8_0 warp-broadcast schedule for single-row decode and the scalar schedule for
 prefill. `auto` remains the global default. Changing this policy requires a new
 `boring build --target ...` followed by `cargo build`; it does not require
 rebuilding or reinstalling the Boring compiler.
