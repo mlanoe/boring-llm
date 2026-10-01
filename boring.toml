@@ -2,3 +2,12 @@
 name = "boring-llm"
 version = "0.1.0"
 main = "src/main.br"
+
+[tensor.linear]
+algorithm = "auto"
+
+[tensor.linear.decode]
+q8_0 = "warp-broadcast"
+
+[tensor.linear.prefill]
+algorithm = "scalar"

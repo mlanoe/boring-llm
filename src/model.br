@@ -65,8 +65,8 @@ pub struct Model:
 # for the whole file — verified directly against a real downloaded
 # Qwen2.5-0.5B-Instruct "Q4_K_M" file: attn_q/k/attn_output/ffn_gate/
 # ffn_up are Q5_0, attn_v is Q8_0, ffn_down alternates Q4_K/Q6_K by layer.
-# fused_linear_gpu (math_gpu.br) dispatches on this tag to the matching
-# fused-dequant kernel.
+# tensor_linear_gpu (math_gpu.br) dispatches on this tag to the matching
+# quantized tensor format.
 pub struct QuantLayer:
     [float32] attn_norm_w
     [uint8] q_w_q8
@@ -405,7 +405,7 @@ pub [float32] forward_gpu(Model model, [int] tokens) throws:
     linear_nobias_gpu(final_normed, model.output_w, seq, d, model.config.vocab_size)
 
 # Phase 2b: same forward pass as forward_gpu, but every big matmul-heavy
-# weight is a fused-dequant Q8_0 GEMM (q8_linear_gpu/q8_linear_nobias_gpu)
+# weight is handled by the tensor quantized-linear primitive
 # reading raw packed bytes directly — no CPU-side dequantization, no full
 # fp32 weight copy ever materialized for these tensors (see math_gpu.br's
 # Q8LinearKernel doc comment for the memory-savings rationale). Token
@@ -435,26 +435,26 @@ pub [float32] forward_gpu_quantized(QuantModel model, [int] tokens) throws:
         let layer = model.layers[l]
 
         let normed = rms_norm_gpu(x, layer.attn_norm_w, seq, d, model.config.rms_eps)
-        var q = fused_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, seq, d, qkv_dim)
-        var k = fused_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, seq, d, kv_dim)
-        let v = fused_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, seq, d, kv_dim)
+        var q = tensor_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, seq, d, qkv_dim)
+        var k = tensor_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, seq, d, kv_dim)
+        let v = tensor_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, seq, d, kv_dim)
         q = rope_apply_gpu(q, seq, model.config.n_head, model.config.d_head, model.config.rope_freq_base, model.config.rope_neox)
         k = rope_apply_gpu(k, seq, model.config.n_kv_head, model.config.d_head, model.config.rope_freq_base, model.config.rope_neox)
         let attn_out = attention_gqa_gpu(q, k, v, seq, seq, model.config.n_head, model.config.n_kv_head, model.config.d_head, true, 0)
-        let attn_proj = fused_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, seq, qkv_dim, d)
+        let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, seq, qkv_dim, d)
         x = vec_add(x, attn_proj)
 
         let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, seq, d, model.config.rms_eps)
-        let gate = fused_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, seq, d, model.config.ffn_dim)
-        let up = fused_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, seq, d, model.config.ffn_dim)
+        let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, seq, d, model.config.ffn_dim)
+        let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, seq, d, model.config.ffn_dim)
         let hidden = swiglu_combine_gpu(gate, up)
-        let ffn_out = fused_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, seq, model.config.ffn_dim, d)
+        let ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, seq, model.config.ffn_dim, d)
         x = vec_add(x, ffn_out)
 
         l += 1
 
     let final_normed = rms_norm_gpu(x, model.output_norm_w, seq, d, model.config.rms_eps)
-    fused_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, seq, d, model.config.vocab_size)
+    tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, seq, d, model.config.vocab_size)
 
 # Phase 3: greedy decoding — repeatedly calls forward_gpu_quantized on the
 # whole sequence so far (no KV-cache, deliberately still deferred — see
@@ -508,17 +508,11 @@ pub [int] generate(QuantModel model, [int] prompt_tokens, int max_new_tokens, in
 
     tokens
 
-# Same as generate() above, but for a plain (non-Q8_0-fused) Model —
+# Same as generate() above, but for a plain Model —
 # every tensor already dequantized to float32 at load time (load_model),
-# forward_gpu's fp32 kernels doing the actual compute. This is what makes
-# a mixed-quantization file (e.g. Q4_K_M: F32 norms/biases, Q5_0/Q8_0/Q6_K/
-# Q4_K weight tensors depending on layer/role) usable for real generation
-# at all — load_model_quantized/forward_gpu_quantized only understand pure
-# Q8_0 weight tensors, no fused kernel exists (yet) for the k-quant/Q5_0
-# formats, so this project's other quantization formats go through the
-# same "dequantize once at load, run ordinary fp32 GPU kernels" path
-# Phase 2a already proved, rather than getting their own fused-dequant
-# kernels the way Q8_0 did in Phase 2b.
+# with forward_gpu's fp32 kernels doing the actual compute. This remains a
+# useful reference path for comparing the packed-weight tensor path against
+# weights dequantized once at load time.
 pub [int] generate_f32(Model model, [int] prompt_tokens, int max_new_tokens, int eos_id,
                         SamplingParams params) throws:
     var [int] tokens = []
@@ -603,9 +597,9 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
         let layer = model.layers[l]
 
         let normed = rms_norm_gpu(x, layer.attn_norm_w, seq, d, model.config.rms_eps)
-        var q = fused_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, seq, d, qkv_dim)
-        let k = fused_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, seq, d, kv_dim)
-        let v = fused_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, seq, d, kv_dim)
+        var q = tensor_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, seq, d, qkv_dim)
+        let k = tensor_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, seq, d, kv_dim)
+        let v = tensor_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, seq, d, kv_dim)
         q = rope_apply_gpu(q, seq, model.config.n_head, model.config.d_head, model.config.rope_freq_base, model.config.rope_neox)
         let k_rope_raw = rope_apply_gpu(k, seq, model.config.n_kv_head, model.config.d_head, model.config.rope_freq_base, model.config.rope_neox)
         # `k_mat`/`v_mat` are materialized here (unlike everything else in
@@ -615,14 +609,14 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
         let k_mat = passthrough(k_rope_raw)
         let v_mat = passthrough(v)
         let attn_out = attention_gqa_gpu(q, k_mat, v_mat, seq, seq, model.config.n_head, model.config.n_kv_head, model.config.d_head, true, 0)
-        let attn_proj = fused_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, seq, qkv_dim, d)
+        let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, seq, qkv_dim, d)
         x = vec_add(x, attn_proj)
 
         let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, seq, d, model.config.rms_eps)
-        let gate = fused_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, seq, d, model.config.ffn_dim)
-        let up = fused_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, seq, d, model.config.ffn_dim)
+        let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, seq, d, model.config.ffn_dim)
+        let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, seq, d, model.config.ffn_dim)
         let hidden = swiglu_combine_gpu(gate, up)
-        let ffn_out = fused_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, seq, model.config.ffn_dim, d)
+        let ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, seq, model.config.ffn_dim, d)
         x = vec_add(x, ffn_out)
 
         # `k_mat`/`v_mat` here already ARE the whole prompt's post-RoPE cache
@@ -632,7 +626,7 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
         l += 1
 
     let final_normed = rms_norm_gpu(x, model.output_norm_w, seq, d, model.config.rms_eps)
-    let logits_all_raw = fused_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, seq, d, model.config.vocab_size)
+    let logits_all_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, seq, d, model.config.vocab_size)
     # `logits_all` is indexed directly below (not just passed to another
     # function call), which also needs an explicit materialization step.
     let logits_all = passthrough(logits_all_raw)
@@ -685,9 +679,9 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
         let lc = cache.layers[l]
 
         let normed = rms_norm_gpu(x, layer.attn_norm_w, n, d, model.config.rms_eps)
-        var q = fused_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, n, d, qkv_dim)
-        let k = fused_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, n, d, kv_dim)
-        let v = fused_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, n, d, kv_dim)
+        var q = tensor_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, n, d, qkv_dim)
+        let k = tensor_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, n, d, kv_dim)
+        let v = tensor_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, n, d, kv_dim)
         # RoPE positions for this batch start at `base_pos` (the number of
         # positions already in the cache), not 0 — same rope_apply_at_gpu
         # forward_step already uses for a single new token, just batched.
@@ -712,21 +706,21 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
         # every already-cached key PLUS new keys 0..i, i.e. absolute key
         # position <= base_pos + i — exactly what causal_offset expresses.
         let attn_out = attention_gqa_gpu(q, full_k, full_v, n, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head, true, base_pos)
-        let attn_proj = fused_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, n, qkv_dim, d)
+        let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, n, qkv_dim, d)
         x = vec_add(x, attn_proj)
 
         let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, n, d, model.config.rms_eps)
-        let gate = fused_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, n, d, model.config.ffn_dim)
-        let up = fused_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, n, d, model.config.ffn_dim)
+        let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, n, d, model.config.ffn_dim)
+        let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, n, d, model.config.ffn_dim)
         let hidden = swiglu_combine_gpu(gate, up)
-        let ffn_out = fused_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, n, model.config.ffn_dim, d)
+        let ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, n, model.config.ffn_dim, d)
         x = vec_add(x, ffn_out)
 
         new_layers.push(LayerCache(full_k, full_v))
         l += 1
 
     let final_normed = rms_norm_gpu(x, model.output_norm_w, n, d, model.config.rms_eps)
-    let logits_all_raw = fused_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, n, d, model.config.vocab_size)
+    let logits_all_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, n, d, model.config.vocab_size)
     let logits_all = passthrough(logits_all_raw)
 
     let vocab = model.config.vocab_size
@@ -767,12 +761,12 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
         let lc = cache.layers[l]
 
         let normed = rms_norm_gpu(x, layer.attn_norm_w, 1, d, model.config.rms_eps)
-        var q = fused_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, 1, d, qkv_dim)
-        let k_new = fused_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, 1, d, kv_dim)
+        var q = tensor_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, 1, d, qkv_dim)
+        let k_new = tensor_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, 1, d, kv_dim)
         # `v_new`/`k_roped` are iterated below (`for..in`), which — unlike a
         # plain function-call argument — still needs an explicit
         # materialization step (`passthrough()`), so those two keep it.
-        let v_new_raw = fused_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, 1, d, kv_dim)
+        let v_new_raw = tensor_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, 1, d, kv_dim)
         let v_new = passthrough(v_new_raw)
 
         q = rope_apply_at_gpu(q, 1, model.config.n_head, model.config.d_head, model.config.rope_freq_base, pos, model.config.rope_neox)
@@ -796,21 +790,21 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
         # position, so every key already in the cache (including the one
         # just appended) is a legitimate position to attend to.
         let attn_out = attention_gqa_gpu(q, full_k, full_v, 1, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head, false, 0)
-        let attn_proj = fused_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, 1, qkv_dim, d)
+        let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, 1, qkv_dim, d)
         x = vec_add(x, attn_proj)
 
         let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, 1, d, model.config.rms_eps)
-        let gate = fused_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, 1, d, model.config.ffn_dim)
-        let up = fused_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, 1, d, model.config.ffn_dim)
+        let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, 1, d, model.config.ffn_dim)
+        let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, 1, d, model.config.ffn_dim)
         let hidden = swiglu_combine_gpu(gate, up)
-        let ffn_out = fused_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, 1, model.config.ffn_dim, d)
+        let ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, 1, model.config.ffn_dim, d)
         x = vec_add(x, ffn_out)
 
         new_layers.push(LayerCache(full_k, full_v))
         l += 1
 
     let final_normed = rms_norm_gpu(x, model.output_norm_w, 1, d, model.config.rms_eps)
-    let logits_raw = fused_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
+    let logits_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
     # returned inside a tuple below, which — like a struct constructor —
     # doesn't trigger the GPU-result-to-array conversion automatically.
     let logits = passthrough(logits_raw)

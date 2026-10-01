@@ -1814,6 +1814,58 @@ pub req [float32]'gpu'unified fused_linear_nobias_gpu([float32] x, [uint8] w_pac
     let [float32] zero_bias = [0.0 for i in 0..<d_out]
     fused_linear_gpu(x, w_packed, w_type, zero_bias, seq, d_in, d_out)
 
+# Tensor-backed equivalent of fused_linear_gpu. Keep the hand-written kernels
+# above as the performance baseline while migration and shape-specific tensor
+# scheduling are measured. Literal format names deliberately keep each packed
+# layout explicit to Boring's tensor checker and generated kernel.
+pub req [float32]'gpu'unified tensor_linear_gpu([float32]'gpu'global x,
+                       [uint8]'gpu'global w_packed, int w_type,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
+    mut [float32]'gpu'unified y = [0.0 as float32 for ..<seq * d_out]
+    if w_type == 8:
+        gpu.tensor.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "q8_0")
+    elif w_type == 6:
+        gpu.tensor.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "q5_0")
+    elif w_type == 12:
+        gpu.tensor.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "q4_k")
+    elif w_type == 14:
+        gpu.tensor.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "q6_k")
+    elif w_type == 2:
+        gpu.tensor.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "q4_0")
+    elif w_type == 10:
+        gpu.tensor.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "q2_k")
+    elif w_type == 11:
+        gpu.tensor.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "q3_k")
+    elif w_type == 20:
+        gpu.tensor.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "iq4_nl")
+    else:
+        throw "tensor_linear_gpu: unsupported ggml type id {w_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
+    y
+
+pub req [float32]'gpu'unified tensor_linear_nobias_gpu([float32]'gpu'global x,
+                       [uint8]'gpu'global w_packed, int w_type,
+                       int seq, int d_in, int d_out) throws:
+    mut [float32]'gpu'unified y = [0.0 as float32 for ..<seq * d_out]
+    if w_type == 8:
+        gpu.tensor.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "q8_0")
+    elif w_type == 6:
+        gpu.tensor.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "q5_0")
+    elif w_type == 12:
+        gpu.tensor.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "q4_k")
+    elif w_type == 14:
+        gpu.tensor.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "q6_k")
+    elif w_type == 2:
+        gpu.tensor.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "q4_0")
+    elif w_type == 10:
+        gpu.tensor.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "q2_k")
+    elif w_type == 11:
+        gpu.tensor.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "q3_k")
+    elif w_type == 20:
+        gpu.tensor.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "iq4_nl")
+    else:
+        throw "tensor_linear_nobias_gpu: unsupported ggml type id {w_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
+    y
+
 # ── Kernel: RMSNorm (row-wise) ───────────────────────────────────────────
 # One thread per row (position) — no bias, no mean subtraction (simpler
 # than whisper-boring's LayerNormSeqKernel).

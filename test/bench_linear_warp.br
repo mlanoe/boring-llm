@@ -20,7 +20,7 @@
 #   boring build --target metal test/bench_linear_warp.br
 #   cd test/bench_linear_warp_metal && cargo build --release
 #   ./target/release/bench_linear_warp <kernel> <shape>
-#     kernel: tiled | warp | warpshared | q8 | q8warp | q8warpbcast |
+#     kernel: tiled | warp | warpshared | q8 | q8tensor | q8warp | q8warpbcast |
 #             q5 | q5bcast | q4 | q4bcast | q4nl | q4nlbcast
 #     shape:  small-seq26 | big-seq26 | small-seq1 | big-seq1
 
@@ -62,7 +62,7 @@ def main() throws:
     # real 34-byte blocks (2-byte f16 scale + 32 signed int8 values), same
     # shape real GGUF Q8_0 tensors use.
     var [uint8] w_packed = []
-    if kernel_name == "q8" or kernel_name == "q8warp" or kernel_name == "q8warpbcast":
+    if kernel_name == "q8" or kernel_name == "q8tensor" or kernel_name == "q8warp" or kernel_name == "q8warpbcast":
         let n_blocks = (d_out * d_model) / 32
         var b = 0
         while b < n_blocks:
@@ -135,6 +135,12 @@ def main() throws:
             let sink = passthrough(out)
             iter += 1
         print "q8_linear_gpu (tiled, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
+    elif kernel_name == "q8tensor":
+        while iter < n_iter:
+            let out = tensor_linear_gpu(x, w_packed, 8, bv, seq, d_model, d_out)
+            let sink = passthrough(out)
+            iter += 1
+        print "gpu.tensor.linear Q8_0, seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q8warp":
         while iter < n_iter:
             let out = q8_linear_warp_gpu(x, w_packed, bv, seq, d_model, d_out)

@@ -104,19 +104,19 @@ def run_forward_debug(GgufFile file, [int] tokens, bool use_gpu) throws:
     print_top5(logits, tokens, m.config.vocab_size)
 
 # Phase 2b debug mode: loads each weight tensor as raw packed bytes (no
-# CPU-side dequantization) and runs the matching fused-dequant GEMM kernel
-# per tensor's own ggml type (see fused_linear_gpu's dispatch in
+# CPU-side dequantization) and runs the matching quantized tensor kernel
+# per tensor's own ggml type (see tensor_linear_gpu's dispatch in
 # math_gpu.br — Q4_0/Q5_0/Q8_0/Q2_K/Q3_K/Q4_K/Q6_K, not just Q8_0).
 def run_forward_debug_quantized(GgufFile file, [int] tokens) throws:
     print "[diag] loading model weights (packed bytes, no CPU dequant)..."
     let m = load_model_quantized(file)
     print "[diag] model loaded (vocab={m.config.vocab_size} d_model={m.config.d_model} n_layer={m.config.n_layer} n_head={m.config.n_head} n_kv_head={m.config.n_kv_head})"
-    print "[diag] running forward_gpu_quantized (fused-dequant Metal kernels)..."
+    print "[diag] running forward_gpu_quantized (quantized tensor kernels)..."
     let logits = forward_gpu_quantized(m, tokens)
     print_top5(logits, tokens, m.config.vocab_size)
 
 # Phase 3: real end-to-end chat generation — tokenize (GGUF-embedded vocab/
-# merges, ChatML wrapping), greedy-decode via the fused-dequant GPU forward
+# merges, ChatML wrapping), greedy-decode via the quantized tensor forward
 # pass, detokenize, print. Also prints tokens/sec for the generation loop
 # (model-load time excluded — that's a one-time cost, not decode throughput).
 def run_generate(GgufFile file, string system_msg, string user_msg, int max_new_tokens,
@@ -132,7 +132,7 @@ def run_generate(GgufFile file, string system_msg, string user_msg, int max_new_
     print "[diag] prompt: {prompt_tokens.length} tokens"
 
     let all_tokens = if quantized:
-        print "[diag] loading model weights (packed bytes, fused GPU dequant)..."
+        print "[diag] loading model weights (packed bytes, quantized tensor kernels)..."
         let m = load_model_quantized(file)
         print "[diag] model loaded (vocab={m.config.vocab_size} d_model={m.config.d_model} n_layer={m.config.n_layer})"
         if kv_cache:
@@ -206,7 +206,7 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
     # around its own single generate call rather than trying to share one
     # model-typed local across both.
     if quantized:
-        print "[diag] loading model weights (packed bytes, fused GPU dequant)..."
+        print "[diag] loading model weights (packed bytes, quantized tensor kernels)..."
         let m = load_model_quantized(file)
         print "[diag] model loaded (vocab={m.config.vocab_size} d_model={m.config.d_model} n_layer={m.config.n_layer})"
 

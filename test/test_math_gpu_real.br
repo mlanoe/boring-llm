@@ -148,6 +148,16 @@ def main() throws:
     assert_close(gpu_q8[1], cpu_q8[1], "q8_linear_gpu[1]")
     print "q8_linear_gpu: OK ({gpu_q8[0]} {gpu_q8[1]}, expected ~132 ~202)"
 
+    # Exercises the tensor scheduler's m=1 warp reduction with a partial
+    # final block of output columns (d_out=2, deliberately below one block's
+    # warp capacity). Inactive warps must still participate in WGPU's
+    # workgroup-barrier-based shuffle emulation.
+    let tensor_q8_raw = tensor_linear_gpu(qx, w_packed, 8, qb, 1, 32, 2)
+    let tensor_q8 = passthrough(tensor_q8_raw)
+    assert_close(tensor_q8[0], cpu_q8[0], "tensor_linear_gpu Q8_0[0]")
+    assert_close(tensor_q8[1], cpu_q8[1], "tensor_linear_gpu Q8_0[1]")
+    print "tensor_linear_gpu Q8_0: OK ({tensor_q8[0]} {tensor_q8[1]})"
+
     # --- q8_linear_warp_gpu (fused-dequant + warp-shuffle) vs. the same CPU
     # reference, same synthetic Q8_0 bytes as q8_linear_gpu above ---
     let gpu_q8_warp_raw = q8_linear_warp_gpu(qx, w_packed, qb, 1, 32, 2)
@@ -253,6 +263,20 @@ def main() throws:
     assert_close(gpu_q5_bcast[0], cpu_q5[0], "q5_linear_warp_broadcast_gpu[0]")
     assert_close(gpu_q5_bcast[1], cpu_q5[1], "q5_linear_warp_broadcast_gpu[1]")
     print "q5_linear_warp_broadcast_gpu: OK ({gpu_q5_bcast[0]} {gpu_q5_bcast[1]}, expected ~132 ~202)"
+
+    # --- gpu.tensor.linear Q5_0 migration path vs. the same references ---
+    let tensor_q5_raw = tensor_linear_gpu(qx, w5_packed, 6, qb, 1, 32, 2)
+    let tensor_q5 = passthrough(tensor_q5_raw)
+    assert_close(tensor_q5[0], cpu_q5[0], "tensor_linear_gpu Q5_0[0]")
+    assert_close(tensor_q5[1], cpu_q5[1], "tensor_linear_gpu Q5_0[1]")
+    print "tensor_linear_gpu Q5_0: OK ({tensor_q5[0]} {tensor_q5[1]})"
+
+    let cpu_q5_nobias = linear(qx, cpu_w5, 1, 32, 2)
+    let tensor_q5_nobias_raw = tensor_linear_nobias_gpu(qx, w5_packed, 6, 1, 32, 2)
+    let tensor_q5_nobias = passthrough(tensor_q5_nobias_raw)
+    assert_close(tensor_q5_nobias[0], cpu_q5_nobias[0], "tensor_linear_nobias_gpu Q5_0[0]")
+    assert_close(tensor_q5_nobias[1], cpu_q5_nobias[1], "tensor_linear_nobias_gpu Q5_0[1]")
+    print "tensor_linear_nobias_gpu Q5_0: OK ({tensor_q5_nobias[0]} {tensor_q5_nobias[1]})"
 
     # --- q6k_linear_gpu vs. CPU dequantize_q6_k + linear_bias ---
     # d_in=256 (one Q6_K superblock per row), d_out=2, seq=1. `qh`=0xAA
