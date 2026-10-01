@@ -10,14 +10,8 @@
 #   cd test/test_math_gpu_real_metal && cargo build --release
 #   ./target/release/test_math_gpu_real
 #
-# Also builds and mostly passes under `--target wgpu` (same source, no
-# target-conditional code) — EXCEPT `q5_linear_warp_broadcast_gpu`'s own
-# test case below, which currently panics partway through the run on wgpu
-# (a real wgpu-backend gap in `boring`'s warp-shuffle emulation when a
-# kernel shuffles two differently-typed values — see that kernel's own doc
-# comment in math_gpu.br for the full writeup). Every test before it in
-# file order still runs and passes; everything after it doesn't get a
-# chance to run under `--target wgpu` until that's fixed upstream.
+# Also fully builds and passes under `--target wgpu` (same source, no
+# target-conditional code) — every one of the 22 kernels, no exceptions.
 
 use io
 use math

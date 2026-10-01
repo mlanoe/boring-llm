@@ -750,11 +750,7 @@ kernel Q5LinearKernel:
                 let byte_val = int(w_packed[qs_base + j])
                 let nib = if offset_in_block < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
                 let hbit_shift = if offset_in_block < 16: j else: j + 16
-                # `as uint32`: works around a real wgpu-backend bug (WGSL's
-                # `>>` requires a u32 shift amount; boring emits a variable
-                # int shift amount as i32 with no auto-cast — filed as
-                # task_23fdd781; harmless no-op on Metal/CUDA/ROCm).
-                let hbit = (qh >> (hbit_shift as uint32)) & 1
+                let hbit = (qh >> hbit_shift) & 1
                 let qv = (nib | (hbit << 4)) - 16
                 let qf = qv as float32
                 tile_w[width = tx, height = ty] = qf * w_scale
@@ -799,24 +795,15 @@ pub req [float32]'gpu'unified q5_linear_nobias_gpu([float32] x, [uint8] w_packed
 # read (and the bit-shift picking this lane's own bit out of the broadcast
 # `qh`) stays per-lane, same reasoning as Q8_0's unavoidable per-lane
 # quantized-value read.
-#
-# METAL-ONLY FOR NOW: shuffling two differently-typed values (`w_scale`,
-# a `float32`, and `qh`, an `int`) in the same kernel body currently fails
-# on the wgpu backend — its warp-shuffle emulation allocates ONE scratch
-# buffer per kernel, typed from whichever shuffled value its type-inference
-# pass sees first (here, `w_scale`'s `float32`), so writing `qh` through
-# that same `float32`-typed buffer produces a real WGSL shader-validation
-# error at runtime (`boring build`/`cargo build` both succeed; only the
-# first real kernel dispatch panics) — a different bug from
-# `task_23fdd781`'s shift-amount issue, not yet filed as its own task since
-# `boring`'s own repo already has unfinished, uncommitted work in exactly
-# this area (per-local-variable shuffle-type tracking for the wgpu
-# backend) that looks aimed at this same class of gap. Metal is this
-# project's primary GPU target and gets the full scale+qh broadcast; wgpu
-# falls back to `q5_linear_gpu` (tiled, unaffected) for prefill as usual,
-# but a real `--quantized --gpu` run on `--target wgpu` with Q5_0 weights
-# at seq=1 will currently panic rather than silently miscompute — revisit
-# once the upstream wgpu shuffle-type-inference work lands.
+##
+# Also verified on `--target wgpu`: shuffling two differently-typed values
+# (`w_scale`, a `float32`, and `qh`, an `int`) in the same kernel body used
+# to break wgpu's warp-shuffle emulation (its one scratch buffer per kernel
+# was typed from only the first shuffled value) — fixed upstream (`boring`
+# commit `3823ed77`) by tracking each shuffled local's own real type
+# instead of defaulting to the first one seen; verified fixed and
+# reinstalled before confirming both `w_scale` and `qh` round-trip
+# correctly on real wgpu hardware too.
 kernel Q5LinearWarpBroadcastKernel:
     let [float32]'global  x                # (seq × d_in)
     let [uint8]'global    w_packed         # (d_out × d_in) Q5_0-packed, GGUF's native layout
@@ -867,9 +854,7 @@ kernel Q5LinearWarpBroadcastKernel:
                 let byte_val = int(w_packed[qs_base + j])
                 let nib = if lane < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
                 let hbit_shift = if lane < 16: j else: j + 16
-                # `as uint32`: same wgpu-backend workaround as
-                # `Q5LinearKernel` above (task_23fdd781).
-                let hbit = (qh >> (hbit_shift as uint32)) & 1
+                let hbit = (qh >> hbit_shift) & 1
                 let qv = (nib | (hbit << 4)) - 16
                 let qf = qv as float32
                 partial += x[row * d_in + i] * (qf * w_scale)
@@ -1360,11 +1345,7 @@ kernel Q2KLinearKernel:
                 let q_base = qs_base + outer * 32
                 let shift = j * 2
                 let byte_pos = q_base + sub * 16 + l
-                # `as uint32`: works around a real wgpu-backend bug (WGSL's
-                # `>>` requires a u32 shift amount; boring emits a variable
-                # int shift amount as i32 with no auto-cast — filed as
-                # task_23fdd781; harmless no-op on Metal/CUDA/ROCm).
-                let qv = (int(w_packed[byte_pos]) >> (shift as uint32)) & 3
+                let qv = (int(w_packed[byte_pos]) >> shift) & 3
 
                 let wf = dl * (qv as float32) - ml
                 tile_w[width = tx, height = ty] = wf
@@ -1489,31 +1470,27 @@ kernel Q3KLinearKernel:
                     ((aux0_in >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4)
                 else:
                     ((aux1_in >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4)
-                # `as uint32` on both shift amounts below: works around a
-                # real wgpu-backend bug (WGSL's `>>` requires a u32 shift
-                # amount; boring emits a variable int shift amount as i32
-                # with no auto-cast — filed as task_23fdd781; harmless
-                # no-op on Metal/CUDA/ROCm).
-                let raw = (word >> ((8 * sbp) as uint32)) & 0xFF
+                let raw = (word >> (8 * sbp)) & 0xFF
                 let sc = if raw > 127: raw - 256 else: raw
                 let dl = d_all * ((sc - 32) as float32)
 
                 let q_base = qs_base + outer * 32
                 let shift = j * 2
                 let byte_pos = q_base + sub * 16 + l
-                let qv = (int(w_packed[byte_pos]) >> (shift as uint32)) & 3
+                let qv = (int(w_packed[byte_pos]) >> shift) & 3
 
-                # `as uint32`: same wgpu-backend `<<`/`>>` workaround as
-                # above (task_23fdd781) — applies to left-shift too. The
-                # literal `1` is routed through a `let int one = 1` first
-                # rather than written inline (`1 << (... as uint32)`) —
-                # WGSL's abstract-int literal type inference can't
-                # concretize an inline `1` as the left operand of a shift
-                # whose right operand is an explicit `u32` cast; binding it
-                # to an `int`-typed local first forces concretization
-                # before the shift, sidestepping the same naga/WGSL quirk.
+                # Routed through a `let int one = 1` rather than written
+                # inline (`1 << ...`) — a real wgpu-backend quirk: WGSL's
+                # abstract-int literal type inference can't concretize a
+                # bare `1` as the left operand of a variable left-shift
+                # (even after the shift-amount-to-u32 auto-cast lands);
+                # binding it to an `int`-typed local first forces
+                # concretization before the shift. Harmless on Metal/CUDA/
+                # ROCm. Not yet filed as its own task — narrower than
+                # task_23fdd781 and not yet hit by anything else in this
+                # file, worth revisiting if it turns up again elsewhere.
                 let int one = 1
-                let m = one << ((outer * 4 + j) as uint32)
+                let m = one << (outer * 4 + j)
                 let hmask_byte_pos = hmask_base + sub * 16 + l
                 let hbit = int(w_packed[hmask_byte_pos]) & m
                 let hi_off = if hbit != 0: 0 else: 4
