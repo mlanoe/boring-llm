@@ -96,4 +96,24 @@ def main() throws:
         i += 1
     print "dequantize_iq4_nl: OK (first 8/32 of 2 real blocks match real GGUF data)"
 
+    # --- Q2_K: first superblock of blk.0.attn_q.weight, real Llama-2-7B-Chat
+    # Q2_K GGUF (first 8 of 256) — this project's small Qwen2.5-0.5B source
+    # never contains a genuine Q2_K tensor at any preset (llama.cpp's own
+    # quantization heuristics substitute other formats at that size), so
+    # real-weight verification for this one format needed a larger real
+    # model instead; a 7B Q2_K file's own quantization heuristics DO keep
+    # real Q2_K tensors (token embeddings and attn_q/attn_k), closing the
+    # one documented verification gap left after every other format.
+    let q2_bytes = [0x66 as uint8, 0x2A as uint8, 0x88 as uint8, 0x45 as uint8, 0x55 as uint8, 0xFF as uint8, 0xFB as uint8, 0x85 as uint8, 0x43 as uint8, 0x66 as uint8, 0x66 as uint8, 0x56 as uint8, 0x38 as uint8, 0xC9 as uint8, 0x77 as uint8, 0x59 as uint8, 0xB5 as uint8, 0xE4 as uint8, 0xB5 as uint8, 0xCE as uint8, 0xA8 as uint8, 0x97 as uint8, 0xD9 as uint8, 0x9A as uint8, 0x8A as uint8, 0x93 as uint8, 0xB6 as uint8, 0xA2 as uint8, 0x1A as uint8, 0xA1 as uint8, 0xAE as uint8, 0xA5 as uint8, 0x94 as uint8, 0xA8 as uint8, 0xE4 as uint8, 0x94 as uint8, 0xA0 as uint8, 0xA4 as uint8, 0xE5 as uint8, 0xE8 as uint8, 0xDC as uint8, 0xE8 as uint8, 0xA5 as uint8, 0xEC as uint8, 0x57 as uint8, 0x15 as uint8, 0xBD as uint8, 0x88 as uint8, 0x06 as uint8, 0x87 as uint8, 0x87 as uint8, 0x8A as uint8, 0x5C as uint8, 0x9B as uint8, 0x99 as uint8, 0x01 as uint8, 0x9B as uint8, 0x9E as uint8, 0x9F as uint8, 0x9B as uint8, 0x89 as uint8, 0x4D as uint8, 0x08 as uint8, 0xF4 as uint8, 0xA7 as uint8, 0x62 as uint8, 0x64 as uint8, 0x77 as uint8, 0x27 as uint8, 0x69 as uint8, 0x6A as uint8, 0x19 as uint8, 0x61 as uint8, 0x5E as uint8, 0xCA as uint8, 0x69 as uint8, 0x66 as uint8, 0x75 as uint8, 0xBA as uint8, 0x2B as uint8, 0xDB as uint8, 0x15 as uint8, 0xA2 as uint8, 0x18 as uint8]
+    let q2_expected_first8 = [-0.004995, -0.013573, -0.004995, 0.003582, -0.013573, 0.012159, -0.004995, 0.003582]
+    let q2_expected_last8 = [0.001555, 0.001555, 0.027287, 0.001555, 0.001555, 0.001555, 0.014421, -0.011311]
+    let q2_out = dequantize_q2_k(q2_bytes, 0, 256)
+    assert_eq(q2_out.length, 256)
+    i = 0
+    while i < 8:
+        assert_close(q2_out[i], q2_expected_first8[i] as float32, "q2_k[{i}]")
+        assert_close(q2_out[248 + i], q2_expected_last8[i] as float32, "q2_k[{248 + i}]")
+        i += 1
+    print "dequantize_q2_k: OK (first/last 8 of 256 match real GGUF data)"
+
     print "test_quant_kquant: all assertions passed"
