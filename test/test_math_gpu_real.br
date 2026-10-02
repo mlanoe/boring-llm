@@ -421,6 +421,12 @@ def main() throws:
     assert_close(gpu_q4_0_bcast[1], cpu_q4_0[1], "q4_linear_warp_broadcast_gpu[1]")
     print "q4_linear_warp_broadcast_gpu: OK ({gpu_q4_0_bcast[0]} {gpu_q4_0_bcast[1]})"
 
+    let tensor_q4_0_raw = tensor_linear_gpu(x4_0, w4_0_packed, 2, b4_0, 1, 64, 2)
+    let tensor_q4_0 = passthrough(tensor_q4_0_raw)
+    assert_close(tensor_q4_0[0], cpu_q4_0[0], "tensor_linear_gpu Q4_0[0]")
+    assert_close(tensor_q4_0[1], cpu_q4_0[1], "tensor_linear_gpu Q4_0[1]")
+    print "tensor_linear_gpu Q4_0: OK ({tensor_q4_0[0]} {tensor_q4_0[1]})"
+
     # --- q2k_linear_gpu vs. CPU dequantize_q2_k + linear_bias ---
     # d_in=256 (one Q2_K superblock per row), d_out=2, seq=1. Same
     # patterned-bytes approach as q4_linear_gpu above — dequantize_q2_k was
@@ -546,5 +552,11 @@ def main() throws:
     assert_close(gpu_q4nl_bcast[0], cpu_q4nl[0], "q4nl_linear_warp_broadcast_gpu[0]")
     assert_close(gpu_q4nl_bcast[1], cpu_q4nl[1], "q4nl_linear_warp_broadcast_gpu[1]")
     print "q4nl_linear_warp_broadcast_gpu: OK ({gpu_q4nl_bcast[0]} {gpu_q4nl_bcast[1]})"
+
+    let tensor_q4nl_raw = tensor_linear_gpu(x4nl, w4nl_packed, 20, b4nl, 1, 64, 2)
+    let tensor_q4nl = passthrough(tensor_q4nl_raw)
+    assert_close(tensor_q4nl[0], cpu_q4nl[0], "tensor_linear_gpu IQ4_NL[0]")
+    assert_close(tensor_q4nl[1], cpu_q4nl[1], "tensor_linear_gpu IQ4_NL[1]")
+    print "tensor_linear_gpu IQ4_NL: OK ({tensor_q4nl[0]} {tensor_q4nl[1]})"
 
     print "test_math_gpu_real: all assertions passed"
