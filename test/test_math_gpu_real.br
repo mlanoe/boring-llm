@@ -463,6 +463,27 @@ def main() throws:
     assert_close(gpu_q2k[1], cpu_q2k[1], "q2k_linear_gpu[1]")
     print "q2k_linear_gpu: OK ({gpu_q2k[0]} {gpu_q2k[1]})"
 
+    let tensor_q2k_raw = tensor_linear_gpu(x2k, w2k_packed, 10, b2k, 1, 256, 2)
+    let tensor_q2k = passthrough(tensor_q2k_raw)
+    assert_close(tensor_q2k[0], cpu_q2k[0], "tensor_linear_gpu Q2_K[0]")
+    assert_close(tensor_q2k[1], cpu_q2k[1], "tensor_linear_gpu Q2_K[1]")
+    print "tensor_linear_gpu Q2_K: OK ({tensor_q2k[0]} {tensor_q2k[1]})"
+
+    # First real superblock from Llama-2-7B-Chat's blk.0.attn_q.weight.
+    # Keeping the extracted 84-byte block here avoids loading the 2.6 GB GGUF
+    # in this regular GPU regression test while still exercising genuine Q2_K
+    # data. test_quant_kquant.br independently checks this block against the
+    # Python gguf package.
+    let real_q2 = [0x66 as uint8, 0x2A as uint8, 0x88 as uint8, 0x45 as uint8, 0x55 as uint8, 0xFF as uint8, 0xFB as uint8, 0x85 as uint8, 0x43 as uint8, 0x66 as uint8, 0x66 as uint8, 0x56 as uint8, 0x38 as uint8, 0xC9 as uint8, 0x77 as uint8, 0x59 as uint8, 0xB5 as uint8, 0xE4 as uint8, 0xB5 as uint8, 0xCE as uint8, 0xA8 as uint8, 0x97 as uint8, 0xD9 as uint8, 0x9A as uint8, 0x8A as uint8, 0x93 as uint8, 0xB6 as uint8, 0xA2 as uint8, 0x1A as uint8, 0xA1 as uint8, 0xAE as uint8, 0xA5 as uint8, 0x94 as uint8, 0xA8 as uint8, 0xE4 as uint8, 0x94 as uint8, 0xA0 as uint8, 0xA4 as uint8, 0xE5 as uint8, 0xE8 as uint8, 0xDC as uint8, 0xE8 as uint8, 0xA5 as uint8, 0xEC as uint8, 0x57 as uint8, 0x15 as uint8, 0xBD as uint8, 0x88 as uint8, 0x06 as uint8, 0x87 as uint8, 0x87 as uint8, 0x8A as uint8, 0x5C as uint8, 0x9B as uint8, 0x99 as uint8, 0x01 as uint8, 0x9B as uint8, 0x9E as uint8, 0x9F as uint8, 0x9B as uint8, 0x89 as uint8, 0x4D as uint8, 0x08 as uint8, 0xF4 as uint8, 0xA7 as uint8, 0x62 as uint8, 0x64 as uint8, 0x77 as uint8, 0x27 as uint8, 0x69 as uint8, 0x6A as uint8, 0x19 as uint8, 0x61 as uint8, 0x5E as uint8, 0xCA as uint8, 0x69 as uint8, 0x66 as uint8, 0x75 as uint8, 0xBA as uint8, 0x2B as uint8, 0xDB as uint8, 0x15 as uint8, 0xA2 as uint8, 0x18 as uint8]
+    let real_q2_weights = dequantize_q2_k(real_q2, 0, 256)
+    let real_q2_x = [((i % 13) as float32) * (0.1 as float32) for i in 0..<256]
+    let real_q2_bias = [0.0]
+    let real_q2_cpu = linear_bias(real_q2_x, real_q2_weights, real_q2_bias, 1, 256, 1)
+    let real_q2_tensor_raw = tensor_linear_gpu(real_q2_x, real_q2, 10, real_q2_bias, 1, 256, 1)
+    let real_q2_tensor = passthrough(real_q2_tensor_raw)
+    assert_close(real_q2_tensor[0], real_q2_cpu[0], "tensor_linear_gpu real Q2_K[0]")
+    print "tensor_linear_gpu real Q2_K: OK ({real_q2_tensor[0]})"
+
     # --- q3k_linear_gpu vs. CPU dequantize_q3_k + linear_bias ---
     # d_in=256 (one Q3_K superblock per row), d_out=2, seq=1. Same
     # patterned-bytes approach as above — dequantize_q3_k was already

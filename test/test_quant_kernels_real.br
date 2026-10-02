@@ -1,8 +1,7 @@
 # Real (compiled, --target metal) cross-check of every fused-dequant GPU
-# linear kernel (Q5_0/Q6_K/Q4_K — Q8_0 already covered by
-# test_math_gpu_real.br) against real tensor bytes from a real downloaded
-# Q4_K_M GGUF file, comparing against the CPU dequantize_*/linear_bias
-# reference with a non-trivial (non-uniform) input vector.
+# linear kernel against real tensor bytes from downloaded GGUF files,
+# comparing against the CPU dequantize_*/linear_bias reference with a
+# non-trivial (non-uniform) input vector.
 #
 # This exists because test_math_gpu_real.br's own Q5_0/Q6_K/Q4_K unit tests
 # use small hand-crafted, deliberately uniform byte patterns (to keep the
@@ -19,7 +18,10 @@
 # Build + run:
 #   boring build --target metal test/test_quant_kernels_real.br
 #   cd test/test_quant_kernels_real_metal && cargo build --release
-#   ./target/release/test_quant_kernels_real ../../weights/qwen2.5-0.5b-instruct-q4_k_m.gguf
+#   ./target/release/test_quant_kernels_real \
+#       ../../weights/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+#       ../../weights/qwen2.5-0.5b-instruct-q2_k.gguf \
+#       ../../weights/qwen2.5-0.5b-instruct-q4_0.gguf
 
 use io
 use gguf
@@ -37,8 +39,9 @@ GgufTensorInfo find_tensor([GgufTensorInfo] tensors, string name) throws:
             return t
     throw "tensor not found: {name}"
 
-# Runs a fused kernel against a real tensor's real bytes, comparing every
-# output element against the CPU dequant + linear_bias reference.
+# Runs both the hand-written and tensor-backed fused kernels against a real
+# tensor's real bytes, comparing every output element against the CPU dequant
+# + linear_bias reference.
 def check_tensor(GgufFile file, string tensor_name, int expected_type) throws:
     let t = find_tensor(file.tensors, tensor_name)
     guard t.ggml_type == expected_type else throw "{tensor_name}: expected type {expected_type}, got {ggml_type_name(t.ggml_type)} (real GGUF quantization choices can shift between re-quantizations — update the test if this fires)"
@@ -61,17 +64,18 @@ def check_tensor(GgufFile file, string tensor_name, int expected_type) throws:
     let cpu_out = linear_bias(x, cpu_w, zero_bias, 1, d_in, d_out)
     let gpu_out_raw = fused_linear_nobias_gpu(x, w_bytes, expected_type, 1, d_in, d_out)
     let gpu_out = passthrough(gpu_out_raw)
+    let tensor_out_raw = tensor_linear_nobias_gpu(x, w_bytes, expected_type, 1, d_in, d_out)
+    let tensor_out = passthrough(tensor_out_raw)
 
     var int j = 0
     while j < d_out:
-        assert_close(gpu_out[j], cpu_out[j], "{tensor_name}[{j}]")
+        assert_close(gpu_out[j], cpu_out[j], "{tensor_name} specialized[{j}]")
+        assert_close(tensor_out[j], cpu_out[j], "{tensor_name} tensor[{j}]")
         j += 1
-    print "{tensor_name} ({ggml_type_name(expected_type)}, d_in={d_in} d_out={d_out}): OK, {d_out}/{d_out} values match"
+    print "{tensor_name} ({ggml_type_name(expected_type)}, d_in={d_in} d_out={d_out}): OK, specialized and tensor both match {d_out}/{d_out} values"
 
-def main() throws:
-    let [string] argv = args()
-    guard argv.length > 1 else throw "usage: test_quant_kernels_real <path.gguf>"
-    let [uint8] bytes = fs.readBytes(argv[1])
+def check_q4_k_m_file(string path) throws:
+    let [uint8] bytes = fs.readBytes(path)
     let file = parse_gguf(bytes)
 
     # blk.0.attn_q.weight: Q5_0 in the real downloaded Q4_K_M file.
@@ -81,5 +85,28 @@ def main() throws:
     check_tensor(file, "blk.0.ffn_down.weight", 14)
     # blk.11.ffn_down.weight: Q4_K in the real downloaded Q4_K_M file.
     check_tensor(file, "blk.11.ffn_down.weight", 12)
+
+def check_q2_preset_file(string path) throws:
+    let [uint8] bytes = fs.readBytes(path)
+    let file = parse_gguf(bytes)
+
+    # This small-model preset contains no actual Q2_K tensors: llama.cpp uses
+    # Q3_K for down projections, IQ4_NL for gate/up projections, Q5_0 for V,
+    # and Q8_0 for the output tensor.
+    check_tensor(file, "blk.0.ffn_down.weight", 11)
+    check_tensor(file, "blk.0.ffn_gate.weight", 20)
+    check_tensor(file, "output.weight", 8)
+
+def check_q4_0_file(string path) throws:
+    let [uint8] bytes = fs.readBytes(path)
+    let file = parse_gguf(bytes)
+    check_tensor(file, "blk.0.attn_q.weight", 2)
+
+def main() throws:
+    let [string] argv = args()
+    guard argv.length > 3 else throw "usage: test_quant_kernels_real <q4_k_m.gguf> <q2_preset.gguf> <q4_0.gguf>"
+    check_q4_k_m_file(argv[1])
+    check_q2_preset_file(argv[2])
+    check_q4_0_file(argv[3])
 
     print "test_quant_kernels_real: all assertions passed"
