@@ -39,7 +39,7 @@ pub float read_f32_le([uint8] bytes, int offset):
 
 # Read n bytes as a list of bytes from bytes at offset.
 pub [uint8] read_bytes([uint8] bytes, int offset, int n):
-    var [uint8] result = []
+    mut [uint8] result = []
     var int i = 0
     while i < n:
         result.push(bytes[offset + i])
@@ -92,7 +92,7 @@ pub string bytes_to_str([uint8] byte_values):
 
 # Read a UTF-8 string of n bytes as a proper string.
 pub string read_utf8([uint8] bytes, int offset, int n):
-    var [uint8] buf = read_bytes(bytes, offset, n)
+    mut [uint8] buf = read_bytes(bytes, offset, n)
     bytes_to_str(buf)
 
 # 2^e for a small integer exponent (e in roughly -14..15 — the half-precision

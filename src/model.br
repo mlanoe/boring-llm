@@ -142,14 +142,14 @@ pub [float32] load_tensor_f32(GgufFile file, string name) throws:
     let n = tensor_n_elements(t)
     let start = file.data_offset + t.offset
     if t.ggml_type == 0:
-        var [float32] result = [0.0 for i in 0..<n]
+        mut [float32] result = [0.0 for i in 0..<n]
         var int i = 0
         while i < n:
             result[i] = read_f32_le(file.bytes, start + i * 4) as float32
             i += 1
         result
     elif t.ggml_type == 1:
-        var [float32] result = [0.0 for i in 0..<n]
+        mut [float32] result = [0.0 for i in 0..<n]
         var int i = 0
         while i < n:
             result[i] = f16_bits_to_f32(read_u16_le(file.bytes, start + i * 2))
@@ -223,7 +223,7 @@ pub Model load_model(GgufFile file) throws:
     let qkv_dim = config.n_head * config.d_head
     let kv_dim = config.n_kv_head * config.d_head
 
-    var [Layer] layers = []
+    mut [Layer] layers = []
     var int l = 0
     while l < config.n_layer:
         let prefix = "blk.{l}"
@@ -272,7 +272,7 @@ pub QuantModel load_model_quantized(GgufFile file) throws:
     let qkv_dim = config.n_head * config.d_head
     let kv_dim = config.n_kv_head * config.d_head
 
-    var [QuantLayer] layers = []
+    mut [QuantLayer] layers = []
     var int l = 0
     while l < config.n_layer:
         let prefix = "blk.{l}"
@@ -320,7 +320,7 @@ pub [float32] forward(Model model, [int] tokens) throws:
     let qkv_dim = model.config.n_head * model.config.d_head
     let kv_dim = model.config.n_kv_head * model.config.d_head
 
-    var [float32] x = [0.0 for i in 0..<(seq * d)]
+    var mut [float32] x = [0.0 for i in 0..<(seq * d)]
     var int p = 0
     while p < seq:
         let tok = tokens[p]
@@ -364,7 +364,7 @@ pub [float32] forward_gpu(Model model, [int] tokens) throws:
     let qkv_dim = model.config.n_head * model.config.d_head
     let kv_dim = model.config.n_kv_head * model.config.d_head
 
-    var [float32] x = [0.0 for i in 0..<(seq * d)]
+    var mut [float32] x = [0.0 for i in 0..<(seq * d)]
     var int p = 0
     while p < seq:
         let tok = tokens[p]
@@ -418,7 +418,7 @@ pub [float32] forward_gpu_quantized(QuantModel model, [int] tokens) throws:
     let kv_dim = model.config.n_kv_head * model.config.d_head
     let tok_embd_row_bytes = quantized_row_bytes(model.tok_embd_type, d)
 
-    var [float32] x = [0.0 for i in 0..<(seq * d)]
+    var mut [float32] x = [0.0 for i in 0..<(seq * d)]
     var int p = 0
     while p < seq:
         let tok = tokens[p]
@@ -476,7 +476,7 @@ pub SamplingParams greedy_params():
     SamplingParams(0.0 as float32, 0, 1.0 as float32, 0, 1.0 as float32, 64)
 
 [float32] extract_row([float32] logits, int row, int vocab):
-    var [float32] out = [0.0 for i in 0..<vocab]
+    mut [float32] out = [0.0 for i in 0..<vocab]
     let base = row * vocab
     var int i = 0
     while i < vocab:
@@ -486,7 +486,7 @@ pub SamplingParams greedy_params():
 
 pub [int] generate(QuantModel model, [int] prompt_tokens, int max_new_tokens, int eos_id,
                     SamplingParams params) throws:
-    var [int] tokens = []
+    mut [int] tokens = []
     for t in prompt_tokens:
         tokens.push(t)
 
@@ -515,7 +515,7 @@ pub [int] generate(QuantModel model, [int] prompt_tokens, int max_new_tokens, in
 # weights dequantized once at load time.
 pub [int] generate_f32(Model model, [int] prompt_tokens, int max_new_tokens, int eos_id,
                         SamplingParams params) throws:
-    var [int] tokens = []
+    mut [int] tokens = []
     for t in prompt_tokens:
         tokens.push(t)
 
@@ -579,7 +579,7 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
     let kv_dim = model.config.n_kv_head * model.config.d_head
     let tok_embd_row_bytes = quantized_row_bytes(model.tok_embd_type, d)
 
-    var [float32] x = [0.0 for i in 0..<(seq * d)]
+    var mut [float32] x = [0.0 for i in 0..<(seq * d)]
     var int p = 0
     while p < seq:
         let tok = tokens[p]
@@ -591,7 +591,7 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
             i += 1
         p += 1
 
-    var [LayerCache] new_layers = []
+    mut [LayerCache] new_layers = []
     var int l = 0
     while l < model.config.n_layer:
         let layer = model.layers[l]
@@ -632,7 +632,7 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
     let logits_all = passthrough(logits_all_raw)
 
     let vocab = model.config.vocab_size
-    var [float32] last_logits = [0.0 for i in 0..<vocab]
+    mut [float32] last_logits = [0.0 for i in 0..<vocab]
     let base = (seq - 1) * vocab
     var int vi = 0
     while vi < vocab:
@@ -660,7 +660,7 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
     let kv_dim = model.config.n_kv_head * model.config.d_head
     let tok_embd_row_bytes = quantized_row_bytes(model.tok_embd_type, d)
 
-    var [float32] x = [0.0 for i in 0..<(n * d)]
+    var mut [float32] x = [0.0 for i in 0..<(n * d)]
     var int p = 0
     while p < n:
         let tok = tokens[p]
@@ -672,7 +672,7 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
             i += 1
         p += 1
 
-    var [LayerCache] new_layers = []
+    mut [LayerCache] new_layers = []
     var int l = 0
     while l < model.config.n_layer:
         let layer = model.layers[l]
@@ -690,12 +690,12 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
         let k_mat = passthrough(k_rope_raw)
         let v_mat = passthrough(v)
 
-        var [float32] full_k = []
+        mut [float32] full_k = []
         for kv in lc.k:
             full_k.push(kv)
         for kv in k_mat:
             full_k.push(kv)
-        var [float32] full_v = []
+        mut [float32] full_v = []
         for vv in lc.v:
             full_v.push(vv)
         for vv in v_mat:
@@ -724,7 +724,7 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
     let logits_all = passthrough(logits_all_raw)
 
     let vocab = model.config.vocab_size
-    var [float32] last_logits = [0.0 for i in 0..<vocab]
+    mut [float32] last_logits = [0.0 for i in 0..<vocab]
     let base = (n - 1) * vocab
     var int vi = 0
     while vi < vocab:
@@ -734,7 +734,7 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
     (last_logits, GenCache(new_layers, base_pos + n))
 
 pub GenCache empty_cache(int n_layer):
-    var [LayerCache] layers = []
+    mut [LayerCache] layers = []
     var int l = 0
     while l < n_layer:
         layers.push(LayerCache([], []))
@@ -754,7 +754,7 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
     let row_byte_offset = token * tok_embd_row_bytes
     var [float32] x = dequantize_row(model.tok_embd_type, model.tok_embd_q8, row_byte_offset, d)
 
-    var [LayerCache] new_layers = []
+    mut [LayerCache] new_layers = []
     var int l = 0
     while l < model.config.n_layer:
         let layer = model.layers[l]
@@ -773,12 +773,12 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
         let k_rope_raw = rope_apply_at_gpu(k_new, 1, model.config.n_kv_head, model.config.d_head, model.config.rope_freq_base, pos, model.config.rope_neox)
         let k_roped = passthrough(k_rope_raw)
 
-        var [float32] full_k = []
+        mut [float32] full_k = []
         for kv in lc.k:
             full_k.push(kv)
         for kv in k_roped:
             full_k.push(kv)
-        var [float32] full_v = []
+        mut [float32] full_v = []
         for vv in lc.v:
             full_v.push(vv)
         for vv in v_new:
@@ -813,7 +813,7 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
 
 pub [int] generate_kv(QuantModel model, [int] prompt_tokens, int max_new_tokens, int eos_id,
                        SamplingParams params) throws:
-    var [int] tokens = []
+    mut [int] tokens = []
     for t in prompt_tokens:
         tokens.push(t)
 
@@ -860,7 +860,7 @@ pub ([int], GenCache) generate_kv_chat_continue(QuantModel model, GenCache cache
                                                  [int] tokens_so_far, int max_new_tokens, int eos_id,
                                                  SamplingParams params) throws:
     let (first_logits, cache1) = prefill_step_gpu_quantized(model, cache, new_tokens)
-    var [int] full_history = []
+    mut [int] full_history = []
     for t in tokens_so_far:
         full_history.push(t)
     for t in new_tokens:
@@ -870,7 +870,7 @@ pub ([int], GenCache) generate_kv_chat_continue(QuantModel model, GenCache cache
 ([int], GenCache) generate_kv_chat_loop(QuantModel model, [float32] first_logits, GenCache cache0,
                                          [int] tokens_so_far, int max_new_tokens, int eos_id,
                                          SamplingParams params) throws:
-    var [int] tokens = []
+    mut [int] tokens = []
     for t in tokens_so_far:
         tokens.push(t)
 

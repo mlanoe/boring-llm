@@ -11,7 +11,7 @@ let int QK8_0 = 32
 
 pub [float32] dequantize_q8_0([uint8] bytes, int offset, int n_elements) throws:
     guard n_elements % QK8_0 == 0 else throw "dequantize_q8_0: n_elements must be a multiple of {QK8_0}, got {n_elements}"
-    var [float32] result = [0.0 for i in 0..<n_elements]
+    mut [float32] result = [0.0 for i in 0..<n_elements]
     let n_blocks = n_elements / QK8_0
     var int cur = offset
     var int out_i = 0
@@ -46,7 +46,7 @@ let int Q4_0_BLOCK_BYTES = 18
 
 pub [float32] dequantize_q4_0([uint8] bytes, int offset, int n_elements) throws:
     guard n_elements % QK4_0 == 0 else throw "dequantize_q4_0: n_elements must be a multiple of {QK4_0}, got {n_elements}"
-    var [float32] result = [0.0 for i in 0..<n_elements]
+    mut [float32] result = [0.0 for i in 0..<n_elements]
     let n_blocks = n_elements / QK4_0
     var int b = 0
     while b < n_blocks:
@@ -81,7 +81,7 @@ let int Q5_0_BLOCK_BYTES = 22
 
 pub [float32] dequantize_q5_0([uint8] bytes, int offset, int n_elements) throws:
     guard n_elements % QK5_0 == 0 else throw "dequantize_q5_0: n_elements must be a multiple of {QK5_0}, got {n_elements}"
-    var [float32] result = [0.0 for i in 0..<n_elements]
+    mut [float32] result = [0.0 for i in 0..<n_elements]
     let n_blocks = n_elements / QK5_0
     var int b = 0
     while b < n_blocks:
@@ -139,7 +139,7 @@ let int Q2_K_BLOCK_BYTES = 84
 
 pub [float32] dequantize_q2_k([uint8] bytes, int offset, int n_elements) throws:
     guard n_elements % QK_K == 0 else throw "dequantize_q2_k: n_elements must be a multiple of {QK_K}, got {n_elements}"
-    var [float32] result = [0.0 for i in 0..<n_elements]
+    mut [float32] result = [0.0 for i in 0..<n_elements]
     let n_blocks = n_elements / QK_K
     var int sb = 0
     while sb < n_blocks:
@@ -233,7 +233,7 @@ let int Q3_K_BLOCK_BYTES = 110
     let aux2 = ((aux0_in >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4)
     let aux3 = ((aux1_in >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4)
 
-    var [int] scales = [0 for i in 0..<16]
+    mut [int] scales = [0 for i in 0..<16]
     var int w = 0
     while w < 4:
         let word = if w == 0: aux0 elif w == 1: aux1 elif w == 2: aux2 else: aux3
@@ -247,7 +247,7 @@ let int Q3_K_BLOCK_BYTES = 110
 
 pub [float32] dequantize_q3_k([uint8] bytes, int offset, int n_elements) throws:
     guard n_elements % QK_K == 0 else throw "dequantize_q3_k: n_elements must be a multiple of {QK_K}, got {n_elements}"
-    var [float32] result = [0.0 for i in 0..<n_elements]
+    mut [float32] result = [0.0 for i in 0..<n_elements]
     let n_blocks = n_elements / QK_K
     var int sb = 0
     while sb < n_blocks:
@@ -311,7 +311,7 @@ let int Q6_K_BLOCK_BYTES = 210
 
 pub [float32] dequantize_q6_k([uint8] bytes, int offset, int n_elements) throws:
     guard n_elements % QK_K == 0 else throw "dequantize_q6_k: n_elements must be a multiple of {QK_K}, got {n_elements}"
-    var [float32] result = [0.0 for i in 0..<n_elements]
+    mut [float32] result = [0.0 for i in 0..<n_elements]
     let n_blocks = n_elements / QK_K
     var int sb = 0
     while sb < n_blocks:
@@ -402,7 +402,7 @@ let int IQ4_NL_BLOCK_BYTES = 18
 pub [float32] dequantize_iq4_nl([uint8] bytes, int offset, int n_elements) throws:
     guard n_elements % QK4_NL == 0 else throw "dequantize_iq4_nl: n_elements must be a multiple of {QK4_NL}, got {n_elements}"
     let [int] codebook = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
-    var [float32] result = [0.0 for i in 0..<n_elements]
+    mut [float32] result = [0.0 for i in 0..<n_elements]
     let n_blocks = n_elements / QK4_NL
     var int b = 0
     while b < n_blocks:
@@ -478,7 +478,7 @@ pub [float32] dequantize_row(int ggml_type, [uint8] bytes, int offset, int n_ele
 
 pub [float32] dequantize_q4_k([uint8] bytes, int offset, int n_elements) throws:
     guard n_elements % QK_K == 0 else throw "dequantize_q4_k: n_elements must be a multiple of {QK_K}, got {n_elements}"
-    var [float32] result = [0.0 for i in 0..<n_elements]
+    mut [float32] result = [0.0 for i in 0..<n_elements]
     let n_blocks = n_elements / QK_K
     var int sb = 0
     while sb < n_blocks:

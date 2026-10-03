@@ -78,14 +78,14 @@ def main() throws:
     var simulated_reply_tokens = tok.encode(reply1_text)
     simulated_reply_tokens.push(tok.eos_token_id)
 
-    var all_tokens = []
+    mut all_tokens = []
     for t in turn1: all_tokens.push(t)
     for t in simulated_reply_tokens: all_tokens.push(t)
 
     let full_turn2 = render_chat_prompt(file, tok, system_msg, [msg1, msg2], [reply1_text], true)
     let new_tokens = full_turn2[all_tokens.length..]
 
-    var incremental = []
+    mut incremental = []
     for t in all_tokens: incremental.push(t)
     for t in new_tokens: incremental.push(t)
 

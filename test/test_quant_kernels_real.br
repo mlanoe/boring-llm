@@ -54,7 +54,7 @@ def check_tensor(GgufFile file, string tensor_name, int expected_type) throws:
 
     let cpu_w = dequantize_row(expected_type, w_bytes, 0, n)
 
-    var [float32] x = [0.0 for i in 0..<d_in]
+    mut [float32] x = [0.0 for i in 0..<d_in]
     var int i = 0
     while i < d_in:
         x[i] = ((i % 13) as float32) * (0.1 as float32)

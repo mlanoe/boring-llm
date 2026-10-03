@@ -46,9 +46,9 @@ def main() throws:
     let is_big = shape == "big-seq26" or shape == "big-seq1"
     let d_out = if is_big: vocab else: d_model
 
-    var [float32] x = [0.0 for i in 0..<(seq * d_model)]
-    var [float32] w = [0.0 for i in 0..<(d_out * d_model)]
-    var [float32] bv = [0.0 for i in 0..<d_out]
+    mut [float32] x = [0.0 for i in 0..<(seq * d_model)]
+    mut [float32] w = [0.0 for i in 0..<(d_out * d_model)]
+    mut [float32] bv = [0.0 for i in 0..<d_out]
     var i = 0
     while i < x.length:
         x[i] = ((i % 13) as float32) * (0.01 as float32)
@@ -62,7 +62,7 @@ def main() throws:
     # (896) is a multiple of 32, so this is exactly (d_out * d_model / 32)
     # real 34-byte blocks (2-byte f16 scale + 32 signed int8 values), same
     # shape real GGUF Q8_0 tensors use.
-    var [uint8] w_packed = []
+    mut [uint8] w_packed = []
     if kernel_name == "q8" or kernel_name == "q8tensor" or kernel_name == "q8warp" or kernel_name == "q8warpbcast":
         let n_blocks = (d_out * d_model) / 32
         var b = 0
@@ -77,7 +77,7 @@ def main() throws:
 
     # Synthetic Q5_0-packed bytes (22 bytes/block: 2-byte scale + 4-byte
     # qh + 16 bytes nibbles), same d_model-multiple-of-32 shape as above.
-    var [uint8] w5_packed = []
+    mut [uint8] w5_packed = []
     if kernel_name == "q5" or kernel_name == "q5tensor" or kernel_name == "q5bcast":
         let n_blocks5 = (d_out * d_model) / 32
         var b5 = 0
@@ -96,7 +96,7 @@ def main() throws:
 
     # Synthetic Q4_0-packed bytes (18 bytes/block: 2-byte scale + 16 bytes
     # nibbles) — same layout shape as IQ4_NL (reused for both below).
-    var [uint8] w4_packed = []
+    mut [uint8] w4_packed = []
     if kernel_name == "q4" or kernel_name == "q4tensor" or kernel_name == "q4bcast" or kernel_name == "q4nl" or kernel_name == "q4nltensor" or kernel_name == "q4nlbcast":
         let n_blocks4 = (d_out * d_model) / 32
         var b4 = 0

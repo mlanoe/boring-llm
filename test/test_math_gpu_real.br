@@ -48,9 +48,9 @@ def main() throws:
     # --- linear_warp_gpu with d_in=100 (spans multiple warp-stride rounds,
     #     since 100 > warp size) and seq=3, d_out=5 (exercises the
     #     block/warp/grid index arithmetic beyond a single trivial warp) ---
-    var [float32] big_x = [0.0 for i in 0..<300]
-    var [float32] big_w = [0.0 for i in 0..<500]
-    var [float32] big_b = [1.0, 2.0, 3.0, 4.0, 5.0]
+    mut [float32] big_x = [0.0 for i in 0..<300]
+    mut [float32] big_w = [0.0 for i in 0..<500]
+    mut [float32] big_b = [1.0, 2.0, 3.0, 4.0, 5.0]
     i = 0
     while i < 300:
         let xv = (i % 7) as float32
@@ -121,7 +121,7 @@ def main() throws:
     # bit-shifts under the hood (this used to be a real, documented
     # Metal-only gap — task_0bd1e42a's own follow-up fix closed it; see
     # `docs/development-log.md`'s wgpu Phase 4 entries for the history).
-    var [uint8] w_packed = []
+    mut [uint8] w_packed = []
     # row0: scale=1.0 (f16 bits 0x3C00), all 32 quantized values = 1
     w_packed.push(0x00 as uint8)
     w_packed.push(0x3C as uint8)
@@ -168,7 +168,7 @@ def main() throws:
 
     # --- q8_linear_warp_gpu with d_in=64 (2 Q8_0 blocks per row, exercises
     # the warp-stride loop crossing a block boundary) and seq=2, d_out=3 ---
-    var [uint8] w8w_packed = []
+    mut [uint8] w8w_packed = []
     var int wr = 0
     while wr < 3:
         var int blk = 0
@@ -219,7 +219,7 @@ def main() throws:
     # cancels, leaving dequantized value = nibble * scale (see quant.br's
     # dequantize_q5_0 — this is just a convenient test-value choice, not a
     # property of the real format).
-    var [uint8] w5_packed = []
+    mut [uint8] w5_packed = []
     # row0: scale=1.0 (f16 bits 0x3C00), qh=all-1s, every nibble=1 -> all 32
     # dequantized values = 1.0
     w5_packed.push(0x00 as uint8)
@@ -288,7 +288,7 @@ def main() throws:
     # +32 the -32 offset exactly cancels), so setting `ql` nibbles picks
     # the value directly — same "constant-high-bits" trick as the Q5_0
     # case above, generalized to Q6_K's 2-bit (not 1-bit) high field.
-    var [uint8] w6_packed = []
+    mut [uint8] w6_packed = []
     # row0: d=1.0, every ql nibble=1 -> all 256 dequantized values = 1.0
     var i6 = 0
     while i6 < 128:
@@ -339,7 +339,7 @@ def main() throws:
     # sub-blocks it is (see quant.br's get_scale_min_k4 — both its `j<4`
     # and `j>=4` branches reduce to reading a low-nibble-only byte when
     # every input byte is 1), so dequantized value = nibble directly.
-    var [uint8] w4_packed = []
+    mut [uint8] w4_packed = []
     # row0: d=1.0, dmin=0.0, every scales byte=1, every qs nibble=1 -> all
     # 256 dequantized values = 1.0
     w4_packed.push(0x00 as uint8)
@@ -387,7 +387,7 @@ def main() throws:
     # oracle here; this test's job is only to confirm the kernel's
     # flat-index-to-(block,nibble) inverse mapping agrees with the CPU's
     # sequential one, which a varied bit pattern actually exercises.
-    var [uint8] w4_0_packed = []
+    mut [uint8] w4_0_packed = []
     var int row4 = 0
     while row4 < 2:
         var int blk4 = 0
@@ -432,7 +432,7 @@ def main() throws:
     # patterned-bytes approach as q4_linear_gpu above — dequantize_q2_k was
     # already verified against a from-scratch Python oracle and real
     # downloaded weights (test/test_quant.br, test_quant_kquant.br).
-    var [uint8] w2k_packed = []
+    mut [uint8] w2k_packed = []
     var int row2k = 0
     while row2k < 2:
         var int sc2 = 0
@@ -493,7 +493,7 @@ def main() throws:
     # q3k_unpack_scales' kmask1/kmask2 bit-twiddling per element instead of
     # calling it), so a varied byte pattern across hmask/qs/scales matters
     # most here.
-    var [uint8] w3k_packed = []
+    mut [uint8] w3k_packed = []
     var int row3k = 0
     while row3k < 2:
         var int hm3 = 0
@@ -535,7 +535,7 @@ def main() throws:
     # local array from inside the kernel body, an untested pattern here)
     # agrees with the CPU version element-for-element across every nibble
     # value 0..15, not just a few hand-picked ones.
-    var [uint8] w4nl_packed = []
+    mut [uint8] w4nl_packed = []
     var int row4nl = 0
     while row4nl < 2:
         var int blk4nl = 0

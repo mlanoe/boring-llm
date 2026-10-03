@@ -56,13 +56,13 @@ def main() throws:
     # go through ordinary BPE, special-token spans become a single atomic id.
     let byte_to_uni = build_byte_to_unicode()
     let uni_to_byte = build_unicode_to_byte()
-    var {string=int} vocab = {=}
+    mut {string=int} vocab = {=}
     vocab["h"] = 1
     vocab["i"] = 2
     vocab["b"] = 3
     vocab["y"] = 4
     vocab["e"] = 5
-    var {string=int} special = {=}
+    mut {string=int} special = {=}
     special["<SPECIAL>"] = 999
     let tok = Tokenizer(vocab, {=}, [], byte_to_uni, uni_to_byte, 0, 0, false, [], [], special)
     let ids = tok.encode_with_specials("hi<SPECIAL>bye")
@@ -76,7 +76,7 @@ def main() throws:
 
     # Longest-match preference: "<ab>" must win over the shorter "<a>" even
     # though both match starting at the same position.
-    var {string=int} overlapping = {=}
+    mut {string=int} overlapping = {=}
     overlapping["<a>"] = 900
     overlapping["<ab>"] = 901
     let tok2 = Tokenizer({=}, {=}, [], byte_to_uni, uni_to_byte, 0, 0, false, [], [], overlapping)

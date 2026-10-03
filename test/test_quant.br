@@ -7,7 +7,7 @@ use quant
 def main() throws:
     # One block: scale = 1.0 (f16 bits 0x3C00), values 0..31 as signed int8
     # (all non-negative here, so raw == q for every one of them).
-    var [uint8] bytes = [0x00 as uint8, 0x3C as uint8]  # scale = 1.0, little-endian
+    mut [uint8] bytes = [0x00 as uint8, 0x3C as uint8]  # scale = 1.0, little-endian
     var int i = 0
     while i < 32:
         bytes.push(i as uint8)
@@ -36,7 +36,7 @@ def main() throws:
     # --- Q4_0: one block, scale = 1.0, every nibble byte = 0x98 (low
     # nibble 8 -> x0 = 0, high nibble 9 -> x1 = 1), so the first 16 output
     # values are all 0 and the last 16 are all 1 ---
-    var [uint8] q4_bytes = [0x00 as uint8, 0x3C as uint8]
+    mut [uint8] q4_bytes = [0x00 as uint8, 0x3C as uint8]
     var int qi4 = 0
     while qi4 < 16:
         q4_bytes.push(0x98 as uint8)
@@ -89,7 +89,7 @@ def main() throws:
     # --- IQ4_NL: one block, scale = 1.0, every qs byte = 0x80 (low nibble 0
     # -> codebook[0] = -127, high nibble 8 -> codebook[8] = 1), so the
     # first 16 output values are all -127.0 and the last 16 are all 1.0 ---
-    var [uint8] iq4nl_bytes = [0x00 as uint8, 0x3C as uint8]
+    mut [uint8] iq4nl_bytes = [0x00 as uint8, 0x3C as uint8]
     var int qi_nl = 0
     while qi_nl < 16:
         iq4nl_bytes.push(0x80 as uint8)

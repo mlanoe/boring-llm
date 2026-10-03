@@ -15,13 +15,13 @@ use gguf
 use jinja
 
 JValue make_message(string role, string content) throws:
-    var {string=JValue} fields = {=}
+    mut {string=JValue} fields = {=}
     fields["role"] = JValue.JStr(role)
     fields["content"] = JValue.JStr(content)
     JValue.JDict(fields)
 
 {string=JValue} build_env([JValue] messages, bool add_gen_prompt, string bos, string eos) throws:
-    var {string=JValue} env = {=}
+    mut {string=JValue} env = {=}
     env["messages"] = JValue.JList(messages)
     env["add_generation_prompt"] = JValue.JBool(add_gen_prompt)
     env["bos_token"] = JValue.JStr(bos)
@@ -40,7 +40,7 @@ def main() throws:
     let qwen_file = parse_gguf(qwen_bytes)
     guard let qwen_tmpl = gguf_get_string(qwen_file.metadata, "tokenizer.chat_template") else throw "qwen GGUF has no chat_template"
 
-    var [JValue] single = []
+    mut [JValue] single = []
     single.push(make_message("system", "You are a helpful assistant."))
     single.push(make_message("user", "What is the capital of France?"))
     let qwen_env1 = build_env(single, true, "", "<|im_end|>")
@@ -49,7 +49,7 @@ def main() throws:
         "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
         "qwen single-turn")
 
-    var [JValue] multi = []
+    mut [JValue] multi = []
     multi.push(make_message("system", "You are a helpful assistant."))
     multi.push(make_message("user", "What is the capital of France?"))
     multi.push(make_message("assistant", "Paris."))

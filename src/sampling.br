@@ -51,14 +51,14 @@ pub [float32] apply_repeat_penalty([float32] logits, [int] history, float32 pena
     if penalty == 1.0 as float32 or history.length == 0:
         logits
     else:
-        var [float32] out = [0.0 for i in 0..<logits.length]
+        mut [float32] out = [0.0 for i in 0..<logits.length]
         var int i = 0
         while i < logits.length:
             out[i] = logits[i]
             i += 1
         let window = if repeat_last_n > 0 and history.length > repeat_last_n: repeat_last_n else: history.length
         let start = history.length - window
-        var {int=bool} seen = {=}
+        mut {int=bool} seen = {=}
         var int j = start
         while j < history.length:
             let tok = history[j]
@@ -88,8 +88,8 @@ pub int sample_greedy([float32] logits, int vocab):
 # sampling actually needs (no reason to fully sort 150k-entry logit rows).
 ([float32], [int]) top_k_select([float32] logits, int vocab, int k):
     let kk = if k > vocab: vocab else: k
-    var [float32] top_val = [-1.0e30 as float32 for i in 0..<kk]
-    var [int] top_idx = [0 for i in 0..<kk]
+    mut [float32] top_val = [-1.0e30 as float32 for i in 0..<kk]
+    mut [int] top_idx = [0 for i in 0..<kk]
     var int v = 0
     while v < vocab:
         let val = logits[v]
@@ -129,7 +129,7 @@ pub (int, Rng) sample(Rng rng, [float32] logits, int vocab, float32 temperature,
         let (top_val, top_idx) = top_k_select(penalized, vocab, k)
         let n = top_val.length
 
-        var [float32] scaled = [0.0 for i in 0..<n]
+        mut [float32] scaled = [0.0 for i in 0..<n]
         var int i = 0
         while i < n:
             scaled[i] = top_val[i] / temperature
@@ -138,7 +138,7 @@ pub (int, Rng) sample(Rng rng, [float32] logits, int vocab, float32 temperature,
         # softmax over the top-k candidates (top_val/scaled are already
         # sorted descending, so scaled[0] is the max — no separate max-scan
         # needed).
-        var [float32] probs = [0.0 for i in 0..<n]
+        mut [float32] probs = [0.0 for i in 0..<n]
         var float32 sum_exp = 0.0
         i = 0
         while i < n:

@@ -59,7 +59,7 @@ float32 parse_float_arg(string name, string s) throws:
     f as float32
 
 [int] parse_token_ids(string csv) throws:
-    var [int] result = []
+    mut [int] result = []
     for part in csv.split(","):
         guard let n = (part as int) else throw "invalid token id: '{part}'"
         result.push(n)
@@ -73,8 +73,8 @@ float32 parse_float_arg(string name, string s) throws:
 def print_top5([float32] logits, [int] tokens, int vocab) throws:
     var int p = 0
     while p < tokens.length:
-        var [int] top_idx = [0, 0, 0, 0, 0]
-        var [float32] top_val = [-1.0e30 as float32, -1.0e30 as float32, -1.0e30 as float32, -1.0e30 as float32, -1.0e30 as float32]
+        mut [int] top_idx = [0, 0, 0, 0, 0]
+        mut [float32] top_val = [-1.0e30 as float32, -1.0e30 as float32, -1.0e30 as float32, -1.0e30 as float32, -1.0e30 as float32]
         var int v = 0
         while v < vocab:
             let val = logits[p * vocab + v]
@@ -152,7 +152,7 @@ def run_generate(GgufFile file, string system_msg, string user_msg, int max_new_
         print "[diag] decoding without KV-cache (full re-forward every step)..."
         generate_f32(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
 
-    var [int] new_tokens = []
+    mut [int] new_tokens = []
     var int i = prompt_tokens.length
     while i < all_tokens.length:
         # Don't include the terminating EOS/<|im_end|> marker in the
@@ -196,8 +196,8 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
     print ""
     print "[chat] interactive mode — type a message and press enter, empty line or Ctrl-D to quit."
 
-    var [string] user_msgs = []
-    var [string] assistant_msgs = []
+    mut [string] user_msgs = []
+    mut [string] assistant_msgs = []
 
     # Two near-identical branches (not one loop parameterized over "which
     # generate function to call") because QuantModel/Model are
@@ -260,7 +260,7 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
                 cache = next_cache
                 first_turn = false
 
-                var [int] reply_tokens = []
+                mut [int] reply_tokens = []
                 var int i = reply_start
                 while i < all_tokens.length:
                     if all_tokens[i] != tok.eos_token_id:
@@ -284,7 +284,7 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
                 let prompt_tokens = render_chat_prompt(file, tok, system_msg, user_msgs, assistant_msgs, true)
                 let all_tokens = generate(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
 
-                var [int] new_tokens = []
+                mut [int] new_tokens = []
                 var int i = prompt_tokens.length
                 while i < all_tokens.length:
                     if all_tokens[i] != tok.eos_token_id:
@@ -312,7 +312,7 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
             let prompt_tokens = render_chat_prompt(file, tok, system_msg, user_msgs, assistant_msgs, true)
             let all_tokens = generate_f32(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
 
-            var [int] new_tokens = []
+            mut [int] new_tokens = []
             var int i = prompt_tokens.length
             while i < all_tokens.length:
                 if all_tokens[i] != tok.eos_token_id:

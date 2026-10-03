@@ -176,7 +176,7 @@ float f64_bits_to_float(int bits):
         guard offset + 12 <= bytes.length else throw "GGUF: truncated array header at offset {offset}"
         let elem_type = read_u32_le(bytes, offset)
         let count = read_u64_le(bytes, offset + 4)
-        var [GgufValue] items = []
+        mut [GgufValue] items = []
         var int cur = offset + 12
         var int i = 0
         while i < count:
@@ -207,7 +207,7 @@ pub GgufFile parse_gguf([uint8] bytes) throws:
     let tensor_count = read_u64_le(bytes, 8)
     let kv_count = read_u64_le(bytes, 16)
 
-    var {string=GgufValue} metadata = {=}
+    mut {string=GgufValue} metadata = {=}
     var int offset = 24
     var int i = 0
     while i < kv_count:
@@ -219,13 +219,13 @@ pub GgufFile parse_gguf([uint8] bytes) throws:
         offset = o2
         i += 1
 
-    var [GgufTensorInfo] tensors = []
+    mut [GgufTensorInfo] tensors = []
     i = 0
     while i < tensor_count:
         let (name, o1) = read_gguf_string(bytes, offset)
         guard o1 + 4 <= bytes.length else throw "GGUF: truncated tensor info for '{name}'"
         let n_dims = read_u32_le(bytes, o1)
-        var [int] dims = []
+        mut [int] dims = []
         var int cur = o1 + 4
         var int d = 0
         while d < n_dims:
@@ -307,7 +307,7 @@ int? gguf_value_as_int(GgufValue v):
         _: nil
 
 pub [string] gguf_get_string_array({string=GgufValue} metadata, string key):
-    var [string] result = []
+    mut [string] result = []
     if metadata.contains(key):
         for item in gguf_value_as_array(metadata[key]):
             if let s = gguf_value_as_str(item):
@@ -315,7 +315,7 @@ pub [string] gguf_get_string_array({string=GgufValue} metadata, string key):
     result
 
 pub [int] gguf_get_int_array({string=GgufValue} metadata, string key):
-    var [int] result = []
+    mut [int] result = []
     if metadata.contains(key):
         for item in gguf_value_as_array(metadata[key]):
             if let v = gguf_value_as_int(item):
@@ -330,7 +330,7 @@ float32? gguf_value_as_f32(GgufValue v):
 # Used for `tokenizer.ggml.scores` (SentencePiece per-token merge priority) —
 # GGUF's own writer always stores these as F32.
 pub [float32] gguf_get_f32_array({string=GgufValue} metadata, string key):
-    var [float32] result = []
+    mut [float32] result = []
     if metadata.contains(key):
         for item in gguf_value_as_array(metadata[key]):
             if let v = gguf_value_as_f32(item):

@@ -45,7 +45,7 @@ pub struct Tokenizer:
                                   # merging (llama.cpp's own `tokenizer_st_partition` concept)
 
     req [string] apply_merge([string] word, string a, string b):
-        var [string] out = []
+        mut [string] out = []
         var int i = 0
         while i < word.length:
             if i < word.length - 1 and word[i] == a and word[i + 1] == b:
@@ -61,7 +61,7 @@ pub struct Tokenizer:
     # applies every BPE merge rule in rank order (same algorithm as
     # whisper-boring's tokenizer.br).
     req [string] bpe_word(string segment):
-        var [string] word = []
+        var mut [string] word = []
         for ch in segment.chars():
             for b in utf8_encode_char(ch):
                 # NOTE: rebinding the for-loop value before using it as a
@@ -117,7 +117,7 @@ pub struct Tokenizer:
         (best_id, best_len)
 
     req [int] encode_with_specials(string text):
-        var [int] ids = []
+        mut [int] ids = []
         var string plain = ""
         let chars = text.chars()
         let n = chars.length
@@ -138,7 +138,7 @@ pub struct Tokenizer:
         ids
 
     req [int] encode_bpe(string text):
-        var [int] ids = []
+        mut [int] ids = []
         for segment in pretokenize(text):
             for tok in self.bpe_word(segment):
                 let id = self.vocab[tok] else -1
@@ -147,7 +147,7 @@ pub struct Tokenizer:
         ids
 
     req string decode_bpe([int] ids):
-        var [uint8] bytes = []
+        mut [uint8] bytes = []
         for id in ids:
             let tok = self.reverse[id] else ""
             for ch in tok.chars():
@@ -187,10 +187,10 @@ pub struct Tokenizer:
                 escaped = "{escaped}{chr(9601)}"
             else:
                 escaped = "{escaped}{ch}"
-        var [string] sym = escaped.chars()
+        mut [string] sym = escaped.chars()
         let n = sym.length
-        var [bool] active = [true for i in 0..<n]
-        var [int] nexts = [0 for i in 0..<n]
+        mut [bool] active = [true for i in 0..<n]
+        mut [int] nexts = [0 for i in 0..<n]
         var int ni = 0
         while ni < n:
             nexts[ni] = if ni + 1 < n: ni + 1 else: -1
@@ -224,7 +224,7 @@ pub struct Tokenizer:
                 nexts[best_left] = after
                 merged_any = true
 
-        var [int] ids = []
+        mut [int] ids = []
         var int i = 0
         while i < n:
             if active[i]:
@@ -242,7 +242,7 @@ pub struct Tokenizer:
         ids
 
     req string decode_spm([int] ids):
-        var [uint8] bytes = []
+        mut [uint8] bytes = []
         for id in ids:
             let piece = self.reverse[id] else ""
             let fallback = byte_fallback_value(piece)
@@ -273,7 +273,7 @@ def bool is_ascii_space(string ch):
 [string] pretokenize(string text):
     let chars = text.chars()
     let n = chars.length
-    var [string] segments = []
+    mut [string] segments = []
     var int i = 0
     while i < n:
         var string seg = ""
@@ -309,8 +309,8 @@ def bool is_ascii_space(string ch):
 # real GGUF vocab entry ("Ġcapital", confirming byte 32/space → codepoint
 # 288 = U+0120 = 'Ġ', matching this algorithm exactly).
 {int=string} build_byte_to_unicode():
-    var {int=string} m = {=}
-    var {int=bool} in_bs = {=}
+    mut {int=string} m = {=}
+    mut {int=bool} in_bs = {=}
     var int b = 33
     while b <= 126:
         m[b] = chr(b)
@@ -341,7 +341,7 @@ def bool is_ascii_space(string ch):
 # mis-transpiles a plain-local (non-`self.`-field) dict index as an array
 # index instead.
 {string=int} build_unicode_to_byte():
-    var {string=int} m = {=}
+    mut {string=int} m = {=}
     var int b = 33
     while b <= 126:
         m[chr(b)] = b
@@ -354,7 +354,7 @@ def bool is_ascii_space(string ch):
     while b <= 255:
         m[chr(b)] = b
         b += 1
-    var {int=bool} in_bs = {=}
+    mut {int=bool} in_bs = {=}
     b = 33
     while b <= 126:
         in_bs[b] = true
@@ -425,7 +425,7 @@ int byte_fallback_value(string piece):
 # rather than throwing, since a missing single byte token is recoverable
 # information loss, not a fatal error).
 [int] build_byte_token_id({string=int} vocab):
-    var [int] result = [0 for i in 0..<256]
+    mut [int] result = [0 for i in 0..<256]
     var int b = 0
     while b < 256:
         result[b] = vocab["<0x{hex2(b)}>"] else -1
@@ -434,8 +434,8 @@ int byte_fallback_value(string piece):
 
 pub Tokenizer load_tokenizer(GgufFile file) throws:
     let tokens = gguf_get_string_array(file.metadata, "tokenizer.ggml.tokens")
-    var {string=int} vocab = {=}
-    var {int=string} reverse = {=}
+    mut {string=int} vocab = {=}
+    mut {int=string} reverse = {=}
     var int i = 0
     while i < tokens.length:
         vocab[tokens[i]] = i
@@ -448,7 +448,7 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
     # whisper-boring/src/tokenizer.br's own merges.txt parser, which uses
     # the identical manual scan for the same reason.
     let merge_strs = gguf_get_string_array(file.metadata, "tokenizer.ggml.merges")
-    var [[string]] merges = []
+    mut [[string]] merges = []
     for m in merge_strs:
         # NOTE: indexes `m.chars()` (a `[string]` array), never `m` (a
         # plain `string`) directly — a real bug makes any direct
@@ -495,7 +495,7 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
     # but that must be encoded as a single atomic vocab id rather than run
     # through ordinary BPE/SPM merging — see encode_with_specials.
     let token_types = gguf_get_int_array(file.metadata, "tokenizer.ggml.token_type")
-    var {string=int} special_tokens = {=}
+    mut {string=int} special_tokens = {=}
     var int ti = 0
     while ti < token_types.length:
         if token_types[ti] == 3:

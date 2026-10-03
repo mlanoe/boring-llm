@@ -240,7 +240,7 @@ bool is_digit_char(string ch):
 pub [EToken] lex_expr_tokens(string src) throws:
     let chars = src.chars()
     let n = chars.length
-    var [EToken] toks = []
+    mut [EToken] toks = []
     var int i = 0
     while i < n:
         let c = chars[i]
@@ -423,7 +423,7 @@ struct RawTok:
 [RawTok] scan_raw(string src) throws:
     let chars = src.chars()
     let n = chars.length
-    var [RawTok] toks = []
+    mut [RawTok] toks = []
     var string buf = ""
     var int i = 0
     while i < n:
@@ -486,7 +486,7 @@ struct RawTok:
     toks
 
 [RawTok] apply_trim([RawTok] toks):
-    var [RawTok] out = []
+    mut [RawTok] out = []
     for t in toks:
         out.push(t)
     var int i = 0
@@ -609,7 +609,7 @@ bool str_in_list(string s, [string] list):
     found
 
 ([JStmt], int) parse_block([RawTok] toks, int start, [string] stop_words) throws:
-    var [JStmt] stmts = []
+    mut [JStmt] stmts = []
     var int i = start
     var bool stop = false
     while i < toks.length and not stop:
@@ -696,7 +696,7 @@ pub [JStmt] parse_template(string src) throws:
 #    header comment for why) ──────────────────────────────────────────────
 
 JValue build_loop_value(int idx, int count):
-    var {string=JValue} fields = {=}
+    mut {string=JValue} fields = {=}
     fields["index0"] = JValue.JInt(idx)
     fields["index"] = JValue.JInt(idx + 1)
     fields["first"] = JValue.JBool(idx == 0)
@@ -704,7 +704,7 @@ JValue build_loop_value(int idx, int count):
     JValue.JDict(fields)
 
 (string, {string=JValue}) render_for_step(JValue item, int idx, int count, string varname, [JStmt] body, {string=JValue} env) throws:
-    var {string=JValue} loop_env = env
+    mut {string=JValue} loop_env = env
     loop_env[varname] = item
     loop_env["loop"] = build_loop_value(idx, count)
     render_stmts(body, loop_env)
@@ -715,7 +715,7 @@ pub (string, {string=JValue}) render_stmt(JStmt s, {string=JValue} env) throws:
         SOutput(e): (jv_to_str(eval_expr(e, env)), env)
         SSet(name, e):
             let v = eval_expr(e, env)
-            var {string=JValue} env2 = env
+            mut {string=JValue} env2 = env
             env2[name] = v
             ("", env2)
         SIf(cond, then_body, else_body):
@@ -763,7 +763,7 @@ pub string render_jinja(string template_src, {string=JValue} env) throws:
 # just Qwen2.5's hardcoded ChatML shape) ────────────────────────────────
 
 pub JValue jv_chat_message(string role, string content):
-    var {string=JValue} fields = {=}
+    mut {string=JValue} fields = {=}
     fields["role"] = JValue.JStr(role)
     fields["content"] = JValue.JStr(content)
     JValue.JDict(fields)
@@ -774,7 +774,7 @@ pub JValue jv_chat_message(string role, string content):
 # actually "system"; an empty system prompt is the caller's way of opting
 # out rather than sending a blank one).
 pub [JValue] build_chat_messages(string system_msg, [string] user_msgs, [string] assistant_msgs):
-    var [JValue] messages = []
+    mut [JValue] messages = []
     if system_msg != "":
         messages.push(jv_chat_message("system", system_msg))
     var int i = 0
@@ -786,7 +786,7 @@ pub [JValue] build_chat_messages(string system_msg, [string] user_msgs, [string]
     messages
 
 pub {string=JValue} build_chat_env([JValue] messages, bool add_generation_prompt, string bos_token, string eos_token):
-    var {string=JValue} env = {=}
+    mut {string=JValue} env = {=}
     env["messages"] = JValue.JList(messages)
     env["add_generation_prompt"] = JValue.JBool(add_generation_prompt)
     env["bos_token"] = JValue.JStr(bos_token)

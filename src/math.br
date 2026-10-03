@@ -8,7 +8,7 @@
 # buffer — x[p * d + i] is position p's i-th feature.
 
 pub [float32] vec_add([float32] a, [float32] b):
-    var [float32] result = [0.0 for i in 0..<a.length]
+    mut [float32] result = [0.0 for i in 0..<a.length]
     var int i = 0
     while i < a.length:
         result[i] = a[i] + b[i]
@@ -16,7 +16,7 @@ pub [float32] vec_add([float32] a, [float32] b):
     result
 
 pub [float32] rms_norm([float32] x, [float32] weight, int seq, int d, float32 eps):
-    var [float32] result = [0.0 for i in 0..<(seq * d)]
+    mut [float32] result = [0.0 for i in 0..<(seq * d)]
     var int p = 0
     while p < seq:
         var float32 ss = 0.0
@@ -37,7 +37,7 @@ pub [float32] rms_norm([float32] x, [float32] weight, int seq, int d, float32 ep
 # y = x @ W^T, W stored (d_out rows x d_in cols) row-major — GGUF/ggml's own
 # convention for a Linear weight tensor (ne = [d_in, d_out], row length d_in).
 pub [float32] linear([float32] x, [float32] w, int seq, int d_in, int d_out):
-    var [float32] result = [0.0 for i in 0..<(seq * d_out)]
+    mut [float32] result = [0.0 for i in 0..<(seq * d_out)]
     var int p = 0
     while p < seq:
         var int o = 0
@@ -53,7 +53,7 @@ pub [float32] linear([float32] x, [float32] w, int seq, int d_in, int d_out):
     result
 
 pub [float32] linear_bias([float32] x, [float32] w, [float32] b, int seq, int d_in, int d_out):
-    var [float32] result = linear(x, w, seq, d_in, d_out)
+    mut [float32] result = linear(x, w, seq, d_in, d_out)
     var int p = 0
     while p < seq:
         var int o = 0
@@ -82,7 +82,7 @@ pub [float32] rope_apply([float32] x, int seq, int n_heads, int d_head, float32 
 # call's (seq x ...) buffer.
 pub [float32] rope_apply_at([float32] x, int seq, int n_heads, int d_head, float32 freq_base, int start_pos, int neox):
     let half_dim = d_head / 2
-    var [float32] result = [0.0 for i in 0..<x.length]
+    mut [float32] result = [0.0 for i in 0..<x.length]
     var int p = 0
     while p < seq:
         let abs_pos = p + start_pos
@@ -117,7 +117,7 @@ pub [float32] swiglu_ffn([float32] x, [float32] gate_w, [float32] up_w, [float32
                           int seq, int d_model, int ffn_dim):
     let gate = linear(x, gate_w, seq, d_model, ffn_dim)
     let up = linear(x, up_w, seq, d_model, ffn_dim)
-    var [float32] hidden = [0.0 for i in 0..<(seq * ffn_dim)]
+    mut [float32] hidden = [0.0 for i in 0..<(seq * ffn_dim)]
     var int idx = 0
     while idx < seq * ffn_dim:
         hidden[idx] = silu(gate[idx]) * up[idx]
@@ -131,13 +131,13 @@ pub [float32] gqa_attention([float32] q, [float32] k, [float32] v,
                              int seq, int n_head, int n_kv_head, int d_head):
     let scale = 1.0 / (d_head as float32).sqrt()
     let group = n_head / n_kv_head
-    var [float32] out = [0.0 for i in 0..<(seq * n_head * d_head)]
+    mut [float32] out = [0.0 for i in 0..<(seq * n_head * d_head)]
     var int h = 0
     while h < n_head:
         let kv_h = h / group
         var int i = 0
         while i < seq:
-            var [float32] scores = [0.0 for jj in 0..<(i + 1)]
+            mut [float32] scores = [0.0 for jj in 0..<(i + 1)]
             var int j = 0
             while j <= i:
                 var float32 dot = 0.0
