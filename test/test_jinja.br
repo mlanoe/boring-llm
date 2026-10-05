@@ -87,4 +87,51 @@ def main() throws:
     let out8 = render_jinja("a\n\n", env)
     assert_eq(out8, "a\n" as string)
 
+    # --- constructs Qwen3's template needs (checked against the real template and
+    #     jinja2 in test_jinja_real.br); `r` renders a template with {ob}{ob}/{ob}% delimiters ---
+    let ns_t = "{ob}%- set ns = namespace(a=0, b=true) -%{cb}{ob}%- for i in range(4) -%{cb}{ob}%- set ns.a = ns.a + i -%{cb}{ob}%- endfor -%{cb}{ob}{ob} ns.a {cb}{cb}{ob}{ob} ns.b {cb}{cb}"
+    assert_eq(render_jinja(ns_t, env), "6True" as string)
+
+    let range_t = "{ob}%- for i in range(2, -1, -1) -%{cb}{ob}{ob} i {cb}{cb}{ob}%- endfor -%{cb},{ob}%- for j in range(3) -%{cb}{ob}{ob} j {cb}{cb}{ob}%- endfor -%{cb}"
+    assert_eq(render_jinja(range_t, env), "210,012" as string)
+
+    # a `set` inside a for body does not leak out of it (Jinja scoping), a namespace does
+    let scope_t = "{ob}%- set x = 1 -%{cb}{ob}%- for i in range(2) -%{cb}{ob}%- set x = 5 -%{cb}{ob}%- endfor -%{cb}{ob}{ob} x {cb}{cb}"
+    assert_eq(render_jinja(scope_t, env), "1" as string)
+
+    # string methods, negative indices, chained calls
+    assert_eq(render_jinja("{ob}{ob} 'a,b,c'.split(',')[-1] {cb}{cb}", env), "c" as string)
+    assert_eq(render_jinja("{ob}{ob} 'a,b,c'.split(',')[0] {cb}{cb}", env), "a" as string)
+    assert_eq(render_jinja("{ob}{ob} ('x' + '\n').rstrip('\n') + '|' {cb}{cb}", env), "x|" as string)
+    assert_eq(render_jinja("{ob}{ob} ('\n\nab\n').strip('\n') {cb}{cb}", env), "ab" as string)
+    assert_eq(render_jinja("{ob}{ob} '\n\nab'.lstrip('\n') {cb}{cb}", env), "ab" as string)
+    assert_eq(render_jinja("{ob}{ob} 'abc'.startswith('ab') {cb}{cb}{ob}{ob} 'abc'.endswith('x') {cb}{cb}", env), "TrueFalse" as string)
+    assert_eq(render_jinja("{ob}{ob} 'a-b'.replace('-', '+') {cb}{cb}", env), "a+b" as string)
+
+    # membership and comparisons; `not` binds looser than `==` and `in`, like Jinja
+    assert_eq(render_jinja("{ob}{ob} 'b' in 'abc' {cb}{cb}{ob}{ob} 'z' in 'abc' {cb}{cb}{ob}{ob} 'z' not in 'abc' {cb}{cb}", env), "TrueFalseTrue" as string)
+    assert_eq(render_jinja("{ob}%- if 3 > 2 and 2 <= 2 and 1 < 2 and 5 >= 5 -%{cb}ok{ob}%- endif -%{cb}", env), "ok" as string)
+    assert_eq(render_jinja("{ob}%- if not 1 == 2 -%{cb}t{ob}%- endif -%{cb}", env), "t" as string)
+    assert_eq(render_jinja("{ob}%- if not('x' in 'abc' and 'a' in 'abc') -%{cb}t{ob}%- else -%{cb}f{ob}%- endif -%{cb}", env), "t" as string)
+
+    # tests and the length filter
+    mut {string=JValue} env5 = {=}
+    env5["s"] = JValue.JStr("text")
+    env5["items"] = JValue.JList(items)
+    env5["off"] = JValue.JBool(false)
+    assert_eq(render_jinja("{ob}{ob} s is string {cb}{cb}{ob}{ob} items is string {cb}{cb}{ob}{ob} missing is defined {cb}{cb}{ob}{ob} missing is none {cb}{cb}{ob}{ob} s is not none {cb}{cb}{ob}{ob} off is false {cb}{cb}{ob}{ob} s is false {cb}{cb}", env5), "TrueFalseFalseTrueTrueTrueFalse" as string)
+    assert_eq(render_jinja("{ob}{ob} items|length - 1 {cb}{cb}{ob}{ob} s|length {cb}{cb}", env5), "24" as string)
+    assert_eq(render_jinja("{ob}{ob} items[items|length - 1] {cb}{cb}", env5), "c" as string)
+
+    # TinyLlama's plain template (no trim markers), expected text from real jinja2:
+    # `not`/comparison precedence and loop scoping must not change what it renders
+    let tl = "{ob}% for message in messages %{cb}\n{ob}% if message['role'] == 'user' %{cb}\n{ob}{ob} '<|user|>\n' + message['content'] + eos_token {cb}{cb}\n{ob}% elif message['role'] == 'system' %{cb}\n{ob}{ob} '<|system|>\n' + message['content'] + eos_token {cb}{cb}\n{ob}% elif message['role'] == 'assistant' %{cb}\n{ob}{ob} '<|assistant|>\n'  + message['content'] + eos_token {cb}{cb}\n{ob}% endif %{cb}\n{ob}% if loop.last and add_generation_prompt %{cb}\n{ob}{ob} '<|assistant|>' {cb}{cb}\n{ob}% endif %{cb}\n{ob}% endfor %{cb}"
+    mut [JValue] tl_msgs = []
+    tl_msgs.push(jv_chat_message("system", "Be brief."))
+    tl_msgs.push(jv_chat_message("user", "Hi"))
+    tl_msgs.push(jv_chat_message("assistant", "Hello!"))
+    tl_msgs.push(jv_chat_message("user", "Bye"))
+    mut {string=JValue} tl_env = build_chat_env(tl_msgs, true, "<s>", "</s>")
+    assert_eq(render_jinja(tl, tl_env), "\n\n<|system|>\nBe brief.</s>\n\n\n\n\n<|user|>\nHi</s>\n\n\n\n\n<|assistant|>\nHello!</s>\n\n\n\n\n<|user|>\nBye</s>\n\n\n<|assistant|>\n\n" as string)
+
     print "test_jinja: all assertions passed"

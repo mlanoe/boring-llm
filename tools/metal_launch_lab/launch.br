@@ -1,0 +1,49 @@
+use std.time.Instant
+
+kernel AddOneKernel:
+    let [float32]'global src
+    mut [float32]'unified out
+    let int n
+
+    init([float32]'global s, int nn):
+        src = s
+        n   = nn
+        out = [0.0 as float32 for ..<nn]
+
+    def ():
+        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if i < n:
+            out[i] = src[i] + 1.0
+
+pub req [float32]'gpu'unified add_one([float32]'gpu'global x, int n) throws:
+    mut k = AddOneKernel(x, n)
+    kernel:
+        k(block = 256, grid = ((n + 255) / 256, 1))
+    k.out
+
+pub req [float32]'gpu'unified fill([float32]'gpu'global src) throws:
+    let n = src.length
+    mut k = AddOneKernel(src, n)
+    kernel:
+        k(block = 256, grid = ((n + 255) / 256, 1))
+    k.out
+
+def main() throws:
+    let [string] argv = args()
+    guard let launches = (argv[1] as int) else throw "launches"
+    guard let n = (argv[2] as int) else throw "n"
+    let host = [0.0 as float32 for i in 0..<n]
+    var x = fill(host)
+    # warm-up
+    x = add_one(x, n)
+    with x:
+        let w = x[0]
+    let t0 = Instant.now()
+    var i = 0
+    while i < launches:
+        x = add_one(x, n)
+        i += 1
+    with x:
+        let first = x[0]
+        let us = t0.elapsed().asMicros() as int
+        print "launches={launches} n={n}: {us} us total, {us / launches} us per launch, x[0]={first}"

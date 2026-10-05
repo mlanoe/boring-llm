@@ -37,6 +37,32 @@ pub JValue jv_set(JValue d, string key, JValue value):
             JValue.JDict(nf, nk)
         _: d
 
+# ── Prompt-prefix reuse ──────────────────────────────────────────────────
+
+# Length of the longest common prefix of two token sequences — how many
+# positions of a previous request's KV cache are still valid for this one.
+pub int common_prefix_len([int] a, [int] b):
+    let n = if a.length < b.length: a.length else: b.length
+    var int i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    i
+
+# Which cached sequence shares the longest prefix with `prompt`: (slot index,
+# shared length), or (-1, 0) when none shares even one token. Ties keep the
+# earliest slot.
+pub (int, int) best_prefix_slot([[int]] slots, [int] prompt):
+    var int best = -1
+    var int best_len = 0
+    var int i = 0
+    while i < slots.length:
+        let c = common_prefix_len(slots[i], prompt)
+        if c > best_len:
+            best_len = c
+            best = i
+        i += 1
+    (best, best_len)
+
 # ── Message normalization ────────────────────────────────────────────────
 
 # `content` may be a plain string, null, or an array of typed parts
@@ -71,6 +97,11 @@ pub [JValue] normalize_messages([JValue] messages) throws:
         var JValue nm = m.clone()
         if jv_is_list(json_get(m, "content")):
             nm = jv_set(nm, "content", JValue.JStr(content_to_text(json_get(m, "content"))))
+        elif not jv_is_str(json_get(m, "content")):
+            # `content: null` (an assistant message that only carries tool calls) or no
+            # content at all: templates do string operations on it (Qwen3's tests
+            # `'</think>' in message.content`), which fail on a null.
+            nm = jv_set(nm, "content", JValue.JStr(""))
         if jv_is_list(json_get(m, "tool_calls")):
             mut [JValue] calls = []
             for c in json_get_list(m, "tool_calls"):
@@ -89,25 +120,67 @@ pub struct ParsedReply:
     string content
     [ParsedToolCall] calls
 
-# Parses one `<tool_call>` body. Qwen2.5's GGUF-embedded chat template renders
-# its own format example with DOUBLED braces (`{{"name": ..., "arguments":
-# ...}}` — real jinja2 does too, it is the template text, not our renderer),
-# and a small model copies that faithfully; llama.cpp's own output for the same
-# prompt is identical. So when strict parsing fails and the body is wrapped in
-# a doubled brace pair, retry with exactly one brace stripped from each end
-# (a legitimate nested `}}` inside the object is never touched).
+# The balanced `{...}` object that starts at `cs[start]` (string-aware: braces
+# inside a JSON string, and escaped quotes, do not count), or "" when it never
+# closes.
+string balanced_object([string] cs, int start):
+    var int depth = 0
+    var bool in_str = false
+    var bool esc = false
+    var int i = start
+    while i < cs.length:
+        let ch = cs[i]
+        if in_str:
+            if esc:
+                esc = false
+            elif ch == "\\":
+                esc = true
+            elif ch == "\"":
+                in_str = false
+        else:
+            if ch == "\"":
+                in_str = true
+            elif ch == "{{":
+                depth += 1
+            elif ch == "}}":
+                depth -= 1
+                if depth == 0:
+                    var out = ""
+                    var j = start
+                    while j <= i:
+                        out = "{out}{cs[j]}"
+                        j += 1
+                    return out
+        i += 1
+    ""
+
+# Parses one `<tool_call>` body. A strict parse first. Qwen2.5's GGUF-embedded
+# chat template renders its own format example with DOUBLED braces (`{{"name":
+# ..., "arguments": ...}}` — real jinja2 does too, it is the template text, not
+# our renderer), and a small model copies that faithfully (llama.cpp's own
+# output for the same prompt is identical) — and, under a long prompt such as
+# OpenCode's, often gets the closing braces wrong: `{{"name": ..., "arguments":
+# {...}}` (one closing short) or `{{...}}}}` (one too many). So when the strict
+# parse fails, take the balanced object starting at each of the first few `{`
+# and keep the first one that is an object with a `name` (a legitimate nested
+# `}}` inside the object is never touched, and trailing junk is ignored).
 JValue? parse_tool_body(string body):
     let direct = try? json_parse(body)
     if let v = direct:
         return v
-    if body.startsWith("{{") and body.endsWith("}}"):
-        let cs = body.chars()
-        var string inner = ""
-        var int i = 1
-        while i < cs.length - 1:
-            inner = "{inner}{cs[i]}"
-            i += 1
-        return try? json_parse(inner)
+    let cs = body.chars()
+    var int tried = 0
+    var int i = 0
+    while i < cs.length and tried < 3:
+        if cs[i] == "{{":
+            tried += 1
+            let candidate = balanced_object(cs, i)
+            if candidate != "":
+                let parsed = try? json_parse(candidate)
+                if let v = parsed:
+                    if json_get_str(v, "name", "") != "":
+                        return v
+        i += 1
     nil
 
 # Hermes-style: `<tool_call>\n{"name": "...", "arguments": {...}}\n</tool_call>`
@@ -134,6 +207,14 @@ pub ParsedReply parse_reply(string text):
             content = "{content}<tool_call>{parts[i]}"
         i += 1
     ParsedReply(content, calls)
+
+# `"tool_choice": "none"`: the model must not call tools, so the tool
+# definitions are left out of the prompt and `<tool_call>` text in the reply is
+# plain content. Other values ("auto", "required", a named function) are
+# accepted; they are not enforced (that needs constrained decoding), the
+# model decides as with "auto".
+pub bool tools_disabled(JValue body):
+    json_get_str(body, "tool_choice", "") == "none"
 
 # Truncates `text` at the earliest occurrence of any non-empty stop string.
 pub (string, bool) apply_stop(string text, [string] stops):
@@ -164,32 +245,248 @@ string usage_json(int prompt_tokens, int completion_tokens):
 pub string error_json(string message, string kind, string code):
     "{{\"error\": {{\"message\": \"{json_escape(message)}\", \"type\": \"{kind}\", \"code\": \"{code}\"}}}}"
 
+# The 400 for a prompt that does not fit the context (`--ctx-size`). Clients
+# detect an overflow from the error code (OpenAI's `context_length_exceeded`)
+# or from phrases in the message ("maximum context length", llama.cpp's
+# "exceeds the available context size"), so the message carries both, and the
+# counts are also given as fields (like llama.cpp's `n_prompt_tokens`, `n_ctx`).
+pub string context_exceeded_json(int n_prompt, int n_ctx):
+    let message = "This model's maximum context length is {n_ctx} tokens. The request exceeds the available context size: your messages resulted in {n_prompt} tokens (the reply needs room too). Shorten the conversation or start the server with a larger --ctx-size."
+    "{{\"error\": {{\"message\": \"{json_escape(message)}\", \"type\": \"invalid_request_error\", \"code\": \"context_length_exceeded\", \"param\": \"messages\", \"n_prompt_tokens\": {n_prompt}, \"n_ctx\": {n_ctx}}}}}"
+
 pub string models_json(string model_id):
     "{{\"object\": \"list\", \"data\": [{{\"id\": \"{json_escape(model_id)}\", \"object\": \"model\", \"created\": 0, \"owned_by\": \"boring-llm\"}}]}}"
 
 pub string completion_json(string id, string model, ParsedReply reply, string finish_reason,
                             int prompt_tokens, int completion_tokens):
+    completion_json_r(id, model, reply, "", finish_reason, prompt_tokens, completion_tokens)
+
+# The same with `reasoning`, the model's `<think>` text (Qwen3 and other
+# reasoning models), returned as `message.reasoning_content` like llama.cpp and
+# DeepSeek's API do, when there is any.
+pub string completion_json_r(string id, string model, ParsedReply reply, string reasoning, string finish_reason,
+                              int prompt_tokens, int completion_tokens):
     let content = if reply.content == "" and reply.calls.length > 0: "null" else: "\"{json_escape(reply.content)}\""
+    let thinking = if reasoning != "": ", \"reasoning_content\": \"{json_escape(reasoning)}\"" else: ""
     let calls = if reply.calls.length > 0: ", \"tool_calls\": {tool_calls_json(id, reply.calls, false)}" else: ""
-    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": 0, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{calls}}}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}"
+    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": 0, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{thinking}{calls}}}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}"
 
 string sse_chunk(string id, string model, string delta, string finish_reason):
     let fr = if finish_reason == "": "null" else: "\"{finish_reason}\""
     "data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"delta\": {delta}, \"finish_reason\": {fr}}}]}}\n\n"
 
-# A complete `stream: true` response body. The whole reply is already
-# generated by the time this runs, so it's emitted as a role chunk, one content
-# chunk, optional tool-call chunk, a finish chunk and (when asked via
-# `stream_options.include_usage`) a usage chunk — wire-compatible with real
-# token-by-token streaming, just not incremental yet.
+# ── SSE events ───────────────────────────────────────────────────────────
+# One function per event so the server can write them as tokens arrive;
+# completion_sse (below) composes the same events into a complete body.
+
+pub string sse_role_event(string id, string model):
+    sse_chunk(id, model, "{{\"role\": \"assistant\", \"content\": \"\"}}", "")
+
+pub string sse_content_event(string id, string model, string text):
+    sse_chunk(id, model, "{{\"content\": \"{json_escape(text)}\"}}", "")
+
+pub string sse_reasoning_event(string id, string model, string text):
+    sse_chunk(id, model, "{{\"reasoning_content\": \"{json_escape(text)}\"}}", "")
+
+pub string sse_tool_calls_event(string id, string model, [ParsedToolCall] calls):
+    sse_chunk(id, model, "{{\"tool_calls\": {tool_calls_json(id, calls, true)}}}", "")
+
+pub string sse_finish_event(string id, string model, string finish_reason):
+    sse_chunk(id, model, "{{}}", finish_reason)
+
+pub string sse_usage_event(string id, string model, int prompt_tokens, int completion_tokens):
+    "data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"{json_escape(model)}\", \"choices\": [], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}\n\n"
+
+pub string sse_done_event():
+    "data: [DONE]\n\n"
+
+pub string sse_error_event(string message):
+    "data: {{\"error\": {{\"message\": \"{json_escape(message)}\", \"type\": \"server_error\", \"code\": \"internal_error\"}}}}\n\n"
+
+# A complete `stream: true` response body, for a reply that is already
+# generated (the server streams the same events token by token instead):
+# role chunk, one content chunk, optional tool-call chunk, a finish chunk and
+# (when asked via `stream_options.include_usage`) a usage chunk.
 pub string completion_sse(string id, string model, ParsedReply reply, string finish_reason,
                            int prompt_tokens, int completion_tokens, bool include_usage):
-    var string out = sse_chunk(id, model, "{{\"role\": \"assistant\", \"content\": \"\"}}", "")
+    var string out = sse_role_event(id, model)
     if reply.content != "":
-        out = "{out}{sse_chunk(id, model, "{{\"content\": \"{json_escape(reply.content)}\"}}", "")}"
+        out = "{out}{sse_content_event(id, model, reply.content)}"
     if reply.calls.length > 0:
-        out = "{out}{sse_chunk(id, model, "{{\"tool_calls\": {tool_calls_json(id, reply.calls, true)}}}", "")}"
-    out = "{out}{sse_chunk(id, model, "{{}}", finish_reason)}"
+        out = "{out}{sse_tool_calls_event(id, model, reply.calls)}"
+    out = "{out}{sse_finish_event(id, model, finish_reason)}"
     if include_usage:
-        out = "{out}data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"{json_escape(model)}\", \"choices\": [], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}\n\n"
-    "{out}data: [DONE]\n\n"
+        out = "{out}{sse_usage_event(id, model, prompt_tokens, completion_tokens)}"
+    "{out}{sse_done_event()}"
+
+# ── Incremental streaming of the reply text ──────────────────────────────
+
+bool reply_is_space(string ch):
+    ch == " " or ch == "\n" or ch == "\t" or ch == "\r"
+
+# How much of the reply generated SO FAR can be sent as content without ever
+# having to take it back: the character range [start, limit) of `text`.
+# `text` is the visible reply with any stop string already cut off. The range
+# is what parse_reply would call `content` for a finished reply — surrounding
+# whitespace trimmed, nothing from a `<tool_call>` marker on — except that the
+# tail stays held back while it could still grow into `<tool_call>` or into
+# one of `stops`. The range only ever extends: `start` stays put once a
+# non-whitespace character exists (until then the range is empty), `limit` never
+# decreases, so the part already sent is always a prefix of what comes next.
+pub (int, int) stream_bounds(string text, [string] stops):
+    let cs = text.chars()
+    let n = cs.length
+    let marker = "<tool_call>".chars()
+    var int limit = n
+    var int found = -1
+    var int i = 0
+    while i + marker.length <= n and found < 0:
+        var bool ok = true
+        var int j = 0
+        while j < marker.length and ok:
+            if cs[i + j] != marker[j]:
+                ok = false
+            j += 1
+        if ok:
+            found = i
+        i += 1
+    if found >= 0:
+        limit = found
+    else:
+        mut [[string]] pats = [marker]
+        for st in stops:
+            if st != "":
+                pats.push(st.chars())
+        var int hold = 0
+        for p in pats:
+            var int k = p.length - 1
+            if k > n:
+                k = n
+            while k > hold:
+                var bool ok = true
+                var int j = 0
+                while j < k and ok:
+                    if cs[n - k + j] != p[j]:
+                        ok = false
+                    j += 1
+                if ok:
+                    hold = k
+                k -= 1
+        limit = n - hold
+    var int start = 0
+    while start < limit and reply_is_space(cs[start]):
+        start += 1
+    while limit > start and reply_is_space(cs[limit - 1]):
+        limit -= 1
+    (start, limit)
+
+
+# ── Reasoning (`<think>...</think>`) ─────────────────────────────────────
+# Qwen3 (thinking mode) writes `<think>`, its reasoning, `</think>`, then the
+# answer. Clients get the reasoning as `reasoning_content` and the answer as
+# `content`, so the raw markers never show up in a chat window or in the
+# next request's history.
+
+string join_from([string] parts, int from, string sep):
+    var string out = ""
+    var int i = from
+    while i < parts.length:
+        out = if i == from: parts[i] else: "{out}{sep}{parts[i]}"
+        i += 1
+    out
+
+# Python's `str.strip('\n')`, on either side.
+string trim_nl(string s, bool left, bool right):
+    let cs = s.chars()
+    var int a = 0
+    var int b = cs.length
+    if left:
+        while a < b and cs[a] == "\n":
+            a += 1
+    if right:
+        while b > a and cs[b - 1] == "\n":
+            b -= 1
+    var string out = ""
+    var int i = a
+    while i < b:
+        out = "{out}{cs[i]}"
+        i += 1
+    out
+
+# (starts with `<think>`, has its `</think>`, the text after `<think>` up to
+# `</think>`, the text after `</think>`); an unterminated block has all its text
+# in the third part. Text that does not start with `<think>` (leading whitespace
+# aside) has no reasoning.
+(bool, bool, string, string) think_parts(string text):
+    let head = text.trim()
+    if not head.startsWith("<think>"):
+        return (false, false, "", text)
+    let after = join_from(head.split("<think>"), 1, "<think>")
+    let closed = after.split("</think>")
+    if closed.length >= 2:
+        (true, true, closed[0], join_from(closed, 1, "</think>"))
+    else:
+        (true, false, after, "")
+
+# A finished reply: (reasoning, the rest). Whitespace newlines around the
+# reasoning and before the answer are dropped, as Qwen3's own template does.
+pub (string, string) split_reasoning(string text):
+    let (has, closed, r, c) = think_parts(text)
+    if not has:
+        ("", text)
+    elif closed:
+        (trim_nl(r, true, true), trim_nl(c, true, false))
+    else:
+        (trim_nl(r, true, true), "")
+
+# `r` without a trailing piece that could still grow into `</think>`.
+string without_partial_close(string r):
+    let cs = r.chars()
+    let marker = "</think>".chars()
+    let n = cs.length
+    var int hold = 0
+    var int k = marker.length - 1
+    if k > n:
+        k = n
+    while k > 0 and hold == 0:
+        var bool ok = true
+        var int j = 0
+        while j < k and ok:
+            if cs[n - k + j] != marker[j]:
+                ok = false
+            j += 1
+        if ok:
+            hold = k
+        k -= 1
+    var string out = ""
+    var int i = 0
+    while i < n - hold:
+        out = "{out}{cs[i]}"
+        i += 1
+    out
+
+# The reply generated SO FAR: (reasoning, content) that can be sent without ever
+# being taken back. Both only grow: the reasoning holds back a trailing
+# newline run and a piece that could become `</think>`, and nothing is sent
+# while the text so far is still only the start of `<think>`.
+pub (string, string) stream_split(string text):
+    let head = text.trim()
+    if head.length > 0 and head.length < 7 and "<think>".startsWith(head):
+        return ("", "")
+    let (has, closed, r, c) = think_parts(text)
+    if not has:
+        ("", text)
+    elif closed:
+        (trim_nl(r, true, true), trim_nl(c, true, false))
+    else:
+        (trim_nl(without_partial_close(r), true, true), "")
+
+# The characters of `s` from index `from` on.
+pub string chars_from(string s, int from):
+    let cs = s.chars()
+    var string out = ""
+    var int i = from
+    while i < cs.length:
+        out = "{out}{cs[i]}"
+        i += 1
+    out

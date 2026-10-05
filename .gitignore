@@ -10,3 +10,4 @@
 *_rocm/
 Cargo.lock
 .claude/worktrees/
+.accuracy-cache/

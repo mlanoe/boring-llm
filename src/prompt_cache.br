@@ -1,0 +1,202 @@
+# boring-llm — KV caches kept on disk, so a restarted server does not prefill
+# the same long prompt again.
+#
+# An agent client (OpenCode) opens every session with the same ~7k tokens of
+# system prompt and tool definitions. Processing them is minutes of prefill on
+# a 7B model; the in-memory slots (server.br) only help while the server stays
+# up. Here a slot's KV cache is written to `<dir>/prompt-cache-<n>.bin`, and a
+# request whose prompt starts like a saved one reads those positions back
+# instead of recomputing them (seconds of disk and upload, not minutes).
+#
+# File layout, little-endian:
+#   0   u32 magic, u32 version, u32 model fingerprint, u32 n_layer, u32 kv_dim,
+#       u32 n_tokens, u32 sequence number, u32 reserved          (32 bytes)
+#   32  n_tokens x u32 token ids
+#   ..  for each layer: K rows, then V rows (n_tokens x kv_dim float32 each)
+# The header is written last: a save that was interrupted leaves a file with no
+# magic, which a later scan ignores (and the next save overwrites).
+#
+# A snapshot is only valid for the exact model that produced it, hence the
+# fingerprint (file size, shape, a hash of the first and last 64 KB of tensor
+# data). Positions are float32 as the GPU holds them: restoring them is exact.
+#
+# Kept apart from server.br because it calls Rust's `std::fs` (`File`,
+# `FileExt::{read,write}_all_at`: Unix-only), like gguf_file.br.
+
+use cache_policy
+use gguf
+use gguf_file
+use io
+use math_gpu
+use model
+use openai
+use std.fs.File
+use std.fs.create_dir_all
+use std.fs.remove_file
+use std.os.unix.fs.FileExt
+
+let int PC_MAGIC = 1263681346       # "BCGK" little-endian
+let int PC_VERSION = 1
+let int PC_HEADER = 32
+let int PC_CHUNK = 262144           # floats per read/write (1 MiB of bytes)
+
+pub string snapshot_path(string dir, int slot):
+    "{dir}/prompt-cache-{slot}.bin"
+
+pub def ensure_dir(string dir) throws:
+    let made = try? create_dir_all(dir)
+    guard let made else throw "cannot create the prompt cache directory {dir}"
+
+# Removes a snapshot file (an evicted one, or one a failed save left half written).
+pub def delete_snapshot(string dir, int slot):
+    let gone = try? remove_file(snapshot_path(dir, slot))
+
+def put_u32(mut [uint8] b, int off, int v):
+    b[off] = (v % 256) as uint8
+    b[off + 1] = ((v / 256) % 256) as uint8
+    b[off + 2] = ((v / 65536) % 256) as uint8
+    b[off + 3] = ((v / 16777216) % 256) as uint8
+
+def write_at(File& f, [uint8]& b, int off) throws:
+    let w = try? f.write_all_at(b, off as uint64)
+    guard let w else throw "prompt cache: write failed at offset {off}"
+
+# `count` floats starting at byte offset `off`.
+def write_floats(File& f, [float32]& xs, int count, int off) throws:
+    var int done = 0
+    while done < count:
+        let m = if count - done < PC_CHUNK: count - done else: PC_CHUNK
+        mut [uint8] buf = [0 as uint8 for i in 0..<(m * 4)]
+        var int j = 0
+        while j < m:
+            put_u32(buf, j * 4, floatToBits(xs[done + j]))
+            j += 1
+        write_at(f, buf, off + done * 4)
+        done += m
+
+[float32] read_floats(File& f, int off, int count) throws:
+    mut [float32] out = [0.0 as float32 for i in 0..<count]
+    var int done = 0
+    while done < count:
+        let m = if count - done < PC_CHUNK: count - done else: PC_CHUNK
+        mut [uint8] buf = [0 as uint8 for i in 0..<(m * 4)]
+        let r = try? f.read_exact_at(buf, (off + done * 4) as uint64)
+        guard let r else throw "prompt cache: short read at offset {off + done * 4}"
+        var int j = 0
+        while j < m:
+            out[done + j] = read_f32_le(buf, j * 4) as float32
+            j += 1
+        done += m
+    out
+
+# Bytes one token adds to a snapshot: its id, and a K and a V row for every layer.
+pub int snapshot_bytes_per_token(int n_layer, int kv_dim):
+    4 + n_layer * 2 * kv_dim * 4
+
+pub int kv_dim_of(QuantModel& model):
+    model.config.n_kv_head * model.config.d_head
+
+# Identifies the weights a snapshot was computed with.
+pub int model_fingerprint(GgufFile file, int n_layer, int kv_dim) throws:
+    var int h = (file.file_size % 2147483629 + n_layer * 7919 + kv_dim * 104729) % 2147483629
+    let span = if file.file_size - file.data_offset < 65536: file.file_size - file.data_offset else: 65536
+    let head = file_bytes(file, file.data_offset, span)
+    let tail = file_bytes(file, file.file_size - span, span)
+    var int i = 0
+    while i < span:
+        h = (h * 131 + (head[i] as int)) % 2147483629
+        h = (h * 131 + (tail[i] as int)) % 2147483629
+        i += 1
+    h
+
+# The snapshot in file `slot` if it is complete and was made by this model;
+# slot = -1 otherwise.
+DiskSnap read_snapshot_header(string dir, int slot, int fp, int n_layer, int kv_dim):
+    let none = DiskSnap(-1, 0, [])
+    let path = snapshot_path(dir, slot)
+    let head = try? read_at(path, 0, PC_HEADER)
+    guard let head else return none
+    if read_u32_le(head, 0) != PC_MAGIC or read_u32_le(head, 4) != PC_VERSION:
+        return none
+    if read_u32_le(head, 8) != fp or read_u32_le(head, 12) != n_layer or read_u32_le(head, 16) != kv_dim:
+        return none
+    let n = read_u32_le(head, 20)
+    let size = try? file_len(path)
+    guard let size else return none
+    if n <= 0 or size != PC_HEADER + 4 * n + n_layer * 2 * n * kv_dim * 4:
+        return none
+    let raw = try? read_at(path, PC_HEADER, 4 * n)
+    guard let raw else return none
+    mut [int] tokens = []
+    var int i = 0
+    while i < n:
+        tokens.push(read_u32_le(raw, i * 4))
+        i += 1
+    DiskSnap(slot, read_u32_le(head, 24), tokens)
+
+pub [DiskSnap] scan_snapshots(string dir, int fp, int n_layer, int kv_dim, int max_files):
+    mut [DiskSnap] found = []
+    var int slot = 0
+    while slot < max_files:
+        let s = read_snapshot_header(dir, slot, fp, n_layer, kv_dim)
+        if s.slot >= 0:
+            found.push(s)
+        slot += 1
+    found
+
+# Writes the first `tokens.length` positions of `cache` to file `slot`.
+pub def save_snapshot(string dir, int fp, int slot, int seq, QuantModel& model, GenCache cache, [int] tokens) throws:
+    let n = tokens.length
+    guard n > 0 and cache.pos >= n else throw "prompt cache: nothing to save"
+    let kv_dim = kv_dim_of(model)
+    let n_layer = model.config.n_layer
+    let path = snapshot_path(dir, slot)
+    let folded = fold_cache(model, cache)
+    let created = try? File.create(path)
+    guard let created else throw "cannot create {path}"
+    var f = created
+    let data_off = PC_HEADER + 4 * n
+    let plane = n * kv_dim * 4
+    var int l = 0
+    while l < n_layer:
+        let k_host = download_floats_gpu(folded.layers[l].k, n * kv_dim)
+        write_floats(f, k_host, n * kv_dim, data_off + 2 * l * plane)
+        let v_host = download_floats_gpu(folded.layers[l].v, n * kv_dim)
+        write_floats(f, v_host, n * kv_dim, data_off + (2 * l + 1) * plane)
+        l += 1
+    mut [uint8] toks = [0 as uint8 for i in 0..<(4 * n)]
+    var int i = 0
+    while i < n:
+        put_u32(toks, i * 4, tokens[i])
+        i += 1
+    write_at(f, toks, PC_HEADER)
+    mut [uint8] head = [0 as uint8 for i in 0..<PC_HEADER]
+    put_u32(head, 0, PC_MAGIC)
+    put_u32(head, 4, PC_VERSION)
+    put_u32(head, 8, fp)
+    put_u32(head, 12, n_layer)
+    put_u32(head, 16, kv_dim)
+    put_u32(head, 20, n)
+    put_u32(head, 24, seq)
+    write_at(f, head, 0)
+
+# The first `common` positions of snapshot `snap`, uploaded to the GPU as a
+# cache ready to resume from.
+pub GenCache load_snapshot(string dir, DiskSnap snap, QuantModel& model, int common) throws:
+    let n_total = snap.tokens.length
+    guard common > 0 and common <= n_total else throw "prompt cache: cannot restore {common} of {n_total} positions"
+    let kv_dim = kv_dim_of(model)
+    let path = snapshot_path(dir, snap.slot)
+    let opened = try? File.open(path)
+    guard let opened else throw "cannot open {path}"
+    var f = opened
+    let data_off = PC_HEADER + 4 * n_total
+    let plane = n_total * kv_dim * 4
+    mut [LayerCache] layers = []
+    var int l = 0
+    while l < model.config.n_layer:
+        let k_host = read_floats(f, data_off + 2 * l * plane, common * kv_dim)
+        let v_host = read_floats(f, data_off + (2 * l + 1) * plane, common * kv_dim)
+        layers.push(LayerCache(upload_floats_gpu(k_host), upload_floats_gpu(v_host), [], []))
+        l += 1
+    GenCache(layers, common, 0)

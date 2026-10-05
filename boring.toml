@@ -10,4 +10,7 @@ algorithm = "auto"
 q8_0 = "warp-broadcast"
 
 [tensor.linear.prefill]
+q8_0 = "native"
+q4_k = "native"
+q6_k = "native"
 algorithm = "scalar"

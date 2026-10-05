@@ -65,7 +65,7 @@ kernel TransposeKernel:
             let j = cell % src.col
             dst[col = i, row = j] = src[col = j, row = i]
 
-pub req [float32]'gpu'unified transpose_gpu([float32]'global src, int rows, int cols) throws:
+pub req [float32]'gpu'unified transpose_gpu([float32]'gpu'global src, int rows, int cols) throws:
     let int n_cells = rows * cols
     let int blocks  = (n_cells + 255) / 256
     let int gx = if blocks > 65535: 65535 else: blocks
@@ -135,7 +135,7 @@ kernel LinearKernel:
         if row < seq and col < d_out:
             y[row * d_out + col] = acc + bv[col]
 
-pub req [float32]'gpu'unified linear_gpu([float32]'global x, [float32]'global w, [float32]'global bv,
+pub req [float32]'gpu'unified linear_gpu([float32]'gpu'global x, [float32]'gpu'global w, [float32]'gpu'global bv,
                        int seq, int d_in, int d_out) throws:
     let int gx = (d_out + 15) / 16
     let int gy = (seq + 15) / 16
@@ -242,8 +242,8 @@ kernel LinearWarpKernel:
             if lane == 0:
                 y[row * d_out + col] = partial + bv[col]
 
-pub req [float32]'gpu'unified linear_warp_gpu([float32]'global x, [float32]'global w,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified linear_warp_gpu([float32]'gpu'global x, [float32]'gpu'global w,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     let int warps_per_block = 8
     let int total_warps = seq * d_out
     let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
@@ -358,8 +358,8 @@ kernel LinearWarpSharedKernel:
             if lane == 0:
                 y[row * d_out + col] = partial + bv[col]
 
-pub req [float32]'gpu'unified linear_warp_shared_gpu([float32]'global x, [float32]'global w,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified linear_warp_shared_gpu([float32]'gpu'global x, [float32]'gpu'global w,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     guard d_in <= LINEAR_WARP_SHARED_MAX_D_IN else throw "linear_warp_shared_gpu: d_in {d_in} exceeds the fixed shared-cache size {LINEAR_WARP_SHARED_MAX_D_IN}"
     let int warps_per_block = 8
     let int gx = (d_out + warps_per_block - 1) / warps_per_block
@@ -460,8 +460,8 @@ kernel Q8LinearKernel:
         if row < seq and col < d_out:
             y[row * d_out + col] = acc + bv[col]
 
-pub req [float32]'gpu'unified q8_linear_gpu([float32]'global x, [uint8]'global w_packed,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified q8_linear_gpu([float32]'gpu'global x, [uint8]'gpu'global w_packed,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     guard d_in % 32 == 0 else throw "q8_linear_gpu: d_in ({d_in}) must be a multiple of 32"
     let int gx = (d_out + 15) / 16
     let int gy = (seq + 15) / 16
@@ -572,8 +572,8 @@ kernel Q8LinearWarpKernel:
             if lane == 0:
                 y[row * d_out + col] = partial + bv[col]
 
-pub req [float32]'gpu'unified q8_linear_warp_gpu([float32]'global x, [uint8]'global w_packed,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified q8_linear_warp_gpu([float32]'gpu'global x, [uint8]'gpu'global w_packed,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     guard d_in % 32 == 0 else throw "q8_linear_warp_gpu: d_in ({d_in}) must be a multiple of 32"
     let int warps_per_block = 8
     let int total_warps = seq * d_out
@@ -678,8 +678,8 @@ kernel Q8LinearWarpBroadcastKernel:
             if lane == 0:
                 y[row * d_out + col] = partial + bv[col]
 
-pub req [float32]'gpu'unified q8_linear_warp_broadcast_gpu([float32]'global x, [uint8]'global w_packed,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified q8_linear_warp_broadcast_gpu([float32]'gpu'global x, [uint8]'gpu'global w_packed,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     guard d_in % 32 == 0 else throw "q8_linear_warp_broadcast_gpu: d_in ({d_in}) must be a multiple of 32"
     let int warps_per_block = 8
     let int total_warps = seq * d_out
@@ -763,8 +763,8 @@ kernel Q5LinearKernel:
         if row < seq and col < d_out:
             y[row * d_out + col] = acc + bv[col]
 
-pub req [float32]'gpu'unified q5_linear_gpu([float32]'global x, [uint8]'global w_packed,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified q5_linear_gpu([float32]'gpu'global x, [uint8]'gpu'global w_packed,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     guard d_in % 32 == 0 else throw "q5_linear_gpu: d_in ({d_in}) must be a multiple of 32"
     let int gx = (d_out + 15) / 16
     let int gy = (seq + 15) / 16
@@ -866,8 +866,8 @@ kernel Q5LinearWarpBroadcastKernel:
             if lane == 0:
                 y[row * d_out + col] = partial + bv[col]
 
-pub req [float32]'gpu'unified q5_linear_warp_broadcast_gpu([float32]'global x, [uint8]'global w_packed,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified q5_linear_warp_broadcast_gpu([float32]'gpu'global x, [uint8]'gpu'global w_packed,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     guard d_in % 32 == 0 else throw "q5_linear_warp_broadcast_gpu: d_in ({d_in}) must be a multiple of 32"
     let int warps_per_block = 8
     let int total_warps = seq * d_out
@@ -980,8 +980,8 @@ kernel Q6KLinearKernel:
         if row < seq and col < d_out:
             y[row * d_out + col] = acc + bv[col]
 
-pub req [float32]'gpu'unified q6k_linear_gpu([float32]'global x, [uint8]'global w_packed,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified q6k_linear_gpu([float32]'gpu'global x, [uint8]'gpu'global w_packed,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     guard d_in % 256 == 0 else throw "q6k_linear_gpu: d_in ({d_in}) must be a multiple of 256"
     let int gx = (d_out + 15) / 16
     let int gy = (seq + 15) / 16
@@ -1088,8 +1088,8 @@ kernel Q4KLinearKernel:
         if row < seq and col < d_out:
             y[row * d_out + col] = acc + bv[col]
 
-pub req [float32]'gpu'unified q4k_linear_gpu([float32]'global x, [uint8]'global w_packed,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified q4k_linear_gpu([float32]'gpu'global x, [uint8]'gpu'global w_packed,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     guard d_in % 256 == 0 else throw "q4k_linear_gpu: d_in ({d_in}) must be a multiple of 256"
     let int gx = (d_out + 15) / 16
     let int gy = (seq + 15) / 16
@@ -1173,8 +1173,8 @@ kernel Q4LinearKernel:
         if row < seq and col < d_out:
             y[row * d_out + col] = acc + bv[col]
 
-pub req [float32]'gpu'unified q4_linear_gpu([float32]'global x, [uint8]'global w_packed,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified q4_linear_gpu([float32]'gpu'global x, [uint8]'gpu'global w_packed,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     guard d_in % 32 == 0 else throw "q4_linear_gpu: d_in ({d_in}) must be a multiple of 32"
     let int gx = (d_out + 15) / 16
     let int gy = (seq + 15) / 16
@@ -1253,8 +1253,8 @@ kernel Q4LinearWarpBroadcastKernel:
             if lane == 0:
                 y[row * d_out + col] = partial + bv[col]
 
-pub req [float32]'gpu'unified q4_linear_warp_broadcast_gpu([float32]'global x, [uint8]'global w_packed,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified q4_linear_warp_broadcast_gpu([float32]'gpu'global x, [uint8]'gpu'global w_packed,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     guard d_in % 32 == 0 else throw "q4_linear_warp_broadcast_gpu: d_in ({d_in}) must be a multiple of 32"
     let int warps_per_block = 8
     let int total_warps = seq * d_out
@@ -1358,8 +1358,8 @@ kernel Q2KLinearKernel:
         if row < seq and col < d_out:
             y[row * d_out + col] = acc + bv[col]
 
-pub req [float32]'gpu'unified q2k_linear_gpu([float32]'global x, [uint8]'global w_packed,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified q2k_linear_gpu([float32]'gpu'global x, [uint8]'gpu'global w_packed,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     guard d_in % 256 == 0 else throw "q2k_linear_gpu: d_in ({d_in}) must be a multiple of 256"
     let int gx = (d_out + 15) / 16
     let int gy = (seq + 15) / 16
@@ -1506,8 +1506,8 @@ kernel Q3KLinearKernel:
         if row < seq and col < d_out:
             y[row * d_out + col] = acc + bv[col]
 
-pub req [float32]'gpu'unified q3k_linear_gpu([float32]'global x, [uint8]'global w_packed,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified q3k_linear_gpu([float32]'gpu'global x, [uint8]'gpu'global w_packed,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     guard d_in % 256 == 0 else throw "q3k_linear_gpu: d_in ({d_in}) must be a multiple of 256"
     let int gx = (d_out + 15) / 16
     let int gy = (seq + 15) / 16
@@ -1624,8 +1624,8 @@ kernel Q4NLLinearKernel:
         if row < seq and col < d_out:
             y[row * d_out + col] = acc + bv[col]
 
-pub req [float32]'gpu'unified q4nl_linear_gpu([float32]'global x, [uint8]'global w_packed,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified q4nl_linear_gpu([float32]'gpu'global x, [uint8]'gpu'global w_packed,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     guard d_in % 32 == 0 else throw "q4nl_linear_gpu: d_in ({d_in}) must be a multiple of 32"
     let int gx = (d_out + 15) / 16
     let int gy = (seq + 15) / 16
@@ -1735,8 +1735,8 @@ kernel Q4NLLinearWarpBroadcastKernel:
             if lane == 0:
                 y[row * d_out + col] = partial + bv[col]
 
-pub req [float32]'gpu'unified q4nl_linear_warp_broadcast_gpu([float32]'global x, [uint8]'global w_packed,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified q4nl_linear_warp_broadcast_gpu([float32]'gpu'global x, [uint8]'gpu'global w_packed,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     guard d_in % 32 == 0 else throw "q4nl_linear_warp_broadcast_gpu: d_in ({d_in}) must be a multiple of 32"
     let int warps_per_block = 8
     let int total_warps = seq * d_out
@@ -1776,8 +1776,8 @@ pub req [float32]'gpu'unified q4nl_linear_warp_broadcast_gpu([float32]'global x,
 # (1 for a decode step, the prompt/turn length for a prefill), so this
 # dispatch needs no new parameter or a decode-specific entry point — it
 # reads `seq` off the same call every other format's branch below ignores.
-pub req [float32]'gpu'unified fused_linear_gpu([float32]'global x, [uint8]'global w_packed, int w_type,
-                       [float32]'global bv, int seq, int d_in, int d_out) throws:
+pub req [float32]'gpu'unified fused_linear_gpu([float32]'gpu'global x, [uint8]'gpu'global w_packed, int w_type,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     if w_type == 8:
         if seq == 1:
             q8_linear_warp_broadcast_gpu(x, w_packed, bv, seq, d_in, d_out)
@@ -1854,10 +1854,30 @@ req [float32]'gpu'unified tensor_linear_schedule_gpu([float32]'gpu'global x,
 # split once `boring` grows a tiled/simdgroup tensor schedule (see
 # boring/docs/tensor-core-primitives.md's own "add tiled shared-memory
 # fallbacks" note) that beats the hand-written kernel at prefill shapes.
+# Q8_0 prefill (seq > 1) goes through `gpu.tensor.linear` too: on Metal
+# `boring.toml`'s `[tensor.linear.prefill] q8_0 = "native"` lowers it to a
+# simdgroup_matrix kernel (~6x faster than the hand-written tiled kernel), and
+# on wgpu the portable tiled Q8 schedule is on par with it. Q4_K and Q6_K (the
+# formats of every Q4_K_M file) have native Metal kernels as well (`q4_k` /
+# `q6_k = "native"` in boring.toml; ~3-10x faster than the hand-written ones and
+# the reason a 3B Q4_K_M model prefills at ~16-20 ms/token instead of ~177), but
+# NO portable schedule: on wgpu the tensor path is a scalar kernel ~3x slower
+# than the hand-written one, so `--kquant-prefill handwritten` keeps those two
+# on `fused_linear_gpu`. Other formats always take the tiled `fused_linear_gpu`
+# for seq > 1.
+static var bool kquant_prefill_handwritten = false
+
+# Metal batches consecutive launches into one command buffer during decode.
+# Other GPU backends provide a no-op implementation of this native hook.
+pub def set_gpu_batch_limit(int limit): native
+
+pub def set_kquant_prefill_handwritten(bool v):
+    kquant_prefill_handwritten = v
+
 pub req [float32]'gpu'unified tensor_linear_gpu([float32]'gpu'global x,
                        [uint8]'gpu'global w_packed, int w_type,
                        [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
-    if seq == 1:
+    if seq == 1 or w_type == 8 or ((w_type == 12 or w_type == 14) and not kquant_prefill_handwritten):
         tensor_linear_schedule_gpu(x, w_packed, w_type, bv, seq, d_in, d_out)
     else:
         fused_linear_gpu(x, w_packed, w_type, bv, seq, d_in, d_out)
@@ -1865,7 +1885,7 @@ pub req [float32]'gpu'unified tensor_linear_gpu([float32]'gpu'global x,
 pub req [float32]'gpu'unified tensor_linear_nobias_gpu([float32]'gpu'global x,
                        [uint8]'gpu'global w_packed, int w_type,
                        int seq, int d_in, int d_out) throws:
-    if seq == 1:
+    if seq == 1 or w_type == 8 or ((w_type == 12 or w_type == 14) and not kquant_prefill_handwritten):
         tensor_linear_nobias_schedule_gpu(x, w_packed, w_type, seq, d_in, d_out)
     else:
         let [float32] zero_bias = [0.0 for i in 0..<d_out]
@@ -1896,8 +1916,12 @@ req [float32]'gpu'unified tensor_linear_nobias_schedule_gpu([float32]'gpu'global
     y
 
 # ── Kernel: RMSNorm (row-wise) ───────────────────────────────────────────
-# One thread per row (position) — no bias, no mean subtraction (simpler
-# than whisper-boring's LayerNormSeqKernel).
+# One SIMD group per row (position) — no bias, no mean subtraction. Each
+# lane accumulates a strided slice of the row, then a shuffle reduction
+# computes the shared RMS. The previous implementation assigned a whole row
+# to one thread and therefore serialized all d elements (896-4096 in the
+# models used here), which made this small-looking kernel disproportionately
+# expensive during single-token decode.
 
 kernel RmsNormKernel:
     let [float32]'global   x
@@ -1916,24 +1940,34 @@ kernel RmsNormKernel:
         out = [0.0 for ..<s * dd]
 
     def ():
-        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
-        if i < seq:
-            let base = i * d
+        let lane = gpu.warp.lane
+        let warp_in_block = gpu.thread.y
+        let row = gpu.block.x * 8 + warp_in_block
+        if row < seq:
+            let base = row * d
             var float32 ss = 0.0
-            for j in 0..<d:
+            var int j = lane
+            while j < d:
                 let v = x[base + j]
                 ss += v * v
+                j += gpu.warp.size
+            var int offset = gpu.warp.size / 2
+            while offset > 0:
+                ss += gpu.warp.shuffle_xor(ss, offset)
+                offset = offset / 2
             let mean_sq = ss / (d as float32)
             let inv_rms = 1.0 / (mean_sq + eps).sqrt()
-            for j in 0..<d:
+            j = lane
+            while j < d:
                 out[base + j] = x[base + j] * inv_rms * w[j]
+                j += gpu.warp.size
 
-pub req [float32]'gpu'unified rms_norm_gpu([float32]'global x, [float32]'global w,
+pub req [float32]'gpu'unified rms_norm_gpu([float32]'gpu'global x, [float32]'gpu'global w,
                        int seq, int d, float32 eps) throws:
-    let int blocks = (seq + 255) / 256
+    let int blocks = (seq + 7) / 8
     mut k = RmsNormKernel(x, w, seq, d, eps)
     kernel:
-        k(block = 256, grid = blocks)
+        k(block = (32, 8), grid = blocks)
     k.out
 
 # ── Kernel: RoPE (NEOX "rotate-half" or NORM "interleaved") ──────────────
@@ -1989,11 +2023,11 @@ kernel RopeApplyKernel:
             out[idx0] = x0 * cos_a - x1 * sin_a
             out[idx1] = x0 * sin_a + x1 * cos_a
 
-pub req [float32]'gpu'unified rope_apply_gpu([float32]'global x, int seq, int n_heads,
+pub req [float32]'gpu'unified rope_apply_gpu([float32]'gpu'global x, int seq, int n_heads,
                        int d_head, float32 freq_base, int neox) throws:
     rope_apply_at_gpu(x, seq, n_heads, d_head, freq_base, 0, neox)
 
-pub req [float32]'gpu'unified rope_apply_at_gpu([float32]'global x, int seq, int n_heads,
+pub req [float32]'gpu'unified rope_apply_at_gpu([float32]'gpu'global x, int seq, int n_heads,
                        int d_head, float32 freq_base, int start_pos, int neox) throws:
     let int half_dim = d_head / 2
     let int total = seq * n_heads * half_dim
@@ -2016,7 +2050,9 @@ pub req [float32]'gpu'unified rope_apply_at_gpu([float32]'global x, int seq, int
 # different bytes of one u32 would race — 16-byte, 4-aligned runs never share
 # a word. 16 bytes/thread also keeps even a ~140 MB tensor under wgpu's
 # 65535-workgroup-per-dimension dispatch limit (256 threads x 16 B = 4096 B
-# per workgroup, i.e. up to ~268 MB per tensor).
+# per workgroup, i.e. up to ~268 MB per tensor in one dimension); larger
+# tensors (a 7B model's 447 MB Q6_K token embedding) spill into a second grid
+# dimension.
 
 kernel CopyBytesKernel:
     let [uint8]'global   src
@@ -2029,7 +2065,8 @@ kernel CopyBytesKernel:
         out = [0 as uint8 for ..<nn]
 
     def ():
-        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        let block_idx = gpu.block.x + gpu.block.y * gpu.grid_dim.x
+        let i = gpu.thread.x + block_idx * gpu.block_dim.x
         let base = i * 16
         var int k = 0
         while k < 16:
@@ -2037,14 +2074,14 @@ kernel CopyBytesKernel:
                 out[base + k] = src[base + k]
             k += 1
 
-pub req [uint8]'gpu'unified upload_bytes_gpu([uint8]'global src) throws:
+pub req [uint8]'gpu'unified upload_bytes_gpu([uint8]'gpu'global src) throws:
     let int n = src.length
     let int blocks = (n + 4095) / 4096
-    if blocks > 65535:
-        throw "upload_bytes_gpu: tensor of {n} bytes exceeds the 65535-workgroup dispatch limit"
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
     mut k = CopyBytesKernel(src, n)
     kernel:
-        k(block = 256, grid = blocks)
+        k(block = 256, grid = (gx, gy))
     k.out
 
 kernel CopyFloatsKernel:
@@ -2058,16 +2095,85 @@ kernel CopyFloatsKernel:
         out = [0.0 for ..<nn]
 
     def ():
-        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        let block_idx = gpu.block.x + gpu.block.y * gpu.grid_dim.x
+        let i = gpu.thread.x + block_idx * gpu.block_dim.x
         if i < n:
             out[i] = src[i]
 
-pub req [float32]'gpu'unified upload_floats_gpu([float32]'global src) throws:
+# A (gx, gy) grid: a buffer over 65535 x 256 floats (a long context's KV rows
+# restored from disk) does not fit one grid dimension.
+pub req [float32]'gpu'unified upload_floats_gpu([float32]'gpu'global src) throws:
     let int n = src.length
     let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
     mut k = CopyFloatsKernel(src, n)
     kernel:
-        k(block = 256, grid = blocks)
+        k(block = 256, grid = (gx, gy))
+    k.out
+
+# Split one decode-only concatenated Q/K/V projection into the three resident
+# buffers expected by the existing RoPE, cache and attention code.
+kernel SplitQkvKernel:
+    let [float32]'global src
+    mut [float32]'unified q
+    mut [float32]'unified k
+    mut [float32]'unified v
+    let int qn
+    let int kvn
+
+    init([float32]'global input, int q_size, int kv_size):
+        src = input
+        qn = q_size
+        kvn = kv_size
+        q = [0.0 as float32 for ..<q_size]
+        k = [0.0 as float32 for ..<kv_size]
+        v = [0.0 as float32 for ..<kv_size]
+
+    def ():
+        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if i < qn + 2 * kvn:
+            if i < qn:
+                q[i] = src[i]
+            elif i < qn + kvn:
+                k[i - qn] = src[i]
+            else:
+                v[i - qn - kvn] = src[i]
+
+pub req ([float32]'gpu'unified, [float32]'gpu'unified, [float32]'gpu'unified) split_qkv_gpu(
+        [float32]'gpu'global src, int q_size, int kv_size) throws:
+    let n = q_size + 2 * kv_size
+    mut split = SplitQkvKernel(src, q_size, kv_size)
+    kernel:
+        split(block = 256, grid = (n + 255) / 256)
+    (split.q, split.k, split.v)
+
+pub req ([float32]'gpu'unified, [float32]'gpu'unified, [float32]'gpu'unified) project_qkv_decode_gpu(
+        [float32]'gpu'global x,
+        [uint8]'gpu'global qw, int qt, [float32]'gpu'global qb,
+        [uint8]'gpu'global kw, int kt, [float32]'gpu'global kb,
+        [uint8]'gpu'global vw, int vt, [float32]'gpu'global vb,
+        [uint8]'gpu'global qkvw, [float32]'gpu'global qkvb, bool fused,
+        int d_in, int q_dim, int kv_dim) throws:
+    if fused:
+        let joined = tensor_linear_gpu(x, qkvw, 8, qkvb, 1, d_in, q_dim + 2 * kv_dim)
+        split_qkv_gpu(joined, q_dim, kv_dim)
+    else:
+        let q = tensor_linear_gpu(x, qw, qt, qb, 1, d_in, q_dim)
+        let k = tensor_linear_gpu(x, kw, kt, kb, 1, d_in, kv_dim)
+        let v = tensor_linear_gpu(x, vw, vt, vb, 1, d_in, kv_dim)
+        (q, k, v)
+
+# The first `n` floats of a device-resident buffer, read back to the host (the
+# KV cache saved to disk; a `'gpu'unified` struct field cannot be handed to
+# `passthrough`, which takes a host array).
+pub [float32] download_floats_gpu([float32]'global src, int n) throws:
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = CopyFloatsKernel(src, n)
+    kernel:
+        k(block = 256, grid = (gx, gy))
     k.out
 
 # ── Kernel: SwiGLU combine (elementwise silu(gate) * up) ─────────────────
@@ -2091,10 +2197,78 @@ kernel SwigluCombineKernel:
             let silu_g = g / (1.0 + (0.0 - g).exp())
             out[i] = silu_g * up[i]
 
-pub req [float32]'gpu'unified swiglu_combine_gpu([float32]'global gate, [float32]'global up) throws:
+pub req [float32]'gpu'unified swiglu_combine_gpu([float32]'gpu'global gate, [float32]'gpu'global up) throws:
     let int n = gate.length
     let int blocks = (n + 255) / 256
     mut k = SwigluCombineKernel(gate, up, n)
+    kernel:
+        k(block = 256, grid = blocks)
+    k.out
+
+# ── Kernel: elementwise add (residual connection) ────────────────────────
+# Keeps the residual stream on the device: `vec_add` (math.br) is a host
+# function, so every `x = vec_add(x, branch)` forced a device-to-host copy of
+# the branch output — a full GPU sync twice per layer per token.
+
+kernel AddKernel:
+    let [float32]'global   a
+    let [float32]'global   b
+    mut [float32]'unified  out
+    let int                n
+
+    init([float32]'global ai, [float32]'global bi, int nn):
+        a   = ai
+        b   = bi
+        n   = nn
+        out = [0.0 for ..<nn]
+
+    def ():
+        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if i < n:
+            out[i] = a[i] + b[i]
+
+pub req [float32]'gpu'unified add_gpu([float32]'gpu'global a, [float32]'gpu'global b, int n) throws:
+    let int blocks = (n + 255) / 256
+    mut k = AddKernel(a, b, n)
+    kernel:
+        k(block = 256, grid = blocks)
+    k.out
+
+# ── Kernel: KV-cache append ──────────────────────────────────────────────
+# New cache = old cache's `old_n` floats followed by `new_n` floats of fresh
+# K (or V) rows. Entirely on the device: the cache never visits the host
+# between decode steps (it used to be read back, extended by a host loop and
+# re-uploaded for every layer of every token).
+
+kernel KvAppendKernel:
+    let [float32]'global   prev
+    let [float32]'global   fresh
+    mut [float32]'unified  out
+    let int                old_n
+    let int                total
+
+    init([float32]'global p, [float32]'global f, int on, int nn):
+        prev  = p
+        fresh = f
+        old_n = on
+        total = on + nn
+        out   = [0.0 for ..<(on + nn)]
+
+    def ():
+        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if i < total:
+            if i < old_n:
+                out[i] = prev[i]
+            else:
+                out[i] = fresh[i - old_n]
+
+# `old_n`/`new_n` are element counts (rows * kv_dim). `old_n` must be > 0:
+# an empty `prev` has nothing to bind as a buffer — callers use `fresh`
+# itself as the first cache.
+pub req [float32]'gpu'unified kv_append_gpu([float32]'gpu'global prev, [float32]'gpu'global fresh,
+                                            int old_n, int new_n) throws:
+    let int blocks = (old_n + new_n + 255) / 256
+    mut k = KvAppendKernel(prev, fresh, old_n, new_n)
     kernel:
         k(block = 256, grid = blocks)
     k.out
@@ -2227,9 +2401,815 @@ kernel MatMulHeadsKernel:
                 s += probs[p = p, i = i, h = h] * v[col = kv_h * d_head + jl, row = p]
             c[col = col, row = i] = s
 
+# ── Kernel: fused (flash-style) attention, d_head = 64 or 128 ───────────
+# The three-kernel path below materializes an (n_head x seq_q x seq_k) score
+# matrix and re-reads it twice — at a 512-token prefill chunk over a 5.6k-token
+# cache that is ~160 MB per layer and about half of a cold prefill. These
+# kernels never build it: one 16x16 workgroup per (head, block of 16 query rows)
+# walks the keys 16 at a time, keeping a running max / sum / output per row
+# (online softmax), reading K and V straight from the cache layout (no
+# transpose) and skipping key tiles that are entirely masked by causality.
+# Thread (tx, ty) owns query row `ty`; during the P*V step it accumulates the
+# output dims tx, tx+16, tx+32, ... in the thread-private array `acc` (4 entries
+# for d_head 64, 8 for 128). One source per head size (tile width and
+# accumulator count are compile-time sizes); any other d_head, and single-query
+# decode, keep the three-kernel path.
+kernel FlashAttn64Kernel:
+    let  [float32, col, row]'global   q          # (seq_q × n_head*64)
+    let  [float32, col, row]'global   k          # (seq_k × n_kv_head*64), cache layout
+    let  [float32, col, row]'global   v          # (seq_k × n_kv_head*64)
+    mut  [float32, col, row]'unified  o          # (seq_q × n_head*64)
+    let int             seq_q
+    let int             seq_k
+    let int             group
+    let float32         scale
+    let int             causal
+    let int             causal_offset
+    mut [float32, width = 64, height = 16]'actor q_tile
+    mut [float32, width = 64, height = 16]'actor k_tile
+    mut [float32, width = 64, height = 16]'actor v_tile
+    mut [float32, width = 16, height = 16]'actor p_tile
+    mut [float32, 4] acc        # thread-private: this thread's 4 output dims
+
+    init([float32]'global qi, [float32]'global ki, [float32]'global vi,
+         int sq, int sk, int d_q, int d_kv, int grp, float32 sc, int caus, int caus_off):
+        q      = qi.reshape(col = d_q, row = sq)
+        k      = ki.reshape(col = d_kv, row = sk)
+        v      = vi.reshape(col = d_kv, row = sk)
+        o      = [0.0 for col = d_q, row = sq]
+        seq_q  = sq
+        seq_k  = sk
+        group  = grp
+        scale  = sc
+        causal = caus
+        causal_offset = caus_off
+
+    def ():
+        let tx   = gpu.thread.x
+        let ty   = gpu.thread.y
+        let h    = gpu.block.z
+        let row0 = gpu.block.y * 16
+        let i    = row0 + ty
+        let q_off = h * 64
+        let k_off = (h / group) * 64
+        for r in 0..<4:
+            let idx = ty * 16 + tx + r * 256
+            let rr = idx / 64
+            let cc = idx % 64
+            if row0 + rr < seq_q:
+                q_tile[width = cc, height = rr] = q[col = q_off + cc, row = row0 + rr]
+            else:
+                q_tile[width = cc, height = rr] = 0.0
+        for e in 0..<4:
+            acc[e] = 0.0
+        var float32 m = -1.0e30
+        var float32 l = 0.0
+        var int kmax = seq_k
+        if causal == 1:
+            let lim = causal_offset + row0 + 16
+            if lim < kmax:
+                kmax = lim
+        let ntiles = (kmax + 15) / 16
+        for t in 0..<ntiles:
+            let j0 = t * 16
+            sync
+            for r in 0..<4:
+                let idx = ty * 16 + tx + r * 256
+                let rr = idx / 64
+                let cc = idx % 64
+                if j0 + rr < seq_k:
+                    k_tile[width = cc, height = rr] = k[col = k_off + cc, row = j0 + rr]
+                    v_tile[width = cc, height = rr] = v[col = k_off + cc, row = j0 + rr]
+                else:
+                    k_tile[width = cc, height = rr] = 0.0
+                    v_tile[width = cc, height = rr] = 0.0
+            sync
+            var float32 s = 0.0
+            for d in 0..<64:
+                s += q_tile[width = d, height = ty] * k_tile[width = d, height = tx]
+            s = s * scale
+            let jg = j0 + tx
+            var int ok = 1
+            if jg >= seq_k:
+                ok = 0
+            if causal == 1 and jg > i + causal_offset:
+                ok = 0
+            if ok == 0:
+                s = -1.0e30 as float32
+            p_tile[width = tx, height = ty] = s
+            sync
+            var float32 mx = m
+            for j in 0..<16:
+                let sv = p_tile[width = j, height = ty]
+                if sv > mx:
+                    mx = sv
+            let alpha = (m - mx).exp()
+            var float32 pv = 0.0
+            if ok == 1:
+                pv = (s - mx).exp()
+            sync
+            p_tile[width = tx, height = ty] = pv
+            sync
+            for e in 0..<4:
+                acc[e] = acc[e] * alpha
+            var float32 psum = 0.0
+            for j in 0..<16:
+                let pj = p_tile[width = j, height = ty]
+                psum += pj
+                for e in 0..<4:
+                    acc[e] += pj * v_tile[width = tx + 16 * e, height = j]
+            l = l * alpha + psum
+            m = mx
+        if i < seq_q:
+            var float32 inv = 0.0
+            if l > 0.0:
+                inv = 1.0 / l
+            for e in 0..<4:
+                o[col = q_off + tx + 16 * e, row = i] = acc[e] * inv
+
+pub req [float32]'gpu'unified attention_flash64_gpu([float32]'gpu'global q, [float32]'gpu'global k, [float32]'gpu'global v,
+                          int seq_q, int seq_k, int n_head, int n_kv_head,
+                          bool causal, int causal_offset) throws:
+    let int d_q   = n_head * 64
+    let int d_kv  = n_kv_head * 64
+    let int group = n_head / n_kv_head
+    let float32 scale = 1.0 / (64.0 as float32).sqrt()
+    let int causal_i = if causal: 1 else: 0
+    mut kf = FlashAttn64Kernel(q, k, v, seq_q, seq_k, d_q, d_kv, group, scale, causal_i, causal_offset)
+    kernel:
+        kf(block = (16, 16), grid = (1, (seq_q + 15) / 16, n_head))
+    kf.o
+
+kernel FlashAttn128Kernel:
+    let  [float32, col, row]'global   q          # (seq_q × n_head*128)
+    let  [float32, col, row]'global   k          # (seq_k × n_kv_head*128), cache layout
+    let  [float32, col, row]'global   v          # (seq_k × n_kv_head*128)
+    mut  [float32, col, row]'unified  o          # (seq_q × n_head*128)
+    let int             seq_q
+    let int             seq_k
+    let int             group
+    let float32         scale
+    let int             causal
+    let int             causal_offset
+    mut [float32, width = 128, height = 16]'actor q_tile
+    mut [float32, width = 128, height = 16]'actor k_tile
+    mut [float32, width = 128, height = 16]'actor v_tile
+    mut [float32, width = 16, height = 16]'actor p_tile
+    mut [float32, 8] acc        # thread-private: this thread's 8 output dims
+
+    init([float32]'global qi, [float32]'global ki, [float32]'global vi,
+         int sq, int sk, int d_q, int d_kv, int grp, float32 sc, int caus, int caus_off):
+        q      = qi.reshape(col = d_q, row = sq)
+        k      = ki.reshape(col = d_kv, row = sk)
+        v      = vi.reshape(col = d_kv, row = sk)
+        o      = [0.0 for col = d_q, row = sq]
+        seq_q  = sq
+        seq_k  = sk
+        group  = grp
+        scale  = sc
+        causal = caus
+        causal_offset = caus_off
+
+    def ():
+        let tx   = gpu.thread.x
+        let ty   = gpu.thread.y
+        let h    = gpu.block.z
+        let row0 = gpu.block.y * 16
+        let i    = row0 + ty
+        let q_off = h * 128
+        let k_off = (h / group) * 128
+        for r in 0..<8:
+            let idx = ty * 16 + tx + r * 256
+            let rr = idx / 128
+            let cc = idx % 128
+            if row0 + rr < seq_q:
+                q_tile[width = cc, height = rr] = q[col = q_off + cc, row = row0 + rr]
+            else:
+                q_tile[width = cc, height = rr] = 0.0
+        for e in 0..<8:
+            acc[e] = 0.0
+        var float32 m = -1.0e30
+        var float32 l = 0.0
+        var int kmax = seq_k
+        if causal == 1:
+            let lim = causal_offset + row0 + 16
+            if lim < kmax:
+                kmax = lim
+        let ntiles = (kmax + 15) / 16
+        for t in 0..<ntiles:
+            let j0 = t * 16
+            sync
+            for r in 0..<8:
+                let idx = ty * 16 + tx + r * 256
+                let rr = idx / 128
+                let cc = idx % 128
+                if j0 + rr < seq_k:
+                    k_tile[width = cc, height = rr] = k[col = k_off + cc, row = j0 + rr]
+                    v_tile[width = cc, height = rr] = v[col = k_off + cc, row = j0 + rr]
+                else:
+                    k_tile[width = cc, height = rr] = 0.0
+                    v_tile[width = cc, height = rr] = 0.0
+            sync
+            var float32 s = 0.0
+            for d in 0..<128:
+                s += q_tile[width = d, height = ty] * k_tile[width = d, height = tx]
+            s = s * scale
+            let jg = j0 + tx
+            var int ok = 1
+            if jg >= seq_k:
+                ok = 0
+            if causal == 1 and jg > i + causal_offset:
+                ok = 0
+            if ok == 0:
+                s = -1.0e30 as float32
+            p_tile[width = tx, height = ty] = s
+            sync
+            var float32 mx = m
+            for j in 0..<16:
+                let sv = p_tile[width = j, height = ty]
+                if sv > mx:
+                    mx = sv
+            let alpha = (m - mx).exp()
+            var float32 pv = 0.0
+            if ok == 1:
+                pv = (s - mx).exp()
+            sync
+            p_tile[width = tx, height = ty] = pv
+            sync
+            for e in 0..<8:
+                acc[e] = acc[e] * alpha
+            var float32 psum = 0.0
+            for j in 0..<16:
+                let pj = p_tile[width = j, height = ty]
+                psum += pj
+                for e in 0..<8:
+                    acc[e] += pj * v_tile[width = tx + 16 * e, height = j]
+            l = l * alpha + psum
+            m = mx
+        if i < seq_q:
+            var float32 inv = 0.0
+            if l > 0.0:
+                inv = 1.0 / l
+            for e in 0..<8:
+                o[col = q_off + tx + 16 * e, row = i] = acc[e] * inv
+
+pub req [float32]'gpu'unified attention_flash128_gpu([float32]'gpu'global q, [float32]'gpu'global k, [float32]'gpu'global v,
+                          int seq_q, int seq_k, int n_head, int n_kv_head,
+                          bool causal, int causal_offset) throws:
+    let int d_q   = n_head * 128
+    let int d_kv  = n_kv_head * 128
+    let int group = n_head / n_kv_head
+    let float32 scale = 1.0 / (128.0 as float32).sqrt()
+    let int causal_i = if causal: 1 else: 0
+    mut kf = FlashAttn128Kernel(q, k, v, seq_q, seq_k, d_q, d_kv, group, scale, causal_i, causal_offset)
+    kernel:
+        kf(block = (16, 16), grid = (1, (seq_q + 15) / 16, n_head))
+    kf.o
+
+# ── Kernels: split-K decode attention (one query row), d_head = 64 or 128 ──
+kernel FlashDecode64Kernel:
+    let  [float32]'global   q          # (n_head*64), the single query row
+    let  [float32]'global   k          # (seq_k * d_kv), cache layout, flat
+    let  [float32]'global   v          # (seq_k * d_kv)
+    mut  [float32]'unified  part       # per (head, split): m, l, then 64 partial output dims
+    let int             seq_k
+    let int             d_kv
+    let int             group
+    let int             nsplit
+    let int             chunk
+    let float32         scale
+    mut [float32, width = 64, height = 1]'actor q_s
+    mut [float32, width = 64, height = 1]'actor p_s
+
+    init([float32]'global qi, [float32]'global ki, [float32]'global vi,
+         int sk, int dkv, int grp, int ns, int ch, float32 sc, int nparts):
+        q      = qi
+        k      = ki
+        v      = vi
+        seq_k  = sk
+        d_kv   = dkv
+        group  = grp
+        nsplit = ns
+        chunk  = ch
+        scale  = sc
+        part   = [0.0 for ..<nparts]
+
+    def ():
+        let t     = gpu.thread.x
+        let split = gpu.block.x
+        let h     = gpu.block.y
+        let k_off = (h / group) * 64
+        let start = split * chunk
+        var int stop = start + chunk
+        if stop > seq_k:
+            stop = seq_k
+        q_s[width = t, height = 0] = q[h * 64 + t]
+        var float32 m = -1.0e30
+        var float32 l = 0.0
+        var float32 acc = 0.0
+        var int ntiles = 0
+        if stop > start:
+            ntiles = (stop - start + 64 - 1) / 64
+        for ti in 0..<ntiles:
+            let j0 = start + ti * 64
+            let jg = j0 + t
+            sync
+            var float32 s = -1.0e30
+            if jg < stop:
+                var float32 dot = 0.0
+                for d in 0..<64:
+                    dot += q_s[width = d, height = 0] * k[jg * d_kv + k_off + d]
+                s = dot * scale
+            p_s[width = t, height = 0] = s
+            sync
+            var float32 mx = m
+            for j in 0..<64:
+                let sv = p_s[width = j, height = 0]
+                if sv > mx:
+                    mx = sv
+            let alpha = (m - mx).exp()
+            var float32 pv = 0.0
+            if jg < stop:
+                pv = (s - mx).exp()
+            sync
+            p_s[width = t, height = 0] = pv
+            sync
+            var float32 psum = 0.0
+            var float32 nacc = 0.0
+            for j in 0..<64:
+                let pj = p_s[width = j, height = 0]
+                psum += pj
+                if j0 + j < stop:
+                    nacc += pj * v[(j0 + j) * d_kv + k_off + t]
+            l = l * alpha + psum
+            acc = acc * alpha + nacc
+            m = mx
+        let base = (h * nsplit + split) * (64 + 2)
+        part[base + 2 + t] = acc
+        if t == 0:
+            part[base] = m
+            part[base + 1] = l
+
+kernel FlashDecodeCombine64Kernel:
+    let  [float32]'global   part
+    mut  [float32]'unified  o          # (n_head*64)
+    let int             nsplit
+
+    init([float32]'global pi, int ns, int n):
+        part   = pi
+        nsplit = ns
+        o      = [0.0 for ..<n]
+
+    def ():
+        let t = gpu.thread.x
+        let h = gpu.block.x
+        var float32 big = -1.0e30
+        for s in 0..<nsplit:
+            let ms = part[(h * nsplit + s) * (64 + 2)]
+            if ms > big:
+                big = ms
+        var float32 total = 0.0
+        var float32 a = 0.0
+        for s in 0..<nsplit:
+            let base = (h * nsplit + s) * (64 + 2)
+            let w = (part[base] - big).exp()
+            total += part[base + 1] * w
+            a += part[base + 2 + t] * w
+        var float32 res = 0.0
+        if total > 0.0:
+            res = a / total
+        o[h * 64 + t] = res
+
+# One query row against the whole cache, split over keys: `nsplit` workgroups per
+# head each run an online softmax over a contiguous key range and write a partial
+# (max, sum, output); the combine kernel merges them. Replaces the three-kernel
+# path for single-query decode, which transposed the entire K cache and
+# materialized an n_head x seq_k score matrix for every layer of every token.
+pub req [float32]'gpu'unified attention_decode64_gpu([float32]'gpu'global q, [float32]'gpu'global k, [float32]'gpu'global v,
+                          int seq_k, int n_head, int n_kv_head) throws:
+    let int d_kv  = n_kv_head * 64
+    let int group = n_head / n_kv_head
+    let float32 scale = 1.0 / (64.0 as float32).sqrt()
+    var int nsplit = (seq_k + 127) / 128
+    if nsplit < 1:
+        nsplit = 1
+    if nsplit > 64:
+        nsplit = 64
+    let int chunk = (seq_k + nsplit - 1) / nsplit
+    mut kd = FlashDecode64Kernel(q, k, v, seq_k, d_kv, group, nsplit, chunk, scale, n_head * nsplit * (64 + 2))
+    kernel:
+        kd(block = 64, grid = (nsplit, n_head))
+    mut kc = FlashDecodeCombine64Kernel(kd.part, nsplit, n_head * 64)
+    kernel:
+        kc(block = 64, grid = n_head)
+    kc.o
+
+kernel FlashDecode128Kernel:
+    let  [float32]'global   q          # (n_head*128), the single query row
+    let  [float32]'global   k          # (seq_k * d_kv), cache layout, flat
+    let  [float32]'global   v          # (seq_k * d_kv)
+    mut  [float32]'unified  part       # per (head, split): m, l, then 128 partial output dims
+    let int             seq_k
+    let int             d_kv
+    let int             group
+    let int             nsplit
+    let int             chunk
+    let float32         scale
+    mut [float32, width = 128, height = 1]'actor q_s
+    mut [float32, width = 128, height = 1]'actor p_s
+
+    init([float32]'global qi, [float32]'global ki, [float32]'global vi,
+         int sk, int dkv, int grp, int ns, int ch, float32 sc, int nparts):
+        q      = qi
+        k      = ki
+        v      = vi
+        seq_k  = sk
+        d_kv   = dkv
+        group  = grp
+        nsplit = ns
+        chunk  = ch
+        scale  = sc
+        part   = [0.0 for ..<nparts]
+
+    def ():
+        let t     = gpu.thread.x
+        let split = gpu.block.x
+        let h     = gpu.block.y
+        let k_off = (h / group) * 128
+        let start = split * chunk
+        var int stop = start + chunk
+        if stop > seq_k:
+            stop = seq_k
+        q_s[width = t, height = 0] = q[h * 128 + t]
+        var float32 m = -1.0e30
+        var float32 l = 0.0
+        var float32 acc = 0.0
+        var int ntiles = 0
+        if stop > start:
+            ntiles = (stop - start + 128 - 1) / 128
+        for ti in 0..<ntiles:
+            let j0 = start + ti * 128
+            let jg = j0 + t
+            sync
+            var float32 s = -1.0e30
+            if jg < stop:
+                var float32 dot = 0.0
+                for d in 0..<128:
+                    dot += q_s[width = d, height = 0] * k[jg * d_kv + k_off + d]
+                s = dot * scale
+            p_s[width = t, height = 0] = s
+            sync
+            var float32 mx = m
+            for j in 0..<128:
+                let sv = p_s[width = j, height = 0]
+                if sv > mx:
+                    mx = sv
+            let alpha = (m - mx).exp()
+            var float32 pv = 0.0
+            if jg < stop:
+                pv = (s - mx).exp()
+            sync
+            p_s[width = t, height = 0] = pv
+            sync
+            var float32 psum = 0.0
+            var float32 nacc = 0.0
+            for j in 0..<128:
+                let pj = p_s[width = j, height = 0]
+                psum += pj
+                if j0 + j < stop:
+                    nacc += pj * v[(j0 + j) * d_kv + k_off + t]
+            l = l * alpha + psum
+            acc = acc * alpha + nacc
+            m = mx
+        let base = (h * nsplit + split) * (128 + 2)
+        part[base + 2 + t] = acc
+        if t == 0:
+            part[base] = m
+            part[base + 1] = l
+
+kernel FlashDecodeCombine128Kernel:
+    let  [float32]'global   part
+    mut  [float32]'unified  o          # (n_head*128)
+    let int             nsplit
+
+    init([float32]'global pi, int ns, int n):
+        part   = pi
+        nsplit = ns
+        o      = [0.0 for ..<n]
+
+    def ():
+        let t = gpu.thread.x
+        let h = gpu.block.x
+        var float32 big = -1.0e30
+        for s in 0..<nsplit:
+            let ms = part[(h * nsplit + s) * (128 + 2)]
+            if ms > big:
+                big = ms
+        var float32 total = 0.0
+        var float32 a = 0.0
+        for s in 0..<nsplit:
+            let base = (h * nsplit + s) * (128 + 2)
+            let w = (part[base] - big).exp()
+            total += part[base + 1] * w
+            a += part[base + 2 + t] * w
+        var float32 res = 0.0
+        if total > 0.0:
+            res = a / total
+        o[h * 128 + t] = res
+
+# One query row against the whole cache, split over keys: `nsplit` workgroups per
+# head each run an online softmax over a contiguous key range and write a partial
+# (max, sum, output); the combine kernel merges them. Replaces the three-kernel
+# path for single-query decode, which transposed the entire K cache and
+# materialized an n_head x seq_k score matrix for every layer of every token.
+pub req [float32]'gpu'unified attention_decode128_gpu([float32]'gpu'global q, [float32]'gpu'global k, [float32]'gpu'global v,
+                          int seq_k, int n_head, int n_kv_head) throws:
+    let int d_kv  = n_kv_head * 128
+    let int group = n_head / n_kv_head
+    let float32 scale = 1.0 / (128.0 as float32).sqrt()
+    var int nsplit = (seq_k + 127) / 128
+    if nsplit < 1:
+        nsplit = 1
+    if nsplit > 64:
+        nsplit = 64
+    let int chunk = (seq_k + nsplit - 1) / nsplit
+    mut kd = FlashDecode128Kernel(q, k, v, seq_k, d_kv, group, nsplit, chunk, scale, n_head * nsplit * (128 + 2))
+    kernel:
+        kd(block = 128, grid = (nsplit, n_head))
+    mut kc = FlashDecodeCombine128Kernel(kd.part, nsplit, n_head * 128)
+    kernel:
+        kc(block = 128, grid = n_head)
+    kc.o
+
+# ── Decode attention over a cache split in two buffers ───────────────────
+# The cache is a main buffer (positions 0..main_len) plus a short tail buffer
+# holding the newest rows. Appending one token's K/V then copies only the tail
+# (a few dozen rows) instead of the whole cache, which `boring` has to copy
+# because a kernel cannot grow a device buffer in place; the tail is folded into
+# the main buffer every TAIL_MAX tokens. Same kernels as FlashDecode64/128 above,
+# each key/value row read from the main or the tail buffer by its position.
+
+kernel FlashDecodeTail64Kernel:
+    let  [float32]'global   q          # (n_head*64), the single query row
+    let  [float32]'global   k          # (seq_k * d_kv), cache layout, flat
+    let  [float32]'global   v          # (main_len * d_kv)
+    let  [float32]'global   tk         # the newest (seq_k - main_len) rows of K
+    let  [float32]'global   tv
+    let int             main_len
+    mut  [float32]'unified  part       # per (head, split): m, l, then 64 partial output dims
+    let int             seq_k
+    let int             d_kv
+    let int             group
+    let int             nsplit
+    let int             chunk
+    let float32         scale
+    mut [float32, width = 64, height = 1]'actor q_s
+    mut [float32, width = 64, height = 1]'actor p_s
+
+    init([float32]'global qi, [float32]'global ki, [float32]'global vi,
+         [float32]'global tki, [float32]'global tvi, int ml,
+         int sk, int dkv, int grp, int ns, int ch, float32 sc, int nparts):
+        q      = qi
+        k      = ki
+        v      = vi
+        tk     = tki
+        tv     = tvi
+        main_len = ml
+        seq_k  = sk
+        d_kv   = dkv
+        group  = grp
+        nsplit = ns
+        chunk  = ch
+        scale  = sc
+        part   = [0.0 for ..<nparts]
+
+    def ():
+        let t     = gpu.thread.x
+        let split = gpu.block.x
+        let h     = gpu.block.y
+        let k_off = (h / group) * 64
+        let start = split * chunk
+        var int stop = start + chunk
+        if stop > seq_k:
+            stop = seq_k
+        q_s[width = t, height = 0] = q[h * 64 + t]
+        var float32 m = -1.0e30
+        var float32 l = 0.0
+        var float32 acc = 0.0
+        var int ntiles = 0
+        if stop > start:
+            ntiles = (stop - start + 64 - 1) / 64
+        for ti in 0..<ntiles:
+            let j0 = start + ti * 64
+            let jg = j0 + t
+            sync
+            var float32 s = -1.0e30
+            if jg < stop:
+                var float32 dot = 0.0
+                if jg < main_len:
+                    for d in 0..<64:
+                        dot += q_s[width = d, height = 0] * k[jg * d_kv + k_off + d]
+                else:
+                    for d in 0..<64:
+                        dot += q_s[width = d, height = 0] * tk[(jg - main_len) * d_kv + k_off + d]
+                s = dot * scale
+            p_s[width = t, height = 0] = s
+            sync
+            var float32 mx = m
+            for j in 0..<64:
+                let sv = p_s[width = j, height = 0]
+                if sv > mx:
+                    mx = sv
+            let alpha = (m - mx).exp()
+            var float32 pv = 0.0
+            if jg < stop:
+                pv = (s - mx).exp()
+            sync
+            p_s[width = t, height = 0] = pv
+            sync
+            var float32 psum = 0.0
+            var float32 nacc = 0.0
+            for j in 0..<64:
+                let pj = p_s[width = j, height = 0]
+                psum += pj
+                if j0 + j < stop:
+                    if j0 + j < main_len:
+                        nacc += pj * v[(j0 + j) * d_kv + k_off + t]
+                    else:
+                        nacc += pj * tv[(j0 + j - main_len) * d_kv + k_off + t]
+            l = l * alpha + psum
+            acc = acc * alpha + nacc
+            m = mx
+        let base = (h * nsplit + split) * (64 + 2)
+        part[base + 2 + t] = acc
+        if t == 0:
+            part[base] = m
+            part[base + 1] = l
+
+kernel FlashDecodeTail128Kernel:
+    let  [float32]'global   q          # (n_head*128), the single query row
+    let  [float32]'global   k          # (seq_k * d_kv), cache layout, flat
+    let  [float32]'global   v          # (main_len * d_kv)
+    let  [float32]'global   tk         # the newest (seq_k - main_len) rows of K
+    let  [float32]'global   tv
+    let int             main_len
+    mut  [float32]'unified  part       # per (head, split): m, l, then 128 partial output dims
+    let int             seq_k
+    let int             d_kv
+    let int             group
+    let int             nsplit
+    let int             chunk
+    let float32         scale
+    mut [float32, width = 128, height = 1]'actor q_s
+    mut [float32, width = 128, height = 1]'actor p_s
+
+    init([float32]'global qi, [float32]'global ki, [float32]'global vi,
+         [float32]'global tki, [float32]'global tvi, int ml,
+         int sk, int dkv, int grp, int ns, int ch, float32 sc, int nparts):
+        q      = qi
+        k      = ki
+        v      = vi
+        tk     = tki
+        tv     = tvi
+        main_len = ml
+        seq_k  = sk
+        d_kv   = dkv
+        group  = grp
+        nsplit = ns
+        chunk  = ch
+        scale  = sc
+        part   = [0.0 for ..<nparts]
+
+    def ():
+        let t     = gpu.thread.x
+        let split = gpu.block.x
+        let h     = gpu.block.y
+        let k_off = (h / group) * 128
+        let start = split * chunk
+        var int stop = start + chunk
+        if stop > seq_k:
+            stop = seq_k
+        q_s[width = t, height = 0] = q[h * 128 + t]
+        var float32 m = -1.0e30
+        var float32 l = 0.0
+        var float32 acc = 0.0
+        var int ntiles = 0
+        if stop > start:
+            ntiles = (stop - start + 128 - 1) / 128
+        for ti in 0..<ntiles:
+            let j0 = start + ti * 128
+            let jg = j0 + t
+            sync
+            var float32 s = -1.0e30
+            if jg < stop:
+                var float32 dot = 0.0
+                if jg < main_len:
+                    for d in 0..<128:
+                        dot += q_s[width = d, height = 0] * k[jg * d_kv + k_off + d]
+                else:
+                    for d in 0..<128:
+                        dot += q_s[width = d, height = 0] * tk[(jg - main_len) * d_kv + k_off + d]
+                s = dot * scale
+            p_s[width = t, height = 0] = s
+            sync
+            var float32 mx = m
+            for j in 0..<128:
+                let sv = p_s[width = j, height = 0]
+                if sv > mx:
+                    mx = sv
+            let alpha = (m - mx).exp()
+            var float32 pv = 0.0
+            if jg < stop:
+                pv = (s - mx).exp()
+            sync
+            p_s[width = t, height = 0] = pv
+            sync
+            var float32 psum = 0.0
+            var float32 nacc = 0.0
+            for j in 0..<128:
+                let pj = p_s[width = j, height = 0]
+                psum += pj
+                if j0 + j < stop:
+                    if j0 + j < main_len:
+                        nacc += pj * v[(j0 + j) * d_kv + k_off + t]
+                    else:
+                        nacc += pj * tv[(j0 + j - main_len) * d_kv + k_off + t]
+            l = l * alpha + psum
+            acc = acc * alpha + nacc
+            m = mx
+        let base = (h * nsplit + split) * (128 + 2)
+        part[base + 2 + t] = acc
+        if t == 0:
+            part[base] = m
+            part[base + 1] = l
+
+pub req [float32]'gpu'unified attention_decode64_tail_gpu([float32]'gpu'global q, [float32]'gpu'global k, [float32]'gpu'global v,
+                          [float32]'gpu'global tk, [float32]'gpu'global tv, int main_len,
+                          int seq_k, int n_head, int n_kv_head) throws:
+    let int d_kv  = n_kv_head * 64
+    let int group = n_head / n_kv_head
+    let float32 scale = 1.0 / (64.0 as float32).sqrt()
+    var int nsplit = (seq_k + 127) / 128
+    if nsplit < 1:
+        nsplit = 1
+    if nsplit > 64:
+        nsplit = 64
+    let int chunk = (seq_k + nsplit - 1) / nsplit
+    mut kd = FlashDecodeTail64Kernel(q, k, v, tk, tv, main_len, seq_k, d_kv, group, nsplit, chunk, scale, n_head * nsplit * (64 + 2))
+    kernel:
+        kd(block = 64, grid = (nsplit, n_head))
+    mut kc = FlashDecodeCombine64Kernel(kd.part, nsplit, n_head * 64)
+    kernel:
+        kc(block = 64, grid = n_head)
+    kc.o
+
+pub req [float32]'gpu'unified attention_decode128_tail_gpu([float32]'gpu'global q, [float32]'gpu'global k, [float32]'gpu'global v,
+                          [float32]'gpu'global tk, [float32]'gpu'global tv, int main_len,
+                          int seq_k, int n_head, int n_kv_head) throws:
+    let int d_kv  = n_kv_head * 128
+    let int group = n_head / n_kv_head
+    let float32 scale = 1.0 / (128.0 as float32).sqrt()
+    var int nsplit = (seq_k + 127) / 128
+    if nsplit < 1:
+        nsplit = 1
+    if nsplit > 64:
+        nsplit = 64
+    let int chunk = (seq_k + nsplit - 1) / nsplit
+    mut kd = FlashDecodeTail128Kernel(q, k, v, tk, tv, main_len, seq_k, d_kv, group, nsplit, chunk, scale, n_head * nsplit * (128 + 2))
+    kernel:
+        kd(block = 128, grid = (nsplit, n_head))
+    mut kc = FlashDecodeCombine128Kernel(kd.part, nsplit, n_head * 128)
+    kernel:
+        kc(block = 128, grid = n_head)
+    kc.o
+
+# Single-query attention for a cache split in main and tail buffers
+# (d_head 64 or 128; the model code folds the tail first for any other width).
+pub req [float32]'gpu'unified attention_gqa_tail_gpu([float32]'gpu'global q, [float32]'gpu'global k, [float32]'gpu'global v,
+                          [float32]'gpu'global tk, [float32]'gpu'global tv, int main_len,
+                          int seq_k, int n_head, int n_kv_head, int d_head) throws:
+    if d_head == 64:
+        attention_decode64_tail_gpu(q, k, v, tk, tv, main_len, seq_k, n_head, n_kv_head)
+    elif d_head == 128:
+        attention_decode128_tail_gpu(q, k, v, tk, tv, main_len, seq_k, n_head, n_kv_head)
+    else:
+        let kv_dim = n_kv_head * d_head
+        let full_k = kv_append_gpu(k, tk, main_len * kv_dim, (seq_k - main_len) * kv_dim)
+        let full_v = kv_append_gpu(v, tv, main_len * kv_dim, (seq_k - main_len) * kv_dim)
+        attention_gqa_three_kernel_gpu(q, full_k, full_v, 1, seq_k, n_head, n_kv_head, d_head, false, 0)
+
+# Appends `fresh` (new_n floats) to a tail buffer holding `old_n` floats; an
+# empty tail (`old_n` = 0) has nothing to bind, so the result is a copy of `fresh`.
+pub req [float32]'gpu'unified kv_tail_push([float32]'gpu'global prev, [float32]'gpu'global fresh,
+                                           int old_n, int new_n) throws:
+    if old_n == 0:
+        upload_floats_gpu(fresh)
+    else:
+        kv_append_gpu(prev, fresh, old_n, new_n)
+
 # Grouped-query multi-head attention (GPU), all heads in one dispatch per
 # stage. `q` is (seq_q × n_head*d_head); `k`/`v` are (seq_k × n_kv_head*d_head).
-pub req [float32]'gpu'unified attention_gqa_gpu([float32]'global q, [float32]'global k, [float32]'global v,
+pub req [float32]'gpu'unified attention_gqa_three_kernel_gpu([float32]'gpu'global q, [float32]'gpu'global k, [float32]'gpu'global v,
                           int seq_q, int seq_k, int n_head, int n_kv_head, int d_head,
                           bool causal, int causal_offset) throws:
     let int d_q     = n_head * d_head
@@ -2257,5 +3237,23 @@ pub req [float32]'gpu'unified attention_gqa_gpu([float32]'global q, [float32]'gl
     mut k_ctx = MatMulHeadsKernel(k_soft.probs, v, seq_q, seq_k, d_q, d_kv, d_head, n_head, group)
     kernel:
         k_ctx(block = 256, grid = out_blocks)
-
     k_ctx.c
+
+# Grouped-query attention entry point. Prefill shapes (seq_q > 1) take the fused
+# kernels for d_head 64 / 128; a single query row that sees the whole cache
+# (decode: `causal` off, or the causal offset puts it at the last position) takes
+# the split-K decode kernels; anything else keeps the three-kernel path.
+pub req [float32]'gpu'unified attention_gqa_gpu([float32]'gpu'global q, [float32]'gpu'global k, [float32]'gpu'global v,
+                          int seq_q, int seq_k, int n_head, int n_kv_head, int d_head,
+                          bool causal, int causal_offset) throws:
+    let bool sees_all = (not causal) or (causal_offset + 1 >= seq_k)
+    if d_head == 64 and seq_q > 1:
+        attention_flash64_gpu(q, k, v, seq_q, seq_k, n_head, n_kv_head, causal, causal_offset)
+    elif d_head == 128 and seq_q > 1:
+        attention_flash128_gpu(q, k, v, seq_q, seq_k, n_head, n_kv_head, causal, causal_offset)
+    elif d_head == 64 and seq_q == 1 and sees_all:
+        attention_decode64_gpu(q, k, v, seq_k, n_head, n_kv_head)
+    elif d_head == 128 and seq_q == 1 and sees_all:
+        attention_decode128_gpu(q, k, v, seq_k, n_head, n_kv_head)
+    else:
+        attention_gqa_three_kernel_gpu(q, k, v, seq_q, seq_k, n_head, n_kv_head, d_head, causal, causal_offset)

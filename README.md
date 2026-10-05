@@ -1,138 +1,51 @@
 # boring-llm
 
-A real, GPU-accelerated LLM inference engine written in [Boring](https://github.com/mlanoe/boring), loading and running actual quantized [GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) model files — the format used by [llama.cpp](https://github.com/ggerganov/llama.cpp) and the wider `ggml` ecosystem — with no conversion step.
-
-## Goal
-
-**Be a small, fast, portable LLM inference engine in the same spirit as llama.cpp** — load a `.gguf` file, run it directly on the GPU, get text out — but written entirely in Boring instead of C++, and used as a real-world proving ground for the language: a decoder-only transformer, real quantization formats, and Boring's own GPU kernel qualifiers (`'unified`/`'actor`/`'global`) driving genuine, not simulated, GPU compute across multiple backends.
-
-## Features
-
-- **Real GGUF loading, no conversion step.** Parses the format directly — header, every KV-metadata value kind (including the embedded tokenizer's vocab/merges as string arrays), tensor-info list — and reads the same files llama.cpp does.
-- **Architecture-generic model/weight loading**: every config value is read from GGUF's own per-architecture metadata keys (not hardcoded to one model), and both RoPE conventions the Llama/Mistral/Qwen2 GGUF family needs (NEOX "rotate-half" vs. the original NORM "interleaved" style) and Qwen2's attention Q/K/V bias tensors (absent in Llama/Mistral) are handled generically. Verified against real Qwen2.5-0.5B-Instruct *and* real TinyLlama-1.1B-Chat (`llama` architecture) weights.
-- **Multiple quantization formats**: F32, F16, Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q6_K, IQ4_NL, and real-world files that mix several of these across different tensors (e.g. a typical "Q4_K_M" model, or a "Q2_K"-named preset that actually turns out to be an IQ4_NL/Q3_K/Q5_0/Q8_0/F32 mix at this model's size). Every format is ported bit-for-bit from ggml's own reference dequantization source and verified against real downloaded GGUF weights.
-- **Portable quantized tensor kernels**: `gpu.tensor.linear` consumes packed Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q6_K, and IQ4_NL weights directly, so the full model never needs a separate dequantized copy in memory. All quantized inference paths use the same tensor API, including full-sequence forward, batched KV-cache prefill, cache append, and single-token decode. The earlier hand-written fused kernels remain as correctness and performance baselines. The tensor path is verified against real downloaded weights end-to-end on Metal and WGPU, including Q4_K_M and IQ4_NL/Q3_K/Q5_0/Q8_0 mixed files.
-- **Two independently GPU-hardware-verified backends**: Metal and wgpu (cross-platform: Vulkan/DirectX12/Metal), producing bit-identical real-model output on both, across every quantization format and every fused/warp-shuffle kernel in `math_gpu.br`, no exceptions — re-swept on wgpu whenever new kernel code lands, not just once. CUDA and ROCm share the same qualified source but are untested on this machine (no hardware available).
-- **GGUF-embedded tokenizer, both families**: byte-level BPE (Qwen2's own `tokenizer.ggml.model = "gpt2"`) and SentencePiece BPE (Llama/Mistral's `"llama"`, auto-detected), built directly from the file's own `tokenizer.ggml.*` metadata — no separate `vocab.json`/`merges.txt`/`tokenizer.model` export step for either.
-- **Any architecture's own GGUF-embedded chat template, actually wired into `--prompt`/`--chat`.** A real Jinja2-subset interpreter (`src/jinja.br`) — `{% if/elif/else/for/set %}`, `{{ expr }}` output, `and`/`or`/`not`, attribute/index access, `is defined`, the `trim`/`tojson` filters, and full `{%-`/`-%}` whitespace-trim handling, verified byte-for-byte against real `jinja2` on both Qwen2.5's own tool-calling-capable template and TinyLlama's simpler one — renders each turn's conversation into prompt text, which `tokenizer.br`'s `render_chat_prompt`/`encode_with_specials` then tokenizes, recognizing the template's own literal special-token strings (`<|im_start|>`, `<s>`, ...) atomically instead of running them through ordinary BPE/SentencePiece merging (llama.cpp's own `tokenizer_st_partition` concept). Replaces the project's earlier Qwen2.5-only hardcoded ChatML construction entirely — verified byte-for-byte identical to it against real `llama-cpp-python` output (`test/test_tokenizer_real.br`), including the KV-cache multi-turn case, where each turn's incremental tokens are now derived generically (`full_ids[all_tokens.length..]`, re-rendering the whole conversation and slicing off what the cache already has) instead of a per-architecture hardcoded shape.
-- **KV-cache incremental decoding**: O(1) GEMM work per new token per layer instead of re-forwarding the whole sequence every step.
-- **OpenAI-compatible HTTP server** (`--serve`): `/v1/models` + `/v1/chat/completions` (JSON and SSE), tool calling through the GGUF's own chat template, written in Boring over plain `std::net`. Its request rendering is verified token-for-token against `jinja2` + `llama.cpp` (`tools/oracle_render_request.py`), including multi-turn tool calls and non-ASCII text.
-- **Sampling**: greedy, or temperature/top-k/top-p, plus a llama.cpp-style repeat penalty.
-- **Interactive multi-turn chat** (`--chat`, like llama.cpp's own `-cnv`): keeps the whole conversation, and with `--kv-cache` reuses each earlier turn's KV-cache instead of re-prefilling the whole conversation from scratch every turn — only the new turn's own tokens are processed.
-- **Verified against llama.cpp**: token-for-token identical tokenization, and matching (often bit-identical) generation output against `llama-cpp-python`/`llama-cli`, on real downloaded model weights.
-
-## What is Boring?
-
-Boring is a high-level language that transpiles to idiomatic Rust. It borrows its syntax from Python and Swift, maps every construct directly onto Rust, and produces auditable output you can read, modify, and ship.
-
-```boring
-string greet(string? name):
-    let who = name else "stranger"
-    "Hello, {who}!"
-```
-
-See the [Boring repository](https://github.com/mlanoe/boring) for the full language reference.
-
-## Goal model
-
-Verified against [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) in GGUF format: small, Apache-2.0 licensed (no gated download), standard modern architecture (RMSNorm, RoPE, grouped-query attention, SwiGLU MLP) representative of the whole Llama/Mistral/Qwen GGUF family.
-
-## Prerequisites
-
-- [Rust toolchain](https://rustup.rs/) (edition 2021)
-- [boring](https://github.com/mlanoe/boring) installed
+A local LLM inference engine written entirely in [Boring](https://github.com/mlanoe/boring): it loads quantized [GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) model files (the llama.cpp format, no conversion step), runs them on the GPU (Metal or wgpu), and serves them through an **OpenAI-compatible HTTP API** that coding agents such as [OpenCode](https://opencode.ai) can use.
 
 ```sh
-cargo install --git https://github.com/mlanoe/boring
+main --gguf qwen2.5-3b-instruct-q4_k_m.gguf --serve --port 8080 --ctx-size 16384 --prompt-cache ~/.cache/boring-llm
 ```
 
-## Repository layout
+Full documentation: [the book](docs/book.md) ([HTML](docs/book.html)): command line, HTTP API, caches, architecture, verification and a development guide. This README is the short version.
 
-```
-boring-llm/
-├── src/
-│   ├── io.br             # LE binary readers (u16/u32/u64/f32, f16-bit-decode)
-│   ├── gguf.br           # GGUF parser: header, typed KV-metadata, tensor-info list
-│   ├── quant.br          # f16 bit-decode + Q8_0/Q5_0/Q6_K/Q4_K dequant (CPU reference)
-│   ├── tokenizer.br      # BPE encode/decode, fed GGUF-embedded tokens/merges, ChatML
-│   ├── model.br          # Config/weight loading, forward pass (fp32 + fused-Q8_0),
-│   │                     # KV-cache (GenCache/forward_step/prefill), generate()/generate_kv()
-│   ├── math.br           # CPU-only reference: RMSNorm, RoPE, naive GQA, SwiGLU
-│   ├── math_gpu.br       # GPU kernels: tiled GEMM (+ warp-shuffle variant), RmsNorm/
-│   │                     # RopeApply/SwigluCombine, GQA attention, quantized tensor GEMM
-│   ├── sampling.br       # xorshift64 RNG, greedy/temperature/top-k/top-p sampling
-│   ├── json.br           # JSON parser into jinja.br's JValue (ordered keys, floats)
-│   ├── openai.br         # OpenAI-API plumbing: message normalization, <tool_call> parsing,
-│   │                     # JSON/SSE response bodies (pure, interpreter-testable)
-│   ├── server.br         # `--serve`: OpenAI-compatible HTTP server over std::net
-│   └── main.br           # CLI entry point
-├── tools/
-│   ├── inspect_gguf.py      # Python `gguf`-package cross-check oracle (metadata dump)
-│   ├── make_test_gguf.py    # synthetic small-fixture GGUF file generator
-│   ├── reference_logits.py  # llama-cpp-python logit oracle for math-correctness checks
-│   ├── oracle_encode.py          # llama.cpp tokenization oracle for `--encode-file`
-│   ├── oracle_render_request.py  # jinja2 + llama.cpp oracle for `--render-request`
-│   └── smoke_server.py           # stdlib-only wire-format smoke test for `--serve`
-├── weights/              # .gguf files, gitignored (download separately, see below)
-├── test/
-│   ├── fixtures/tiny.gguf   # small synthetic fixture for interpreter-speed tests
-│   └── test_*.br            # per-module unit tests, plus *_real.br compiled-only tests
-│                             # needing a real --target build + real downloaded weights
-├── docs/development-log.md  # full phase-by-phase build history and bug hunt notes
-└── .github/workflows/ci.yml # `boring run` over test/*.br (interpreter path only)
-```
+## What it does
 
-## Run
+- **Runs real models.** Qwen2.5 (0.5B, 3B, 7B tested), Qwen3 (4B tested) and Llama-architecture models (TinyLlama 1.1B tested), in F32, F16, Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q6_K and IQ4_NL, including the mixed-format files llama.cpp produces (`*-Q4_K_M.gguf`). Weights stay quantized on the GPU; there is no dequantized copy.
+- **Needs little memory.** Tensors are read from disk one at a time, then live on the GPU: a 3B Q4_K_M server starts in ~5 s and holds ~3.1 GB.
+- **Serves the OpenAI API.** `GET /v1/models` and `POST /v1/chat/completions`, JSON or streamed (SSE, token by token, with `stream_options.include_usage`), `stop` strings, `max_tokens`, sampling parameters, `top_k`, `repeat_penalty`, `frequency_penalty` and `presence_penalty`, and **tool calling** through the model's own chat template (Hermes-style `<tool_call>` output is parsed back into `tool_calls`; `tool_choice: "none"` leaves the tools out). Reasoning models (Qwen3) have their `<think>` text returned as `reasoning_content`, streamed too, and `chat_template_kwargs` (e.g. `{"enable_thinking": false}`) reaches the chat template.
+- **Is fast enough for agents.** An agent resends its whole history every turn, so the server keeps the KV caches of its recent requests in memory (`--cache-slots`) and, with `--prompt-cache DIR`, on disk across restarts: only the tokens after the shared prefix are processed.
+- **Has two GPU backends**, Metal and wgpu (Vulkan, DirectX 12, Metal), producing the same output. CUDA and ROCm share the source but have never been run (no hardware).
+- **Is checked against llama.cpp.** Tokenization and chat-template rendering are compared token for token with `llama-cpp-python`/`jinja2`, and greedy generation matches llama.cpp's on real weights (identical text on Qwen2.5 0.5B Q8_0 and Q4_K_M and on 7B Q4_K_M for the prompts checked; the 3B was checked for consistency across backends and compilers, not against llama.cpp).
 
-**Quick smoke test** (interpreter, no build, no download — uses the tiny synthetic fixture):
+## Quick start
+
+Requirements: the [Rust toolchain](https://rustup.rs/), [Boring](https://github.com/mlanoe/boring) (`cargo install --git https://github.com/mlanoe/boring`), and a GPU supported by Metal or wgpu. Use a `boring` built from `51d7260e` or later. Earlier builds cannot select launch batching only during decode (before `51d7260e`), leave about 1.8 ms/token on the table for the large Q8_0 decode projections (before `a08df631`), decode Q8_0 weights ~2x slower on Metal (before `1faf71e2`), do not compile the disk prompt cache or the native Metal K-quant kernels on macOS 27 (before `a057dd8c`), decode Q4_K weights ~2x slower (before `6fb92947`), prefill ~3x slower on Metal, stage the prefill tiles in half precision (`6acc7d44` to `316c7695`: logits of the 7B drift) or, between `316c7695` and `ff79f091`, return wrong values for the biased Q8_0 projections of small Qwen models, or, between `8bdac11d` and `d38813c8`, return wrong values for every odd output column of Q6_K matrices (Q4_K_M models then produce garbage), or, before `46c2473f`, fail to transpile a `.split()` used as a call argument.
 
 ```sh
-# The `--` is required — `boring run` otherwise treats `--gguf` as one of its
-# own flags (e.g. `--gpu`/`--locked`/`--offline`) and rejects it.
-boring run src/main.br -- --gguf test/fixtures/tiny.gguf --dump-metadata
-```
-
-**Real model**, any real command (`--dump-metadata`, `--tokens`, `--prompt`, `--quantized`, `--kv-cache`, ...): `boring run`'s interpreter OOMs on a file this size (a documented interpreter limitation), and the plain `boring build` (no `--target`) can't emit this project's GPU-kernel code at all, so a real GGUF always needs a compiled `--target metal` (or `--target wgpu`, also fully verified) build first:
-
-```sh
+# 1. build (Metal; use --target wgpu on other platforms)
 boring build --target metal src/main.br
-cd src/main_metal && cargo build --release
-./target/release/main --gguf ../../weights/qwen2.5-0.5b-instruct-q8_0.gguf --dump-metadata
-```
+(cd src/main_metal && cargo build --release)
+BIN=src/main_metal/target/release/main
 
-Model weights aren't tracked by git — download them from Hugging Face, e.g.:
+# 2. get a model
+huggingface-cli download Qwen/Qwen2.5-3B-Instruct-GGUF qwen2.5-3b-instruct-q4_k_m.gguf --local-dir weights
+# (or: tools/fetch_models.py ensure qwen2.5-3b-instruct-q4_k_m   -- the models the tests and tools use,
+#  downloaded on demand into weights/, resumable and checked against Hugging Face's SHA-256)
 
-```sh
-huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct-GGUF qwen2.5-0.5b-instruct-q8_0.gguf --local-dir weights
-```
+# 3. chat from the terminal
+$BIN --gguf weights/qwen2.5-3b-instruct-q4_k_m.gguf --quantized --kv-cache --chat
 
-Then, for real chat generation:
-
-```sh
-./target/release/main --gguf ../../weights/qwen2.5-0.5b-instruct-q8_0.gguf --quantized --kv-cache \
-    --prompt "What is the capital of France?" --max-tokens 30
-```
-
-Or for an interactive, multi-turn conversation (llama.cpp's own `-cnv` mode) — type a message and press enter, an empty line or Ctrl-D quits:
-
-```sh
-./target/release/main --gguf ../../weights/qwen2.5-0.5b-instruct-q8_0.gguf --quantized --kv-cache --chat \
-    --max-tokens 60 --repeat-penalty 1.1
-```
-
-### OpenAI-compatible server (`--serve`)
-
-`--serve` loads the model once (packed quantized weights, GPU) and exposes it as an OpenAI-compatible HTTP API on `127.0.0.1`: `GET /v1/models` and `POST /v1/chat/completions` (JSON, or SSE with `"stream": true`, including `stream_options.include_usage`). The conversation goes through the GGUF's own chat template, so `tools`, `role: "tool"` results and assistant `tool_calls` all work for models whose template supports them (e.g. Qwen2.5); Hermes-style `<tool_call>{...}</tool_call>` output is parsed back into structured `tool_calls` with `finish_reason: "tool_calls"`. One request is served at a time (a single GPU needs that anyway).
-
-```sh
-./target/release/main --gguf ../../weights/qwen2.5-0.5b-instruct-q8_0.gguf --serve --port 8080 \
-    --ctx-size 4096 --max-tokens 512   # --max-tokens = default when a request sets none
+# or serve it
+$BIN --gguf weights/qwen2.5-3b-instruct-q4_k_m.gguf --serve --port 8080 --ctx-size 16384
 curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
     -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":32}'
-../../tools/smoke_server.py http://127.0.0.1:8080   # wire-format checks
 ```
 
-A client config for [OpenCode](https://opencode.ai) (`opencode.json`) would look like the following — **written from OpenCode's documented config shape, not yet run against OpenCode itself**:
+A real model always needs the compiled build: the interpreter (`boring run`) cannot hold a file this size and a plain `boring build` cannot emit GPU kernels. Without a build, `boring run src/main.br -- --gguf test/fixtures/tiny.gguf --dump-metadata` exercises the parser on a tiny synthetic file.
+
+## Using it with OpenCode
+
+Point an OpenAI-compatible provider at the server (`opencode.json`). Start the server with `--ctx-size 16384` at least: OpenCode's system prompt plus its ten tool definitions is ~7.6k tokens.
 
 ```json
 {
@@ -143,47 +56,123 @@ A client config for [OpenCode](https://opencode.ai) (`opencode.json`) would look
       "name": "boring-llm (local)",
       "options": { "baseURL": "http://127.0.0.1:8080/v1" },
       "models": {
-        "qwen2.5-0.5b-instruct": { "name": "Qwen2.5 0.5B Instruct", "tool_call": true,
-                                    "limit": { "context": 4096, "output": 1024 } }
+        "Qwen2.5 3B Instruct": { "name": "Qwen2.5 3B Instruct", "tool_call": true,
+                                  "limit": { "context": 16384, "output": 1024 } }
       }
     }
   }
 }
 ```
 
-Known limits today (see `docs/development-log.md`): the whole reply is generated before it is sent (the SSE framing is real, the streaming is not incremental yet), every request re-prefills its whole prompt (no cross-request KV-cache reuse), and a prompt longer than `--ctx-size` is rejected with `context_length_exceeded` — an agent like OpenCode sends prompts of many thousands of tokens, which needs a larger context plus chunked prefill (the attention kernel materializes a `seq x seq` score matrix per head). A small model (0.5B) answers tool requests but is not a reliable agent.
+The model id is whatever `GET /v1/models` returns (the GGUF's `general.name`, or `--model-name`). `tools/opencode_trial.sh <main-binary> <model.gguf> "<prompt>"` runs a real OpenCode against a fresh server with its own configuration, data and cache in a temporary directory (yours is never touched), a throwaway project and OpenCode's default permissions.
 
-## Status
+What to expect, from the trials run so far (OpenCode 1.18.32, five small tasks in a throwaway project):
 
-The core pipeline — GGUF parsing, tokenizer, forward pass, sampling, generation — is complete and verified end-to-end against `llama-cpp-python`/`llama-cli` on real Qwen2.5-0.5B-Instruct weights, across every quantization format listed above. GPU-accelerated inference is verified correct and bit-identical to the CPU reference on both the Metal and wgpu backends; CUDA and ROCm share the same source but remain untested (no hardware available). See [`docs/development-log.md`](docs/development-log.md) for the full phase-by-phase history, including the dozen real Boring compiler bugs found and fixed along the way.
+| Model | Result |
+|---|---|
+| Qwen2.5-0.5B Q8_0 | reads a file and explains it; other tasks fail (invented paths, loops calling the `task` tool) |
+| Qwen2.5-3B Instruct Q4_K_M | read a file, read the README, list the directory and create a file: correct; an edit went to a wrong new file |
+| Qwen2.5-7B Instruct Q4_K_M | the same four correct; the edit changed the function signature but not its body, and was reported as finished |
 
-**Not yet done**: CUDA/ROCm hardware verification (no hardware available). Everything else is functionally done — every ggml quantization format this project targets (including IQ4_NL and Q2_K, both of which needed a larger real model to find genuine real-world tensors of that type in, since small Qwen2.5-0.5B files never get them from llama.cpp's own per-tensor quantization heuristics) is implemented in the packed-weight tensor path and verified against real downloaded weights on both the Qwen2.5 and Llama GGUF families. Real end-to-end `--prompt`/`--chat` generation is verified on both GGUF families this project targets: Qwen2.5 (byte-for-byte identical prompt tokens against real `llama-cpp-python`, across every code path) and TinyLlama-1.1B-Chat (`architecture = "llama"`, SentencePiece tokenizer, its own non-ChatML Jinja template, GQA 32/4 heads) — single-shot `--prompt` and multi-turn `--chat` with and without `--kv-cache` all produce correct, coherent output on real downloaded weights for both. (A real Llama-2-7B-Chat GGUF, used specifically for Q2_K real-weight verification, has no embedded chat template to drive `--prompt`/`--chat` with — verified instead via `--tokens` against real token sequences and real `llama-cpp-python` top-token predictions, matching this project's original Phase 1 verification bar.)
+The server never failed on the plumbing. The limit is the model: small models are not reliable agents.
 
-**Perf opportunity investigated — retained as a baseline.** The fp32 warp-shuffle GEMM kernel (`math_gpu.br`'s `linear_warp_gpu`) beats the tiled GEMM by ~1.4-1.8x at the single-token decode-step shape (`seq=1`, the dominant real workload once `--kv-cache` is in use) — but the first fused-dequant Q8_0 counterpart (`q8_linear_warp_gpu`) was slower than the tiled `q8_linear_gpu`. A follow-up (`q8_linear_warp_broadcast_gpu`) broadcasts the shared scale header with `gpu.warp.shuffle` and wins by ~20-33% at `seq=1`; equivalent Q5_0, Q4_0, and IQ4_NL variants win by roughly 30-40%. The legacy `fused_linear_gpu` dispatcher still selects these variants by shape and remains available for benchmarking. Production inference uses `gpu.tensor.linear` for single-row decode (`seq == 1`), but **prefill (`seq > 1`) is routed to the hand-written tiled kernels behind `fused_linear_gpu`**: the compiler's tensor schedule only has a scalar prefill (one thread per output cell, no weight reuse across rows), which measured ~0.5 s of FFN matmul per layer at 28 tokens on a 0.5B model (~1-2 GFLOP/s) — a 38-token prefill took ~32-36 s, ~3 s with the tiled kernels. Output is unchanged (same greedy text on every checked prompt, same top-5 logits to ~5 digits); the split goes away once `boring` grows a tiled tensor schedule that wins at prefill shapes. Decode went from ~0.9 to ~0.40 s/token (Qwen2.5-0.5B Q8_0) after `boring` stopped re-creating the Metal device on every dispatch and the model weights became **GPU-resident** (uploaded once at load, `upload_bytes_gpu` in `math_gpu.br`, instead of cloned and re-uploaded per matmul per token). What remains is mostly GPU->host synchronization: each layer still reads K/V back and re-uploads the growing cache on the host, so the next step is a GPU-resident KV cache. See `docs/development-log.md` for the numbers.
+The first request of a session is the slow one, because the ~7.5k-token prompt has to be processed once (about 2 minutes on a 7B model: 115 s of prefill measured through OpenCode on a 16 GB Apple-silicon machine). OpenCode gives up on a response that is silent for 5 minutes, so the server opens the stream immediately and sends an SSE comment after every 512 prompt tokens. Later turns reuse ~99% of the prompt from the cache (a few seconds), and with `--prompt-cache` the first request after a restart does too, as long as the project directory is the same (OpenCode writes its path into the system prompt).
 
-Tensor scheduling is selected in `boring.toml`. The project requests the Q8_0
-warp-broadcast schedule for single-row decode; the `[tensor.linear.prefill]`
-setting is now only the fallback, since `math_gpu.br`'s `tensor_linear_gpu`
-sends `seq > 1` to the tiled kernels itself. Changing this policy requires a new
-`boring build --target ...` followed by `cargo build`; it does not require
-rebuilding or reinstalling the Boring compiler.
+## Server options
+
+| Option | Default | |
+|---|---|---|
+| `--gguf PATH` | | model file (required) |
+| `--serve`, `--port N` | `8080` | HTTP server on `127.0.0.1` |
+| `--ctx-size N` | `4096` | prompt + reply tokens a request may use; a longer prompt gets `context_length_exceeded` |
+| `--max-tokens N` | `40` | reply length when a request sets none |
+| `--model-name NAME` | GGUF `general.name` | id returned by `/v1/models` |
+| `--cache-slots N` | `4` | KV caches kept in memory (LRU) |
+| `--prompt-cache DIR` | off | also keep KV caches on disk, reused after a restart |
+| `--prompt-cache-files N` | `2` | snapshots kept on disk |
+| `--prompt-cache-max-mb N` | `4096` | cap on all snapshots together (`0` = none) |
+| `--kquant-prefill handwritten` | `tensor` | wgpu/CUDA/ROCm: keep the hand-written Q4_K/Q6_K prefill kernels (faster there today) |
+| `--temperature`, `--top-k`, `--top-p`, `--seed`, `--repeat-penalty`, `--repeat-last-n` | greedy | sampling defaults; a request can override temperature, top_p, top_k, seed and repeat_penalty, and add frequency_penalty and presence_penalty |
+
+One request is served at a time (one GPU). Every response is `Connection: close`.
+
+**Prompt cache on disk.** After a request, the cache it left is written to `DIR/prompt-cache-<n>.bin` when it adds at least 1024 tokens to what the disk already holds; the write happens after the response has been sent. A later request whose prompt starts like a snapshot reads those positions back (`N reused from disk` in the log) instead of recomputing them. A snapshot replaces the one it extends, else takes a free file, else the oldest; the oldest are also dropped to stay under `--prompt-cache-max-mb`. A snapshot is used only by the exact model that wrote it, a truncated or half-written file is ignored, and floats are stored as the GPU holds them, so a restored cache gives the same answers as a cold one. The files contain the prompts' token ids and activations: keep the directory private. On the 0.5B model a 6.4k-token prompt takes ~13 s cold and 0.5-1.5 s restored. On the 7B model, OpenCode's first request (7.6k tokens) spent 321 s in prefill cold and 1.9 s restored from an ~890 MB snapshot (7,636 tokens read back), after a server restart.
+
+## Performance
+
+Measured on one 16 GB Apple-silicon machine (Apple M3, Metal). The 0.5B rows use `boring` 8ed96591; the other rows are the earlier clean run with 46c2473f. Timings on it still move by tens of percent from one repetition to the next (min-max is in `docs/development-log.md`), so read the ratios as indications, not as constants.
+
+Against llama.cpp (llama-cpp-python, Metal, same GGUF, same machine, 3 alternating runs, medians, `tools/bench_vs_llamacpp.py`), tokens per second:
+
+| Model | Prompt | boring-llm prefill | llama.cpp prefill | | boring-llm decode | llama.cpp decode | |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-7B Q4_K_M | ~570 | 114 | 125 | 0.91x | 7.7 | 13.0 | 0.59x |
+| Qwen2.5-7B Q4_K_M | ~4150 | 87 | 122 | 0.71x | 6.1 | 10.0 | 0.61x |
+| Qwen3-4B Q4_K_M | ~550 | 181 | 277 | 0.66x | 10.8 | 28.3 | 0.38x |
+| Qwen3-4B Q4_K_M | ~4130 | 130 | 221 | 0.59x | 9.0 | 15.6 | 0.58x |
+| Qwen2.5-3B Q4_K_M | ~570 | 222 | 314 | 0.71x | 11.7 | 28.8 | 0.41x |
+| Qwen2.5-3B Q4_K_M | ~4150 | 158 | 271 | 0.58x | 10.3 | 20.9 | 0.49x |
+| Qwen2.5-0.5B Q8_0 | ~630 | 1,874 | 2,938 | 0.64x | 52.2 | 124.3 | 0.42x |
+| Qwen2.5-0.5B Q8_0 | ~4200 | 1,149 | 2,169 | 0.53x | 44.0 | 82.5 | 0.53x |
+
+The server needs 3.1 GB (peak 3.3 GB) for the 3B model and 6.4 GB (peak 6.8 GB) for the 7B, and is ready in about 4 s on the 7B (disk-streaming loader). Through OpenCode, the 7B model's first request (7,539 tokens, ten tools) spent 115 s in prefill cold and 2.5 s on the follow-up that reused 7,559 of 7,638 tokens; a cold start used to take 321-453 s.
+
+Where the gap to llama.cpp is: prefill is close on short prompts on the 7B and remains more variable at long context; a newer run no longer reproduced the earlier 0.91x-to-0.71x fall, and making llama.cpp's KV cache float32 did not explain the remaining gap. Decode is about 0.6x on the 7B. On the 0.5B, `boring` 1faf71e2's four-row Q8_0 Metal schedule nearly doubled short-context decode and distributing RMSNorm rows across SIMD groups raised it by another 44% (21.2 to 14.7 ms per token in the CLI). `boring` a08df631 then fully unrolls the four private rows for large Q8_0 projections: gate/up rise from 47.2 to 61.3 GB/s, down from 49.7 to 66.0 GB/s and the tied head from 59.8 to 71.3 GB/s, predicting about 1.8 ms/token saved. Launches are now batched by eight automatically during KV-cache decode, without applying the policy to prefill; an adjacent 200-token run fell from 5.07 to 4.49 seconds including model loading. Fusing the small attention projections is the clearest remaining short-context target. The detail is in `docs/development-log.md`. Earlier gains came from `boring`'s Q4_K single-token decode, the fragment-blocked quantized prefill schedule and float32 staging, plus this project's fused attention and two-buffer KV cache.
+
+On wgpu the portable K-quant prefill is still ~3x slower than the hand-written kernels (hence `--kquant-prefill handwritten` there).
+
+## Verifying it
+
+```sh
+for t in test/test_*.br; do case $t in *_real.br) ;; *) boring run $t;; esac; done   # interpreter tests, no model needed
+tools/smoke_server.py http://127.0.0.1:8080                                         # wire-format checks against a running server
+```
+
+The `test/*_real.br` programs need a compiled build and real weights (each lists the files it expects). The models are not in the repository (`weights/` is git-ignored): `tools/fetch_models.py list` shows what the tests and tools use and what is present, `ensure NAME` downloads one, and `tools/accuracy_vs_llamacpp.py --model NAME --fetch` fetches a missing one first. `tools/` holds the oracles that compare against llama.cpp: `accuracy_vs_llamacpp.py` (the whole forward pass, position by position: run it on a Q8_0 and a Q4_K_M model after any change to the GPU kernels or to `boring`), `decode_vs_llamacpp.py` (generation through the KV-cache decode path, which the logits check never runs: run it with the accuracy check), `reference_logits.py` (logits), `oracle_encode.py` (tokenization), `oracle_render_request.py` (chat-template rendering), `inspect_gguf.py` (metadata).
+
+## Repository layout
+
+```
+src/
+  gguf.br, gguf_file.br   GGUF parser; reads tensors from disk on demand
+  io.br, json.br, jinja.br  binary readers, JSON, the Jinja2 subset chat templates use
+  tokenizer.br            byte-level BPE and SentencePiece, from the GGUF's own metadata
+  quant.br                CPU reference dequantization for every supported format
+  model.br                config and weight loading, forward pass, KV cache, prefill/decode
+  math.br, math_gpu.br    CPU reference math; GPU kernels (attention, norms, RoPE, copies, quantized GEMM)
+  sampling.br             greedy, temperature, top-k, top-p, repeat penalty
+  openai.br               message normalization, tool-call parsing, JSON/SSE bodies (pure)
+  cache_policy.br         what the disk prompt cache keeps and when it is used (pure)
+  prompt_cache.br         reading and writing the disk snapshots
+  server.br               the HTTP server
+  main.br                 command line
+tools/                    oracles, accuracy and speed comparisons with llama.cpp, model downloader, smoke test, OpenCode trial script, Metal prefill lab
+test/                     interpreter tests (test_*.br) and compiled real-model tests (*_real.br)
+docs/book.md              the book: using, operating, understanding and extending the engine
+docs/build.py             generates the HTML versions of the documentation (python3 docs/build.py)
+docs/development-log.md   how it was built, with the measurements and the bugs found on the way
+boring.toml               kernel scheduling policy (native Metal paths for Q8_0, Q4_K, Q6_K)
+```
+
+## Limits
+
+- Requests are served one at a time; there is no batching.
+- Context is limited by `--ctx-size` and by memory (the KV cache is float32: ~115 KB per token for the 7B model).
+- Only Llama-style GGUF layouts are supported (Qwen2 and Llama are the ones tested); no MoE, no vision.
+- Chat templates use a Jinja2 subset (enough for Qwen2.5 and TinyLlama); an unsupported construct is reported, not ignored.
+- Snapshots on disk and the disk-streaming loader use Unix file APIs; GGUF files split in several parts are not supported.
+- CUDA and ROCm have not been run.
+
+## Boring
+
+Boring is a language that transpiles to Rust, with Python-like indentation and Swift-like optionals. This project is also its real-world test: every bug found in the compiler while building it was reported and fixed upstream (see `docs/development-log.md`). See the [Boring repository](https://github.com/mlanoe/boring) for the language reference.
 
 ## Contributing
 
-Contributions are welcome.
-
-Before your first Pull Request can be merged, you must sign the [Contributor License Agreement](CLA.md) by adding your name to [`CLA-signatories.md`](CLA-signatories.md) as part of your PR.
+Contributions are welcome. Before your first Pull Request can be merged, sign the [Contributor License Agreement](CLA.md) by adding your name to [`CLA-signatories.md`](CLA-signatories.md) as part of your PR.
 
 ## License
 
 Copyright (C) 2026 Mickaël LANOË
 
-This program is free software: you can redistribute it and/or modify it under the terms of the
-[GNU General Public License v3.0](LICENSE) as published by the Free Software Foundation.
-
-This program is distributed in the hope that it will be useful, but **without any warranty**.
-See the LICENSE file for the full terms.
-
----
-
-*Mickaël LANOË*
+This program is free software: you can redistribute it and/or modify it under the terms of the [GNU General Public License v3.0](LICENSE) as published by the Free Software Foundation. It is distributed in the hope that it will be useful, but **without any warranty**. See the LICENSE file for the full terms.

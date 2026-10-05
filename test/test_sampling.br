@@ -74,4 +74,25 @@ def main() throws:
     let (tok_p, _) = sample(rng_p, [10.0, 9.0], 2, 0.0 as float32, 0, 1.0 as float32, [0], 2.0 as float32, 64)
     assert_eq(tok_p, 1)   # token 0's logit (10.0) halved to 5.0, now below token 1's 9.0
 
+    # --- apply_presence_frequency_penalty: both 0 is a no-op ---
+    let pf_none = apply_presence_frequency_penalty([1.0, 5.0, -3.0], [1, 1], 0.0 as float32, 0.0 as float32)
+    assert_eq(pf_none[0], 1.0 as float32)
+    assert_eq(pf_none[1], 5.0 as float32)
+    assert_eq(pf_none[2], -3.0 as float32)
+
+    # --- frequency penalty grows with the number of occurrences, presence
+    #     penalty is flat per distinct token, untouched tokens stay as they are ---
+    let pf = apply_presence_frequency_penalty([10.0, 10.0, 10.0], [0, 0, 0, 1], 0.5 as float32, 2.0 as float32)
+    assert_eq(pf[0], 6.5 as float32)    # 10 - 3 * 0.5 - 2.0
+    assert_eq(pf[1], 7.5 as float32)    # 10 - 1 * 0.5 - 2.0
+    assert_eq(pf[2], 10.0 as float32)   # never generated
+    let pf_neg = apply_presence_frequency_penalty([1.0, 2.0], [0], 0.0 as float32, -1.5 as float32)
+    assert_eq(pf_neg[0], 2.5 as float32)  # a negative presence penalty encourages the token
+
+    # --- it can flip the greedy winner, and an empty history changes nothing ---
+    let (tok_pf, _) = sample(seed_rng(1), apply_presence_frequency_penalty([10.0, 9.0], [0], 0.0 as float32, 2.0 as float32), 2, 0.0 as float32, 0, 1.0 as float32, [], 1.0 as float32, 64)
+    assert_eq(tok_pf, 1)
+    let pf_empty = apply_presence_frequency_penalty([10.0, 9.0], [], 1.0 as float32, 1.0 as float32)
+    assert_eq(pf_empty[0], 10.0 as float32)
+
     print "test_sampling: all assertions passed"

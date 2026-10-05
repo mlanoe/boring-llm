@@ -22,6 +22,96 @@ def assert_close(float32 a, float32 b, string msg):
     let diff = if a > b: a - b else: b - a
     assert(diff < 0.001 as float32, "{msg}: expected ~{b}, got {a}")
 
+[float32] fill_vals(int n, int salt):
+    mut [float32] v = [0.0 for i in 0..<n]
+    var int i = 0
+    while i < n:
+        v[i] = (((i * 7 + salt * 13) % 101) as float32) / 101.0 * 4.0 - 2.0
+        i += 1
+    v
+
+# attention_gqa_gpu dispatches d_head 64 / 128 at seq_q > 1 to the fused
+# (flash-style) kernels; check them against the three-kernel path, which
+# materializes the score matrix, on shapes that stress the tiling: several
+# 16-row query blocks, sizes that are not multiples of 16, a causal offset (a
+# prefill chunk over an existing cache) and the non-causal case.
+def check_fused_attention(int d_head, int n_head, int n_kv, int seq_q, int seq_k, bool causal, int offset) throws:
+    let q = fill_vals(seq_q * n_head * d_head, 1)
+    let k = fill_vals(seq_k * n_kv * d_head, 2)
+    let v = fill_vals(seq_k * n_kv * d_head, 3)
+    let fused_raw = attention_gqa_gpu(q, k, v, seq_q, seq_k, n_head, n_kv, d_head, causal, offset)
+    let fused = passthrough(fused_raw)
+    let ref_raw = attention_gqa_three_kernel_gpu(q, k, v, seq_q, seq_k, n_head, n_kv, d_head, causal, offset)
+    let reference = passthrough(ref_raw)
+    assert(fused.length == reference.length, "fused attention length d_head={d_head}")
+    var i = 0
+    while i < reference.length:
+        assert_close(fused[i], reference[i], "fused attention d_head={d_head} seq_q={seq_q} seq_k={seq_k} causal={causal} offset={offset} [{i}]")
+        i += 1
+    print "fused attention d_head={d_head} seq_q={seq_q} seq_k={seq_k} causal={causal} offset={offset}: OK"
+
+# Single-query decode (seq_q == 1) dispatches to the split-K decode kernels for
+# d_head 64 / 128; compare against the three-kernel path on cache lengths that
+# give one split, several splits (> 128 keys per split boundary), a partial last
+# tile, and the causal spelling of "the query is the last position".
+def check_decode_attention(int d_head, int n_head, int n_kv, int seq_k, bool causal) throws:
+    let q = fill_vals(n_head * d_head, 1)
+    let k = fill_vals(seq_k * n_kv * d_head, 2)
+    let v = fill_vals(seq_k * n_kv * d_head, 3)
+    let offset = if causal: seq_k - 1 else: 0
+    let fused_raw = attention_gqa_gpu(q, k, v, 1, seq_k, n_head, n_kv, d_head, causal, offset)
+    let fused = passthrough(fused_raw)
+    let ref_raw = attention_gqa_three_kernel_gpu(q, k, v, 1, seq_k, n_head, n_kv, d_head, causal, offset)
+    let reference = passthrough(ref_raw)
+    assert(fused.length == reference.length, "decode attention length d_head={d_head}")
+    var i = 0
+    while i < reference.length:
+        assert_close(fused[i], reference[i], "decode attention d_head={d_head} seq_k={seq_k} causal={causal} [{i}]")
+        i += 1
+    print "decode attention d_head={d_head} seq_k={seq_k} causal={causal}: OK"
+
+# Decode attention over a cache split in a main and a tail buffer
+# (attention_gqa_tail_gpu, what forward_step uses): the first `main_len` rows
+# come from the main buffer, the rest from the tail, and the main buffer carries
+# 5 garbage rows past `main_len` that must be ignored. Compared with the
+# three-kernel path on the one contiguous cache. `main_len` values cut a key
+# tile (64/128 keys) in the middle on purpose.
+def check_tail_attention(int d_head, int n_head, int n_kv, int seq_k, int main_len) throws:
+    let kv_dim = n_kv * d_head
+    let q = fill_vals(n_head * d_head, 1)
+    let k = fill_vals(seq_k * kv_dim, 2)
+    let v = fill_vals(seq_k * kv_dim, 3)
+    let junk = fill_vals(5 * kv_dim, 9)
+    mut [float32] k_main = []
+    mut [float32] v_main = []
+    mut [float32] k_tail = []
+    mut [float32] v_tail = []
+    var int i = 0
+    while i < main_len * kv_dim:
+        k_main.push(k[i])
+        v_main.push(v[i])
+        i += 1
+    i = 0
+    while i < 5 * kv_dim:
+        k_main.push(junk[i])
+        v_main.push(junk[i])
+        i += 1
+    i = main_len * kv_dim
+    while i < seq_k * kv_dim:
+        k_tail.push(k[i])
+        v_tail.push(v[i])
+        i += 1
+    let got_raw = attention_gqa_tail_gpu(q, k_main, v_main, k_tail, v_tail, main_len, seq_k, n_head, n_kv, d_head)
+    let got = passthrough(got_raw)
+    let ref_raw = attention_gqa_three_kernel_gpu(q, k, v, 1, seq_k, n_head, n_kv, d_head, false, 0)
+    let reference = passthrough(ref_raw)
+    assert(got.length == reference.length, "tail attention length d_head={d_head}")
+    i = 0
+    while i < reference.length:
+        assert_close(got[i], reference[i], "tail attention d_head={d_head} seq_k={seq_k} main_len={main_len} [{i}]")
+        i += 1
+    print "tail attention d_head={d_head} seq_k={seq_k} main_len={main_len}: OK"
+
 def main() throws:
     # --- linear_gpu vs. CPU linear_bias, d_in=3, d_out=2, seq=2 ---
     let x = [1.0, 2.0, 3.0,  4.0, 5.0, 6.0]
@@ -111,6 +201,27 @@ def main() throws:
         assert_close(gpu_attn[i], cpu_attn[i], "attention_gqa_gpu[{i}]")
         i += 1
     print "attention_gqa_gpu: OK"
+
+    check_fused_attention(64, 4, 2, 20, 20, true, 0)
+    check_fused_attention(64, 4, 2, 20, 37, true, 17)
+    check_fused_attention(64, 4, 2, 5, 21, false, 0)
+    check_fused_attention(128, 4, 2, 18, 18, true, 0)
+    check_fused_attention(128, 4, 2, 33, 70, true, 37)
+
+    check_decode_attention(64, 4, 2, 1, false)
+    check_decode_attention(64, 4, 2, 37, false)
+    check_decode_attention(64, 4, 2, 300, false)
+    check_decode_attention(64, 4, 2, 50, true)
+    check_decode_attention(128, 4, 2, 70, false)
+    check_decode_attention(128, 4, 2, 520, true)
+    check_tail_attention(64, 4, 2, 70, 64)
+    check_tail_attention(64, 4, 2, 70, 37)
+    check_tail_attention(64, 4, 2, 300, 299)
+    check_tail_attention(64, 4, 2, 330, 266)
+    check_tail_attention(128, 4, 2, 90, 26)
+    check_tail_attention(128, 4, 2, 520, 456)
+    check_tail_attention(128, 4, 2, 130, 129)
+    check_tail_attention(96, 4, 2, 40, 33)
 
     # --- q8_linear_gpu vs. CPU dequantize_q8_0 + linear_bias ---
     # d_in=32 (exactly one Q8_0 block per row), d_out=2, seq=1.

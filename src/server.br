@@ -5,7 +5,8 @@
 # `"stream": true`), so any OpenAI-compatible client — OpenCode, the Vercel AI
 # SDK, `curl` — can drive it. Plain `std::net` (no extra crate): one blocking
 # accept loop, one request at a time, which is also exactly the serialization a
-# single GPU needs. Every response is `Connection: close`.
+# single GPU needs. Every response is `Connection: close`; a streamed reply
+# (`"stream": true`) is written token by token as the model produces it.
 #
 # The pure parts (message normalization, `<tool_call>` parsing, JSON/SSE
 # bodies) live in openai.br and are unit-tested there; this file is the socket
@@ -17,7 +18,9 @@ use jinja
 use json
 use openai
 use tokenizer
+use cache_policy
 use model
+use prompt_cache
 use sampling
 use std.net.TcpListener, TcpStream
 use std.io.Read, Write
@@ -30,7 +33,27 @@ pub struct ServerCtx:
     string model_name
     int max_ctx             # prompt + generated tokens must fit in this
     int default_max_tokens  # used when a request sets no max_tokens
+    int cache_slots         # how many prompt KV caches to keep (LRU)
     SamplingParams defaults
+    string cache_dir        # prompt caches kept on disk across restarts; "" = off
+    int cache_fp            # fingerprint of the loaded model (see prompt_cache.br)
+    int cache_files         # how many snapshots to keep on disk
+    int cache_max_bytes     # cap on all snapshots together; 0 = none
+    int cache_bpt           # bytes one token adds to a snapshot
+
+# A finished request's KV cache and the token ids it covers. A later prompt
+# starts from the slot sharing the longest prefix with it (an agent client
+# resends its whole history every turn, and interleaves unrelated small
+# requests such as title generation, which must not evict the main one).
+pub struct CacheSlot:
+    GenCache cache
+    [int] tokens
+    int used        # request counter when last touched; smallest = least recently used
+
+# 0 = nothing written for the current request yet, 1 = an SSE stream is open
+# (a failure then must not write a second HTTP response into it), 2 = a complete
+# response was written.
+static var int response_state = 0
 
 pub struct HttpRequest:
     string method
@@ -53,6 +76,13 @@ def respond(var TcpStream sock, int status, string reason, string content_type, 
     let head = "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {body_len}\r\nConnection: close\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n\r\n"
     write_text(sock, head)
     write_text(sock, body)
+    response_state = 2
+
+# Headers of a streamed reply: no Content-Length, the body ends when the
+# connection closes. Events follow as the model produces them.
+def respond_stream_head(var TcpStream sock) throws:
+    response_state = 1
+    write_text(sock, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nX-Accel-Buffering: no\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n\r\n")
 
 def respond_json(var TcpStream sock, int status, string reason, string body) throws:
     respond(sock, status, reason, "application/json", body)
@@ -114,58 +144,236 @@ HttpRequest read_http_request(var TcpStream sock) throws:
             out
         _: []
 
-def handle_chat(ServerCtx& ctx, var TcpStream sock, string body_text, int counter) throws:
+# `slots` are the KV caches left by earlier requests; the returned list
+# replaces them. A new prompt only pays for the tokens after its longest common
+# prefix with the best slot.
+[CacheSlot] handle_chat(ServerCtx& ctx, var TcpStream sock, string body_text, int counter,
+                        [CacheSlot] slots, [DiskSnap] disk) throws:
     let parsed = try? json_parse(body_text)
     guard let body = parsed else:
         respond_json(sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
-        return
+        return slots
     let messages = normalize_messages(json_get_list(body, "messages"))
     if messages.length == 0:
         respond_json(sock, 400, "Bad Request", error_json("`messages` is required and must be a non-empty array", "invalid_request_error", "missing_messages"))
-        return
-    let tools = json_get_list(body, "tools")
-    let prompt_tokens = render_chat_prompt_messages(ctx.file, ctx.tok, messages, tools, true)
+        return slots
+    let tools = if tools_disabled(body): [] else: json_get_list(body, "tools")
+    let prompt_tokens = render_chat_prompt_messages_kw(ctx.file, ctx.tok, messages, tools, true, json_get(body, "chat_template_kwargs"))
 
     let room = ctx.max_ctx - prompt_tokens.length
     if room <= 0:
-        respond_json(sock, 400, "Bad Request", error_json("prompt is {prompt_tokens.length} tokens, over this server's context size of {ctx.max_ctx}", "invalid_request_error", "context_length_exceeded"))
-        return
+        respond_json(sock, 400, "Bad Request", context_exceeded_json(prompt_tokens.length, ctx.max_ctx))
+        return slots
     let asked = json_get_int(body, "max_tokens", json_get_int(body, "max_completion_tokens", ctx.default_max_tokens))
     let max_new = if asked < room: asked else: room
 
     let temperature = json_get_float(body, "temperature", ctx.defaults.temperature as float)
     let top_p = json_get_float(body, "top_p", ctx.defaults.top_p as float)
     let seed = json_get_int(body, "seed", ctx.defaults.seed)
-    let params = SamplingParams(temperature as float32, ctx.defaults.top_k, top_p as float32, seed, ctx.defaults.repeat_penalty, ctx.defaults.repeat_last_n)
+    let top_k = json_get_int(body, "top_k", ctx.defaults.top_k)
+    let repeat_penalty = json_get_float(body, "repeat_penalty", ctx.defaults.repeat_penalty as float)
+    let frequency_penalty = json_get_float(body, "frequency_penalty", 0.0) as float32
+    let presence_penalty = json_get_float(body, "presence_penalty", 0.0) as float32
+    let params = SamplingParams(temperature as float32, top_k, top_p as float32, seed, repeat_penalty as float32, ctx.defaults.repeat_last_n)
 
     let started = Instant.now()
-    let all_tokens = generate_kv(ctx.model, prompt_tokens, max_new, ctx.tok.eos_token_id, params)
-    let gen_ms = started.elapsed().asMillis() as int
+    let stops = stop_list(body)
+    let streaming = json_get_bool(body, "stream", false)
+    let include_usage = json_get_bool(json_get(body, "stream_options"), "include_usage", false)
+    let id = "{counter}"
+    # The last prompt token always goes through the model (its logits pick the
+    # first reply token), so at most `length - 1` cached positions are reusable.
+    mut [[int]] slot_tokens = []
+    for sl in slots:
+        slot_tokens.push(sl.tokens)
+    let (mem_best, common) = best_prefix_slot(slot_tokens, prompt_tokens)
+    let mem_reuse = if common < prompt_tokens.length: common else: prompt_tokens.length - 1
+    mut [[int]] disk_tokens = []
+    for d in disk:
+        disk_tokens.push(d.tokens)
+    let (disk_best, disk_common) = best_prefix_slot(disk_tokens, prompt_tokens)
+    let disk_reuse = if disk_common < prompt_tokens.length: disk_common else: prompt_tokens.length - 1
+    let from_disk = restore_from_disk(mem_reuse, disk_best, disk_reuse)
+    let best = if from_disk: -1 else: mem_best
+    var int reuse = if from_disk: disk_reuse else: mem_reuse
+    # A streamed reply opens before the prompt is processed: a cold agent prompt
+    # takes minutes on a large model, and clients give up on a response whose
+    # headers (OpenCode: `headerTimeout`) or body (`chunkTimeout`) stay silent for
+    # 5 minutes by default. An SSE comment line follows each prefill chunk; clients
+    # ignore it, but the connection is not idle. A client that has gone away is
+    # noticed by the failing write, so its prefill stops early.
+    if streaming:
+        respond_stream_head(sock)
+        write_text(sock, sse_role_event(id, ctx.model_name))
+    var base_cache = empty_cache(ctx.model.config.n_layer)
+    var bool restored = false
+    if from_disk:
+        let loaded = try? load_snapshot(ctx.cache_dir, disk[disk_best], ctx.model, reuse)
+        if let c = loaded:
+            base_cache = c
+            restored = true
+        else:
+            print "[serve] prompt cache: could not restore file {disk[disk_best].slot}, prefilling from scratch"
+            reuse = 0
+    elif best >= 0 and reuse > 0:
+        base_cache = slots[best].cache
+    let start_cache = resume_cache(ctx.model, base_cache, reuse, prompt_tokens.length)
+    let pending = prompt_tokens[reuse..<prompt_tokens.length]
+    let chunk_len = prefill_chunk_len()
+    var cache_p = start_cache
+    var [float32] first_logits = []
+    var done = 0
+    while done < pending.length:
+        let upto = if done + chunk_len < pending.length: done + chunk_len else: pending.length
+        let (lg, c) = prefill_step_gpu_quantized(ctx.model, cache_p, pending[done..<upto])
+        first_logits = lg
+        cache_p = c
+        done = upto
+        if streaming and done < pending.length:
+            write_text(sock, ": prefill {done}/{pending.length}\n\n")
+    let cache0 = cache_p
+    let prefill_ms = started.elapsed().asMillis() as int
 
+    # Decode loop, here rather than in model.br so each token can be sent as it
+    # is produced. `text` is the visible reply so far, decoded incrementally from
+    # a small window of tokens (a character can span several byte-level tokens:
+    # nothing is taken from the window until it ends on a complete character).
+    mut [int] tokens = []
+    for pt in prompt_tokens:
+        tokens.push(pt)
     mut [int] reply_tokens = []
+    var logits = first_logits
+    var cur = cache0
+    var rng = seed_rng(params.seed)
+    let vocab = ctx.model.config.vocab_size
+    var string text = ""
+    var int prefix_off = 0
+    var int read_off = 0
+    var int emitted = 0
+    var int emitted_r = 0
     var bool hit_eos = false
-    var int t = prompt_tokens.length
-    while t < all_tokens.length:
-        if all_tokens[t] == ctx.tok.eos_token_id:
+    var bool stopped = false
+    var int generated = 0
+    var int first_token_ms = -1
+    while generated < max_new and not hit_eos and not stopped:
+        let penalized = apply_presence_frequency_penalty(logits, reply_tokens, frequency_penalty, presence_penalty)
+        let (next_tok, new_rng) = sample(rng, penalized, vocab, params.temperature, params.top_k, params.top_p, tokens, params.repeat_penalty, params.repeat_last_n)
+        rng = new_rng
+        tokens.push(next_tok)
+        generated += 1
+        if first_token_ms < 0:
+            first_token_ms = started.elapsed().asMillis() as int
+        if next_tok == ctx.tok.eos_token_id:
             hit_eos = true
         else:
-            reply_tokens.push(all_tokens[t])
-        t += 1
-    let completion_tokens = all_tokens.length - prompt_tokens.length
+            reply_tokens.push(next_tok)
+            let n_reply = reply_tokens.length
+            let window_before = ctx.tok.decode(reply_tokens[prefix_off..<read_off])
+            let window_now = ctx.tok.decode(reply_tokens[prefix_off..<n_reply])
+            let before_len = window_before.chars().length
+            let now_chars = window_now.chars()
+            if now_chars.length > before_len and not window_now.endsWith(chr(65533)):
+                var string piece = ""
+                var int q = before_len
+                while q < now_chars.length:
+                    piece = "{piece}{now_chars[q]}"
+                    q += 1
+                text = "{text}{piece}"
+                prefix_off = read_off
+                read_off = n_reply
+                let (cut, hit) = apply_stop(text, stops)
+                if hit:
+                    text = cut
+                    stopped = true
+            if streaming:
+                let (reasoning_now, content_now) = stream_split(text)
+                let n_reasoning = reasoning_now.chars().length
+                if n_reasoning > emitted_r:
+                    write_text(sock, sse_reasoning_event(id, ctx.model_name, chars_from(reasoning_now, emitted_r)))
+                    emitted_r = n_reasoning
+                let (vs, vl) = stream_bounds(content_now, stops)
+                if vl > vs + emitted:
+                    let tcs = content_now.chars()
+                    var string delta = ""
+                    var int q2 = vs + emitted
+                    while q2 < vl:
+                        delta = "{delta}{tcs[q2]}"
+                        q2 += 1
+                    write_text(sock, sse_content_event(id, ctx.model_name, delta))
+                    emitted = vl - vs
+            if not stopped:
+                let (step_logits, step_cache) = forward_step(ctx.model, cur, next_tok)
+                logits = step_logits
+                cur = step_cache
+    let gen_ms = started.elapsed().asMillis() as int
 
-    let (text, stopped) = apply_stop(ctx.tok.decode(reply_tokens), stop_list(body))
-    let reply = parse_reply(text)
-    let finish = if reply.calls.length > 0: "tool_calls" elif hit_eos or stopped: "stop" else: "length"
+    # Authoritative text and tool calls: one full decode of the whole reply
+    # (what a non-streaming reply is built from; the incremental text above is
+    # only a prefix-safe preview of it).
+    let (final_text, stopped_full) = apply_stop(ctx.tok.decode(reply_tokens), stops)
+    let (final_reasoning, final_rest) = split_reasoning(final_text)
+    let reply = if tools_disabled(body): ParsedReply(final_rest.trim(), []) else: parse_reply(final_rest)
+    let finish = if reply.calls.length > 0: "tool_calls" elif hit_eos or stopped or stopped_full: "stop" else: "length"
+    let completion_tokens = generated
 
-    let id = "{counter}"
-    let include_usage = json_get_bool(json_get(body, "stream_options"), "include_usage", false)
-    print "[serve] chat: {messages.length} messages, {tools.length} tools, prompt {prompt_tokens.length} tokens, generated {completion_tokens}, finish={finish}, {gen_ms} ms total"
-    if json_get_bool(body, "stream", false):
-        respond(sock, 200, "OK", "text/event-stream", completion_sse(id, ctx.model_name, reply, finish, prompt_tokens.length, completion_tokens, include_usage))
+    let mode = if streaming: "streamed" else: "buffered"
+    let reuse_src = if restored: "disk" else: "cache"
+    print "[serve] chat: {messages.length} messages, {tools.length} tools, prompt {prompt_tokens.length} tokens ({reuse} reused from {reuse_src}), generated {completion_tokens}, finish={finish}, {gen_ms} ms total (prefill {prefill_ms} ms, first token {first_token_ms} ms, {mode})"
+    if streaming:
+        # whatever of the final content was held back (or arrived after the last
+        # preview), then the tool calls, finish reason, usage and end marker
+        if final_reasoning.chars().length > emitted_r:
+            write_text(sock, sse_reasoning_event(id, ctx.model_name, chars_from(final_reasoning, emitted_r)))
+        let content_chars = reply.content.chars()
+        var string tail = ""
+        var int q3 = emitted
+        while q3 < content_chars.length:
+            tail = "{tail}{content_chars[q3]}"
+            q3 += 1
+        if tail != "":
+            write_text(sock, sse_content_event(id, ctx.model_name, tail))
+        if reply.calls.length > 0:
+            write_text(sock, sse_tool_calls_event(id, ctx.model_name, reply.calls))
+        write_text(sock, sse_finish_event(id, ctx.model_name, finish))
+        if include_usage:
+            write_text(sock, sse_usage_event(id, ctx.model_name, prompt_tokens.length, completion_tokens))
+        write_text(sock, sse_done_event())
+        response_state = 2
     else:
-        respond_json(sock, 200, "OK", completion_json(id, ctx.model_name, reply, finish, prompt_tokens.length, completion_tokens))
+        respond_json(sock, 200, "OK", completion_json_r(id, ctx.model_name, reply, final_reasoning, finish, prompt_tokens.length, completion_tokens))
+    # `cur` covers cur.pos tokens: every token that was fed through the model
+    # (the final EOS, or the token that completed a stop string, is sampled but
+    # never fed back).
+    let covered = tokens[0..<cur.pos]
+    let fresh = CacheSlot(cur, covered, counter)
+    mut [CacheSlot] out = []
+    for sl in slots:
+        out.push(sl)
+    # Placement: a slot that is a prefix of this conversation is extended in
+    # place; one that already covers it is kept as is; a diverging prompt gets
+    # its own slot (the old branch may come back), evicting the least recently
+    # used one when all slots are taken.
+    if best >= 0 and reuse > 0:
+        let shared = common_prefix_len(slots[best].tokens, covered)
+        if shared == slots[best].tokens.length:
+            out[best] = fresh
+            return out
+        if shared == covered.length:
+            out[best] = CacheSlot(slots[best].cache, slots[best].tokens, counter)
+            return out
+    if out.length < ctx.cache_slots:
+        out.push(fresh)
+    else:
+        var int lru = 0
+        var int k = 1
+        while k < out.length:
+            if out[k].used < out[lru].used:
+                lru = k
+            k += 1
+        out[lru] = fresh
+    out
 
-def handle_request(ServerCtx& ctx, var TcpStream sock, int counter) throws:
+[CacheSlot] handle_request(ServerCtx& ctx, var TcpStream sock, int counter, [CacheSlot] slots, [DiskSnap] disk) throws:
     let r = read_http_request(sock)
     print "[serve] {r.method} {r.path}"
     if r.method == "OPTIONS":
@@ -175,18 +383,76 @@ def handle_request(ServerCtx& ctx, var TcpStream sock, int counter) throws:
     elif r.method == "GET" and (r.path == "/health" or r.path == "/"):
         respond_json(sock, 200, "OK", "{{\"status\": \"ok\"}}")
     elif r.method == "POST" and (r.path == "/v1/chat/completions" or r.path == "/chat/completions"):
-        handle_chat(ctx, sock, r.body, counter)
+        return handle_chat(ctx, sock, r.body, counter, slots, disk)
     else:
         respond_json(sock, 404, "Not Found", error_json("no route for {r.method} {r.path}", "invalid_request_error", "not_found"))
+    slots
+
+# After a request: write the cache it left to disk when cache_policy.br says so
+# (enough new tokens, inside the size cap). Files the plan drops are deleted
+# first. A failed save is logged, its half-written file removed, and the
+# snapshot left out of the index.
+[DiskSnap] maybe_save(ServerCtx& ctx, [CacheSlot] slots, int counter, [DiskSnap] disk):
+    var int idx = -1
+    var int i = 0
+    while i < slots.length:
+        if slots[i].used == counter:
+            idx = i
+        i += 1
+    if idx < 0:
+        return disk
+    let s = slots[idx]
+    let plan = plan_save(disk, s.tokens, ctx.cache_files, ctx.cache_bpt, ctx.cache_max_bytes)
+    if not plan.save:
+        return disk
+    mut [DiskSnap] kept = []
+    for d in disk:
+        var bool dropped = d.slot == plan.slot
+        for x in plan.drop:
+            if d.slot == x:
+                dropped = true
+        if not dropped:
+            kept.push(d)
+    for x in plan.drop:
+        delete_snapshot(ctx.cache_dir, x)
+        print "[serve] prompt cache: dropped file {x} (size cap)"
+    let started = Instant.now()
+    try:
+        save_snapshot(ctx.cache_dir, ctx.cache_fp, plan.slot, plan.seq, ctx.model, s.cache, s.tokens)
+        kept.push(DiskSnap(plan.slot, plan.seq, s.tokens))
+        let ms = started.elapsed().asMillis() as int
+        print "[serve] prompt cache: saved {s.tokens.length} tokens to file {plan.slot} ({ms} ms)"
+    catch:
+        print "[serve] prompt cache: save failed: {error}"
+        delete_snapshot(ctx.cache_dir, plan.slot)
+    kept
+
+# One connection, start to finish. The socket belongs to this function, so it
+# is closed when it returns — before the caller spends time writing a snapshot.
+[CacheSlot] serve_conn(ServerCtx& ctx, var TcpStream sock, int counter, [CacheSlot] slots, [DiskSnap] disk) throws:
+    var [CacheSlot] out = slots
+    try:
+        out = handle_request(ctx, sock, counter, slots, disk)
+    catch:
+        print "[serve] request {counter} failed: {error}"
+        if response_state == 0:
+            let sent = try? respond_json(sock, 500, "Internal Server Error", error_json(error, "server_error", "internal_error"))
+        elif response_state == 1:
+            # a stream is open (or the client left): end it with an error event
+            let sent = try? write_text(sock, "{sse_error_event(error)}{sse_done_event()}")
+    out
 
 # One request at a time, forever. A failure inside a request (bad socket,
 # generation error) is reported to the client when possible and logged, but
-# never takes the server down.
-pub def serve(ServerCtx& ctx, int port) throws:
+# never takes the server down. `disk0` is what the prompt cache directory held
+# at startup.
+pub def serve(ServerCtx& ctx, int port, [DiskSnap] disk0) throws:
     let listener = try? TcpListener.bind("127.0.0.1:{port}")
     guard let listener else throw "could not bind 127.0.0.1:{port} (port already in use?)"
-    print "[serve] model '{ctx.model_name}' ready — listening on http://127.0.0.1:{port}/v1 (context {ctx.max_ctx} tokens)"
+    print "[serve] model '{ctx.model_name}' ready — listening on http://127.0.0.1:{port}/v1 (context {ctx.max_ctx} tokens, {ctx.cache_slots} prompt-cache slots)"
     var int counter = 0
+    var [CacheSlot] slots = []
+    var [DiskSnap] disk = disk0
     for conn in listener.incoming():
         let c = try? conn
         guard let c else:
@@ -194,8 +460,7 @@ pub def serve(ServerCtx& ctx, int port) throws:
             continue
         var sock = c
         counter += 1
-        try:
-            handle_request(ctx, sock, counter)
-        catch:
-            print "[serve] request {counter} failed: {error}"
-            let sent = try? respond_json(sock, 500, "Internal Server Error", error_json(error, "server_error", "internal_error"))
+        response_state = 0
+        slots = serve_conn(ctx, sock, counter, slots, disk)
+        if ctx.cache_dir != "":
+            disk = maybe_save(ctx, slots, counter, disk)

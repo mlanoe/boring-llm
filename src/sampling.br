@@ -69,6 +69,28 @@ pub [float32] apply_repeat_penalty([float32] logits, [int] history, float32 pena
             j += 1
         out
 
+# OpenAI-style penalties over the tokens generated so far (not the prompt):
+# logit[t] -= count[t] * frequency_penalty + (count[t] > 0 ? presence_penalty : 0).
+# Unlike the repeat penalty above this one is additive and grows with the number
+# of occurrences. Both penalties at 0 (the default) return `logits` unchanged.
+pub [float32] apply_presence_frequency_penalty([float32] logits, [int] generated, float32 frequency, float32 presence):
+    if (frequency == 0.0 as float32 and presence == 0.0 as float32) or generated.length == 0:
+        logits
+    else:
+        mut [float32] out = [0.0 for i in 0..<logits.length]
+        var int i = 0
+        while i < logits.length:
+            out[i] = logits[i]
+            i += 1
+        mut {int=int} counts = {=}
+        for tok in generated:
+            let seen_before = counts[tok] else 0
+            counts[tok] = seen_before + 1
+        for tok in counts.keys():
+            let c = counts[tok] else 0
+            out[tok] = out[tok] - (c as float32) * frequency - presence
+        out
+
 pub int sample_greedy([float32] logits, int vocab):
     var int best = 0
     var float32 best_val = logits[0]

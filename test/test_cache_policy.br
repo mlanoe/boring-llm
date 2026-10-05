@@ -1,0 +1,77 @@
+# Interpreter-speed unit tests for src/cache_policy.br: when the on-disk prompt
+# cache is written, where, what it drops to stay inside its size cap, and when a
+# request starts from it.
+
+use cache_policy
+
+# `n` token ids starting at `base`: two lists with different bases share no prefix.
+[int] toks(int base, int n):
+    mut [int] out = []
+    var int i = 0
+    while i < n:
+        out.push(base + i)
+        i += 1
+    out
+
+# The same ids as `a`, cut to `n` tokens, then `extra` more different ones.
+[int] branch([int] a, int n, int extra):
+    mut [int] out = []
+    var int i = 0
+    while i < n:
+        out.push(a[i])
+        i += 1
+    var int j = 0
+    while j < extra:
+        out.push(900000 + j)
+        j += 1
+    out
+
+def main():
+    # restore only when the disk covers clearly more than memory does
+    assert(restore_from_disk(0, 0, 5000), "empty memory, big snapshot: restore")
+    assert(not restore_from_disk(5000, 0, 5200), "a gain under 256 tokens is not worth the read")
+    assert(restore_from_disk(5000, 1, 5256), "a gain of 256 tokens is")
+    assert(not restore_from_disk(0, -1, 0), "no snapshot, nothing to restore")
+
+    let a = toks(1, 3000)
+    let none = plan_save([], toks(1, 1000), 2, 100, 0)
+    assert(not none.save, "under 1024 tokens is never written")
+    let first = plan_save([], a, 2, 100, 0)
+    assert(first.save and first.slot == 0 and first.seq == 1 and first.drop.length == 0, "first snapshot: file 0, seq 1")
+
+    # a longer prompt that extends the saved one replaces it, once it adds 1024 tokens
+    let disk1 = [DiskSnap(0, 1, a)]
+    let grown = toks(1, 3500)
+    assert(not plan_save(disk1, grown, 2, 100, 0).save, "500 new tokens: not yet")
+    let grown2 = toks(1, 4100)
+    let rep = plan_save(disk1, grown2, 2, 100, 0)
+    assert(rep.save and rep.slot == 0 and rep.seq == 2, "extending a snapshot replaces its file")
+    assert(not plan_save(disk1, a, 2, 100, 0).save, "an identical cache adds nothing")
+
+    # an unrelated prompt takes the free file, then (files full) the oldest
+    let b = toks(50000, 3000)
+    let other = plan_save(disk1, b, 2, 100, 0)
+    assert(other.save and other.slot == 1 and other.seq == 2, "unrelated prompt: free file 1")
+    let disk2 = [DiskSnap(0, 1, a), DiskSnap(1, 2, b)]
+    let c = toks(80000, 3000)
+    let evict = plan_save(disk2, c, 2, 100, 0)
+    assert(evict.save and evict.slot == 0 and evict.seq == 3, "files full: the oldest (file 0) is overwritten")
+    let disk2b = [DiskSnap(0, 5, a), DiskSnap(1, 2, b)]
+    assert(plan_save(disk2b, c, 2, 100, 0).slot == 1, "the oldest is by seq, not by file number")
+
+    # a branch that diverges from a saved snapshot does not replace it
+    let fork = branch(a, 1500, 1600)
+    let forked = plan_save(disk1, fork, 2, 100, 0)
+    assert(forked.save and forked.slot == 1, "diverging branch keeps the old snapshot and takes a free file")
+
+    # size cap: 100 bytes per token, snapshots of 3000 tokens = 300000 bytes
+    assert(not plan_save([], a, 2, 100, 200000).save, "a snapshot over the cap alone is not written")
+    let capped = plan_save(disk2, c, 2, 100, 700000)
+    assert(capped.save and capped.drop.length == 0, "three of 3000 tokens would be 900000: file 0 is overwritten, 600000 fit")
+    let tight = plan_save(disk2, c, 3, 100, 700000)
+    assert(tight.save and tight.slot == 2 and tight.drop.length == 1 and tight.drop[0] == 0, "free file, but the cap drops the oldest")
+    let tighter = plan_save(disk2, c, 3, 100, 400000)
+    assert(tighter.save and tighter.drop.length == 2, "a cap of 400000 drops both older snapshots")
+    assert(plan_save(disk2, c, 3, 100, 0).drop.length == 0, "no cap, nothing dropped")
+
+    print "test_cache_policy: all assertions passed"

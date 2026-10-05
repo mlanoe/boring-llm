@@ -6,6 +6,10 @@
 # Later phases add --prompt/--max-tokens for real text generation.
 
 use gguf
+use gguf_file
+use cache_policy
+use prompt_cache
+use math_gpu
 use model
 use tokenizer
 use sampling
@@ -117,6 +121,23 @@ def run_forward_debug_quantized(GgufFile file, [int] tokens) throws:
     print "[diag] running forward_gpu_quantized (quantized tensor kernels)..."
     let logits = forward_gpu_quantized(m, tokens)
     print_top5(logits, tokens, m.config.vocab_size)
+
+# Greedy-or-sampled generation from raw token ids through the KV-cache decode path
+# (prefill_chunked + forward_step), printing only the generated ids. tools/decode_vs_llamacpp.py
+# compares them with llama.cpp's continuation of the same ids: the logits check (--tokens)
+# never runs forward_step, so a decode-only bug is invisible to it.
+def run_generate_tokens(GgufFile file, [int] prompt_tokens, int max_new_tokens, SamplingParams params) throws:
+    let tok = load_tokenizer(file)
+    let m = load_model_quantized(file)
+    let all_tokens = generate_kv(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
+    var string ids = ""
+    var int i = prompt_tokens.length
+    while i < all_tokens.length:
+        if ids != "":
+            ids = ids + ","
+        ids = ids + "{all_tokens[i]}"
+        i += 1
+    print "generated: {ids}"
 
 # Phase 3: real end-to-end chat generation — tokenize (GGUF-embedded vocab/
 # merges, ChatML wrapping), greedy-decode via the quantized tensor forward
@@ -334,11 +355,47 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
 # oracle (jinja2 + llama-cpp-python, see tools/): reads an OpenAI-style request
 # body from `path`, renders it exactly the way server.br would, and prints the
 # resulting prompt token ids on one line.
+# What `--serve` loads: the model (weights end up resident on the GPU), the
+# tokenizer and a GgufFile that holds the metadata (chat template, vocabulary)
+# and the file's path — tensor data is read from disk tensor by tensor, so the
+# file is never held in memory.
+(GgufFile, QuantModel, Tokenizer) load_for_serving(string path) throws:
+    print "[diag] parsing {path}..."
+    let file = parse_gguf_path(path)
+    print "[diag] parsed ({file.file_size} bytes, {file.tensors.length} tensors, {file.metadata.length} metadata keys)"
+    print "[diag] loading model weights (packed bytes, quantized tensor kernels)..."
+    let m = load_model_quantized(file)
+    print "[diag] model loaded (vocab={m.config.vocab_size} d_model={m.config.d_model} n_layer={m.config.n_layer})"
+    let tok = load_tokenizer(file)
+    (file, m, tok)
+
+def run_serve(string path, string model_name, int ctx_size, int max_tokens, int cache_slots, string prompt_cache_dir, int prompt_cache_files, int prompt_cache_max_mb, int port, SamplingParams params) throws:
+    guard cache_slots >= 1 else throw "--cache-slots must be at least 1"
+    guard prompt_cache_files >= 1 else throw "--prompt-cache-files must be at least 1"
+    guard prompt_cache_max_mb >= 0 else throw "--prompt-cache-max-mb must not be negative"
+    let (file, m, tok) = load_for_serving(path)
+    let name = if model_name != "": model_name else: (gguf_get_string(file.metadata, "general.name") else "boring-llm")
+    var int fp = 0
+    var int bpt = 0
+    var [DiskSnap] disk = []
+    if prompt_cache_dir != "":
+        ensure_dir(prompt_cache_dir)
+        let kv_dim = kv_dim_of(m)
+        fp = model_fingerprint(file, m.config.n_layer, kv_dim)
+        bpt = snapshot_bytes_per_token(m.config.n_layer, kv_dim)
+        disk = scan_snapshots(prompt_cache_dir, fp, m.config.n_layer, kv_dim, prompt_cache_files)
+        for d in disk:
+            print "[serve] prompt cache: file {d.slot} holds {d.tokens.length} tokens"
+        let cap = if prompt_cache_max_mb > 0: "{prompt_cache_max_mb} MB" else: "no size cap"
+        print "[serve] prompt cache: {prompt_cache_dir} ({disk.length} snapshot(s), keeping up to {prompt_cache_files} files, {cap})"
+    let ctx = ServerCtx(file, tok, m, name, ctx_size, max_tokens, cache_slots, params, prompt_cache_dir, fp, prompt_cache_files, prompt_cache_max_mb * 1048576, bpt)
+    serve(ctx, port, disk)
+
 def run_render_request(GgufFile file, string path) throws:
     let tok = load_tokenizer(file)
     let body = json_parse(bytes_to_str(fs.readBytes(path)))
     let messages = normalize_messages(json_get_list(body, "messages"))
-    let ids = render_chat_prompt_messages(file, tok, messages, json_get_list(body, "tools"), true)
+    let ids = render_chat_prompt_messages_kw(file, tok, messages, json_get_list(body, "tools"), true, json_get(body, "chat_template_kwargs"))
     var string line = ""
     var int i = 0
     while i < ids.length:
@@ -375,6 +432,7 @@ def main() throws:
     var string gguf_path = ""
     var bool dump_metadata = false
     var string tokens_csv = ""
+    var string generate_tokens_csv = ""
     var bool use_gpu = false
     var bool quantized = false
     var string prompt = ""
@@ -394,6 +452,10 @@ def main() throws:
     var int port = 8080
     var string model_name = ""
     var int ctx_size = 4096
+    var int cache_slots = 4
+    var string prompt_cache_dir = ""
+    var int prompt_cache_files = 2
+    var int prompt_cache_max_mb = 4096
 
     var int i = 1
     while i < argv.length:
@@ -406,6 +468,9 @@ def main() throws:
             i += 1
         elif a == "--tokens" and i + 1 < argv.length:
             tokens_csv = argv[i + 1]
+            i += 2
+        elif a == "--generate-tokens" and i + 1 < argv.length:
+            generate_tokens_csv = argv[i + 1]
             i += 2
         elif a == "--gpu":
             use_gpu = true
@@ -464,15 +529,38 @@ def main() throws:
         elif a == "--ctx-size" and i + 1 < argv.length:
             ctx_size = parse_int_arg("--ctx-size", argv[i + 1])
             i += 2
+        elif a == "--kquant-prefill" and i + 1 < argv.length:
+            guard argv[i + 1] == "tensor" or argv[i + 1] == "handwritten" else throw "--kquant-prefill expects `tensor` or `handwritten`"
+            set_kquant_prefill_handwritten(argv[i + 1] == "handwritten")
+            i += 2
+        elif a == "--prompt-cache" and i + 1 < argv.length:
+            prompt_cache_dir = argv[i + 1]
+            i += 2
+        elif a == "--prompt-cache-files" and i + 1 < argv.length:
+            prompt_cache_files = parse_int_arg("--prompt-cache-files", argv[i + 1])
+            i += 2
+        elif a == "--prompt-cache-max-mb" and i + 1 < argv.length:
+            prompt_cache_max_mb = parse_int_arg("--prompt-cache-max-mb", argv[i + 1])
+            i += 2
+        elif a == "--cache-slots" and i + 1 < argv.length:
+            cache_slots = parse_int_arg("--cache-slots", argv[i + 1])
+            i += 2
         else:
             i += 1
 
-    guard gguf_path != "" else throw "usage: --gguf <path.gguf> [--dump-metadata] [--tokens 1,2,3 [--gpu|--quantized]] [--prompt \"...\"|--chat [--system \"...\"] [--max-tokens N] [--kv-cache] [--temperature T --top-k K --top-p P --seed S --repeat-penalty R --repeat-last-n N]|--serve [--port N] [--ctx-size N] [--model-name NAME] [--max-tokens N default per request]]"
+    guard gguf_path != "" else throw "usage: --gguf <path.gguf> [--dump-metadata] [--tokens 1,2,3 [--gpu|--quantized]] [--generate-tokens 1,2,3 --max-tokens N] [--prompt \"...\"|--chat [--system \"...\"] [--max-tokens N] [--kv-cache] [--temperature T --top-k K --top-p P --seed S --repeat-penalty R --repeat-last-n N]|--serve [--port N] [--ctx-size N] [--cache-slots N] [--prompt-cache DIR [--prompt-cache-files N] [--prompt-cache-max-mb N]] [--kquant-prefill tensor|handwritten] [--model-name NAME] [--max-tokens N default per request]]"
+
+    if serve_mode:
+        # OpenAI-compatible HTTP server (see server.br) — always the packed-
+        # weight quantized GPU path, with the model loaded once up front and
+        # kept resident for every request. Handled before the generic parse
+        # below (which would also be fine now: no mode holds the file in memory).
+        run_serve(gguf_path, model_name, ctx_size, max_tokens, cache_slots, prompt_cache_dir, prompt_cache_files, prompt_cache_max_mb, port, SamplingParams(temperature, top_k, top_p, seed, repeat_penalty, repeat_last_n))
+        return
 
     print "[diag] parsing {gguf_path}..."
-    let [uint8] bytes = fs.readBytes(gguf_path)
-    let file = parse_gguf(bytes)
-    print "[diag] parsed ({bytes.length} bytes, {file.tensors.length} tensors, {file.metadata.length} metadata keys)"
+    let file = parse_gguf_path(gguf_path)
+    print "[diag] parsed ({file.file_size} bytes, {file.tensors.length} tensors, {file.metadata.length} metadata keys)"
 
     if dump_metadata:
         print_metadata(file)
@@ -483,22 +571,14 @@ def main() throws:
         else:
             run_forward_debug(file, parse_token_ids(tokens_csv), use_gpu)
 
+    if generate_tokens_csv != "":
+        run_generate_tokens(file, parse_token_ids(generate_tokens_csv), max_tokens, SamplingParams(temperature, top_k, top_p, seed, repeat_penalty, repeat_last_n))
+
     if encode_file_path != "":
         run_encode_file(file, encode_file_path)
     if render_request_path != "":
         run_render_request(file, render_request_path)
-    if serve_mode:
-        # OpenAI-compatible HTTP server (see server.br) — always the packed-
-        # weight quantized GPU path, with the model loaded once up front and
-        # kept resident for every request.
-        let params = SamplingParams(temperature, top_k, top_p, seed, repeat_penalty, repeat_last_n)
-        let name = if model_name != "": model_name else: (gguf_get_string(file.metadata, "general.name") else "boring-llm")
-        print "[diag] loading model weights (packed bytes, quantized tensor kernels)..."
-        let m = load_model_quantized(file)
-        print "[diag] model loaded (vocab={m.config.vocab_size} d_model={m.config.d_model} n_layer={m.config.n_layer})"
-        let ctx = ServerCtx(file, load_tokenizer(file), m, name, ctx_size, max_tokens, params)
-        serve(ctx, port)
-    elif chat_mode:
+    if chat_mode:
         let params = SamplingParams(temperature, top_k, top_p, seed, repeat_penalty, repeat_last_n)
         run_chat(file, system_msg, max_tokens, kv_cache, quantized, params)
     elif prompt != "":

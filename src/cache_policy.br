@@ -1,0 +1,105 @@
+# boring-llm — what the on-disk prompt cache keeps, and when it is used.
+#
+# The decisions of `--prompt-cache` live here, apart from the file and GPU code
+# of prompt_cache.br and server.br, so the interpreter tests can exercise them
+# (test/test_cache_policy.br): this module touches neither files nor the GPU.
+
+use openai
+
+# One snapshot on disk, as the server tracks it: which file, how new (larger
+# `seq` = saved later), and the tokens it covers.
+pub struct DiskSnap:
+    int slot
+    int seq
+    [int] tokens
+
+# `save`: whether to write a snapshot; `slot`: the file to write it to; `seq`:
+# its sequence number; `drop`: other files to delete first, to stay inside the
+# size cap.
+pub struct SavePlan:
+    bool save
+    int slot
+    int seq
+    [int] drop
+
+# A snapshot only replaces the in-memory slot when it covers at least this many
+# more tokens of the prompt (reading and uploading it is not free).
+let int DISK_MIN_GAIN = 256
+# A snapshot is only written when it adds at least this many tokens to what the
+# disk already holds (so never for a cache shorter than that).
+let int SAVE_MIN_GAIN = 1024
+
+# Whether a request should start from snapshot `disk_best` (covering `disk_reuse`
+# usable positions of its prompt) rather than from the best in-memory slot
+# (covering `mem_reuse`).
+pub bool restore_from_disk(int mem_reuse, int disk_best, int disk_reuse):
+    disk_best >= 0 and disk_reuse >= mem_reuse + DISK_MIN_GAIN
+
+# Decides whether the cache a request left (`tokens`) should be written, and
+# where. `bytes_per_token` is a snapshot's size per token (token id plus K and V
+# rows of every layer), `max_bytes` the cap on all snapshots together (0 = no
+# cap). The snapshot replaces the one it extends, else takes a free file (of
+# `max_files`), else the oldest; when the cap would be exceeded the oldest of
+# the others are dropped, and a snapshot that alone exceeds it is not written.
+pub SavePlan plan_save([DiskSnap] disk, [int] tokens, int max_files, int bytes_per_token, int max_bytes):
+    let none = SavePlan(false, -1, 0, [])
+    let n = tokens.length
+    mut [[int]] disk_tokens = []
+    for d in disk:
+        disk_tokens.push(d.tokens)
+    let (best, common) = best_prefix_slot(disk_tokens, tokens)
+    if n - common < SAVE_MIN_GAIN:
+        return none
+    let need = n * bytes_per_token
+    if max_bytes > 0 and need > max_bytes:
+        return none
+    var int target = -1
+    if best >= 0 and common == disk[best].tokens.length:
+        target = disk[best].slot
+    else:
+        var int f = 0
+        while f < max_files and target < 0:
+            var bool taken = false
+            for d in disk:
+                if d.slot == f:
+                    taken = true
+            if not taken:
+                target = f
+            f += 1
+        if target < 0:
+            var int oldest = 0
+            var int k = 1
+            while k < disk.length:
+                if disk[k].seq < disk[oldest].seq:
+                    oldest = k
+                k += 1
+            target = disk[oldest].slot
+    var int seq = 1
+    mut [DiskSnap] others = []
+    for d in disk:
+        if d.seq >= seq:
+            seq = d.seq + 1
+        if d.slot != target:
+            others.push(d)
+    mut [int] drop = []
+    if max_bytes > 0:
+        var int total = need
+        for d in others:
+            total = total + d.tokens.length * bytes_per_token
+        while total > max_bytes and others.length > 0:
+            var int old = 0
+            var int j = 1
+            while j < others.length:
+                if others[j].seq < others[old].seq:
+                    old = j
+                j += 1
+            drop.push(others[old].slot)
+            total = total - others[old].tokens.length * bytes_per_token
+            mut [DiskSnap] rest = []
+            var int m = 0
+            while m < others.length:
+                if m != old:
+                    rest.push(others[m])
+                m += 1
+            others = rest
+    SavePlan(true, target, seq, drop)

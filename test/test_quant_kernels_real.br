@@ -15,6 +15,13 @@
 # actually caught it — kept as a permanent regression test for exactly
 # that class of bug.
 #
+# The tensor schedules also run here with several rows (prefill, m > 1, a row
+# count that is not a multiple of any tile) and with a bias: the single-row
+# check alone missed a native Metal prefill bug that returned wrong values for
+# every odd output column of Q6_K (210-byte blocks, misaligned wide loads).
+# Q4_K_M-file tensors are the only real Q6_K ones, so that file is the one to
+# run. Any subset of the three files may be given.
+#
 # Build + run:
 #   boring build --target metal test/test_quant_kernels_real.br
 #   cd test/test_quant_kernels_real_metal && cargo build --release
@@ -73,6 +80,38 @@ def check_tensor(GgufFile file, string tensor_name, int expected_type) throws:
         assert_close(tensor_out[j], cpu_out[j], "{tensor_name} tensor[{j}]")
         j += 1
     print "{tensor_name} ({ggml_type_name(expected_type)}, d_in={d_in} d_out={d_out}): OK, specialized and tensor both match {d_out}/{d_out} values"
+    if n <= 8000000:
+        check_prefill(tensor_name, expected_type, w_bytes, cpu_w, d_in, d_out)
+
+# Several rows at once (the batched prefill path, m > 1), without and with a
+# bias, against the CPU reference. 70 rows: not a multiple of any tile size.
+def check_prefill(string tensor_name, int expected_type, [uint8] w_bytes, [float32] cpu_w, int d_in, int d_out) throws:
+    let m = 70
+    mut [float32] x = [0.0 for i in 0..<(m * d_in)]
+    var int i = 0
+    while i < m * d_in:
+        x[i] = (((i * 7919) % 10007) as float32) * (0.0002 as float32) - (1.0 as float32)
+        i += 1
+    mut [float32] bias = [0.0 for i in 0..<d_out]
+    var int b = 0
+    while b < d_out:
+        bias[b] = (((b * 131) % 97) as float32) * (0.01 as float32) + (1.0 as float32)
+        b += 1
+    let zero_bias = [0.0 for i in 0..<d_out]
+
+    let cpu_plain = linear_bias(x, cpu_w, zero_bias, m, d_in, d_out)
+    let cpu_biased = linear_bias(x, cpu_w, bias, m, d_in, d_out)
+    let plain_raw = tensor_linear_nobias_gpu(x, w_bytes, expected_type, m, d_in, d_out)
+    let plain = passthrough(plain_raw)
+    let biased_raw = tensor_linear_gpu(x, w_bytes, expected_type, bias, m, d_in, d_out)
+    let biased = passthrough(biased_raw)
+
+    var int j = 0
+    while j < m * d_out:
+        assert_close(plain[j], cpu_plain[j], "{tensor_name} prefill m={m} no bias [row {j / d_out}, column {j % d_out}]")
+        assert_close(biased[j], cpu_biased[j], "{tensor_name} prefill m={m} bias [row {j / d_out}, column {j % d_out}]")
+        j += 1
+    print "{tensor_name} ({ggml_type_name(expected_type)}): prefill m={m} OK, with and without bias, {m * d_out}/{m * d_out} values"
 
 def check_q4_k_m_file(string path) throws:
     let [uint8] bytes = fs.readBytes(path)
@@ -104,9 +143,11 @@ def check_q4_0_file(string path) throws:
 
 def main() throws:
     let [string] argv = args()
-    guard argv.length > 3 else throw "usage: test_quant_kernels_real <q4_k_m.gguf> <q2_preset.gguf> <q4_0.gguf>"
+    guard argv.length > 1 else throw "usage: test_quant_kernels_real <q4_k_m.gguf> [<q2_preset.gguf> [<q4_0.gguf>]]"
     check_q4_k_m_file(argv[1])
-    check_q2_preset_file(argv[2])
-    check_q4_0_file(argv[3])
+    if argv.length > 2:
+        check_q2_preset_file(argv[2])
+    if argv.length > 3:
+        check_q4_0_file(argv[3])
 
     print "test_quant_kernels_real: all assertions passed"

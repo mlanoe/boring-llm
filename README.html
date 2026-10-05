@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>boring-llm — a local LLM inference engine in Boring</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 16px; line-height: 1.7; color: #1a1a2e;
+  background: #f8f9fa;
+}
+.sidebar {
+  position: fixed; top: 0; left: 0; width: 270px; height: 100vh;
+  background: #1a1a2e; color: #c9d1d9; overflow-y: auto;
+  padding: 0 0 2rem 0; z-index: 100;
+}
+.sidebar-header {
+  background: #0f3460; padding: 1.2rem 1.5rem; margin-bottom: 0.5rem;
+}
+.sidebar-header h2 { font-size: 1rem; color: #e94560; font-weight: 700; letter-spacing: 0.03em; }
+.sidebar-header p  { font-size: 0.75rem; color: #8b949e; margin-top: 0.2rem; }
+.sidebar nav a {
+  display: block; padding: 0.3rem 1.5rem; color: #8b949e;
+  text-decoration: none; font-size: 0.875rem; transition: all 0.15s;
+}
+.sidebar nav a:hover { color: #e6edf3; background: rgba(255,255,255,0.05); }
+.sidebar nav a.h2 { font-weight: 600; color: #c9d1d9; margin-top: 0.4rem; }
+.sidebar nav a.h3 { padding-left: 2.5rem; font-size: 0.825rem; }
+.main { margin-left: 270px; padding: 3rem 4rem; max-width: 980px; }
+h1 { font-size: 2.2rem; font-weight: 800; color: #0f3460; margin: 2rem 0 1rem;
+     border-bottom: 3px solid #e94560; padding-bottom: 0.5rem; }
+h2 { font-size: 1.6rem; font-weight: 700; color: #16213e; margin: 2.5rem 0 1rem;
+     border-bottom: 1px solid #dee2e6; padding-bottom: 0.4rem; }
+h3 { font-size: 1.15rem; font-weight: 600; color: #0f3460; margin: 1.8rem 0 0.6rem; }
+h4 { font-size: 1rem;    font-weight: 600; color: #495057; margin: 1.2rem 0 0.4rem; }
+p  { margin-bottom: 1rem; }
+a  { color: #e94560; text-decoration: none; }
+a:hover { text-decoration: underline; }
+hr { border: none; border-top: 1px solid #dee2e6; margin: 2rem 0; }
+strong { color: #16213e; }
+code {
+  font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+  font-size: 0.875em; background: #e8ecf0; color: #c7254e;
+  padding: 0.15em 0.4em; border-radius: 4px;
+}
+.code-block { position: relative; margin: 1.2rem 0; }
+.code-block pre {
+  background: #1e2030; border-radius: 8px; padding: 1.2rem 1.5rem;
+  overflow-x: auto; line-height: 1.6;
+  border-left: 3px solid transparent;
+}
+.code-block[data-lang="boring"] pre {
+  background: #1e2030;
+  border-left: 3px solid #89b4fa;
+}
+.code-block[data-lang="rust"] pre {
+  background: #d4d8e0;
+  border-left: 3px solid #b7410e;
+}
+.code-block pre code {
+  font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
+  font-size: 0.875rem; background: none; color: #cdd6f4; padding: 0;
+  border-radius: 0;
+}
+.code-block[data-lang="rust"] pre code { color: #2d2d3a; }
+.lang-label {
+  position: absolute; top: 0; right: 0;
+  background: #313244; color: #7f849c; font-size: 0.7rem;
+  padding: 0.2rem 0.6rem; border-radius: 0 8px 0 6px;
+  font-family: "JetBrains Mono", monospace; text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.code-block[data-lang="boring"] .lang-label { background: #1e3a5f; color: #89b4fa; }
+.code-block[data-lang="rust"]   .lang-label { background: #e8e0f0; color: #7c3aed; }
+/* Rust light-theme syntax overrides */
+.code-block[data-lang="rust"] .kw { color: #7c3aed; }
+.code-block[data-lang="rust"] .kt { color: #0e7490; }
+.code-block[data-lang="rust"] .fn { color: #1d4ed8; }
+.code-block[data-lang="rust"] .fm { color: #c2410c; }
+.code-block[data-lang="rust"] .s  { color: #16a34a; }
+.code-block[data-lang="rust"] .si { color: #92400e; }
+.code-block[data-lang="rust"] .nb { color: #c2410c; }
+.code-block[data-lang="rust"] .co { color: #9ca3af; }
+.code-block[data-lang="rust"] .at { color: #dc2626; }
+.code-block[data-lang="rust"] .lf { color: #9d174d; }
+/* Syntax colors (Catppuccin-inspired) */
+.kw { color: #cba6f7; font-weight: 600; }  /* keywords */
+.kt { color: #89dceb; }                     /* types */
+.fn { color: #89b4fa; }                     /* function names */
+.fm { color: #fab387; }                     /* macros */
+.s  { color: #a6e3a1; }                     /* strings */
+.si { color: #f9e2af; font-weight: 600; }   /* string interpolation */
+.nb { color: #fab387; }                     /* numbers */
+.co { color: #6c7086; font-style: italic; } /* comments */
+.at { color: #f38ba8; }                     /* attributes */
+.lf { color: #f2cdcd; }                     /* lifetime/qualifier */
+/* Tables */
+table { border-collapse: collapse; width: 100%; margin: 1.2rem 0; font-size: 0.9rem; }
+th { background: #0f3460; color: #fff; padding: 0.6rem 1rem; text-align: left; }
+td { padding: 0.5rem 1rem; border-bottom: 1px solid #dee2e6; }
+tr:nth-child(even) td { background: #f1f3f5; }
+tr:hover td { background: #e8f4fd; }
+/* Blockquote (preview banner) */
+blockquote {
+  background: #fff3cd; border-left: 4px solid #e94560;
+  padding: 1rem 1.5rem; border-radius: 0 8px 8px 0;
+  margin: 1.5rem 0; color: #664d03; font-size: 0.95rem;
+}
+ul, ol { padding-left: 1.5rem; margin-bottom: 1rem; }
+li { margin-bottom: 0.3rem; }
+@media (max-width: 900px) {
+  .sidebar { display: none; }
+  .main { margin-left: 0; padding: 1.5rem; }
+}
+</style>
+</head>
+<body>
+<aside class="sidebar">
+  <div class="sidebar-header">
+    <h2>boring-llm</h2>
+    <p>Overview</p>
+  </div>
+  <nav id="toc"></nav>
+</aside>
+<main class="main" id="content">
+<h1 id="boring-llm">boring-llm</h1>
+<p>A local LLM inference engine written entirely in <a href="https://github.com/mlanoe/boring">Boring</a>: it loads quantized <a href="https://github.com/ggml-org/ggml/blob/master/docs/gguf.md">GGUF</a> model files (the llama.cpp format, no conversion step), runs them on the GPU (Metal or wgpu), and serves them through an <strong>OpenAI-compatible HTTP API</strong> that coding agents such as <a href="https://opencode.ai">OpenCode</a> can use.</p>
+<div class="code-block" data-lang="sh"><span class="lang-label">sh</span><pre><code>main --gguf qwen2.5-3b-instruct-q4_k_m.gguf --serve --port 8080 --ctx-size 16384 --prompt-cache ~/.cache/boring-llm</code></pre></div>
+<p>Full documentation: <a href="docs/book.html">the book</a> (<a href="docs/book.html">HTML</a>): command line, HTTP API, caches, architecture, verification and a development guide. This README is the short version.</p>
+<h2 id="what-it-does">What it does</h2>
+<ul><li><strong>Runs real models.</strong> Qwen2.5 (0.5B, 3B, 7B tested), Qwen3 (4B tested) and Llama-architecture models (TinyLlama 1.1B tested), in F32, F16, Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q6_K and IQ4_NL, including the mixed-format files llama.cpp produces (<code>*-Q4_K_M.gguf</code>). Weights stay quantized on the GPU; there is no dequantized copy.</li><li><strong>Needs little memory.</strong> Tensors are read from disk one at a time, then live on the GPU: a 3B Q4_K_M server starts in ~5 s and holds ~3.1 GB.</li><li><strong>Serves the OpenAI API.</strong> <code>GET /v1/models</code> and <code>POST /v1/chat/completions</code>, JSON or streamed (SSE, token by token, with <code>stream_options.include_usage</code>), <code>stop</code> strings, <code>max_tokens</code>, sampling parameters, <code>top_k</code>, <code>repeat_penalty</code>, <code>frequency_penalty</code> and <code>presence_penalty</code>, and <strong>tool calling</strong> through the model&#x27;s own chat template (Hermes-style <code>&lt;tool_call&gt;</code> output is parsed back into <code>tool_calls</code>; <code>tool_choice: &quot;none&quot;</code> leaves the tools out). Reasoning models (Qwen3) have their <code>&lt;think&gt;</code> text returned as <code>reasoning_content</code>, streamed too, and <code>chat_template_kwargs</code> (e.g. <code>{&quot;enable_thinking&quot;: false}</code>) reaches the chat template.</li><li><strong>Is fast enough for agents.</strong> An agent resends its whole history every turn, so the server keeps the KV caches of its recent requests in memory (<code>--cache-slots</code>) and, with <code>--prompt-cache DIR</code>, on disk across restarts: only the tokens after the shared prefix are processed.</li><li><strong>Has two GPU backends</strong>, Metal and wgpu (Vulkan, DirectX 12, Metal), producing the same output. CUDA and ROCm share the source but have never been run (no hardware).</li><li><strong>Is checked against llama.cpp.</strong> Tokenization and chat-template rendering are compared token for token with <code>llama-cpp-python</code>/<code>jinja2</code>, and greedy generation matches llama.cpp&#x27;s on real weights (identical text on Qwen2.5 0.5B Q8_0 and Q4_K_M and on 7B Q4_K_M for the prompts checked; the 3B was checked for consistency across backends and compilers, not against llama.cpp).</li></ul>
+<h2 id="quick-start">Quick start</h2>
+<p>Requirements: the <a href="https://rustup.rs/">Rust toolchain</a>, <a href="https://github.com/mlanoe/boring">Boring</a> (<code>cargo install --git https://github.com/mlanoe/boring</code>), and a GPU supported by Metal or wgpu. Use a <code>boring</code> built from <code>51d7260e</code> or later. Earlier builds cannot select launch batching only during decode (before <code>51d7260e</code>), leave about 1.8 ms/token on the table for the large Q8_0 decode projections (before <code>a08df631</code>), decode Q8_0 weights ~2x slower on Metal (before <code>1faf71e2</code>), do not compile the disk prompt cache or the native Metal K-quant kernels on macOS 27 (before <code>a057dd8c</code>), decode Q4_K weights ~2x slower (before <code>6fb92947</code>), prefill ~3x slower on Metal, stage the prefill tiles in half precision (<code>6acc7d44</code> to <code>316c7695</code>: logits of the 7B drift) or, between <code>316c7695</code> and <code>ff79f091</code>, return wrong values for the biased Q8_0 projections of small Qwen models, or, between <code>8bdac11d</code> and <code>d38813c8</code>, return wrong values for every odd output column of Q6_K matrices (Q4_K_M models then produce garbage), or, before <code>46c2473f</code>, fail to transpile a <code>.split()</code> used as a call argument.</p>
+<div class="code-block" data-lang="sh"><span class="lang-label">sh</span><pre><code><span class="co"># 1. build (Metal; use --target wgpu on other platforms)</span>
+boring build --target metal src/main.br
+(cd src/main_metal &amp;&amp; cargo build --release)
+BIN=src/main_metal/target/release/main
+
+<span class="co"># 2. get a model</span>
+huggingface-cli download Qwen/Qwen2.5-3B-Instruct-GGUF qwen2.5-3b-instruct-q4_k_m.gguf --local-dir weights
+<span class="co"># (or: tools/fetch_models.py ensure qwen2.5-3b-instruct-q4_k_m   -- the models the tests and tools use,</span>
+<span class="co">#  downloaded on demand into weights/, resumable and checked against Hugging Face&#x27;s SHA-256)</span>
+
+<span class="co"># 3. chat from the terminal</span>
+$BIN --gguf weights/qwen2.5-3b-instruct-q4_k_m.gguf --quantized --kv-cache --chat
+
+<span class="co"># or serve it</span>
+$BIN --gguf weights/qwen2.5-3b-instruct-q4_k_m.gguf --serve --port 8080 --ctx-size 16384
+curl -s localhost:8080/v1/chat/completions -H &#x27;Content-Type: application/json&#x27; \
+    -d &#x27;{&quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;What is the capital of France?&quot;}],&quot;max_tokens&quot;:32}&#x27;</code></pre></div>
+<p>A real model always needs the compiled build: the interpreter (<code>boring run</code>) cannot hold a file this size and a plain <code>boring build</code> cannot emit GPU kernels. Without a build, <code>boring run src/main.br -- --gguf test/fixtures/tiny.gguf --dump-metadata</code> exercises the parser on a tiny synthetic file.</p>
+<h2 id="using-it-with-opencode">Using it with OpenCode</h2>
+<p>Point an OpenAI-compatible provider at the server (<code>opencode.json</code>). Start the server with <code>--ctx-size 16384</code> at least: OpenCode&#x27;s system prompt plus its ten tool definitions is ~7.6k tokens.</p>
+<div class="code-block" data-lang="json"><span class="lang-label">json</span><pre><code>{
+  &quot;$schema&quot;: &quot;https://opencode.ai/config.json&quot;,
+  &quot;provider&quot;: {
+    &quot;boring-llm&quot;: {
+      &quot;npm&quot;: &quot;@ai-sdk/openai-compatible&quot;,
+      &quot;name&quot;: &quot;boring-llm (local)&quot;,
+      &quot;options&quot;: { &quot;baseURL&quot;: &quot;http://127.0.0.1:8080/v1&quot; },
+      &quot;models&quot;: {
+        &quot;Qwen2.5 3B Instruct&quot;: { &quot;name&quot;: &quot;Qwen2.5 3B Instruct&quot;, &quot;tool_call&quot;: true,
+                                  &quot;limit&quot;: { &quot;context&quot;: 16384, &quot;output&quot;: 1024 } }
+      }
+    }
+  }
+}</code></pre></div>
+<p>The model id is whatever <code>GET /v1/models</code> returns (the GGUF&#x27;s <code>general.name</code>, or <code>--model-name</code>). <code>tools/opencode_trial.sh &lt;main-binary&gt; &lt;model.gguf&gt; &quot;&lt;prompt&gt;&quot;</code> runs a real OpenCode against a fresh server with its own configuration, data and cache in a temporary directory (yours is never touched), a throwaway project and OpenCode&#x27;s default permissions.</p>
+<p>What to expect, from the trials run so far (OpenCode 1.18.32, five small tasks in a throwaway project):</p>
+<table><thead><tr><th>Model</th><th>Result</th></tr></thead><tbody><tr><td>Qwen2.5-0.5B Q8_0</td><td>reads a file and explains it; other tasks fail (invented paths, loops calling the <code>task</code> tool)</td></tr><tr><td>Qwen2.5-3B Instruct Q4_K_M</td><td>read a file, read the README, list the directory and create a file: correct; an edit went to a wrong new file</td></tr><tr><td>Qwen2.5-7B Instruct Q4_K_M</td><td>the same four correct; the edit changed the function signature but not its body, and was reported as finished</td></tr></tbody></table>
+<p>The server never failed on the plumbing. The limit is the model: small models are not reliable agents.</p>
+<p>The first request of a session is the slow one, because the ~7.5k-token prompt has to be processed once (about 2 minutes on a 7B model: 115 s of prefill measured through OpenCode on a 16 GB Apple-silicon machine). OpenCode gives up on a response that is silent for 5 minutes, so the server opens the stream immediately and sends an SSE comment after every 512 prompt tokens. Later turns reuse ~99% of the prompt from the cache (a few seconds), and with <code>--prompt-cache</code> the first request after a restart does too, as long as the project directory is the same (OpenCode writes its path into the system prompt).</p>
+<h2 id="server-options">Server options</h2>
+<table><thead><tr><th>Option</th><th>Default</th><th></th></tr></thead><tbody><tr><td><code>--gguf PATH</code></td><td></td><td>model file (required)</td></tr><tr><td><code>--serve</code>, <code>--port N</code></td><td><code>8080</code></td><td>HTTP server on <code>127.0.0.1</code></td></tr><tr><td><code>--ctx-size N</code></td><td><code>4096</code></td><td>prompt + reply tokens a request may use; a longer prompt gets <code>context_length_exceeded</code></td></tr><tr><td><code>--max-tokens N</code></td><td><code>40</code></td><td>reply length when a request sets none</td></tr><tr><td><code>--model-name NAME</code></td><td>GGUF <code>general.name</code></td><td>id returned by <code>/v1/models</code></td></tr><tr><td><code>--cache-slots N</code></td><td><code>4</code></td><td>KV caches kept in memory (LRU)</td></tr><tr><td><code>--prompt-cache DIR</code></td><td>off</td><td>also keep KV caches on disk, reused after a restart</td></tr><tr><td><code>--prompt-cache-files N</code></td><td><code>2</code></td><td>snapshots kept on disk</td></tr><tr><td><code>--prompt-cache-max-mb N</code></td><td><code>4096</code></td><td>cap on all snapshots together (<code>0</code> = none)</td></tr><tr><td><code>--kquant-prefill handwritten</code></td><td><code>tensor</code></td><td>wgpu/CUDA/ROCm: keep the hand-written Q4_K/Q6_K prefill kernels (faster there today)</td></tr><tr><td><code>--temperature</code>, <code>--top-k</code>, <code>--top-p</code>, <code>--seed</code>, <code>--repeat-penalty</code>, <code>--repeat-last-n</code></td><td>greedy</td><td>sampling defaults; a request can override temperature, top_p, top_k, seed and repeat_penalty, and add frequency_penalty and presence_penalty</td></tr></tbody></table>
+<p>One request is served at a time (one GPU). Every response is <code>Connection: close</code>.</p>
+<p><strong>Prompt cache on disk.</strong> After a request, the cache it left is written to <code>DIR/prompt-cache-&lt;n&gt;.bin</code> when it adds at least 1024 tokens to what the disk already holds; the write happens after the response has been sent. A later request whose prompt starts like a snapshot reads those positions back (<code>N reused from disk</code> in the log) instead of recomputing them. A snapshot replaces the one it extends, else takes a free file, else the oldest; the oldest are also dropped to stay under <code>--prompt-cache-max-mb</code>. A snapshot is used only by the exact model that wrote it, a truncated or half-written file is ignored, and floats are stored as the GPU holds them, so a restored cache gives the same answers as a cold one. The files contain the prompts&#x27; token ids and activations: keep the directory private. On the 0.5B model a 6.4k-token prompt takes ~13 s cold and 0.5-1.5 s restored. On the 7B model, OpenCode&#x27;s first request (7.6k tokens) spent 321 s in prefill cold and 1.9 s restored from an ~890 MB snapshot (7,636 tokens read back), after a server restart.</p>
+<h2 id="performance">Performance</h2>
+<p>Measured on one 16 GB Apple-silicon machine (Apple M3, Metal). The 0.5B rows use <code>boring</code> 8ed96591; the other rows are the earlier clean run with 46c2473f. Timings on it still move by tens of percent from one repetition to the next (min-max is in <code>docs/development-log.md</code>), so read the ratios as indications, not as constants.</p>
+<p>Against llama.cpp (llama-cpp-python, Metal, same GGUF, same machine, 3 alternating runs, medians, <code>tools/bench_vs_llamacpp.py</code>), tokens per second:</p>
+<table><thead><tr><th>Model</th><th>Prompt</th><th>boring-llm prefill</th><th>llama.cpp prefill</th><th></th><th>boring-llm decode</th><th>llama.cpp decode</th><th></th></tr></thead><tbody><tr><td>Qwen2.5-7B Q4_K_M</td><td>~570</td><td>114</td><td>125</td><td>0.91x</td><td>7.7</td><td>13.0</td><td>0.59x</td></tr><tr><td>Qwen2.5-7B Q4_K_M</td><td>~4150</td><td>87</td><td>122</td><td>0.71x</td><td>6.1</td><td>10.0</td><td>0.61x</td></tr><tr><td>Qwen3-4B Q4_K_M</td><td>~550</td><td>181</td><td>277</td><td>0.66x</td><td>10.8</td><td>28.3</td><td>0.38x</td></tr><tr><td>Qwen3-4B Q4_K_M</td><td>~4130</td><td>130</td><td>221</td><td>0.59x</td><td>9.0</td><td>15.6</td><td>0.58x</td></tr><tr><td>Qwen2.5-3B Q4_K_M</td><td>~570</td><td>222</td><td>314</td><td>0.71x</td><td>11.7</td><td>28.8</td><td>0.41x</td></tr><tr><td>Qwen2.5-3B Q4_K_M</td><td>~4150</td><td>158</td><td>271</td><td>0.58x</td><td>10.3</td><td>20.9</td><td>0.49x</td></tr><tr><td>Qwen2.5-0.5B Q8_0</td><td>~630</td><td>1,874</td><td>2,938</td><td>0.64x</td><td>52.2</td><td>124.3</td><td>0.42x</td></tr><tr><td>Qwen2.5-0.5B Q8_0</td><td>~4200</td><td>1,149</td><td>2,169</td><td>0.53x</td><td>44.0</td><td>82.5</td><td>0.53x</td></tr></tbody></table>
+<p>The server needs 3.1 GB (peak 3.3 GB) for the 3B model and 6.4 GB (peak 6.8 GB) for the 7B, and is ready in about 4 s on the 7B (disk-streaming loader). Through OpenCode, the 7B model&#x27;s first request (7,539 tokens, ten tools) spent 115 s in prefill cold and 2.5 s on the follow-up that reused 7,559 of 7,638 tokens; a cold start used to take 321-453 s.</p>
+<p>Where the gap to llama.cpp is: prefill is close on short prompts on the 7B and remains more variable at long context; a newer run no longer reproduced the earlier 0.91x-to-0.71x fall, and making llama.cpp&#x27;s KV cache float32 did not explain the remaining gap. Decode is about 0.6x on the 7B. On the 0.5B, <code>boring</code> 1faf71e2&#x27;s four-row Q8_0 Metal schedule nearly doubled short-context decode and distributing RMSNorm rows across SIMD groups raised it by another 44% (21.2 to 14.7 ms per token in the CLI). <code>boring</code> a08df631 then fully unrolls the four private rows for large Q8_0 projections: gate/up rise from 47.2 to 61.3 GB/s, down from 49.7 to 66.0 GB/s and the tied head from 59.8 to 71.3 GB/s, predicting about 1.8 ms/token saved. Launches are now batched by eight automatically during KV-cache decode, without applying the policy to prefill; an adjacent 200-token run fell from 5.07 to 4.49 seconds including model loading. Fusing the small attention projections is the clearest remaining short-context target. The detail is in <code>docs/development-log.md</code>. Earlier gains came from <code>boring</code>&#x27;s Q4_K single-token decode, the fragment-blocked quantized prefill schedule and float32 staging, plus this project&#x27;s fused attention and two-buffer KV cache.</p>
+<p>On wgpu the portable K-quant prefill is still ~3x slower than the hand-written kernels (hence <code>--kquant-prefill handwritten</code> there).</p>
+<h2 id="verifying-it">Verifying it</h2>
+<div class="code-block" data-lang="sh"><span class="lang-label">sh</span><pre><code>for t in test/test_*.br; do case $t in *_real.br) ;; *) boring run $t;; esac; done   # interpreter tests, no model needed
+tools/smoke_server.py http://127.0.0.1:8080                                         # wire-format checks against a running server</code></pre></div>
+<p>The <code>test/*_real.br</code> programs need a compiled build and real weights (each lists the files it expects). The models are not in the repository (<code>weights/</code> is git-ignored): <code>tools/fetch_models.py list</code> shows what the tests and tools use and what is present, <code>ensure NAME</code> downloads one, and <code>tools/accuracy_vs_llamacpp.py --model NAME --fetch</code> fetches a missing one first. <code>tools/</code> holds the oracles that compare against llama.cpp: <code>accuracy_vs_llamacpp.py</code> (the whole forward pass, position by position: run it on a Q8_0 and a Q4_K_M model after any change to the GPU kernels or to <code>boring</code>), <code>decode_vs_llamacpp.py</code> (generation through the KV-cache decode path, which the logits check never runs: run it with the accuracy check), <code>reference_logits.py</code> (logits), <code>oracle_encode.py</code> (tokenization), <code>oracle_render_request.py</code> (chat-template rendering), <code>inspect_gguf.py</code> (metadata).</p>
+<h2 id="repository-layout">Repository layout</h2>
+<div class="code-block"><pre><code>src/
+  gguf.br, gguf_file.br   GGUF parser; reads tensors from disk on demand
+  io.br, json.br, jinja.br  binary readers, JSON, the Jinja2 subset chat templates use
+  tokenizer.br            byte-level BPE and SentencePiece, from the GGUF&#x27;s own metadata
+  quant.br                CPU reference dequantization for every supported format
+  model.br                config and weight loading, forward pass, KV cache, prefill/decode
+  math.br, math_gpu.br    CPU reference math; GPU kernels (attention, norms, RoPE, copies, quantized GEMM)
+  sampling.br             greedy, temperature, top-k, top-p, repeat penalty
+  openai.br               message normalization, tool-call parsing, JSON/SSE bodies (pure)
+  cache_policy.br         what the disk prompt cache keeps and when it is used (pure)
+  prompt_cache.br         reading and writing the disk snapshots
+  server.br               the HTTP server
+  main.br                 command line
+tools/                    oracles, accuracy and speed comparisons with llama.cpp, model downloader, smoke test, OpenCode trial script, Metal prefill lab
+test/                     interpreter tests (test_*.br) and compiled real-model tests (*_real.br)
+docs/book.md              the book: using, operating, understanding and extending the engine
+docs/build.py             generates the HTML versions of the documentation (python3 docs/build.py)
+docs/development-log.md   how it was built, with the measurements and the bugs found on the way
+boring.toml               kernel scheduling policy (native Metal paths for Q8_0, Q4_K, Q6_K)</code></pre></div>
+<h2 id="limits">Limits</h2>
+<ul><li>Requests are served one at a time; there is no batching.</li><li>Context is limited by <code>--ctx-size</code> and by memory (the KV cache is float32: ~115 KB per token for the 7B model).</li><li>Only Llama-style GGUF layouts are supported (Qwen2 and Llama are the ones tested); no MoE, no vision.</li><li>Chat templates use a Jinja2 subset (enough for Qwen2.5 and TinyLlama); an unsupported construct is reported, not ignored.</li><li>Snapshots on disk and the disk-streaming loader use Unix file APIs; GGUF files split in several parts are not supported.</li><li>CUDA and ROCm have not been run.</li></ul>
+<h2 id="boring">Boring</h2>
+<p>Boring is a language that transpiles to Rust, with Python-like indentation and Swift-like optionals. This project is also its real-world test: every bug found in the compiler while building it was reported and fixed upstream (see <code>docs/development-log.md</code>). See the <a href="https://github.com/mlanoe/boring">Boring repository</a> for the language reference.</p>
+<h2 id="contributing">Contributing</h2>
+<p>Contributions are welcome. Before your first Pull Request can be merged, sign the <a href="CLA.md">Contributor License Agreement</a> by adding your name to <a href="CLA-signatories.md">`CLA-signatories.md`</a> as part of your PR.</p>
+<h2 id="license">License</h2>
+<p>Copyright (C) 2026 Mickaël LANOË</p>
+<p>This program is free software: you can redistribute it and/or modify it under the terms of the <a href="LICENSE">GNU General Public License v3.0</a> as published by the Free Software Foundation. It is distributed in the hope that it will be useful, but <strong>without any warranty</strong>. See the LICENSE file for the full terms.</p>
+</main>
+<script>
+// Build TOC from headings
+const toc = document.getElementById('toc');
+document.querySelectorAll('h2,h3').forEach(h => {
+  const a = document.createElement('a');
+  a.href = '#' + h.id;
+  a.textContent = h.textContent;
+  a.className = h.tagName.toLowerCase();
+  toc.appendChild(a);
+});
+// Highlight active section on scroll
+const headings = [...document.querySelectorAll('h2,h3')];
+const links = [...toc.querySelectorAll('a')];
+window.addEventListener('scroll', () => {
+  let current = headings[0];
+  headings.forEach(h => { if (window.scrollY >= h.offsetTop - 80) current = h; });
+  links.forEach(a => a.style.color = a.getAttribute('href') === '#' + current?.id ? '#e94560' : '');
+});
+</script>
+</body>
+</html>

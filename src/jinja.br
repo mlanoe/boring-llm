@@ -2,14 +2,21 @@
 # GGUF chat templates actually use (verified against two real ones: Qwen2.5's
 # own tool-calling-capable template and TinyLlama/Llama's simpler one — see
 # test/test_jinja_real.br). Not a general Jinja implementation: no macros,
-# no includes, no arithmetic beyond `+`/`-`, no membership (`in`) tests
-# inside expressions, no dict/list literals, no `{% raise %}`. What IS
-# supported, because both real templates above need it: `{% if/elif/else/
-# endif %}`, `{% for x in y %}...{% endfor %}` with `loop.first/last/index/
-# index0`, `{% set x = expr %}`, `{{ expr }}` output, `and`/`or`/`not`,
-# `==`/`!=`, string concatenation via `+`, attribute access (`msg.role` and
-# `msg['role']` are the same operation), `is defined`, and the `trim`/
-# `tojson` filters. `{%-`/`-%}`/`{{-`/`-}}` whitespace-trim markers are
+# no includes, no dict/list literals, no `{% raise %}` statement. What IS
+# supported, because the real templates above need it (Qwen3's added most of
+# the second half of this list): `{% if/elif/else/endif %}`,
+# `{% for x in y %}...{% endfor %}` with `loop.first/last/index/index0`,
+# `{% set x = expr %}` and `{% set ns.attr = expr %}`, `{{ expr }}` output,
+# `and`/`or`/`not`, `==`/`!=`/`<`/`>`/`<=`/`>=`, `in`/`not in`, `+`/`-` (ints
+# add, anything else concatenates), unary minus, attribute access (`msg.role`
+# and `msg['role']` are the same operation), list indexing (negative indices
+# count from the end), `namespace(a=1)`, `range(...)`, `raise_exception(msg)`,
+# the string methods `split`, `strip`, `lstrip`, `rstrip`, `startswith`,
+# `endswith`, `replace`, `lower`, the tests `is [not] defined/undefined/none/
+# string/true/false/mapping/number/sequence`, and the `trim`/`tojson`/`length`
+# filters. A `for` body has its own scope (a `set` inside it does not leak
+# out), except that a namespace modified inside the loop keeps the change,
+# which is what namespaces are for. `{%-`/`-%}`/`{{-`/`-}}` whitespace-trim markers are
 # fully handled (every real template found in the wild leans on them
 # heavily for readable source with no stray blank lines in the rendered
 # output).
@@ -172,7 +179,9 @@ pub enum JExpr:
     EBinOp(string op, JExpr left, JExpr right)
     ENot(JExpr e)
     EIsDefined(JExpr e)
+    ETest(JExpr e, string test)
     EFilter(JExpr base, string name)
+    ECall(JExpr callee, [JExpr] args, [string] kwnames, [JExpr] kwvals)
 
 JValue jv_get_attr(JValue base, string name):
     match base:
@@ -184,8 +193,9 @@ JValue jv_get_index(JValue base, JValue idx):
         JList(items):
             match idx:
                 JInt(n):
-                    if n >= 0 and n < items.length:
-                        items[n]
+                    let at = if n < 0: n + items.length else: n
+                    if at >= 0 and at < items.length:
+                        items[at]
                     else:
                         JValue.JUndefined
                 _: JValue.JUndefined
@@ -202,8 +212,152 @@ JValue apply_filter(string name, JValue v) throws:
             _: v
     elif name == "tojson":
         JValue.JStr(jv_to_json(v))
+    elif name == "length":
+        match v:
+            JStr(x): JValue.JInt(x.chars().length)
+            JList(items): JValue.JInt(items.length)
+            JDict(fields, keys): JValue.JInt(keys.length)
+            _: JValue.JInt(0)
     else:
         throw "jinja: unsupported filter '{name}'"
+
+bool jv_contains(JValue container, JValue item):
+    match container:
+        JStr(s):
+            match item:
+                JStr(x): s.contains(x)
+                _: false
+        JList(items):
+            var bool found = false
+            for it in items:
+                if jv_eq(it, item):
+                    found = true
+            found
+        JDict(fields, keys):
+            match item:
+                JStr(k): fields.contains(k)
+                _: false
+        _: false
+
+# `chars`: the set of characters to remove (Python's str.strip(chars)).
+string strip_chars(string s, string chars, bool left, bool right):
+    let cs = s.chars()
+    let set = chars.chars()
+    var int a = 0
+    var int b = cs.length
+    if left:
+        while a < b and str_in_list(cs[a], set):
+            a += 1
+    if right:
+        while b > a and str_in_list(cs[b - 1], set):
+            b -= 1
+    var string out = ""
+    var int i = a
+    while i < b:
+        out = "{out}{cs[i]}"
+        i += 1
+    out
+
+bool is_namespace(JValue v):
+    match v:
+        JDict(fields, keys): fields.contains("__namespace__")
+        _: false
+
+JValue jv_test(string name, JValue v) throws:
+    if name == "defined":
+        JValue.JBool(not jv_is_undefined(v))
+    elif name == "undefined":
+        JValue.JBool(jv_is_undefined(v))
+    elif name == "none":
+        # a JSON null is read as undefined here, so the two are not told apart
+        JValue.JBool(jv_is_undefined(v))
+    elif name == "string":
+        match v:
+            JStr(s): JValue.JBool(true)
+            _: JValue.JBool(false)
+    elif name == "false":
+        match v:
+            JBool(b): JValue.JBool(not b)
+            _: JValue.JBool(false)
+    elif name == "true":
+        match v:
+            JBool(b): JValue.JBool(b)
+            _: JValue.JBool(false)
+    elif name == "mapping":
+        match v:
+            JDict(fields, keys): JValue.JBool(true)
+            _: JValue.JBool(false)
+    elif name == "number" or name == "integer":
+        match v:
+            JInt(n): JValue.JBool(true)
+            JFloat(f): JValue.JBool(name == "number")
+            _: JValue.JBool(false)
+    elif name == "sequence" or name == "iterable":
+        match v:
+            JList(items): JValue.JBool(true)
+            JStr(s): JValue.JBool(true)
+            _: JValue.JBool(false)
+    else:
+        throw "jinja: unsupported test 'is {name}'"
+
+JValue call_method(JValue recv, string name, [JValue] args) throws:
+    match recv:
+        JStr(s):
+            let arg0 = if args.length > 0: jv_to_str(args[0]) else: ""
+            if name == "split":
+                guard args.length >= 1 and arg0 != "" else throw "jinja: split() needs a non-empty separator"
+                mut [JValue] parts = []
+                for piece in s.split(arg0):
+                    parts.push(JValue.JStr(piece))
+                JValue.JList(parts)
+            elif name == "strip" or name == "lstrip" or name == "rstrip":
+                let chars = if args.length > 0: arg0 else: " \n\t\r"
+                JValue.JStr(strip_chars(s, chars, name != "rstrip", name != "lstrip"))
+            elif name == "startswith":
+                JValue.JBool(s.startsWith(arg0))
+            elif name == "endswith":
+                JValue.JBool(s.endsWith(arg0))
+            elif name == "replace":
+                guard args.length >= 2 else throw "jinja: replace() needs two arguments"
+                JValue.JStr(s.replace(arg0, jv_to_str(args[1])))
+            elif name == "lower":
+                JValue.JStr(s.toLower())
+            else:
+                throw "jinja: unsupported string method '{name}'"
+        _: throw "jinja: unsupported method '{name}' on this value"
+
+JValue call_function(string name, [JValue] args, [string] kwnames, [JValue] kwvals) throws:
+    if name == "namespace":
+        mut {string=JValue} fields = {=}
+        var int i = 0
+        while i < kwnames.length:
+            fields[kwnames[i]] = kwvals[i]
+            i += 1
+        fields["__namespace__"] = JValue.JBool(true)
+        JValue.JDict(fields, kwnames)
+    elif name == "range":
+        mut [int] bounds = []
+        for a in args:
+            match a:
+                JInt(n): bounds.push(n)
+                _: throw "jinja: range() takes ints"
+        guard bounds.length >= 1 and bounds.length <= 3 else throw "jinja: range() takes 1 to 3 arguments"
+        let start = if bounds.length >= 2: bounds[0] else: 0
+        let stop = if bounds.length >= 2: bounds[1] else: bounds[0]
+        let step = if bounds.length == 3: bounds[2] else: 1
+        guard step != 0 else throw "jinja: range() step must not be zero"
+        mut [JValue] items = []
+        var int v = start
+        while (step > 0 and v < stop) or (step < 0 and v > stop):
+            items.push(JValue.JInt(v))
+            v += step
+            guard items.length <= 100000 else throw "jinja: range() too long"
+        JValue.JList(items)
+    elif name == "raise_exception":
+        let msg = if args.length > 0: jv_to_str(args[0]) else: ""
+        throw "jinja: template raised: {msg}"
+    else:
+        throw "jinja: unsupported function '{name}'"
 
 JValue eval_binop(string op, JValue l, JValue r) throws:
     if op == "+":
@@ -227,6 +381,25 @@ JValue eval_binop(string op, JValue l, JValue r) throws:
         JValue.JBool(jv_eq(l, r))
     elif op == "!=":
         JValue.JBool(not jv_eq(l, r))
+    elif op == "<" or op == ">" or op == "<=" or op == ">=":
+        match l:
+            JInt(a):
+                match r:
+                    JInt(b):
+                        if op == "<":
+                            JValue.JBool(a < b)
+                        elif op == ">":
+                            JValue.JBool(a > b)
+                        elif op == "<=":
+                            JValue.JBool(a <= b)
+                        else:
+                            JValue.JBool(a >= b)
+                    _: throw "jinja: '{op}' compares ints with ints"
+            _: throw "jinja: '{op}' compares ints with ints"
+    elif op == "in":
+        JValue.JBool(jv_contains(r, l))
+    elif op == "not in":
+        JValue.JBool(not jv_contains(r, l))
     else:
         throw "jinja: unsupported operator '{op}'"
 
@@ -238,7 +411,19 @@ pub JValue eval_expr(JExpr e, {string=JValue} env) throws:
         EIndex(base, idxe): jv_get_index(eval_expr(base, env), eval_expr(idxe, env))
         ENot(e2): JValue.JBool(not jv_truthy(eval_expr(e2, env)))
         EIsDefined(e2): JValue.JBool(not jv_is_undefined(eval_expr(e2, env)))
+        ETest(e2, test): jv_test(test, eval_expr(e2, env))
         EFilter(base, name): apply_filter(name, eval_expr(base, env))
+        ECall(callee, args, kwnames, kwexprs):
+            mut [JValue] argv = []
+            for a in args:
+                argv.push(eval_expr(a, env))
+            mut [JValue] kwv = []
+            for k in kwexprs:
+                kwv.push(eval_expr(k, env))
+            match callee:
+                EAttr(recv, mname): call_method(eval_expr(recv, env), mname, argv)
+                EVar(fname): call_function(fname, argv, kwnames, kwv)
+                _: throw "jinja: unsupported call"
         EBinOp(op, l, r):
             if op == "and":
                 let lv = eval_expr(l, env)
@@ -317,6 +502,9 @@ pub [EToken] lex_expr_tokens(string src) throws:
         elif c == "!" and i + 1 < n and chars[i + 1] == "=":
             toks.push(EToken("op", "!="))
             i += 2
+        elif (c == "<" or c == ">") and i + 1 < n and chars[i + 1] == "=":
+            toks.push(EToken("op", "{c}="))
+            i += 2
         else:
             toks.push(EToken("op", c))
             i += 1
@@ -329,7 +517,7 @@ bool tok_is_ident(EToken t, string s):
     t.kind == "ident" and t.text == s
 
 # ── Expression parser (recursive descent, lowest to highest precedence:
-#    or, and, ==/!=, not, +/-, postfix .attr/[idx]/|filter/is defined) ───
+#    or, and, not, comparisons and in, +/-, postfix .attr/[idx]/(call)/|filter/is test) ───
 
 (JExpr, int) parse_primary([EToken] toks, int i) throws:
     guard i < toks.length else throw "jinja: unexpected end of expression"
@@ -350,8 +538,41 @@ bool tok_is_ident(EToken t, string s):
         let (e, j) = parse_or(toks, i + 1)
         guard j < toks.length and tok_is_op(toks[j], ")") else throw "jinja: expected ')' in expression"
         (e, j + 1)
+    elif tok_is_op(t, "-"):
+        let (e, j) = parse_postfix(toks, i + 1)
+        (JExpr.EBinOp("-", JExpr.ELit(JValue.JInt(0)), e), j)
     else:
         throw "jinja: unexpected token '{t.text}' in expression"
+
+# Arguments of a call, `i` just after the "(": positional expressions and
+# `name=expression` keywords, up to and including the ")".
+([JExpr], [string], [JExpr], int) parse_call_args([EToken] toks, int i) throws:
+    mut [JExpr] args = []
+    mut [string] kwnames = []
+    mut [JExpr] kwvals = []
+    var int j = i
+    var bool done = false
+    while not done:
+        guard j < toks.length else throw "jinja: unterminated call"
+        if tok_is_op(toks[j], ")"):
+            j += 1
+            done = true
+        else:
+            if toks[j].kind == "ident" and j + 1 < toks.length and tok_is_op(toks[j + 1], "="):
+                let (v, j2) = parse_or(toks, j + 2)
+                kwnames.push(toks[j].text)
+                kwvals.push(v)
+                j = j2
+            else:
+                let (v, j2) = parse_or(toks, j)
+                args.push(v)
+                j = j2
+            guard j < toks.length else throw "jinja: unterminated call"
+            if tok_is_op(toks[j], ","):
+                j += 1
+            elif not tok_is_op(toks[j], ")"):
+                throw "jinja: expected ',' or ')' in a call"
+    (args, kwnames, kwvals, j)
 
 (JExpr, int) parse_postfix([EToken] toks, int i) throws:
     let (e0, i0) = parse_primary(toks, i)
@@ -372,17 +593,24 @@ bool tok_is_ident(EToken t, string s):
             guard j + 1 < toks.length and toks[j + 1].kind == "ident" else throw "jinja: expected filter name after '|'"
             e = JExpr.EFilter(e, toks[j + 1].text)
             j += 2
+        elif tok_is_op(toks[j], "("):
+            # a call: only a name (`namespace(...)`, `range(...)`) or a method (`x.split(...)`)
+            let (call_args, call_kwnames, call_kwvals, j_end) = parse_call_args(toks, j + 1)
+            e = JExpr.ECall(e, call_args, call_kwnames, call_kwvals)
+            j = j_end
         elif tok_is_ident(toks[j], "is"):
             var int k = j + 1
             var bool negate = false
             if k < toks.length and tok_is_ident(toks[k], "not"):
                 negate = true
                 k += 1
-            guard k < toks.length and tok_is_ident(toks[k], "defined") else throw "jinja: expected 'defined' after 'is'"
+            guard k < toks.length and toks[k].kind == "ident" else throw "jinja: expected a test name after 'is'"
+            let test_name = toks[k].text
+            let test_e = if test_name == "defined": JExpr.EIsDefined(e) else: JExpr.ETest(e, test_name)
             if negate:
-                e = JExpr.ENot(JExpr.EIsDefined(e))
+                e = JExpr.ENot(test_e)
             else:
-                e = JExpr.EIsDefined(e)
+                e = test_e
             j = k + 1
         else:
             cont = false
@@ -400,29 +628,43 @@ bool tok_is_ident(EToken t, string s):
         j = j2
     (e, j)
 
+(JExpr, int) parse_cmp([EToken] toks, int i) throws:
+    let (lhs, j0) = parse_add(toks, i)
+    var JExpr e = lhs
+    var int j = j0
+    var bool cont = true
+    while cont and j < toks.length:
+        let t = toks[j]
+        if t.kind == "op" and (t.text == "==" or t.text == "!=" or t.text == "<" or t.text == ">" or t.text == "<=" or t.text == ">="):
+            let (rhs, j2) = parse_add(toks, j + 1)
+            e = JExpr.EBinOp(t.text, e, rhs)
+            j = j2
+        elif tok_is_ident(t, "in"):
+            let (rhs, j2) = parse_add(toks, j + 1)
+            e = JExpr.EBinOp("in", e, rhs)
+            j = j2
+        elif tok_is_ident(t, "not") and j + 1 < toks.length and tok_is_ident(toks[j + 1], "in"):
+            let (rhs, j2) = parse_add(toks, j + 2)
+            e = JExpr.EBinOp("not in", e, rhs)
+            j = j2
+        else:
+            cont = false
+    (e, j)
+
 (JExpr, int) parse_not([EToken] toks, int i) throws:
     if i < toks.length and tok_is_ident(toks[i], "not"):
         let (e, j) = parse_not(toks, i + 1)
         (JExpr.ENot(e), j)
     else:
-        parse_add(toks, i)
-
-(JExpr, int) parse_cmp([EToken] toks, int i) throws:
-    let (lhs, j0) = parse_not(toks, i)
-    if j0 < toks.length and (tok_is_op(toks[j0], "==") or tok_is_op(toks[j0], "!=")):
-        let op = toks[j0].text
-        let (rhs, j1) = parse_not(toks, j0 + 1)
-        (JExpr.EBinOp(op, lhs, rhs), j1)
-    else:
-        (lhs, j0)
+        parse_cmp(toks, i)
 
 (JExpr, int) parse_and([EToken] toks, int i) throws:
-    let (e0, i0) = parse_cmp(toks, i)
+    let (e0, i0) = parse_not(toks, i)
     var JExpr e = e0
     var int j = i0
     var bool cont = true
     while cont and j < toks.length and tok_is_ident(toks[j], "and"):
-        let (rhs, j2) = parse_cmp(toks, j + 1)
+        let (rhs, j2) = parse_not(toks, j + 1)
         e = JExpr.EBinOp("and", e, rhs)
         j = j2
     (e, j)
@@ -748,8 +990,38 @@ pub (string, {string=JValue}) render_stmt(JStmt s, {string=JValue} env) throws:
         SOutput(e): (jv_to_str(eval_expr(e, env)), env)
         SSet(name, e):
             let v = eval_expr(e, env)
-            mut {string=JValue} env2 = env
-            env2[name] = v
+            mut {string=JValue} env2 = env.clone()
+            let chars = name.chars()
+            var int dot = -1
+            var int di = 0
+            while di < chars.length and dot < 0:
+                if chars[di] == ".":
+                    dot = di
+                di += 1
+            if dot >= 0:
+                # `ns.attr = value`: the namespace is replaced by a copy with the attribute set
+                var string base_name = ""
+                var string attr = ""
+                var int ci = 0
+                while ci < chars.length:
+                    if ci < dot:
+                        base_name = "{base_name}{chars[ci]}"
+                    elif ci > dot:
+                        attr = "{attr}{chars[ci]}"
+                    ci += 1
+                let base = env[base_name] else JValue.JUndefined
+                match base:
+                    JDict(fields, keys):
+                        guard fields.contains("__namespace__") else throw "jinja: cannot set an attribute of '{base_name}': it is not a namespace"
+                        mut {string=JValue} nf = fields.clone()
+                        nf[attr] = v
+                        mut [string] nk = keys.clone()
+                        if not str_in_list(attr, keys):
+                            nk.push(attr)
+                        env2[base_name] = JValue.JDict(nf, nk)
+                    _: throw "jinja: cannot set an attribute of '{base_name}': it is not a namespace"
+            else:
+                env2[name] = v
             ("", env2)
         SIf(cond, then_body, else_body):
             if jv_truthy(eval_expr(cond, env)):
@@ -761,7 +1033,7 @@ pub (string, {string=JValue}) render_stmt(JStmt s, {string=JValue} env) throws:
             match iter_v:
                 JList(items):
                     var string out = ""
-                    var {string=JValue} cur_env = env
+                    var {string=JValue} cur_env = env.clone()
                     var int idx = 0
                     let count = items.length
                     while idx < count:
@@ -769,7 +1041,13 @@ pub (string, {string=JValue}) render_stmt(JStmt s, {string=JValue} env) throws:
                         out = "{out}{piece}"
                         cur_env = new_env
                         idx += 1
-                    (out, cur_env)
+                    # The body had its own scope: only namespaces keep what the loop did to them.
+                    mut {string=JValue} after = env.clone()
+                    for key in env.keys():
+                        let outer = env[key] else JValue.JUndefined
+                        if is_namespace(outer):
+                            after[key] = cur_env[key] else outer
+                    (out, after)
                 _:
                     ("", env)
 

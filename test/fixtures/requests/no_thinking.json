@@ -1,0 +1,71 @@
+{
+ "messages": [
+  {
+   "role": "system",
+   "content": "You are concise."
+  },
+  {
+   "role": "user",
+   "content": "What is 2+2?"
+  },
+  {
+   "role": "assistant",
+   "content": "<think>\nSimple addition.\n</think>\n\n4"
+  },
+  {
+   "role": "user",
+   "content": "And 3+3? Use the tool."
+  },
+  {
+   "role": "assistant",
+   "content": null,
+   "reasoning_content": "I should call the calculator.",
+   "tool_calls": [
+    {
+     "id": "c1",
+     "type": "function",
+     "function": {
+      "name": "calc",
+      "arguments": "{\"expr\": \"3+3\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "c1",
+   "content": "6"
+  },
+  {
+   "role": "assistant",
+   "content": "<think>\nThe tool said 6.\n</think>\n\nIt is 6."
+  },
+  {
+   "role": "user",
+   "content": "Thanks. And 5+5, no need to think."
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "calc",
+    "description": "Evaluate arithmetic",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "expr": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "expr"
+     ]
+    }
+   }
+  }
+ ],
+ "chat_template_kwargs": {
+  "enable_thinking": false
+ }
+}

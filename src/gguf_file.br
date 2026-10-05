@@ -1,0 +1,59 @@
+# boring-llm — reading a GGUF from disk without holding it in memory.
+#
+# parse_gguf (gguf.br) takes the whole file as one `[uint8]`. For a real model
+# that meant 2-3 copies of the file alive at once (the buffer read from disk,
+# the copy stored in GgufFile, transient clones during parsing): a 2.1 GB 3B
+# model peaked at ~13 GB of physical memory on a 16 GB machine, which swaps and
+# freezes it, and a 7B model could not have loaded at all. Here only the header
+# (metadata + tensor table, ~7 MB for Qwen2.5) is read and parsed; each tensor's
+# bytes are then read straight from the file when the loader asks for them, so
+# the peak is one tensor, not the model.
+#
+# Kept apart from gguf.br because it calls Rust's `std::fs` (`File`, and
+# `FileExt::read_exact_at`, which is Unix-only): gguf.br and io.br are also run
+# by the interpreter tests, which cannot call external Rust types.
+
+use gguf
+use io
+use std.fs.File
+use std.os.unix.fs.FileExt
+
+# `n` bytes at absolute offset `off`, read from the file into a fresh exact-size buffer.
+pub [uint8] read_at(string path, int off, int n) throws:
+    let f = try? File.open(path)
+    guard let f else throw "cannot open {path}"
+    mut [uint8] buf = [0 as uint8 for i in 0..<n]
+    let r = try? f.read_exact_at(buf, off as uint64)
+    guard let r else throw "short read: {n} bytes at offset {off} of {path}"
+    buf
+
+pub int file_len(string path) throws:
+    let f = try? File.open(path)
+    guard let f else throw "cannot open {path}"
+    let m = try? f.metadata()
+    guard let m else throw "cannot stat {path}"
+    m.len() as int
+
+# Parses the header of the GGUF at `path`. The header is read as a prefix of the
+# file, doubled (x4) until parse_gguf stops reporting a truncation.
+pub GgufFile parse_gguf_path(string path) throws:
+    let size = file_len(path)
+    var int prefix = 16777216
+    while true:
+        let n = if prefix < size: prefix else: size
+        let head = read_at(path, 0, n)
+        let parsed = try? parse_gguf(head)
+        if let g = parsed:
+            return GgufFile(g.version, g.metadata, g.tensors, g.data_offset, [], path, size)
+        if n >= size:
+            parse_gguf(head)    # the whole file and still not parseable: surface the real error
+        prefix = prefix * 4
+    throw "unreachable"
+
+# `n` bytes of tensor data at absolute file offset `start`: from disk when the
+# file was opened by path, from the in-memory copy otherwise.
+pub [uint8] file_bytes(GgufFile file, int start, int n) throws:
+    if file.path != "":
+        read_at(file.path, start, n)
+    else:
+        read_bytes(file.bytes, start, n)

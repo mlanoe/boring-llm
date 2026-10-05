@@ -59,7 +59,9 @@ pub struct GgufFile:
     {string=GgufValue} metadata
     [GgufTensorInfo] tensors
     int data_offset     # absolute byte offset where tensor data begins
-    [uint8] bytes        # the whole file, kept around for later tensor reads
+    [uint8] bytes        # the whole file when parsed from memory (tests, small files); EMPTY when `path` is set
+    string path          # non-empty: tensor data is read from this file on demand and never held in memory
+    int file_size        # size of the file in bytes
 
 # --- low-level readers -----------------------------------------------------
 
@@ -245,7 +247,7 @@ pub GgufFile parse_gguf([uint8] bytes) throws:
     let alignment = alignment_from_metadata(metadata)
     let data_offset = align_up(offset, alignment)
 
-    GgufFile(version, metadata, tensors, data_offset, bytes)
+    GgufFile(version, metadata, tensors, data_offset, bytes, "", bytes.length)
 
 # --- typed metadata accessors (used by main.br and later phases) -----------
 

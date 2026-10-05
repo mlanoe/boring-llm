@@ -22,6 +22,14 @@ def main() throws:
     assert_eq(e[0], 0xC3)
     assert_eq(e[1], 0xA9)
     assert_eq(bytes_to_str([0xC3 as uint8, 0xA9 as uint8]), "é")
+    # truncated or invalid sequences become U+FFFD, never an out-of-bounds read
+    let fffd = chr(0xFFFD)
+    assert_eq(bytes_to_str([0xC3 as uint8]), fffd)
+    assert_eq(bytes_to_str([65 as uint8, 0xE6 as uint8, 0x97 as uint8]), "A{fffd}{fffd}")
+    assert_eq(bytes_to_str([0xF0 as uint8, 0x9F as uint8, 0x98 as uint8]), "{fffd}{fffd}{fffd}")
+    assert_eq(bytes_to_str([0xF0 as uint8, 0x9F as uint8, 0x98 as uint8, 0x80 as uint8]), "😀")
+    assert_eq(bytes_to_str([0x80 as uint8, 66 as uint8]), "{fffd}B")
+    assert_eq(bytes_to_str([0xE6 as uint8, 0x97 as uint8, 0xA5 as uint8]), "日")
 
     # --- byte-to-unicode: space (32) -> U+0120 'Ġ'; 'A' (65) -> identity ---
     let b2u = build_byte_to_unicode()
@@ -64,7 +72,7 @@ def main() throws:
     vocab["e"] = 5
     mut {string=int} special = {=}
     special["<SPECIAL>"] = 999
-    let tok = Tokenizer(vocab, {=}, [], byte_to_uni, uni_to_byte, 0, 0, false, [], [], special)
+    let tok = Tokenizer(vocab, {=}, {=}, byte_to_uni, uni_to_byte, 0, 0, false, [], [], special)
     let ids = tok.encode_with_specials("hi<SPECIAL>bye")
     assert_eq(ids.length, 6)
     assert_eq(ids[0], 1)
@@ -79,7 +87,7 @@ def main() throws:
     mut {string=int} overlapping = {=}
     overlapping["<a>"] = 900
     overlapping["<ab>"] = 901
-    let tok2 = Tokenizer({=}, {=}, [], byte_to_uni, uni_to_byte, 0, 0, false, [], [], overlapping)
+    let tok2 = Tokenizer({=}, {=}, {=}, byte_to_uni, uni_to_byte, 0, 0, false, [], [], overlapping)
     let ids2 = tok2.encode_with_specials("<ab>")
     assert_eq(ids2.length, 1)
     assert_eq(ids2[0], 901)

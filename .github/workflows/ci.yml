@@ -24,27 +24,38 @@ jobs:
         run: cargo install --git https://github.com/mlanoe/boring
 
       - name: Run tests
+        shell: bash
         run: |
-          # test_math_gpu_real.br needs a real --target metal build + a real
-          # GPU (see its own header comment) — GH Actions macOS runners
-          # don't reliably expose one, so it's excluded from this loop, same
-          # limitation whisper-boring's CI already accepts for its own GPU code.
-          # test_tokenizer_real.br, test_tokenizer_spm_real.br,
-          # test_quant_kernels_real.br, and test_jinja_real.br need the
-          # real (gitignored, not present in CI) downloaded GGUF file and a
-          # compiled build, for the same reason. test_jinja.br (no "_real"
-          # suffix) needs neither and runs in this loop normally.
-          # bench_linear_warp.br isn't a test at all — it's a manual wall-clock
-          # benchmark tool that requires a CLI argument (see its own header
-          # comment) and throws with none given; excluded so `test/*.br`'s glob
-          # doesn't sweep it in and fail every run before any real test executes.
+          # The *_real.br programs need a real --target metal build, a GPU and
+          # downloaded GGUF files (gitignored, absent in CI); GitHub's macOS
+          # runners do not reliably expose a GPU, same limitation as
+          # whisper-boring's CI. bench_linear_warp.br is a manual benchmark that
+          # throws without a command-line argument, so it is not swept in.
+          # Any test/*_real.br (compiled build, real weights) is skipped by name.
           for f in test/*.br; do
-            if [ "$f" = "test/test_math_gpu_real.br" ]; then continue; fi
-            if [ "$f" = "test/test_tokenizer_real.br" ]; then continue; fi
-            if [ "$f" = "test/test_tokenizer_spm_real.br" ]; then continue; fi
-            if [ "$f" = "test/test_quant_kernels_real.br" ]; then continue; fi
-            if [ "$f" = "test/test_jinja_real.br" ]; then continue; fi
-            if [ "$f" = "test/bench_linear_warp.br" ]; then continue; fi
+            case "$f" in
+              *_real.br) continue ;;
+              test/bench_linear_warp.br) continue ;;
+            esac
             echo "=== $f ==="
             boring run "$f"
           done
+
+      - name: Tool self-tests
+        shell: bash
+        run: |
+          # stdlib only: the parsing and comparison logic of the llama.cpp
+          # comparison tools (the tools themselves need llama-cpp-python and a
+          # model, which CI does not have).
+          python3 tools/bench_vs_llamacpp.py --selftest
+          python3 tools/accuracy_vs_llamacpp.py --selftest
+          python3 tools/decode_vs_llamacpp.py --selftest
+          python3 tools/fetch_models.py --selftest
+
+      - name: Documentation is up to date
+        if: runner.os == 'Linux'
+        run: |
+          # docs/*.html and README.html are generated from the Markdown files:
+          # regenerating them must not change anything that is committed.
+          python3 docs/build.py
+          git diff --exit-code -- README.html docs

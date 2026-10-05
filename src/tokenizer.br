@@ -31,7 +31,7 @@ use jinja
 pub struct Tokenizer:
     {string=int} vocab
     {int=string} reverse
-    [[string]] merges
+    {string=int} merge_rank  # "a b" -> priority (lower merges first), from tokenizer.ggml.merges
     {int=string} byte_to_uni
     {string=int} uni_to_byte
     int bos_token_id
@@ -57,9 +57,8 @@ pub struct Tokenizer:
         out
 
     # `segment` is a pretokenized chunk of ORIGINAL text (not yet
-    # byte-remapped) — converts it to byte-level unicode chars, then
-    # applies every BPE merge rule in rank order (same algorithm as
-    # whisper-boring's tokenizer.br).
+    # byte-remapped) — converts it to byte-level unicode chars, then merges
+    # adjacent pairs in rank order (see the loop below).
     req [string] bpe_word(string segment):
         var mut [string] word = []
         for ch in segment.chars():
@@ -70,8 +69,30 @@ pub struct Tokenizer:
                 # double-dereference, "type isize cannot be dereferenced").
                 let int bb = b
                 word.push(self.byte_to_uni[bb])
-        for merge in self.merges:
-            word = self.apply_merge(word, merge[0], merge[1])
+        # Standard BPE: repeatedly merge the adjacent pair with the lowest
+        # rank (every non-overlapping occurrence of it), until no adjacent pair
+        # is a known merge. Looking up the word's own pairs costs O(len^2) per
+        # word; applying all ~150k merge rules in turn (what this used to do)
+        # cost O(merges x len) per word and made a 500-token prompt take seconds.
+        var bool merging = true
+        while merging and word.length > 1:
+            var int best_rank = -1
+            var int best_i = -1
+            var int i = 0
+            while i < word.length - 1:
+                let key = "{word[i]} {word[i + 1]}"
+                if self.merge_rank.contains(key):
+                    let r = self.merge_rank[key]
+                    if best_rank < 0 or r < best_rank:
+                        best_rank = r
+                        best_i = i
+                i += 1
+            if best_i < 0:
+                merging = false
+            else:
+                let a = word[best_i]
+                let b = word[best_i + 1]
+                word = self.apply_merge(word, a, b)
         word
 
     req [int] encode(string text):
@@ -95,35 +116,42 @@ pub struct Tokenizer:
     # strings directly as plain text, and neither BPE nor SPM merging on
     # its own would ever reconstruct them as a single token (e.g. SPM would
     # merge "<" + "|" + "i" + "m" + ... byte-by-byte instead).
-    #
-    # Finds the longest special token matching at position `i` in `chars`
-    # (length `n`), or (-1, 0) when none matches.
-    req (int, int) match_special_at([string] chars, int i, int n):
-        var int best_id = -1
-        var int best_len = 0
-        for tok in self.special_tokens.keys():
-            let tok_chars = tok.chars()
-            let tlen = tok_chars.length
-            if tlen > best_len and i + tlen <= n:
-                var bool ok = true
-                var int j = 0
-                while j < tlen and ok:
-                    if chars[i + j] != tok_chars[j]:
-                        ok = false
-                    j += 1
-                if ok:
-                    best_len = tlen
-                    best_id = self.special_tokens[tok]
-        (best_id, best_len)
-
     req [int] encode_with_specials(string text):
         mut [int] ids = []
         var string plain = ""
         let chars = text.chars()
         let n = chars.length
+        # Special tokens' characters, computed once per call (not per position).
+        mut [[string]] sp_chars = []
+        mut [int] sp_ids = []
+        for tok in self.special_tokens.keys():
+            let tc = tok.chars()
+            if tc.length > 0:
+                sp_chars.push(tc)
+                sp_ids.push(self.special_tokens[tok])
         var int i = 0
         while i < n:
-            let (best_id, best_len) = self.match_special_at(chars, i, n)
+            # Longest special token matching at `i`. Inlined (not a helper
+            # taking `chars`/`sp_chars`): a by-value array parameter is cloned
+            # on every call, i.e. once per input character here.
+            var int best_id = -1
+            var int best_len = 0
+            var int s = 0
+            while s < sp_chars.length:
+                let tlen = sp_chars[s].length
+                # first-character test before the full comparison: almost
+                # every position in ordinary text fails it immediately
+                if tlen > best_len and i + tlen <= n and chars[i] == sp_chars[s][0]:
+                    var bool ok = true
+                    var int j = 1
+                    while j < tlen and ok:
+                        if chars[i + j] != sp_chars[s][j]:
+                            ok = false
+                        j += 1
+                    if ok:
+                        best_len = tlen
+                        best_id = sp_ids[s]
+                s += 1
             if best_id >= 0:
                 if plain != "":
                     for t in self.encode(plain): ids.push(t)
@@ -563,7 +591,7 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
     # whisper-boring/src/tokenizer.br's own merges.txt parser, which uses
     # the identical manual scan for the same reason.
     let merge_strs = gguf_get_string_array(file.metadata, "tokenizer.ggml.merges")
-    mut [[string]] merges = []
+    mut {string=int} merge_rank = {=}
     for m in merge_strs:
         # NOTE: indexes `m.chars()` (a `[string]` array), never `m` (a
         # plain `string`) directly — a real bug makes any direct
@@ -589,7 +617,9 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
             while bi < m_chars.length:
                 b = "{b}{m_chars[bi]}"
                 bi += 1
-            merges.push([a, b])
+            let key = "{a} {b}"
+            if not merge_rank.contains(key):
+                merge_rank[key] = merge_rank.length
 
     let bos = gguf_get_int(file.metadata, "tokenizer.ggml.bos_token_id") else 0
     let eos = gguf_get_int(file.metadata, "tokenizer.ggml.eos_token_id") else 0
@@ -619,7 +649,7 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
             special_tokens[tokens[ti]] = ti
         ti += 1
 
-    Tokenizer(vocab, reverse, merges, byte_to_uni, uni_to_byte, bos, eos, is_spm, scores, byte_token_id, special_tokens)
+    Tokenizer(vocab, reverse, merge_rank, byte_to_uni, uni_to_byte, bos, eos, is_spm, scores, byte_token_id, special_tokens)
 
 # Builds the full prompt token sequence for a chat turn using the GGUF's
 # own embedded `tokenizer.chat_template` (any architecture, any template —
@@ -655,10 +685,23 @@ pub [int] render_chat_prompt(GgufFile file, Tokenizer tok, string system_msg, [s
 # render_chat_prompt's `[string]` signature can express.
 pub [int] render_chat_prompt_messages(GgufFile file, Tokenizer tok, [JValue] messages, [JValue] tools,
                                        bool add_generation_prompt) throws:
+    render_chat_prompt_messages_kw(file, tok, messages, tools, add_generation_prompt, JValue.JUndefined)
+
+# The same with `kwargs`, a JSON object of extra template variables (the
+# request's `chat_template_kwargs`, as llama.cpp and vLLM name it): Qwen3's
+# template reads `enable_thinking` this way. A value that is not an object
+# adds nothing.
+pub [int] render_chat_prompt_messages_kw(GgufFile file, Tokenizer tok, [JValue] messages, [JValue] tools,
+                                          bool add_generation_prompt, JValue kwargs) throws:
     guard let template = gguf_get_string(file.metadata, "tokenizer.chat_template") else throw "tokenizer: GGUF has no tokenizer.chat_template"
     let bos = tok.reverse[tok.bos_token_id] else ""
     let eos = tok.reverse[tok.eos_token_id] else ""
     mut {string=JValue} env = build_chat_env(messages, add_generation_prompt, bos, eos)
     env["tools"] = JValue.JList(tools)
+    match kwargs:
+        JDict(fields, keys):
+            for key in keys:
+                env[key] = fields[key] else JValue.JUndefined
+        _: env["tools"] = JValue.JList(tools)
     let prompt_text = render_jinja(template, env)
     tok.encode_with_specials(prompt_text)

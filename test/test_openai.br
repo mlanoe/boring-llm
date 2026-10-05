@@ -5,6 +5,33 @@ use jinja
 use json
 use openai
 
+# The part of `text` stream_bounds says is safe to send, as a string.
+string view_of(string text, [string] stops):
+    let (vs, vl) = stream_bounds(text, stops)
+    let cs = text.chars()
+    var string out = ""
+    var int i = vs
+    while i < vl:
+        out = "{out}{cs[i]}"
+        i += 1
+    out
+
+# Feeds `full` one character at a time (as generation would), cutting stop
+# strings like the server does, and returns the final emitted view. Asserts
+# the invariant streaming relies on: each view extends the previous one.
+string stream_all(string full, [string] stops):
+    var string prev = ""
+    var string p = ""
+    for ch in full.chars():
+        p = "{p}{ch}"
+        let (cut, hit) = apply_stop(p, stops)
+        let v = view_of(cut, stops)
+        assert(v.startsWith(prev), "view must extend the previous one: '{prev}' then '{v}' at '{p}'")
+        prev = v
+        if hit:
+            return prev
+    prev
+
 def main() throws:
     # ── normalize_messages: parts flattened, tool_call arguments parsed ──
     let msgs = json_parse("[{{\"role\": \"user\", \"content\": [{{\"type\": \"text\", \"text\": \"a\"}}, {{\"type\": \"text\", \"text\": \"b\"}}]}}, {{\"role\": \"assistant\", \"content\": null, \"tool_calls\": [{{\"id\": \"c1\", \"type\": \"function\", \"function\": {{\"name\": \"get_weather\", \"arguments\": \"{{\\\"city\\\": \\\"Paris\\\"}}\"}}}}]}}, {{\"role\": \"tool\", \"tool_call_id\": \"c1\", \"content\": \"sunny\"}}]")
@@ -18,7 +45,7 @@ def main() throws:
     let norm = normalize_messages(msg_items)
     assert_eq(norm.length, 3 as int)
     assert_eq(jv_to_json(norm[0]), "{{\"role\": \"user\", \"content\": \"ab\"}}" as string)
-    assert_eq(jv_to_json(norm[1]), "{{\"role\": \"assistant\", \"content\": null, \"tool_calls\": [{{\"id\": \"c1\", \"type\": \"function\", \"function\": {{\"name\": \"get_weather\", \"arguments\": {{\"city\": \"Paris\"}}}}}}]}}" as string)
+    assert_eq(jv_to_json(norm[1]), "{{\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{{\"id\": \"c1\", \"type\": \"function\", \"function\": {{\"name\": \"get_weather\", \"arguments\": {{\"city\": \"Paris\"}}}}}}]}}" as string)
     assert_eq(jv_to_json(norm[2]), "{{\"role\": \"tool\", \"tool_call_id\": \"c1\", \"content\": \"sunny\"}}" as string)
 
     # ── parse_reply ──
@@ -102,5 +129,138 @@ def main() throws:
     assert_eq(json_get_int(json_get(usage_evt, "usage"), "completion_tokens", 0), 6 as int)
     let nousage = completion_sse("3", "m", ParsedReply("x", []), "stop", 1, 1, false)
     assert_eq(nousage.contains("usage"), false as bool)
+
+    assert_eq(common_prefix_len([1, 2, 3], [1, 2, 3, 4]), 3 as int)
+    assert_eq(common_prefix_len([1, 2, 3, 4], [1, 2, 9, 4]), 2 as int)
+    assert_eq(common_prefix_len([5], [6]), 0 as int)
+    assert_eq(common_prefix_len([], [1]), 0 as int)
+
+    let (bi, bl) = best_prefix_slot([[1, 2, 3], [1, 2, 3, 4, 5], [9]], [1, 2, 3, 4, 7])
+    assert_eq(bi, 1 as int)
+    assert_eq(bl, 4 as int)
+    let (ni, nl) = best_prefix_slot([[7, 8]], [1, 2])
+    assert_eq(ni, -1 as int)
+    assert_eq(nl, 0 as int)
+    let (ei, el) = best_prefix_slot([], [1])
+    assert_eq(ei, -1 as int)
+
+    # --- stream_bounds ---
+    let (s1, l1) = stream_bounds("  hi there  ", [])
+    assert_eq(s1, 2 as int)
+    assert_eq(l1, 10 as int)
+    assert_eq(view_of("Hello <to", []), "Hello" as string)
+    assert_eq(view_of("Hello <tool_call", []), "Hello" as string)
+    assert_eq(view_of("Hello <tool_call>\n{{\"name\": \"f\"", []), "Hello" as string)
+    assert_eq(view_of("abc EN", ["END"]), "abc" as string)
+    assert_eq(view_of("a <b", []), "a <b" as string)
+    assert_eq(view_of("   ", []), "" as string)
+    assert_eq(view_of("", []), "" as string)
+    assert_eq(view_of("x\n\n", []), "x" as string)
+
+    let tc_text = "  Let me check.\n<tool_call>\n{{\"name\": \"f\", \"arguments\": {{}}}}\n</tool_call>"
+    assert_eq(stream_all(tc_text, []), parse_reply(tc_text).content)
+    assert_eq(stream_all("Hello world, how are you?", []), "Hello world, how are you?" as string)
+    assert_eq(stream_all("Hello world, how are you?", ["how"]), "Hello world," as string)
+    assert_eq(stream_all("one two END three", ["END"]), "one two" as string)
+    assert_eq(stream_all("a <b> c < d <tool", []), "a <b> c < d" as string)
+    assert_eq(stream_all("  \n lead", []), "lead" as string)
+
+    # a malformed tool call stays in content for parse_reply: the stream emits
+    # the part before the marker, the server sends the rest at the end
+    let bad = "text <tool_call>not json</tool_call>"
+    assert_eq(view_of(bad, []), "text" as string)
+    assert(parse_reply(bad).content.startsWith("text"), "parse_reply keeps the malformed call in content")
+
+    # --- SSE event builders compose to completion_sse ---
+    let ev = "{sse_role_event("7", "m")}{sse_content_event("7", "m", "hi")}{sse_finish_event("7", "m", "stop")}{sse_done_event()}"
+    assert_eq(ev, completion_sse("7", "m", ParsedReply("hi", []), "stop", 1, 1, false))
+
+    # extra leading brace, object closed once (seen from Qwen2.5-0.5B under OpenCode)
+    let lead = parse_reply("<tool_call>\n{{\"name\": \"webfetch\", \"arguments\": {{\"url\": \"https://x.com\", \"format\": \"text\"}}}}\n</tool_call>")
+    assert_eq(lead.calls.length, 1 as int)
+    assert_eq(lead.calls[0].name, "webfetch" as string)
+    assert_eq(lead.calls[0].arguments, "{{\"url\": \"https://x.com\", \"format\": \"text\"}}" as string)
+    # three opening, four closing braces (seen under OpenCode): the extra closer is ignored
+    let extra = parse_reply("<tool_call> {{\"name\": \"read\", \"arguments\": {{\"filePath\": \"/a/b.md\", \"offset\": 0, \"limit\": 2000}}}}}} </tool_call>")
+    assert_eq(extra.calls.length, 1 as int)
+    assert_eq(extra.calls[0].name, "read" as string)
+    assert_eq(extra.calls[0].arguments, "{{\"filePath\": \"/a/b.md\", \"offset\": 0, \"limit\": 2000}}" as string)
+    # braces and escaped quotes inside a JSON string must not confuse the scan
+    let tricky = parse_reply("<tool_call>{{\"name\": \"w\", \"arguments\": {{\"text\": \"a }} b {{ \\\" c\"}}}}</tool_call>")
+    assert_eq(tricky.calls.length, 1 as int)
+    assert_eq(tricky.calls[0].name, "w" as string)
+    let hopeless = parse_reply("<tool_call>\n{{\"name\": \n</tool_call>")
+    assert_eq(hopeless.calls.length, 0 as int)
+
+    # --- tool_choice "none" turns tools off; anything else leaves them on ---
+    assert_eq(tools_disabled(json_parse("{{\"tool_choice\": \"none\"}}")), true)
+    assert_eq(tools_disabled(json_parse("{{\"tool_choice\": \"auto\"}}")), false)
+    assert_eq(tools_disabled(json_parse("{{\"tool_choice\": \"required\"}}")), false)
+    assert_eq(tools_disabled(json_parse("{{\"tool_choice\": {{\"type\": \"function\"}}}}")), false)
+    assert_eq(tools_disabled(json_parse("{{}}")), false)
+
+    # --- the context-overflow error carries the code, both phrases clients look for, and the counts ---
+    let ce = json_parse(context_exceeded_json(5000, 4096))
+    let ce_err = json_get(ce, "error")
+    assert_eq(json_get_str(ce_err, "code", ""), "context_length_exceeded" as string)
+    assert_eq(json_get_str(ce_err, "type", ""), "invalid_request_error" as string)
+    assert_eq(json_get_int(ce_err, "n_prompt_tokens", 0), 5000 as int)
+    assert_eq(json_get_int(ce_err, "n_ctx", 0), 4096 as int)
+    let ce_msg = json_get_str(ce_err, "message", "")
+    assert(ce_msg.contains("maximum context length is 4096"), "message: {ce_msg}")
+    assert(ce_msg.contains("exceeds the available context size"), "message: {ce_msg}")
+    assert(ce_msg.contains("5000 tokens"), "message: {ce_msg}")
+    assert(ce_msg.contains("--ctx-size"), "message: {ce_msg}")
+
+    # --- reasoning: <think>...</think> goes to reasoning_content, the rest is content ---
+    let (r1, c1) = split_reasoning("<think>\nLet me think.\nSecond line.\n</think>\n\nThe answer is 4.")
+    assert_eq(r1, "Let me think.\nSecond line." as string)
+    assert_eq(c1, "The answer is 4." as string)
+    let (r2, c2) = split_reasoning("Just an answer.")
+    assert_eq(r2, "" as string)
+    assert_eq(c2, "Just an answer." as string)
+    let (r3, c3) = split_reasoning("<think>\nStill thinking when the tokens ran out")
+    assert_eq(r3, "Still thinking when the tokens ran out" as string)
+    assert_eq(c3, "" as string)
+    let (r4, c4) = split_reasoning("<think>\n\n</think>\n\nDirect.")
+    assert_eq(r4, "" as string)
+    assert_eq(c4, "Direct." as string)
+    let (r5, c5) = split_reasoning("  <think>\nhm\n</think>\n\n<tool_call>\n{{\"name\": \"f\", \"arguments\": {{}}}}\n</tool_call>")
+    assert_eq(r5, "hm" as string)
+    assert_eq(parse_reply(c5).calls.length, 1 as int)
+
+    # while streaming, what has been split off only ever grows (a prefix of the final split)
+    let think_full = "<think>\nOkay, so 2+2.\nThat is 4.\n</think>\n\nIt is 4.\n"
+    var string tprev_r = ""
+    var string tprev_c = ""
+    var string tp = ""
+    for ch in think_full.chars():
+        tp = "{tp}{ch}"
+        let (sr, sc) = stream_split(tp)
+        assert(sr.startsWith(tprev_r), "reasoning must extend: '{tprev_r}' then '{sr}' at '{tp}'")
+        assert(sc.startsWith(tprev_c), "content must extend: '{tprev_c}' then '{sc}' at '{tp}'")
+        assert(not sr.contains("</"), "marker leaked into reasoning at '{tp}': '{sr}'")
+        tprev_r = sr
+        tprev_c = sc
+    let (fr, fc) = split_reasoning(think_full)
+    assert_eq(tprev_r, fr)
+    assert_eq(trim_nl(tprev_c, false, true), trim_nl(fc, false, true))
+    let (hold_r, hold_c) = stream_split("<thi")
+    assert_eq(hold_r, "" as string)
+    assert_eq(hold_c, "" as string)
+    let (plain_r, plain_c) = stream_split("Hello <b")
+    assert_eq(plain_r, "" as string)
+    assert_eq(plain_c, "Hello <b" as string)
+
+    # --- reasoning in the response bodies ---
+    let with_reasoning = json_parse(completion_json_r("5", "m", ParsedReply("4", []), "Two and two.", "stop", 3, 9))
+    let msg_r = json_get(json_get_list(with_reasoning, "choices")[0], "message")
+    assert_eq(json_get_str(msg_r, "reasoning_content", ""), "Two and two." as string)
+    assert_eq(json_get_str(msg_r, "content", ""), "4" as string)
+    let without_reasoning = completion_json("5", "m", ParsedReply("4", []), "stop", 3, 9)
+    assert(not without_reasoning.contains("reasoning_content"), "no reasoning_content when there is none")
+    assert_eq(without_reasoning, completion_json_r("5", "m", ParsedReply("4", []), "", "stop", 3, 9))
+    let rev = json_parse(sse_reasoning_event("5", "m", "think").replace("data: ", "").trim())
+    assert_eq(json_get_str(json_get(json_get_list(rev, "choices")[0], "delta"), "reasoning_content", ""), "think" as string)
 
     print "test_openai: ok"
