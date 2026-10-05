@@ -68,24 +68,24 @@ pub struct Model:
 # tensor_linear_gpu (math_gpu.br) dispatches on this tag to the matching
 # quantized tensor format.
 pub struct QuantLayer:
-    [float32] attn_norm_w
-    [uint8] q_w_q8
+    [float32]'gpu'unified attn_norm_w
+    [uint8]'gpu'unified q_w_q8
     int q_w_type
-    [float32] q_b
-    [uint8] k_w_q8
+    [float32]'gpu'unified q_b
+    [uint8]'gpu'unified k_w_q8
     int k_w_type
-    [float32] k_b
-    [uint8] v_w_q8
+    [float32]'gpu'unified k_b
+    [uint8]'gpu'unified v_w_q8
     int v_w_type
-    [float32] v_b
-    [uint8] o_w_q8
+    [float32]'gpu'unified v_b
+    [uint8]'gpu'unified o_w_q8
     int o_w_type
-    [float32] ffn_norm_w
-    [uint8] gate_w_q8
+    [float32]'gpu'unified ffn_norm_w
+    [uint8]'gpu'unified gate_w_q8
     int gate_w_type
-    [uint8] up_w_q8
+    [uint8]'gpu'unified up_w_q8
     int up_w_type
-    [uint8] down_w_q8
+    [uint8]'gpu'unified down_w_q8
     int down_w_type
 
 pub struct QuantModel:
@@ -93,8 +93,8 @@ pub struct QuantModel:
     [uint8] tok_embd_q8
     int tok_embd_type
     [QuantLayer] layers
-    [float32] output_norm_w
-    [uint8] output_w_q8
+    [float32]'gpu'unified output_norm_w
+    [uint8]'gpu'unified output_w_q8
     int output_w_type
 
 GgufTensorInfo find_tensor([GgufTensorInfo] tensors, string name) throws:
@@ -283,26 +283,28 @@ pub QuantModel load_model_quantized(GgufFile file) throws:
         let (gate_w, gate_ty) = load_tensor_quantized(file, "{prefix}.ffn_gate.weight")
         let (up_w, up_ty) = load_tensor_quantized(file, "{prefix}.ffn_up.weight")
         let (down_w, down_ty) = load_tensor_quantized(file, "{prefix}.ffn_down.weight")
+        # Every weight and norm/bias is uploaded to the GPU exactly once, here,
+        # and stays resident for the model's lifetime (see upload_bytes_gpu).
         let layer = QuantLayer(
-            load_tensor_f32(file, "{prefix}.attn_norm.weight"),
-            q_w, q_ty,
-            load_tensor_f32_or_zero(file, "{prefix}.attn_q.bias", qkv_dim),
-            k_w, k_ty,
-            load_tensor_f32_or_zero(file, "{prefix}.attn_k.bias", kv_dim),
-            v_w, v_ty,
-            load_tensor_f32_or_zero(file, "{prefix}.attn_v.bias", kv_dim),
-            o_w, o_ty,
-            load_tensor_f32(file, "{prefix}.ffn_norm.weight"),
-            gate_w, gate_ty,
-            up_w, up_ty,
-            down_w, down_ty)
+            upload_floats_gpu(load_tensor_f32(file, "{prefix}.attn_norm.weight")),
+            upload_bytes_gpu(q_w), q_ty,
+            upload_floats_gpu(load_tensor_f32_or_zero(file, "{prefix}.attn_q.bias", qkv_dim)),
+            upload_bytes_gpu(k_w), k_ty,
+            upload_floats_gpu(load_tensor_f32_or_zero(file, "{prefix}.attn_k.bias", kv_dim)),
+            upload_bytes_gpu(v_w), v_ty,
+            upload_floats_gpu(load_tensor_f32_or_zero(file, "{prefix}.attn_v.bias", kv_dim)),
+            upload_bytes_gpu(o_w), o_ty,
+            upload_floats_gpu(load_tensor_f32(file, "{prefix}.ffn_norm.weight")),
+            upload_bytes_gpu(gate_w), gate_ty,
+            upload_bytes_gpu(up_w), up_ty,
+            upload_bytes_gpu(down_w), down_ty)
         layers.push(layer)
         l += 1
 
     let output_norm_w = load_tensor_f32(file, "output_norm.weight")
     let (output_w_q8, output_w_type) = resolve_output_weight_q8(file, config, tok_embd_q8, tok_embd_type)
 
-    QuantModel(config, tok_embd_q8, tok_embd_type, layers, output_norm_w, output_w_q8, output_w_type)
+    QuantModel(config, tok_embd_q8, tok_embd_type, layers, upload_floats_gpu(output_norm_w), upload_bytes_gpu(output_w_q8), output_w_type)
 
 ([uint8], int) resolve_output_weight_q8(GgufFile file, Config config, [uint8] tok_embd_q8, int tok_embd_type) throws:
     if config.tied_embeddings:
@@ -411,7 +413,7 @@ pub [float32] forward_gpu(Model model, [int] tokens) throws:
 # Q8LinearKernel doc comment for the memory-savings rationale). Token
 # embedding lookup dequantizes just the one needed row per position (cheap,
 # CPU-side, quant.br's dequantize_q8_0) rather than the whole vocab table.
-pub [float32] forward_gpu_quantized(QuantModel model, [int] tokens) throws:
+pub [float32] forward_gpu_quantized(QuantModel& model, [int] tokens) throws:
     let seq = tokens.length
     let d = model.config.d_model
     let qkv_dim = model.config.n_head * model.config.d_head
@@ -484,7 +486,7 @@ pub SamplingParams greedy_params():
         i += 1
     out
 
-pub [int] generate(QuantModel model, [int] prompt_tokens, int max_new_tokens, int eos_id,
+pub [int] generate(QuantModel& model, [int] prompt_tokens, int max_new_tokens, int eos_id,
                     SamplingParams params) throws:
     mut [int] tokens = []
     for t in prompt_tokens:
@@ -572,7 +574,7 @@ pub struct GenCache:
 # single-token GPU dispatch sequences turned out to be *slower* wall-clock
 # than one batched 26-token forward, purely from per-kernel-launch overhead
 # at this model's small scale (confirmed empirically before adding this).
-pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) throws:
+pub ([float32], GenCache) prefill_gpu_quantized(QuantModel& model, [int] tokens) throws:
     let seq = tokens.length
     let d = model.config.d_model
     let qkv_dim = model.config.n_head * model.config.d_head
@@ -625,19 +627,21 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
         new_layers.push(LayerCache(k_mat, v_mat))
         l += 1
 
-    let final_normed = rms_norm_gpu(x, model.output_norm_w, seq, d, model.config.rms_eps)
-    let logits_all_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, seq, d, model.config.vocab_size)
-    # `logits_all` is indexed directly below (not just passed to another
-    # function call), which also needs an explicit materialization step.
-    let logits_all = passthrough(logits_all_raw)
-
-    let vocab = model.config.vocab_size
-    mut [float32] last_logits = [0.0 for i in 0..<vocab]
-    let base = (seq - 1) * vocab
-    var int vi = 0
-    while vi < vocab:
-        last_logits[vi] = logits_all[base + vi]
-        vi += 1
+    # Only the LAST position's logits are ever used (they pick the first
+    # generated token), so only the last row goes through the final norm and
+    # the vocab-wide output projection — the biggest single matmul in the
+    # model (d_model x vocab_size, e.g. 896 x 151936). Running it over all
+    # `seq` rows (as this used to) cost `seq`x the work and read back
+    # seq*vocab_size floats, ~97% of a 38-token prefill's wall-clock.
+    # RMSNorm is row-independent, so the last row's logits are the same
+    # math; as a seq=1 projection it also takes fused_linear_gpu's
+    # decode-shape (warp-broadcast) kernel.
+    let x_last = extract_row(x, seq - 1, d)
+    let final_normed = rms_norm_gpu(x_last, model.output_norm_w, 1, d, model.config.rms_eps)
+    let logits_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
+    # returned inside a tuple below, which — like a struct constructor —
+    # doesn't trigger the GPU-result-to-array conversion automatically.
+    let last_logits = passthrough(logits_raw)
 
     (last_logits, GenCache(new_layers, seq))
 
@@ -652,7 +656,7 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
 # prefill_gpu_quantized, mirroring generate()/generate_kv()'s own existing
 # split, rather than unifying them behind an "empty vs non-empty cache"
 # branch — same GPU-orchestration code, same reasoning.
-pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache cache, [int] tokens) throws:
+pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel& model, GenCache cache, [int] tokens) throws:
     let n = tokens.length
     let base_pos = cache.pos
     let d = model.config.d_model
@@ -719,17 +723,11 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
         new_layers.push(LayerCache(full_k, full_v))
         l += 1
 
-    let final_normed = rms_norm_gpu(x, model.output_norm_w, n, d, model.config.rms_eps)
-    let logits_all_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, n, d, model.config.vocab_size)
-    let logits_all = passthrough(logits_all_raw)
-
-    let vocab = model.config.vocab_size
-    mut [float32] last_logits = [0.0 for i in 0..<vocab]
-    let base = (n - 1) * vocab
-    var int vi = 0
-    while vi < vocab:
-        last_logits[vi] = logits_all[base + vi]
-        vi += 1
+    # Last row only — see prefill_gpu_quantized's identical tail for why.
+    let x_last = extract_row(x, n - 1, d)
+    let final_normed = rms_norm_gpu(x_last, model.output_norm_w, 1, d, model.config.rms_eps)
+    let logits_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
+    let last_logits = passthrough(logits_raw)
 
     (last_logits, GenCache(new_layers, base_pos + n))
 
@@ -744,7 +742,7 @@ pub GenCache empty_cache(int n_layer):
 # Processes exactly one new token against the existing cache. Returns the
 # new token's own logits row (vocab_size long — there's only ever one
 # position per call) and the grown cache.
-pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int token) throws:
+pub ([float32], GenCache) forward_step(QuantModel& model, GenCache cache, int token) throws:
     let d = model.config.d_model
     let qkv_dim = model.config.n_head * model.config.d_head
     let kv_dim = model.config.n_kv_head * model.config.d_head
@@ -811,7 +809,7 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
 
     (logits, GenCache(new_layers, pos + 1))
 
-pub [int] generate_kv(QuantModel model, [int] prompt_tokens, int max_new_tokens, int eos_id,
+pub [int] generate_kv(QuantModel& model, [int] prompt_tokens, int max_new_tokens, int eos_id,
                        SamplingParams params) throws:
     mut [int] tokens = []
     for t in prompt_tokens:
@@ -851,12 +849,12 @@ pub [int] generate_kv(QuantModel model, [int] prompt_tokens, int max_new_tokens,
 # prefill_step_gpu_quantized, instead of re-prefilling the whole
 # conversation-so-far). Both share this decode loop, which is otherwise
 # identical to generate_kv()'s own loop body.
-pub ([int], GenCache) generate_kv_chat_first(QuantModel model, [int] prompt_tokens, int max_new_tokens,
+pub ([int], GenCache) generate_kv_chat_first(QuantModel& model, [int] prompt_tokens, int max_new_tokens,
                                               int eos_id, SamplingParams params) throws:
     let (first_logits, cache0) = prefill_gpu_quantized(model, prompt_tokens)
     generate_kv_chat_loop(model, first_logits, cache0, prompt_tokens, max_new_tokens, eos_id, params)
 
-pub ([int], GenCache) generate_kv_chat_continue(QuantModel model, GenCache cache, [int] new_tokens,
+pub ([int], GenCache) generate_kv_chat_continue(QuantModel& model, GenCache cache, [int] new_tokens,
                                                  [int] tokens_so_far, int max_new_tokens, int eos_id,
                                                  SamplingParams params) throws:
     let (first_logits, cache1) = prefill_step_gpu_quantized(model, cache, new_tokens)
@@ -867,7 +865,7 @@ pub ([int], GenCache) generate_kv_chat_continue(QuantModel model, GenCache cache
         full_history.push(t)
     generate_kv_chat_loop(model, first_logits, cache1, full_history, max_new_tokens, eos_id, params)
 
-([int], GenCache) generate_kv_chat_loop(QuantModel model, [float32] first_logits, GenCache cache0,
+([int], GenCache) generate_kv_chat_loop(QuantModel& model, [float32] first_logits, GenCache cache0,
                                          [int] tokens_so_far, int max_new_tokens, int eos_id,
                                          SamplingParams params) throws:
     mut [int] tokens = []

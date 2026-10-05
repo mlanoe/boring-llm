@@ -18,7 +18,7 @@ JValue make_message(string role, string content) throws:
     mut {string=JValue} fields = {=}
     fields["role"] = JValue.JStr(role)
     fields["content"] = JValue.JStr(content)
-    JValue.JDict(fields)
+    JValue.JDict(fields, ["role", "content"])
 
 {string=JValue} build_env([JValue] messages, bool add_gen_prompt, string bos, string eos) throws:
     mut {string=JValue} env = {=}

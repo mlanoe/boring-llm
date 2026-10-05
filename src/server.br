@@ -1,0 +1,201 @@
+# boring-llm — OpenAI-compatible HTTP server (`--serve`)
+#
+# Exposes the loaded model as `GET /v1/models` and
+# `POST /v1/chat/completions` (JSON, or SSE when the request says
+# `"stream": true`), so any OpenAI-compatible client — OpenCode, the Vercel AI
+# SDK, `curl` — can drive it. Plain `std::net` (no extra crate): one blocking
+# accept loop, one request at a time, which is also exactly the serialization a
+# single GPU needs. Every response is `Connection: close`.
+#
+# The pure parts (message normalization, `<tool_call>` parsing, JSON/SSE
+# bodies) live in openai.br and are unit-tested there; this file is the socket
+# + model glue.
+
+use gguf
+use io
+use jinja
+use json
+use openai
+use tokenizer
+use model
+use sampling
+use std.net.TcpListener, TcpStream
+use std.io.Read, Write
+use std.time.Instant
+
+pub struct ServerCtx:
+    GgufFile file
+    Tokenizer tok
+    QuantModel model
+    string model_name
+    int max_ctx             # prompt + generated tokens must fit in this
+    int default_max_tokens  # used when a request sets no max_tokens
+    SamplingParams defaults
+
+pub struct HttpRequest:
+    string method
+    string path
+    string body
+
+# ── Socket helpers ───────────────────────────────────────────────────────
+
+int read_some(var TcpStream sock, mut [uint8] b) throws:
+    let n = try? sock.read(b)
+    guard let n else throw "socket read failed"
+    n as int
+
+def write_text(var TcpStream sock, string text) throws:
+    let w = try? sock.writeAll(text.asBytes())
+    guard let w else throw "socket write failed"
+
+def respond(var TcpStream sock, int status, string reason, string content_type, string body) throws:
+    let body_len = body.asBytes().length
+    let head = "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {body_len}\r\nConnection: close\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n\r\n"
+    write_text(sock, head)
+    write_text(sock, body)
+
+def respond_json(var TcpStream sock, int status, string reason, string body) throws:
+    respond(sock, status, reason, "application/json", body)
+
+int parse_content_length(string head):
+    for line in head.split("\r\n"):
+        let low = line.toLower()
+        if low.startsWith("content-length:"):
+            let v = low.replace("content-length:", "").trim()
+            return (v as int) else 0
+    0
+
+# Reads one HTTP request: accumulates raw bytes until the blank line ending
+# the headers, then until `Content-Length` body bytes have arrived. Decoded as
+# UTF-8 only once complete (a multi-byte character can straddle two reads).
+HttpRequest read_http_request(var TcpStream sock) throws:
+    mut [uint8] chunk = [0 as uint8 for i in 0..<65536]
+    mut [uint8] data = []
+    var int scan = 0
+    var int header_end = -1
+    var int content_length = 0
+    var string head = ""
+    while true:
+        let n = read_some(sock, chunk)
+        if n == 0:
+            break
+        var int k = 0
+        while k < n:
+            data.push(chunk[k])
+            k += 1
+        if header_end < 0:
+            while scan + 3 < data.length:
+                if int(data[scan]) == 13 and int(data[scan + 1]) == 10 and int(data[scan + 2]) == 13 and int(data[scan + 3]) == 10:
+                    header_end = scan + 4
+                    break
+                scan += 1
+            if header_end >= 0:
+                head = bytes_to_str(read_bytes(data, 0, header_end))
+                content_length = parse_content_length(head)
+        if header_end >= 0 and data.length >= header_end + content_length:
+            break
+    guard header_end >= 0 else throw "malformed request: no end of headers"
+    let request_line = head.split("\r\n")[0].split(" ")
+    guard request_line.length >= 2 else throw "malformed request line"
+    let body = bytes_to_str(read_bytes(data, header_end, content_length))
+    HttpRequest(request_line[0], request_line[1].split("?")[0], body)
+
+# ── Chat completions ─────────────────────────────────────────────────────
+
+[string] stop_list(JValue body):
+    match json_get(body, "stop"):
+        JStr(s): [s]
+        JList(items):
+            mut [string] out = []
+            for it in items:
+                match it:
+                    JStr(s): out.push(s)
+                    _: out.push("")
+            out
+        _: []
+
+def handle_chat(ServerCtx& ctx, var TcpStream sock, string body_text, int counter) throws:
+    let parsed = try? json_parse(body_text)
+    guard let body = parsed else:
+        respond_json(sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
+        return
+    let messages = normalize_messages(json_get_list(body, "messages"))
+    if messages.length == 0:
+        respond_json(sock, 400, "Bad Request", error_json("`messages` is required and must be a non-empty array", "invalid_request_error", "missing_messages"))
+        return
+    let tools = json_get_list(body, "tools")
+    let prompt_tokens = render_chat_prompt_messages(ctx.file, ctx.tok, messages, tools, true)
+
+    let room = ctx.max_ctx - prompt_tokens.length
+    if room <= 0:
+        respond_json(sock, 400, "Bad Request", error_json("prompt is {prompt_tokens.length} tokens, over this server's context size of {ctx.max_ctx}", "invalid_request_error", "context_length_exceeded"))
+        return
+    let asked = json_get_int(body, "max_tokens", json_get_int(body, "max_completion_tokens", ctx.default_max_tokens))
+    let max_new = if asked < room: asked else: room
+
+    let temperature = json_get_float(body, "temperature", ctx.defaults.temperature as float)
+    let top_p = json_get_float(body, "top_p", ctx.defaults.top_p as float)
+    let seed = json_get_int(body, "seed", ctx.defaults.seed)
+    let params = SamplingParams(temperature as float32, ctx.defaults.top_k, top_p as float32, seed, ctx.defaults.repeat_penalty, ctx.defaults.repeat_last_n)
+
+    let started = Instant.now()
+    let all_tokens = generate_kv(ctx.model, prompt_tokens, max_new, ctx.tok.eos_token_id, params)
+    let gen_ms = started.elapsed().asMillis() as int
+
+    mut [int] reply_tokens = []
+    var bool hit_eos = false
+    var int t = prompt_tokens.length
+    while t < all_tokens.length:
+        if all_tokens[t] == ctx.tok.eos_token_id:
+            hit_eos = true
+        else:
+            reply_tokens.push(all_tokens[t])
+        t += 1
+    let completion_tokens = all_tokens.length - prompt_tokens.length
+
+    let (text, stopped) = apply_stop(ctx.tok.decode(reply_tokens), stop_list(body))
+    let reply = parse_reply(text)
+    let finish = if reply.calls.length > 0: "tool_calls" elif hit_eos or stopped: "stop" else: "length"
+
+    let id = "{counter}"
+    let include_usage = json_get_bool(json_get(body, "stream_options"), "include_usage", false)
+    print "[serve] chat: {messages.length} messages, {tools.length} tools, prompt {prompt_tokens.length} tokens, generated {completion_tokens}, finish={finish}, {gen_ms} ms total"
+    if json_get_bool(body, "stream", false):
+        respond(sock, 200, "OK", "text/event-stream", completion_sse(id, ctx.model_name, reply, finish, prompt_tokens.length, completion_tokens, include_usage))
+    else:
+        respond_json(sock, 200, "OK", completion_json(id, ctx.model_name, reply, finish, prompt_tokens.length, completion_tokens))
+
+def handle_request(ServerCtx& ctx, var TcpStream sock, int counter) throws:
+    let r = read_http_request(sock)
+    print "[serve] {r.method} {r.path}"
+    if r.method == "OPTIONS":
+        respond(sock, 204, "No Content", "text/plain", "")
+    elif r.method == "GET" and (r.path == "/v1/models" or r.path == "/models"):
+        respond_json(sock, 200, "OK", models_json(ctx.model_name))
+    elif r.method == "GET" and (r.path == "/health" or r.path == "/"):
+        respond_json(sock, 200, "OK", "{{\"status\": \"ok\"}}")
+    elif r.method == "POST" and (r.path == "/v1/chat/completions" or r.path == "/chat/completions"):
+        handle_chat(ctx, sock, r.body, counter)
+    else:
+        respond_json(sock, 404, "Not Found", error_json("no route for {r.method} {r.path}", "invalid_request_error", "not_found"))
+
+# One request at a time, forever. A failure inside a request (bad socket,
+# generation error) is reported to the client when possible and logged, but
+# never takes the server down.
+pub def serve(ServerCtx& ctx, int port) throws:
+    let listener = try? TcpListener.bind("127.0.0.1:{port}")
+    guard let listener else throw "could not bind 127.0.0.1:{port} (port already in use?)"
+    print "[serve] model '{ctx.model_name}' ready — listening on http://127.0.0.1:{port}/v1 (context {ctx.max_ctx} tokens)"
+    var int counter = 0
+    for conn in listener.incoming():
+        let c = try? conn
+        guard let c else:
+            print "[serve] accept failed"
+            continue
+        var sock = c
+        counter += 1
+        try:
+            handle_request(ctx, sock, counter)
+        catch:
+            print "[serve] request {counter} failed: {error}"
+            let sent = try? respond_json(sock, 500, "Internal Server Error", error_json(error, "server_error", "internal_error"))

@@ -9,6 +9,9 @@ use gguf
 use model
 use tokenizer
 use sampling
+use server
+use json
+use openai
 
 def print_metadata(GgufFile file):
     print "GGUF version: {file.version}"
@@ -327,6 +330,45 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
             print "> "
             line = readLine()
 
+# Debug aid for verifying chat-template rendering against an independent
+# oracle (jinja2 + llama-cpp-python, see tools/): reads an OpenAI-style request
+# body from `path`, renders it exactly the way server.br would, and prints the
+# resulting prompt token ids on one line.
+def run_render_request(GgufFile file, string path) throws:
+    let tok = load_tokenizer(file)
+    let body = json_parse(bytes_to_str(fs.readBytes(path)))
+    let messages = normalize_messages(json_get_list(body, "messages"))
+    let ids = render_chat_prompt_messages(file, tok, messages, json_get_list(body, "tools"), true)
+    var string line = ""
+    var int i = 0
+    while i < ids.length:
+        line = if i == 0: "{ids[i]}" else: "{line},{ids[i]}"
+        i += 1
+    print "ids: {line}"
+
+# Debug aid: `path` holds a JSON array of strings; prints one `ids: ...` line
+# per string — the plain-text tokenization (special-token strings recognized
+# atomically), diffed against llama.cpp by tools/oracle_encode.py.
+def run_encode_file(GgufFile file, string path) throws:
+    let tok = load_tokenizer(file)
+    let doc = json_parse(bytes_to_str(fs.readBytes(path)))
+    match doc:
+        JList(items):
+            for it in items:
+                match it:
+                    JStr(text):
+                        let ids = tok.encode_with_specials(text)
+                        var string line = ""
+                        var int i = 0
+                        while i < ids.length:
+                            line = if i == 0: "{ids[i]}" else: "{line},{ids[i]}"
+                            i += 1
+                        print "ids: {line}"
+                    _:
+                        throw "--encode-file: every array element must be a string"
+        _:
+            throw "--encode-file: expected a JSON array of strings"
+
 def main() throws:
     let [string] argv = args()
 
@@ -346,6 +388,12 @@ def main() throws:
     var int seed = 0
     var float32 repeat_penalty = 1.0 as float32
     var int repeat_last_n = 64
+    var bool serve_mode = false
+    var string render_request_path = ""
+    var string encode_file_path = ""
+    var int port = 8080
+    var string model_name = ""
+    var int ctx_size = 4096
 
     var int i = 1
     while i < argv.length:
@@ -398,10 +446,28 @@ def main() throws:
         elif a == "--repeat-last-n" and i + 1 < argv.length:
             repeat_last_n = parse_int_arg("--repeat-last-n", argv[i + 1])
             i += 2
+        elif a == "--serve":
+            serve_mode = true
+            i += 1
+        elif a == "--encode-file" and i + 1 < argv.length:
+            encode_file_path = argv[i + 1]
+            i += 2
+        elif a == "--render-request" and i + 1 < argv.length:
+            render_request_path = argv[i + 1]
+            i += 2
+        elif a == "--port" and i + 1 < argv.length:
+            port = parse_int_arg("--port", argv[i + 1])
+            i += 2
+        elif a == "--model-name" and i + 1 < argv.length:
+            model_name = argv[i + 1]
+            i += 2
+        elif a == "--ctx-size" and i + 1 < argv.length:
+            ctx_size = parse_int_arg("--ctx-size", argv[i + 1])
+            i += 2
         else:
             i += 1
 
-    guard gguf_path != "" else throw "usage: --gguf <path.gguf> [--dump-metadata] [--tokens 1,2,3 [--gpu|--quantized]] [--prompt \"...\"|--chat [--system \"...\"] [--max-tokens N] [--kv-cache] [--temperature T --top-k K --top-p P --seed S --repeat-penalty R --repeat-last-n N]]"
+    guard gguf_path != "" else throw "usage: --gguf <path.gguf> [--dump-metadata] [--tokens 1,2,3 [--gpu|--quantized]] [--prompt \"...\"|--chat [--system \"...\"] [--max-tokens N] [--kv-cache] [--temperature T --top-k K --top-p P --seed S --repeat-penalty R --repeat-last-n N]|--serve [--port N] [--ctx-size N] [--model-name NAME] [--max-tokens N default per request]]"
 
     print "[diag] parsing {gguf_path}..."
     let [uint8] bytes = fs.readBytes(gguf_path)
@@ -417,7 +483,22 @@ def main() throws:
         else:
             run_forward_debug(file, parse_token_ids(tokens_csv), use_gpu)
 
-    if chat_mode:
+    if encode_file_path != "":
+        run_encode_file(file, encode_file_path)
+    if render_request_path != "":
+        run_render_request(file, render_request_path)
+    if serve_mode:
+        # OpenAI-compatible HTTP server (see server.br) — always the packed-
+        # weight quantized GPU path, with the model loaded once up front and
+        # kept resident for every request.
+        let params = SamplingParams(temperature, top_k, top_p, seed, repeat_penalty, repeat_last_n)
+        let name = if model_name != "": model_name else: (gguf_get_string(file.metadata, "general.name") else "boring-llm")
+        print "[diag] loading model weights (packed bytes, quantized tensor kernels)..."
+        let m = load_model_quantized(file)
+        print "[diag] model loaded (vocab={m.config.vocab_size} d_model={m.config.d_model} n_layer={m.config.n_layer})"
+        let ctx = ServerCtx(file, load_tokenizer(file), m, name, ctx_size, max_tokens, params)
+        serve(ctx, port)
+    elif chat_mode:
         let params = SamplingParams(temperature, top_k, top_p, seed, repeat_penalty, repeat_last_n)
         run_chat(file, system_msg, max_tokens, kv_cache, quantized, params)
     elif prompt != "":

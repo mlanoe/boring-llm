@@ -1,0 +1,222 @@
+# boring-llm — JSON parser (feeds the OpenAI-compatible server in server.br)
+#
+# Parses a JSON document into jinja.br's own `JValue` tree rather than a
+# separate JSON type: the request's `messages`/`tools` arrays are handed
+# straight to the GGUF's own chat template as the Jinja environment, so one
+# shared value type means no conversion step at all. Object key order is
+# preserved (`JDict`'s `keys`), so serializing a parsed value back out with
+# `jv_to_json` reproduces the request's own field order — a prompt rendered
+# twice from the same JSON must be byte-identical for a prefix KV-cache to
+# ever hit across requests.
+#
+# JSON `null` maps to `JUndefined` (jinja's own "no value" — falsy, and
+# `jv_to_json` writes it back as `null`).
+
+use jinja
+
+bool is_json_ws(string ch):
+    ch == " " or ch == "\n" or ch == "\t" or ch == "\r"
+
+int json_skip_ws([string] cs, int pos):
+    var int p = pos
+    while p < cs.length and is_json_ws(cs[p]):
+        p += 1
+    p
+
+int json_hex_val(string ch) throws:
+    if ch >= "0" and ch <= "9":
+        ord(ch) - ord("0")
+    elif ch >= "a" and ch <= "f":
+        ord(ch) - ord("a") + 10
+    elif ch >= "A" and ch <= "F":
+        ord(ch) - ord("A") + 10
+    else:
+        throw "json: invalid hex digit '{ch}' in \\u escape"
+
+int json_hex4([string] cs, int pos) throws:
+    guard pos + 4 <= cs.length else throw "json: truncated \\u escape"
+    var int v = 0
+    var int i = 0
+    while i < 4:
+        v = v * 16 + json_hex_val(cs[pos + i])
+        i += 1
+    v
+
+# `pos` points at the opening quote; returns (decoded string, index just past
+# the closing quote). Handles every JSON escape, including \uXXXX and
+# surrogate pairs (an emoji arrives as two consecutive \u escapes).
+(string, int) json_parse_string([string] cs, int pos) throws:
+    var string out = ""
+    var int p = pos + 1
+    while true:
+        guard p < cs.length else throw "json: unterminated string"
+        let ch = cs[p]
+        if ch == "\"":
+            return (out, p + 1)
+        elif ch == "\\":
+            guard p + 1 < cs.length else throw "json: truncated escape"
+            let e = cs[p + 1]
+            if e == "n":
+                out = "{out}\n"
+                p += 2
+            elif e == "t":
+                out = "{out}\t"
+                p += 2
+            elif e == "r":
+                out = "{out}\r"
+                p += 2
+            elif e == "b":
+                out = "{out}{chr(8)}"
+                p += 2
+            elif e == "f":
+                out = "{out}{chr(12)}"
+                p += 2
+            elif e == "u":
+                var int cp = json_hex4(cs, p + 2)
+                p += 6
+                if cp >= 0xD800 and cp <= 0xDBFF and p + 1 < cs.length and cs[p] == "\\" and cs[p + 1] == "u":
+                    let lo = json_hex4(cs, p + 2)
+                    if lo >= 0xDC00 and lo <= 0xDFFF:
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+                        p += 6
+                out = "{out}{chr(cp)}"
+            else:
+                # \" \\ \/ — the escaped char is itself
+                out = "{out}{e}"
+                p += 2
+        else:
+            out = "{out}{ch}"
+            p += 1
+    ("", p)
+
+(JValue, int) json_parse_number([string] cs, int pos) throws:
+    var string text = ""
+    var bool is_float = false
+    var int p = pos
+    while p < cs.length:
+        let ch = cs[p]
+        if (ch >= "0" and ch <= "9") or ch == "-" or ch == "+":
+            text = "{text}{ch}"
+        elif ch == "." or ch == "e" or ch == "E":
+            text = "{text}{ch}"
+            is_float = true
+        else:
+            break
+        p += 1
+    guard text != "" else throw "json: unexpected character '{cs[pos]}' at {pos}"
+    if not is_float:
+        # An integer too large for int64 falls through to a float below.
+        if let n = (text as int):
+            return (JValue.JInt(n), p)
+    guard let f = (text as float) else throw "json: invalid number '{text}'"
+    (JValue.JFloat(f), p)
+
+bool json_has_literal([string] cs, int pos, string lit):
+    let lc = lit.chars()
+    if pos + lc.length > cs.length:
+        return false
+    var int i = 0
+    while i < lc.length:
+        if cs[pos + i] != lc[i]:
+            return false
+        i += 1
+    true
+
+(JValue, int) json_parse_value([string] cs, int pos) throws:
+    let p = json_skip_ws(cs, pos)
+    guard p < cs.length else throw "json: unexpected end of input"
+    let ch = cs[p]
+    if ch == "{{":
+        var {string=JValue} fields = {=}
+        var [string] keys = []
+        var int q = json_skip_ws(cs, p + 1)
+        if q < cs.length and cs[q] == "}}":
+            return (JValue.JDict(fields, keys), q + 1)
+        while true:
+            q = json_skip_ws(cs, q)
+            guard q < cs.length and cs[q] == "\"" else throw "json: expected object key at {q}"
+            let (key, after_key) = json_parse_string(cs, q)
+            q = json_skip_ws(cs, after_key)
+            guard q < cs.length and cs[q] == ":" else throw "json: expected ':' after key '{key}'"
+            let (child, after_val) = json_parse_value(cs, q + 1)
+            if not fields.contains(key):
+                keys.push(key.clone())
+            fields[key] = child
+            q = json_skip_ws(cs, after_val)
+            guard q < cs.length else throw "json: unterminated object"
+            if cs[q] == ",":
+                q += 1
+            elif cs[q] == "}}":
+                return (JValue.JDict(fields, keys), q + 1)
+            else:
+                throw "json: expected ',' or '}}' at {q}"
+        (JValue.JUndefined, q)
+    elif ch == "[":
+        var [JValue] items = []
+        var int q = json_skip_ws(cs, p + 1)
+        if q < cs.length and cs[q] == "]":
+            return (JValue.JList(items), q + 1)
+        while true:
+            let (child, after_val) = json_parse_value(cs, q)
+            items.push(child)
+            q = json_skip_ws(cs, after_val)
+            guard q < cs.length else throw "json: unterminated array"
+            if cs[q] == ",":
+                q += 1
+            elif cs[q] == "]":
+                return (JValue.JList(items), q + 1)
+            else:
+                throw "json: expected ',' or ']' at {q}"
+        (JValue.JUndefined, q)
+    elif ch == "\"":
+        let (s, np) = json_parse_string(cs, p)
+        (JValue.JStr(s), np)
+    elif json_has_literal(cs, p, "true"):
+        (JValue.JBool(true), p + 4)
+    elif json_has_literal(cs, p, "false"):
+        (JValue.JBool(false), p + 5)
+    elif json_has_literal(cs, p, "null"):
+        (JValue.JUndefined, p + 4)
+    else:
+        json_parse_number(cs, p)
+
+pub JValue json_parse(string src) throws:
+    let cs = src.chars()
+    let (v, end) = json_parse_value(cs, 0)
+    let tail = json_skip_ws(cs, end)
+    guard tail == cs.length else throw "json: trailing characters at {tail}"
+    v
+
+# ── Typed accessors for pulling request fields out of a parsed object ─────
+
+pub JValue json_get(JValue v, string key):
+    match v:
+        JDict(fields, keys): fields[key] else JValue.JUndefined
+        _: JValue.JUndefined
+
+pub string json_get_str(JValue v, string key, string fallback):
+    match json_get(v, key):
+        JStr(s): s
+        _: fallback
+
+pub int json_get_int(JValue v, string key, int fallback):
+    match json_get(v, key):
+        JInt(n): n
+        JFloat(f): f as int
+        _: fallback
+
+pub float json_get_float(JValue v, string key, float fallback):
+    match json_get(v, key):
+        JFloat(f): f
+        JInt(n): n as float
+        _: fallback
+
+pub bool json_get_bool(JValue v, string key, bool fallback):
+    match json_get(v, key):
+        JBool(b): b
+        _: fallback
+
+pub [JValue] json_get_list(JValue v, string key):
+    match json_get(v, key):
+        JList(items): items
+        _: []

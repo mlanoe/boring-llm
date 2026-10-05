@@ -1,0 +1,57 @@
+# Interpreter-speed unit tests for src/json.br (no GGUF needed). A literal
+# `{`/`}` in a Boring string is written doubled (`{{`/`}}`) — see
+# test_jinja.br's header for the same note.
+
+use jinja
+use json
+
+def main() throws:
+    # Round trip: key order, nesting, null/bool/float/escapes all survive
+    # parse -> jv_to_json byte-for-byte (Python json.dumps-style spacing).
+    let src1 = "{{\"b\": 1, \"a\": [true, null, \"x\\ny\"], \"c\": 1.5, \"d\": {{\"z\": -2, \"y\": \"q\"}}}}"
+    let v1 = json_parse(src1)
+    assert_eq(jv_to_json(v1), src1 as string)
+
+    # Whitespace-insensitive on input, normalized on output.
+    let v2 = json_parse("  {{ \"k\" :  [ 1 ,2 , 3 ] , \"e\" : {{ }} , \"l\": [ ] }}  ")
+    assert_eq(jv_to_json(v2), "{{\"k\": [1, 2, 3], \"e\": {{}}, \"l\": []}}" as string)
+
+    # Typed accessors.
+    let body = json_parse("{{\"model\": \"qwen\", \"max_tokens\": 64, \"temperature\": 0.7, \"stream\": true, \"messages\": [{{\"role\": \"user\", \"content\": \"hi\"}}]}}")
+    assert_eq(json_get_str(body, "model", "?"), "qwen" as string)
+    assert_eq(json_get_int(body, "max_tokens", -1), 64 as int)
+    assert_eq(json_get_int(body, "missing", -1), -1 as int)
+    assert_eq(json_get_float(body, "temperature", 0.0), 0.7 as float)
+    assert_eq(json_get_float(body, "max_tokens", 0.0), 64.0 as float)
+    assert_eq(json_get_bool(body, "stream", false), true as bool)
+    assert_eq(json_get_list(body, "messages").length, 1 as int)
+
+    # \u escapes: BMP char, ASCII, and a surrogate pair (U+1F600 grinning face).
+    let v3 = json_parse("\"caf\\u00e9 \\u0041 \\ud83d\\ude00 \\\"q\\\" \\\\ \\/\"")
+    match v3:
+        JStr(s):
+            assert_eq(s, "café A {chr(0x1F600)} \"q\" \\ /" as string)
+        _:
+            throw "expected a string"
+
+    # Raw (unescaped) non-ASCII input passes straight through, and
+    # control characters re-escape on output.
+    let v4 = json_parse("\"héllo wörld\"")
+    assert_eq(jv_to_json(v4), "\"héllo wörld\"" as string)
+    assert_eq(jv_to_json(JValue.JStr("a{chr(1)}b")), "\"a\\u0001b\"" as string)
+
+    # Big integer falls back to float rather than failing.
+    let v5 = json_parse("123456789012345678901234567890")
+    match v5:
+        JFloat(f): assert_eq(f > 1.0e29, true as bool)
+        _: throw "expected a float for an out-of-range integer"
+
+    # Malformed input is a clean error, never a crash.
+    var int errors = 0
+    for bad in ["", "{{", "[1, 2", "{{\"a\" 1}}", "{{\"a\": }}", "\"abc", "[1] x", "tru", "{{'a': 1}}", "\"\\u12\""]:
+        try:
+            let _ = json_parse(bad)
+        catch:
+            errors += 1
+    assert_eq(errors, 10 as int)
+    print "test_json: ok"

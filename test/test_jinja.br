@@ -44,12 +44,29 @@ def main() throws:
     msg["role"] = JValue.JStr("user")
     msg["content"] = JValue.JStr("hi")
     mut [JValue] messages = []
-    messages.push(JValue.JDict(msg))
+    messages.push(JValue.JDict(msg, ["role", "content"]))
     mut {string=JValue} env5 = {=}
     env5["messages"] = JValue.JList(messages)
     let tmpl5 = "{ob}%- if messages[0]['role'] == \"user\" and not (messages[0].role == \"system\") -%{cb}{ob}{ob} messages[0].role {cb}{cb}:{ob}{ob} messages[0]['content'] {cb}{cb}{ob}%- endif -%{cb}"
     let out5 = render_jinja(tmpl5, env5)
     assert_eq(out5, "user:hi" as string)
+
+    # `+` adds two ints (index arithmetic) but still concatenates strings, and
+    # Qwen's consecutive-tool-message pattern (lookahead at messages[idx + 1])
+    # only closes a tool group at the LAST tool message of the group.
+    mut {string=JValue} env7 = {=}
+    mut [JValue] seq7 = []
+    for r in ["tool", "tool", "user"]:
+        mut {string=JValue} mm = {=}
+        mm["role"] = JValue.JStr(r)
+        seq7.push(JValue.JDict(mm, ["role"]))
+    env7["msgs"] = JValue.JList(seq7)
+    let out7a = render_jinja("{ob}%- for m in msgs -%{cb}[{ob}{ob} loop.index0 + 1 {cb}{cb}]{ob}%- endfor -%{cb}", env7)
+    assert_eq(out7a, "[1][2][3]" as string)
+    let out7b = render_jinja("{ob}%- for m in msgs -%{cb}{ob}{ob} 'a' + 'b' {cb}{cb}|{ob}%- endfor -%{cb}", env7)
+    assert_eq(out7b, "ab|ab|ab|" as string)
+    let out7c = render_jinja("{ob}%- for m in msgs -%{cb}{ob}%- if loop.last or (msgs[loop.index0 + 1].role != \"tool\") -%{cb}E{ob}%- else -%{cb}.{ob}%- endif -%{cb}{ob}%- endfor -%{cb}", env7)
+    assert_eq(out7c, ".EE" as string)
 
     # is defined + set
     mut {string=JValue} env6 = {=}

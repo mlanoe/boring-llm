@@ -1,0 +1,195 @@
+# boring-llm — OpenAI-compatible API plumbing (pure, no sockets, no GPU)
+#
+# Everything server.br needs that doesn't touch a socket or the model:
+# normalizing an OpenAI-style `messages` array into what a GGUF chat template
+# expects, pulling Hermes-style `<tool_call>` blocks (the format Qwen2.5 and
+# many other instruct models emit) back out of generated text, and building
+# the JSON / SSE response bodies. Kept separate so all of it can be unit-tested
+# under `boring run` (test/test_openai.br) without a model or a port.
+#
+# Literal `{`/`}` in the JSON-building strings below are written doubled
+# (`{{`/`}}`) — Boring's own interpolation syntax otherwise.
+
+use jinja
+use json
+
+# ── JValue helpers ───────────────────────────────────────────────────────
+
+bool jv_is_list(JValue v):
+    match v:
+        JList(items): true
+        _: false
+
+bool jv_is_str(JValue v):
+    match v:
+        JStr(s): true
+        _: false
+
+# Returns `d` with `key` set to `value` (appended to the key order if new).
+pub JValue jv_set(JValue d, string key, JValue value):
+    match d:
+        JDict(fields, keys):
+            mut {string=JValue} nf = fields.clone()
+            mut [string] nk = keys.clone()
+            if not fields.contains(key):
+                nk.push(key)
+            nf[key] = value
+            JValue.JDict(nf, nk)
+        _: d
+
+# ── Message normalization ────────────────────────────────────────────────
+
+# `content` may be a plain string, null, or an array of typed parts
+# (`[{"type": "text", "text": "..."}]` — what the AI SDK sends); chat
+# templates only understand a string.
+pub string content_to_text(JValue c):
+    match c:
+        JStr(s): s
+        JList(parts):
+            var string out = ""
+            for p in parts:
+                let t = json_get_str(p, "text", "")
+                out = "{out}{t}"
+            out
+        _: ""
+
+# OpenAI sends an assistant `tool_calls[i].function.arguments` as a JSON
+# *string*; chat templates (Qwen's, ...) apply `| tojson` to it and expect an
+# object — parse it once here. A string that isn't valid JSON is left alone.
+JValue normalize_tool_call(JValue call):
+    let func = json_get(call, "function")
+    if not jv_is_str(json_get(func, "arguments")):
+        return call
+    let parsed = try? json_parse(json_get_str(func, "arguments", ""))
+    if let pv = parsed:
+        return jv_set(call, "function", jv_set(func, "arguments", pv))
+    call
+
+pub [JValue] normalize_messages([JValue] messages) throws:
+    mut [JValue] out = []
+    for m in messages:
+        var JValue nm = m.clone()
+        if jv_is_list(json_get(m, "content")):
+            nm = jv_set(nm, "content", JValue.JStr(content_to_text(json_get(m, "content"))))
+        if jv_is_list(json_get(m, "tool_calls")):
+            mut [JValue] calls = []
+            for c in json_get_list(m, "tool_calls"):
+                calls.push(normalize_tool_call(c))
+            nm = jv_set(nm, "tool_calls", JValue.JList(calls))
+        out.push(nm)
+    out
+
+# ── Generated text -> content + tool calls ───────────────────────────────
+
+pub struct ParsedToolCall:
+    string name
+    string arguments   # JSON text, as OpenAI's `function.arguments` wants it
+
+pub struct ParsedReply:
+    string content
+    [ParsedToolCall] calls
+
+# Parses one `<tool_call>` body. Qwen2.5's GGUF-embedded chat template renders
+# its own format example with DOUBLED braces (`{{"name": ..., "arguments":
+# ...}}` — real jinja2 does too, it is the template text, not our renderer),
+# and a small model copies that faithfully; llama.cpp's own output for the same
+# prompt is identical. So when strict parsing fails and the body is wrapped in
+# a doubled brace pair, retry with exactly one brace stripped from each end
+# (a legitimate nested `}}` inside the object is never touched).
+JValue? parse_tool_body(string body):
+    let direct = try? json_parse(body)
+    if let v = direct:
+        return v
+    if body.startsWith("{{") and body.endsWith("}}"):
+        let cs = body.chars()
+        var string inner = ""
+        var int i = 1
+        while i < cs.length - 1:
+            inner = "{inner}{cs[i]}"
+            i += 1
+        return try? json_parse(inner)
+    nil
+
+# Hermes-style: `<tool_call>\n{"name": "...", "arguments": {...}}\n</tool_call>`
+# (zero or more, optionally preceded by plain text). A block whose body isn't
+# valid JSON with a `name` is left in `content` verbatim rather than dropped.
+pub ParsedReply parse_reply(string text):
+    let parts = text.split("<tool_call>")
+    var string content = parts[0].trim()
+    mut [ParsedToolCall] calls = []
+    var int i = 1
+    while i < parts.length:
+        let seg = parts[i].split("</tool_call>")
+        let parsed = parse_tool_body(seg[0].trim())
+        var bool ok = false
+        if seg.length > 1:
+            if let v = parsed:
+                let name = json_get_str(v, "name", "")
+                if name != "":
+                    let args = json_get(v, "arguments")
+                    let args_text = if jv_is_str(args): json_get_str(v, "arguments", "") else: jv_to_json(args)
+                    calls.push(ParsedToolCall(name, args_text))
+                    ok = true
+        if not ok:
+            content = "{content}<tool_call>{parts[i]}"
+        i += 1
+    ParsedReply(content, calls)
+
+# Truncates `text` at the earliest occurrence of any non-empty stop string.
+pub (string, bool) apply_stop(string text, [string] stops):
+    var string out = text
+    var bool stopped = false
+    for s in stops:
+        if s != "" and out.contains(s):
+            out = out.split(s)[0]
+            stopped = true
+    (out, stopped)
+
+# ── Response bodies ──────────────────────────────────────────────────────
+
+string tool_calls_json(string id, [ParsedToolCall] calls, bool with_index):
+    var string out = "["
+    var int i = 0
+    while i < calls.length:
+        if i > 0:
+            out = "{out}, "
+        let idx = if with_index: "\"index\": {i}, " else: ""
+        out = "{out}{{{idx}\"id\": \"call_{id}_{i}\", \"type\": \"function\", \"function\": {{\"name\": \"{json_escape(calls[i].name)}\", \"arguments\": \"{json_escape(calls[i].arguments)}\"}}}}"
+        i += 1
+    "{out}]"
+
+string usage_json(int prompt_tokens, int completion_tokens):
+    "{{\"prompt_tokens\": {prompt_tokens}, \"completion_tokens\": {completion_tokens}, \"total_tokens\": {prompt_tokens + completion_tokens}}}"
+
+pub string error_json(string message, string kind, string code):
+    "{{\"error\": {{\"message\": \"{json_escape(message)}\", \"type\": \"{kind}\", \"code\": \"{code}\"}}}}"
+
+pub string models_json(string model_id):
+    "{{\"object\": \"list\", \"data\": [{{\"id\": \"{json_escape(model_id)}\", \"object\": \"model\", \"created\": 0, \"owned_by\": \"boring-llm\"}}]}}"
+
+pub string completion_json(string id, string model, ParsedReply reply, string finish_reason,
+                            int prompt_tokens, int completion_tokens):
+    let content = if reply.content == "" and reply.calls.length > 0: "null" else: "\"{json_escape(reply.content)}\""
+    let calls = if reply.calls.length > 0: ", \"tool_calls\": {tool_calls_json(id, reply.calls, false)}" else: ""
+    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": 0, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{calls}}}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}"
+
+string sse_chunk(string id, string model, string delta, string finish_reason):
+    let fr = if finish_reason == "": "null" else: "\"{finish_reason}\""
+    "data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"delta\": {delta}, \"finish_reason\": {fr}}}]}}\n\n"
+
+# A complete `stream: true` response body. The whole reply is already
+# generated by the time this runs, so it's emitted as a role chunk, one content
+# chunk, optional tool-call chunk, a finish chunk and (when asked via
+# `stream_options.include_usage`) a usage chunk — wire-compatible with real
+# token-by-token streaming, just not incremental yet.
+pub string completion_sse(string id, string model, ParsedReply reply, string finish_reason,
+                           int prompt_tokens, int completion_tokens, bool include_usage):
+    var string out = sse_chunk(id, model, "{{\"role\": \"assistant\", \"content\": \"\"}}", "")
+    if reply.content != "":
+        out = "{out}{sse_chunk(id, model, "{{\"content\": \"{json_escape(reply.content)}\"}}", "")}"
+    if reply.calls.length > 0:
+        out = "{out}{sse_chunk(id, model, "{{\"tool_calls\": {tool_calls_json(id, reply.calls, true)}}}", "")}"
+    out = "{out}{sse_chunk(id, model, "{{}}", finish_reason)}"
+    if include_usage:
+        out = "{out}data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"{json_escape(model)}\", \"choices\": [], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}\n\n"
+    "{out}data: [DONE]\n\n"

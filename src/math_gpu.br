@@ -1818,7 +1818,7 @@ pub req [float32]'gpu'unified fused_linear_nobias_gpu([float32] x, [uint8] w_pac
 # above as the performance baseline while migration and shape-specific tensor
 # scheduling are measured. Literal format names deliberately keep each packed
 # layout explicit to Boring's tensor checker and generated kernel.
-pub req [float32]'gpu'unified tensor_linear_gpu([float32]'gpu'global x,
+req [float32]'gpu'unified tensor_linear_schedule_gpu([float32]'gpu'global x,
                        [uint8]'gpu'global w_packed, int w_type,
                        [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
     mut [float32]'gpu'unified y = [0.0 as float32 for ..<seq * d_out]
@@ -1839,10 +1839,39 @@ pub req [float32]'gpu'unified tensor_linear_gpu([float32]'gpu'global x,
     elif w_type == 20:
         gpu.tensor.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "iq4_nl")
     else:
-        throw "tensor_linear_gpu: unsupported ggml type id {w_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
+        throw "tensor_linear_schedule_gpu: unsupported ggml type id {w_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
     y
 
+# Shape-aware entry points model.br actually calls. `gpu.tensor.linear` (the
+# compiler's tensor schedule, used for single-row decode where its warp-
+# broadcast schedule wins) only has a scalar prefill schedule today — one
+# thread per output cell, no weight reuse across the `seq` rows — which on a
+# real 0.5B model measured ~0.5 s per layer of FFN matmul at seq=28
+# (~1-2 GFLOP/s). The hand-written tiled kernels behind `fused_linear_gpu`
+# (16x16 shared-memory tiles, reuse each weight tile across rows) are the
+# project's measured prefill baseline (see test/bench_linear_warp.br), so any
+# `seq > 1` call goes there; `seq == 1` keeps the tensor schedule. Drop this
+# split once `boring` grows a tiled/simdgroup tensor schedule (see
+# boring/docs/tensor-core-primitives.md's own "add tiled shared-memory
+# fallbacks" note) that beats the hand-written kernel at prefill shapes.
+pub req [float32]'gpu'unified tensor_linear_gpu([float32]'gpu'global x,
+                       [uint8]'gpu'global w_packed, int w_type,
+                       [float32]'gpu'global bv, int seq, int d_in, int d_out) throws:
+    if seq == 1:
+        tensor_linear_schedule_gpu(x, w_packed, w_type, bv, seq, d_in, d_out)
+    else:
+        fused_linear_gpu(x, w_packed, w_type, bv, seq, d_in, d_out)
+
 pub req [float32]'gpu'unified tensor_linear_nobias_gpu([float32]'gpu'global x,
+                       [uint8]'gpu'global w_packed, int w_type,
+                       int seq, int d_in, int d_out) throws:
+    if seq == 1:
+        tensor_linear_nobias_schedule_gpu(x, w_packed, w_type, seq, d_in, d_out)
+    else:
+        let [float32] zero_bias = [0.0 for i in 0..<d_out]
+        fused_linear_gpu(x, w_packed, w_type, zero_bias, seq, d_in, d_out)
+
+req [float32]'gpu'unified tensor_linear_nobias_schedule_gpu([float32]'gpu'global x,
                        [uint8]'gpu'global w_packed, int w_type,
                        int seq, int d_in, int d_out) throws:
     mut [float32]'gpu'unified y = [0.0 as float32 for ..<seq * d_out]
@@ -1863,7 +1892,7 @@ pub req [float32]'gpu'unified tensor_linear_nobias_gpu([float32]'gpu'global x,
     elif w_type == 20:
         gpu.tensor.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "iq4_nl")
     else:
-        throw "tensor_linear_nobias_gpu: unsupported ggml type id {w_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
+        throw "tensor_linear_nobias_schedule_gpu: unsupported ggml type id {w_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
     y
 
 # ── Kernel: RMSNorm (row-wise) ───────────────────────────────────────────
@@ -1970,6 +1999,73 @@ pub req [float32]'gpu'unified rope_apply_at_gpu([float32]'global x, int seq, int
     let int total = seq * n_heads * half_dim
     let int blocks = (total + 255) / 256
     mut k = RopeApplyKernel(x, seq, n_heads, d_head, freq_base, start_pos, neox)
+    kernel:
+        k(block = 256, grid = blocks)
+    k.out
+
+# ── One-time upload: host array -> GPU-resident buffer ───────────────────
+# Model weights are uploaded ONCE at load time (model.br's load_model_quantized)
+# and kept resident in `QuantLayer`/`QuantModel` fields, instead of every
+# matmul of every token re-cloning the host bytes and re-uploading them
+# (`BoringGpuArg::Host`, which uploads lazily at each kernel use). A kernel
+# `'global` input is what makes `boring` upload; copying it into a `'unified`
+# output yields a value that stays on the device across calls.
+#
+# Each thread copies 16 consecutive bytes (a multiple of 4): on `--target
+# wgpu`, byte arrays are packed into `array<u32>`, and two threads writing
+# different bytes of one u32 would race — 16-byte, 4-aligned runs never share
+# a word. 16 bytes/thread also keeps even a ~140 MB tensor under wgpu's
+# 65535-workgroup-per-dimension dispatch limit (256 threads x 16 B = 4096 B
+# per workgroup, i.e. up to ~268 MB per tensor).
+
+kernel CopyBytesKernel:
+    let [uint8]'global   src
+    mut [uint8]'unified  out
+    let int              n
+
+    init([uint8]'global s, int nn):
+        src = s
+        n   = nn
+        out = [0 as uint8 for ..<nn]
+
+    def ():
+        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        let base = i * 16
+        var int k = 0
+        while k < 16:
+            if base + k < n:
+                out[base + k] = src[base + k]
+            k += 1
+
+pub req [uint8]'gpu'unified upload_bytes_gpu([uint8]'global src) throws:
+    let int n = src.length
+    let int blocks = (n + 4095) / 4096
+    if blocks > 65535:
+        throw "upload_bytes_gpu: tensor of {n} bytes exceeds the 65535-workgroup dispatch limit"
+    mut k = CopyBytesKernel(src, n)
+    kernel:
+        k(block = 256, grid = blocks)
+    k.out
+
+kernel CopyFloatsKernel:
+    let [float32]'global   src
+    mut [float32]'unified  out
+    let int                n
+
+    init([float32]'global s, int nn):
+        src = s
+        n   = nn
+        out = [0.0 for ..<nn]
+
+    def ():
+        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if i < n:
+            out[i] = src[i]
+
+pub req [float32]'gpu'unified upload_floats_gpu([float32]'global src) throws:
+    let int n = src.length
+    let int blocks = (n + 255) / 256
+    mut k = CopyFloatsKernel(src, n)
     kernel:
         k(block = 256, grid = blocks)
     k.out

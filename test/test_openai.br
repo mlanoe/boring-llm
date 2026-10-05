@@ -1,0 +1,106 @@
+# Interpreter-speed unit tests for src/openai.br (no GGUF, no socket). A
+# literal `{`/`}` in a Boring string is written doubled (`{{`/`}}`).
+
+use jinja
+use json
+use openai
+
+def main() throws:
+    # ── normalize_messages: parts flattened, tool_call arguments parsed ──
+    let msgs = json_parse("[{{\"role\": \"user\", \"content\": [{{\"type\": \"text\", \"text\": \"a\"}}, {{\"type\": \"text\", \"text\": \"b\"}}]}}, {{\"role\": \"assistant\", \"content\": null, \"tool_calls\": [{{\"id\": \"c1\", \"type\": \"function\", \"function\": {{\"name\": \"get_weather\", \"arguments\": \"{{\\\"city\\\": \\\"Paris\\\"}}\"}}}}]}}, {{\"role\": \"tool\", \"tool_call_id\": \"c1\", \"content\": \"sunny\"}}]")
+    mut [JValue] msg_items = []
+    match msgs:
+        JList(items):
+            for it in items:
+                msg_items.push(it)
+        _:
+            throw "expected a list"
+    let norm = normalize_messages(msg_items)
+    assert_eq(norm.length, 3 as int)
+    assert_eq(jv_to_json(norm[0]), "{{\"role\": \"user\", \"content\": \"ab\"}}" as string)
+    assert_eq(jv_to_json(norm[1]), "{{\"role\": \"assistant\", \"content\": null, \"tool_calls\": [{{\"id\": \"c1\", \"type\": \"function\", \"function\": {{\"name\": \"get_weather\", \"arguments\": {{\"city\": \"Paris\"}}}}}}]}}" as string)
+    assert_eq(jv_to_json(norm[2]), "{{\"role\": \"tool\", \"tool_call_id\": \"c1\", \"content\": \"sunny\"}}" as string)
+
+    # ── parse_reply ──
+    let r0 = parse_reply("  just text  ")
+    assert_eq(r0.content, "just text" as string)
+    assert_eq(r0.calls.length, 0 as int)
+
+    let r1 = parse_reply("Let me check.\n<tool_call>\n{{\"name\": \"get_weather\", \"arguments\": {{\"city\": \"Paris\", \"days\": 3}}}}\n</tool_call>")
+    assert_eq(r1.content, "Let me check." as string)
+    assert_eq(r1.calls.length, 1 as int)
+    assert_eq(r1.calls[0].name, "get_weather" as string)
+    assert_eq(r1.calls[0].arguments, "{{\"city\": \"Paris\", \"days\": 3}}" as string)
+
+    let r2 = parse_reply("<tool_call>\n{{\"name\": \"a\", \"arguments\": {{}}}}\n</tool_call>\n<tool_call>\n{{\"name\": \"b\", \"arguments\": \"raw\"}}\n</tool_call>")
+    assert_eq(r2.content, "" as string)
+    assert_eq(r2.calls.length, 2 as int)
+    assert_eq(r2.calls[0].arguments, "{{}}" as string)
+    assert_eq(r2.calls[1].name, "b" as string)
+    assert_eq(r2.calls[1].arguments, "raw" as string)
+
+    # Malformed / truncated blocks stay in the content instead of vanishing.
+    let r3 = parse_reply("x <tool_call>\n{{\"name\": \"a\", \"argum")
+    assert_eq(r3.calls.length, 0 as int)
+    assert_eq(r3.content.contains("<tool_call>"), true as bool)
+
+    # Qwen2.5's template teaches a doubled-brace format; a model copying it is
+    # still parsed (one brace stripped per end), nested `}}` left intact.
+    let rd = parse_reply("<tool_call>\n{{{{\"name\": \"get_weather\", \"arguments\": {{\"city\": \"Paris\"}}}}}}\n</tool_call>")
+    assert_eq(rd.calls.length, 1 as int)
+    assert_eq(rd.calls[0].name, "get_weather" as string)
+    assert_eq(rd.calls[0].arguments, "{{\"city\": \"Paris\"}}" as string)
+    let rn = parse_reply("<tool_call>\n{{\"name\": \"f\", \"arguments\": {{\"a\": {{\"b\": 1}}}}}}\n</tool_call>")
+    assert_eq(rn.calls[0].arguments, "{{\"a\": {{\"b\": 1}}}}" as string)
+
+    # ── apply_stop ──
+    let (s1, st1) = apply_stop("hello END world", ["END"])
+    assert_eq(s1, "hello " as string)
+    assert_eq(st1, true as bool)
+    let (s2, st2) = apply_stop("hello world", ["END", ""])
+    assert_eq(s2, "hello world" as string)
+    assert_eq(st2, false as bool)
+    let (s3, st3) = apply_stop("a b c", ["c", "b"])
+    assert_eq(s3, "a " as string)
+    assert_eq(st3, true as bool)
+
+    # ── completion_json is valid JSON with the right fields ──
+    let plain = completion_json("7", "m\"1", ParsedReply("hi \"there\"\nbye", []), "stop", 10, 3)
+    let pj = json_parse(plain)
+    assert_eq(json_get_str(pj, "id", ""), "chatcmpl-7" as string)
+    assert_eq(json_get_str(pj, "model", ""), "m\"1" as string)
+    let choice = json_get_list(pj, "choices")[0]
+    assert_eq(json_get_str(choice, "finish_reason", ""), "stop" as string)
+    assert_eq(json_get_str(json_get(choice, "message"), "content", ""), "hi \"there\"\nbye" as string)
+    assert_eq(json_get_int(json_get(pj, "usage"), "total_tokens", 0), 13 as int)
+
+    let with_calls = completion_json("8", "m", r1, "tool_calls", 5, 6)
+    let cj = json_parse(with_calls)
+    let cmsg = json_get(json_get_list(cj, "choices")[0], "message")
+    let tc = json_get_list(cmsg, "tool_calls")
+    assert_eq(tc.length, 1 as int)
+    assert_eq(json_get_str(json_get(tc[0], "function"), "name", ""), "get_weather" as string)
+    # arguments is a JSON *string* that itself parses back to the object
+    let args_back = json_parse(json_get_str(json_get(tc[0], "function"), "arguments", ""))
+    assert_eq(json_get_int(args_back, "days", 0), 3 as int)
+
+    let only_calls = completion_json("9", "m", ParsedReply("", r1.calls), "tool_calls", 1, 1)
+    assert_eq(only_calls.contains("\"content\": null"), true as bool)
+
+    # ── SSE: every event is `data: <json>` ending in [DONE]; deltas rebuild the reply ──
+    let sse = completion_sse("3", "m", r1, "tool_calls", 5, 6, true)
+    let events = sse.split("\n\n")
+    # role, content, tool_calls, finish, usage, [DONE], trailing ""
+    assert_eq(events.length, 7 as int)
+    assert_eq(events[5], "data: [DONE]" as string)
+    let first = json_parse(events[0].replace("data: ", ""))
+    assert_eq(json_get_str(json_get(json_get_list(first, "choices")[0], "delta"), "role", ""), "assistant" as string)
+    let fin = json_parse(events[3].replace("data: ", ""))
+    assert_eq(json_get_str(json_get_list(fin, "choices")[0], "finish_reason", ""), "tool_calls" as string)
+    let usage_evt = json_parse(events[4].replace("data: ", ""))
+    assert_eq(json_get_list(usage_evt, "choices").length, 0 as int)
+    assert_eq(json_get_int(json_get(usage_evt, "usage"), "completion_tokens", 0), 6 as int)
+    let nousage = completion_sse("3", "m", ParsedReply("x", []), "stop", 1, 1, false)
+    assert_eq(nousage.contains("usage"), false as bool)
+
+    print "test_openai: ok"

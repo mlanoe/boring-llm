@@ -261,46 +261,161 @@ pub struct Tokenizer:
                 out = "{out}{ch}"
         out
 
-def bool is_ascii_letter(string ch):
-    (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z")
+# ── Qwen2 pre-tokenizer ──────────────────────────────────────────────────
+# A hand-written scanner for the pre-tokenization regex Qwen2 (and every GGUF
+# with `tokenizer.ggml.pre = "qwen2"`) applies before BPE merging:
+#
+#   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}
+#   | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+#
+# Regex alternation takes the FIRST alternative that matches at a position, so
+# match_pretoken tries them in that order. Notably: digits split one per token,
+# a single non-letter/non-newline char glues onto a following letter run
+# ("(abc", " word"), punctuation absorbs the newlines right after it (".\n\n"
+# is ONE pre-token), and a whitespace run gives its last char back to the next
+# token. Verified token-for-token against llama.cpp on a tricky corpus
+# (tools/oracle_encode.py).
+#
+# `\p{L}`/`\p{N}`/`\s` are approximated by code-point ranges rather than full
+# Unicode tables (none exist in Boring): exact for ASCII, Latin-1/Extended,
+# Greek, Cyrillic, CJK, Hangul and emoji — the text that actually shows up in
+# prompts — but a rare letter in a symbol block (letterlike symbols
+# U+2100-214F) is treated as a symbol.
 
-def bool is_ascii_digit(string ch):
-    ch >= "0" and ch <= "9"
+def bool is_letter_cp(int cp):
+    if cp < 128:
+        (cp >= 65 and cp <= 90) or (cp >= 97 and cp <= 122)
+    elif cp == 0xAA or cp == 0xB5 or cp == 0xBA:
+        true
+    elif cp < 0xC0:
+        false
+    elif cp == 0xD7 or cp == 0xF7:
+        false
+    elif cp >= 0x300 and cp <= 0x36F:
+        false
+    elif cp >= 0x2000 and cp <= 0x2BFF:
+        false
+    elif cp >= 0x3000 and cp <= 0x3004:
+        false
+    elif cp >= 0x3008 and cp <= 0x3020:
+        false
+    elif cp >= 0xFE00 and cp <= 0xFE0F:
+        false
+    elif cp >= 0xFF01 and cp <= 0xFF20:
+        false
+    elif cp >= 0xFF3B and cp <= 0xFF40:
+        false
+    elif cp >= 0xFF5B and cp <= 0xFF65:
+        false
+    elif cp >= 0x1F000 and cp <= 0x1FAFF:
+        false
+    elif cp >= 0xE000 and cp <= 0xF8FF:
+        false
+    else:
+        true
 
-def bool is_ascii_space(string ch):
-    ch == " " or ch == "\n" or ch == "\t" or ch == "\r"
+def bool is_digit_cp(int cp):
+    (cp >= 48 and cp <= 57) or cp == 0xB2 or cp == 0xB3 or cp == 0xB9 or (cp >= 0xBC and cp <= 0xBE) or (cp >= 0x660 and cp <= 0x669) or (cp >= 0x6F0 and cp <= 0x6F9) or (cp >= 0x966 and cp <= 0x96F) or (cp >= 0xFF10 and cp <= 0xFF19)
+
+def bool is_space_cp(int cp):
+    (cp >= 9 and cp <= 13) or cp == 32 or cp == 0x85 or cp == 0xA0 or cp == 0x1680 or (cp >= 0x2000 and cp <= 0x200A) or cp == 0x2028 or cp == 0x2029 or cp == 0x202F or cp == 0x205F or cp == 0x3000
+
+def bool is_newline_cp(int cp):
+    cp == 10 or cp == 13
+
+# `[^\s\p{L}\p{N}]`
+def bool is_other_cp(int cp):
+    not is_space_cp(cp) and not is_letter_cp(cp) and not is_digit_cp(cp)
+
+# ASCII-only lowercase of a code point (for the case-insensitive contractions).
+def int ascii_lower_cp(int cp):
+    if cp >= 65 and cp <= 90:
+        cp + 32
+    else:
+        cp
+
+# Exclusive end index of the pre-token starting at `i` (always > i).
+def int match_pretoken([int] cps, int i, int n):
+    let c = cps[i]
+
+    # 1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
+    if c == 39 and i + 1 < n:
+        let d = ascii_lower_cp(cps[i + 1])
+        if d == 115 or d == 116 or d == 109 or d == 100:
+            return i + 2
+        if i + 2 < n:
+            let e = ascii_lower_cp(cps[i + 2])
+            if (d == 114 and e == 101) or (d == 118 and e == 101) or (d == 108 and e == 108):
+                return i + 3
+
+    # 2. [^\r\n\p{L}\p{N}]?\p{L}+
+    var int j = -1
+    if is_letter_cp(c):
+        j = i
+    elif not is_newline_cp(c) and not is_digit_cp(c):
+        if i + 1 < n and is_letter_cp(cps[i + 1]):
+            j = i + 1
+    if j >= 0:
+        var int e = j
+        while e < n and is_letter_cp(cps[e]):
+            e += 1
+        return e
+
+    # 3. \p{N}
+    if is_digit_cp(c):
+        return i + 1
+
+    # 4.  ?[^\s\p{L}\p{N}]+[\r\n]*
+    var int k = i
+    if c == 32:
+        k = i + 1
+    if k < n and is_other_cp(cps[k]):
+        while k < n and is_other_cp(cps[k]):
+            k += 1
+        while k < n and is_newline_cp(cps[k]):
+            k += 1
+        return k
+
+    # 5-7. whitespace: \s*[\r\n]+  |  \s+(?!\S)  |  \s+
+    if is_space_cp(c):
+        var int s = i
+        while s < n and is_space_cp(cps[s]):
+            s += 1
+        var int last_nl = -1
+        var int t = i
+        while t < s:
+            if is_newline_cp(cps[t]):
+                last_nl = t
+            t += 1
+        if last_nl >= 0:
+            return last_nl + 1
+        if s >= n:
+            return s
+        if s - i > 1:
+            return s - 1
+        return s
+
+    i + 1
 
 [string] pretokenize(string text):
     let chars = text.chars()
     let n = chars.length
+    mut [int] cps = [0 for i in 0..<n]
+    var int ci = 0
+    while ci < n:
+        cps[ci] = ord(chars[ci])
+        ci += 1
     mut [string] segments = []
     var int i = 0
     while i < n:
+        let end = match_pretoken(cps, i, n)
         var string seg = ""
-        if chars[i] == " " and i + 1 < n and chars[i + 1] != " " and chars[i + 1] != "\n" and chars[i + 1] != "\t":
-            seg = " "
-            i += 1
-        if i >= n:
-            segments.push(seg)
-            break
-        let c = chars[i]
-        if is_ascii_letter(c):
-            while i < n and is_ascii_letter(chars[i]):
-                seg = "{seg}{chars[i]}"
-                i += 1
-        elif is_ascii_digit(c):
-            while i < n and is_ascii_digit(chars[i]):
-                seg = "{seg}{chars[i]}"
-                i += 1
-        elif is_ascii_space(c):
-            while i < n and is_ascii_space(chars[i]):
-                seg = "{seg}{chars[i]}"
-                i += 1
-        else:
-            while i < n and not is_ascii_letter(chars[i]) and not is_ascii_digit(chars[i]) and not is_ascii_space(chars[i]):
-                seg = "{seg}{chars[i]}"
-                i += 1
+        var int q = i
+        while q < end:
+            seg = "{seg}{chars[q]}"
+            q += 1
         segments.push(seg)
+        i = end
     segments
 
 # GPT-2's byte-level encoding: printable ASCII/Latin-1 bytes map to their
@@ -498,7 +613,9 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
     mut {string=int} special_tokens = {=}
     var int ti = 0
     while ti < token_types.length:
-        if token_types[ti] == 3:
+        # type 3 = CONTROL, type 4 = USER_DEFINED (e.g. Qwen2.5's <tool_call>/
+        # </tool_call>): llama.cpp matches both atomically in raw text.
+        if token_types[ti] == 3 or token_types[ti] == 4:
             special_tokens[tokens[ti]] = ti
         ti += 1
 
@@ -527,5 +644,21 @@ pub [int] render_chat_prompt(GgufFile file, Tokenizer tok, string system_msg, [s
     let bos = tok.reverse[tok.bos_token_id] else ""
     let eos = tok.reverse[tok.eos_token_id] else ""
     let env = build_chat_env(messages, add_generation_prompt, bos, eos)
+    let prompt_text = render_jinja(template, env)
+    tok.encode_with_specials(prompt_text)
+
+# Same as render_chat_prompt, but for an arbitrary already-built message list
+# (roles `system`/`user`/`assistant`/`tool`, assistant `tool_calls`, ...) plus
+# an optional `tools` list handed to the template as its `tools` variable —
+# what server.br feeds it from a parsed OpenAI-style request body, where the
+# conversation isn't the plain alternating user/assistant string pairs
+# render_chat_prompt's `[string]` signature can express.
+pub [int] render_chat_prompt_messages(GgufFile file, Tokenizer tok, [JValue] messages, [JValue] tools,
+                                       bool add_generation_prompt) throws:
+    guard let template = gguf_get_string(file.metadata, "tokenizer.chat_template") else throw "tokenizer: GGUF has no tokenizer.chat_template"
+    let bos = tok.reverse[tok.bos_token_id] else ""
+    let eos = tok.reverse[tok.eos_token_id] else ""
+    mut {string=JValue} env = build_chat_env(messages, add_generation_prompt, bos, eos)
+    env["tools"] = JValue.JList(tools)
     let prompt_text = render_jinja(template, env)
     tok.encode_with_specials(prompt_text)

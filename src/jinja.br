@@ -41,8 +41,13 @@ pub enum JValue:
     JStr(string s)
     JInt(int n)
     JBool(bool b)
+    JFloat(float f)
     JList([JValue] items)
-    JDict({string=JValue} fields)
+    # `keys` records insertion order (Boring's `{K=V}` is an unordered map),
+    # so `tojson` and any other serialization reproduces a request's own
+    # field order — a prompt rendered twice from the same JSON must be
+    # byte-identical, or a prefix KV-cache could never match across requests.
+    JDict({string=JValue} fields, [string] keys)
     JUndefined
 
 pub bool jv_truthy(JValue v):
@@ -50,8 +55,9 @@ pub bool jv_truthy(JValue v):
         JStr(s): s.length > 0
         JInt(n): n != 0
         JBool(b): b
+        JFloat(f): f != 0.0
         JList(items): items.length > 0
-        JDict(fields): true
+        JDict(fields, keys): true
         JUndefined: false
 
 bool jv_is_undefined(JValue v):
@@ -80,10 +86,11 @@ string jv_to_str(JValue v):
         JStr(s): s
         JInt(n): "{n}"
         JBool(b): if b: "True" else: "False"
+        JFloat(f): "{f}"
         JUndefined: ""
         _: ""
 
-string json_escape(string s):
+pub string json_escape(string s):
     var string out = ""
     for ch in s.chars():
         if ch == "\"":
@@ -92,19 +99,28 @@ string json_escape(string s):
             out = "{out}\\\\"
         elif ch == "\n":
             out = "{out}\\n"
+        elif ch == "\r":
+            out = "{out}\\r"
+        elif ch == "\t":
+            out = "{out}\\t"
+        elif ord(ch) < 32:
+            out = "{out}\\u{hex4(ord(ch))}"
         else:
             out = "{out}{ch}"
     out
 
-# Only ever reached inside a real template's tool-calling branches, which
-# this project always steers around (`tools`/`message.tool_calls` are
-# always empty in the environment this project builds — see
-# build_chat_env in model-facing code) — implemented anyway for
-# completeness, not exercised by test_jinja_real.br's own assertions.
-string jv_to_json(JValue v):
+string hex4(int n):
+    let digits = "0123456789abcdef".chars()
+    "{digits[(n >> 12) & 15]}{digits[(n >> 8) & 15]}{digits[(n >> 4) & 15]}{digits[n & 15]}"
+
+# Python-`json.dumps`-style (`", "`/`": "` separators, non-ASCII kept raw —
+# what HF's own `tojson` filter produces with `ensure_ascii=False`), which is
+# what real chat templates' tool-calling branches were written/tested against.
+pub string jv_to_json(JValue v):
     match v:
         JStr(s): "\"{json_escape(s)}\""
         JInt(n): "{n}"
+        JFloat(f): "{f}"
         JBool(b): if b: "true" else: "false"
         JUndefined: "null"
         JList(items):
@@ -112,12 +128,21 @@ string jv_to_json(JValue v):
             var int i = 0
             while i < items.length:
                 if i > 0:
-                    out = "{out},"
+                    out = "{out}, "
                 out = "{out}{jv_to_json(items[i])}"
                 i += 1
             "{out}]"
-        JDict(fields):
-            "{{}}"
+        JDict(fields, keys):
+            var string out = "{{"
+            var int i = 0
+            while i < keys.length:
+                if i > 0:
+                    out = "{out}, "
+                let k = keys[i]
+                let child = fields[k] else JValue.JUndefined
+                out = "{out}\"{json_escape(k)}\": {jv_to_json(child)}"
+                i += 1
+            "{out}}}"
 
 string strip_ws(string s):
     let chars = s.chars()
@@ -151,7 +176,7 @@ pub enum JExpr:
 
 JValue jv_get_attr(JValue base, string name):
     match base:
-        JDict(fields): fields[name] else JValue.JUndefined
+        JDict(fields, keys): fields[name] else JValue.JUndefined
         _: JValue.JUndefined
 
 JValue jv_get_index(JValue base, JValue idx):
@@ -164,7 +189,7 @@ JValue jv_get_index(JValue base, JValue idx):
                     else:
                         JValue.JUndefined
                 _: JValue.JUndefined
-        JDict(fields):
+        JDict(fields, keys):
             match idx:
                 JStr(k): fields[k] else JValue.JUndefined
                 _: JValue.JUndefined
@@ -182,7 +207,15 @@ JValue apply_filter(string name, JValue v) throws:
 
 JValue eval_binop(string op, JValue l, JValue r) throws:
     if op == "+":
-        JValue.JStr("{jv_to_str(l)}{jv_to_str(r)}")
+        # Two ints add (`messages[loop.index0 + 1]`, which Qwen's tool-message
+        # branch uses to look at the NEXT message); anything else concatenates
+        # as strings (`'\n' + message.content`), like Jinja.
+        match l:
+            JInt(a):
+                match r:
+                    JInt(b): JValue.JInt(a + b)
+                    _: JValue.JStr("{jv_to_str(l)}{jv_to_str(r)}")
+            _: JValue.JStr("{jv_to_str(l)}{jv_to_str(r)}")
     elif op == "-":
         match l:
             JInt(a):
@@ -701,7 +734,7 @@ JValue build_loop_value(int idx, int count):
     fields["index"] = JValue.JInt(idx + 1)
     fields["first"] = JValue.JBool(idx == 0)
     fields["last"] = JValue.JBool(idx == count - 1)
-    JValue.JDict(fields)
+    JValue.JDict(fields, ["index0", "index", "first", "last"])
 
 (string, {string=JValue}) render_for_step(JValue item, int idx, int count, string varname, [JStmt] body, {string=JValue} env) throws:
     mut {string=JValue} loop_env = env
@@ -766,7 +799,7 @@ pub JValue jv_chat_message(string role, string content):
     mut {string=JValue} fields = {=}
     fields["role"] = JValue.JStr(role)
     fields["content"] = JValue.JStr(content)
-    JValue.JDict(fields)
+    JValue.JDict(fields, ["role", "content"])
 
 # `system_msg == ""` omits the system message entirely (some templates,
 # e.g. TinyLlama's, render differently — or throw via a real Jinja
