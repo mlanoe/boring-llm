@@ -605,7 +605,7 @@ q6_k = "native"
 algorithm = "scalar"
 ```
 
-`gpu.tensor.linear` is Boring's built-in quantized matrix-multiply. The file chooses its schedule per phase and format: single-token decode, and batched prefill. Here the Metal native schedules are enabled for Q8_0, Q4_K and Q6_K prefill, and the default for any other format stays the scalar schedule. The decode path for Q4_K and Q6_K uses `boring`'s native decode kernels under `auto`.
+`kernel.tensors.linear` is Boring's built-in quantized matrix-multiply. The file chooses its schedule per phase and format: single-token decode, and batched prefill. Here the Metal native schedules are enabled for Q8_0, Q4_K and Q6_K prefill, and the default for any other format stays the scalar schedule. The decode path for Q4_K and Q6_K uses `boring`'s native decode kernels under `auto`.
 
 A prefill schedule has a staging precision: `float` (the default, exact against the scalar schedule up to summation order) or `half` (an opt-in, faster, with a half-precision rounding error of about 3e-4 of the largest output). Half was measured to move the 7B model's logits, so it is off by default.
 
@@ -724,7 +724,7 @@ Qwen3 is the worked example: three small changes in `model.br` (the head size fr
 
 ### 12.4 Working with GPU kernels in Boring
 
-- A kernel is a `kernel` struct with `'global` inputs and `'unified` outputs; a host wrapper (`req ... 'gpu'unified`) launches it and returns a resident buffer.
+- A kernel is a `kernel` struct with `'global` inputs and `'unified` outputs; a host wrapper (`req ... 'kernel'unified`) launches it and returns a resident buffer.
 - Resident values passed to a non-`req` helper may be rejected; keep GPU orchestration in `req` functions.
 - Values built from resident arguments are copied, never mutated in place, and a write to such a copy is silently lost (no compiler diagnostic yet); return new state from functions, and run `tools/decode_vs_llamacpp.py` after touching a kernel.
 - A matrix with more than 65,535 workgroups needs a two-dimensional grid (see the copy kernels).

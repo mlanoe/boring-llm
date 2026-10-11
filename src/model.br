@@ -72,38 +72,38 @@ pub struct Model:
 # tensor_linear_gpu (math_gpu.br) dispatches on this tag to the matching
 # quantized tensor format.
 pub struct QuantLayer:
-    [float32]'gpu'unified attn_norm_w
-    [uint8]'gpu'unified q_w_q8
+    [float32]'kernel'unified attn_norm_w
+    [uint8]'kernel'unified q_w_q8
     int q_w_type
-    [float32]'gpu'unified q_b
-    [uint8]'gpu'unified k_w_q8
+    [float32]'kernel'unified q_b
+    [uint8]'kernel'unified k_w_q8
     int k_w_type
-    [float32]'gpu'unified k_b
-    [uint8]'gpu'unified v_w_q8
+    [float32]'kernel'unified k_b
+    [uint8]'kernel'unified v_w_q8
     int v_w_type
-    [float32]'gpu'unified v_b
-    [uint8]'gpu'unified qkv_w_q8
-    [float32]'gpu'unified qkv_b
+    [float32]'kernel'unified v_b
+    [uint8]'kernel'unified qkv_w_q8
+    [float32]'kernel'unified qkv_b
     bool qkv_fused
-    [uint8]'gpu'unified o_w_q8
+    [uint8]'kernel'unified o_w_q8
     int o_w_type
-    [float32]'gpu'unified ffn_norm_w
-    [uint8]'gpu'unified gate_w_q8
+    [float32]'kernel'unified ffn_norm_w
+    [uint8]'kernel'unified gate_w_q8
     int gate_w_type
-    [uint8]'gpu'unified up_w_q8
+    [uint8]'kernel'unified up_w_q8
     int up_w_type
-    [uint8]'gpu'unified down_w_q8
+    [uint8]'kernel'unified down_w_q8
     int down_w_type
-    [float32]'gpu'unified q_norm_w   # d_head floats; zeros and unused unless config.qk_norm
-    [float32]'gpu'unified k_norm_w
+    [float32]'kernel'unified q_norm_w   # d_head floats; zeros and unused unless config.qk_norm
+    [float32]'kernel'unified k_norm_w
 
 pub struct QuantModel:
     Config config
     [uint8] tok_embd_q8
     int tok_embd_type
     [QuantLayer] layers
-    [float32]'gpu'unified output_norm_w
-    [uint8]'gpu'unified output_w_q8
+    [float32]'kernel'unified output_norm_w
+    [uint8]'kernel'unified output_w_q8
     int output_w_type
 
 GgufTensorInfo find_tensor([GgufTensorInfo] tensors, string name) throws:
@@ -610,7 +610,7 @@ pub [int] generate_f32(Model model, [int] prompt_tokens, int max_new_tokens, int
 # actually works (mirrors mha_step_gpu's own `(out, new_cache_k,
 # new_cache_v)` return shape).
 
-# `k`/`v` are GPU-resident (`'gpu'unified`): they live on the device for the
+# `k`/`v` are GPU-resident (`'kernel'unified`): they live on the device for the
 # whole generation and are grown there by `kv_append_gpu`, never read back.
 #
 # A kernel cannot grow a device buffer in place, so every append builds a new
@@ -623,10 +623,10 @@ pub [int] generate_f32(Model model, [int] prompt_tokens, int max_new_tokens, int
 # TAIL_MAX tokens, so the full copy is amortised over TAIL_MAX steps. Prefill
 # folds the tail first and works on one buffer.
 pub struct LayerCache:
-    [float32]'gpu'unified k     # main rows: the first `GenCache.pos - GenCache.tail` are valid
-    [float32]'gpu'unified v
-    [float32]'gpu'unified tk    # the newest `GenCache.tail` rows ([] when there are none)
-    [float32]'gpu'unified tv
+    [float32]'kernel'unified k     # main rows: the first `GenCache.pos - GenCache.tail` are valid
+    [float32]'kernel'unified v
+    [float32]'kernel'unified tk    # the newest `GenCache.tail` rows ([] when there are none)
+    [float32]'kernel'unified tv
 
 pub struct GenCache:
     [LayerCache] layers

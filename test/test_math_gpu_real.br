@@ -1,6 +1,6 @@
 # Real (compiled, --target metal) counterpart to test_math_gpu.br — covers
 # the two kernels the interpreter can't currently simulate correctly
-# (RopeApplyKernel: task_cc223e5c: .powf() fails under simulation; and, as
+# (the inline RoPE kernel: task_cc223e5c: .powf() fails under simulation; and, as
 # of this file, LinearKernel: task_88105830, a literal-0.0-into-a-float32-
 # array-slot type bug that also blocks simulation) plus a full small-scale
 # sanity check of every kernel against math.br's CPU reference values.
@@ -375,7 +375,7 @@ def main() throws:
     assert_close(gpu_q5_bcast[1], cpu_q5[1], "q5_linear_warp_broadcast_gpu[1]")
     print "q5_linear_warp_broadcast_gpu: OK ({gpu_q5_bcast[0]} {gpu_q5_bcast[1]}, expected ~132 ~202)"
 
-    # --- gpu.tensor.linear Q5_0 migration path vs. the same references ---
+    # --- kernel.tensors.linear Q5_0 migration path vs. the same references ---
     let tensor_q5_raw = tensor_linear_gpu(qx, w5_packed, 6, qb, 1, 32, 2)
     let tensor_q5 = passthrough(tensor_q5_raw)
     assert_close(tensor_q5[0], cpu_q5[0], "tensor_linear_gpu Q5_0[0]")

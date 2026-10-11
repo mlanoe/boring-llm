@@ -1,8 +1,8 @@
 # Tests for src/math_gpu.br against math.br's already-verified CPU reference
 # values (see test/test_math.br), run through boring run's kernel-simulation
 # path. Only covers kernels that path currently handles correctly:
-#   - RmsNormKernel, SwigluCombineKernel: fine.
-#   - RopeApplyKernel: `.powf()` fails under simulation only, correct in a
+#   - RMSNorm and SwiGLU inline kernels: fine.
+#   - The inline RoPE kernel: `.powf()` fails under simulation only, correct in a
 #     real build (task_cc223e5c).
 #   - LinearKernel, MatMulBTHeadsKernel (used by attention_gqa_gpu): a
 #     literal `0.0` written into a float32 tile-padding slot loses its type

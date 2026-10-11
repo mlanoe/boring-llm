@@ -141,7 +141,7 @@ def main() throws:
             let out = tensor_linear_gpu(x, w_packed, 8, bv, seq, d_model, d_out)
             let sink = passthrough(out)
             iter += 1
-        print "gpu.tensor.linear Q8_0, seq={seq} d_out={d_out}, {n_iter} iters: done"
+        print "kernel.tensors.linear Q8_0, seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q8warp":
         while iter < n_iter:
             let out = q8_linear_warp_gpu(x, w_packed, bv, seq, d_model, d_out)
@@ -165,7 +165,7 @@ def main() throws:
             let out = tensor_linear_gpu(x, w5_packed, 6, bv, seq, d_model, d_out)
             let sink = passthrough(out)
             iter += 1
-        print "gpu.tensor.linear Q5_0, seq={seq} d_out={d_out}, {n_iter} iters: done"
+        print "kernel.tensors.linear Q5_0, seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q5bcast":
         while iter < n_iter:
             let out = q5_linear_warp_broadcast_gpu(x, w5_packed, bv, seq, d_model, d_out)
@@ -183,7 +183,7 @@ def main() throws:
             let out = tensor_linear_gpu(x, w4_packed, 2, bv, seq, d_model, d_out)
             let sink = passthrough(out)
             iter += 1
-        print "gpu.tensor.linear Q4_0, seq={seq} d_out={d_out}, {n_iter} iters: done"
+        print "kernel.tensors.linear Q4_0, seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q4bcast":
         while iter < n_iter:
             let out = q4_linear_warp_broadcast_gpu(x, w4_packed, bv, seq, d_model, d_out)
@@ -201,7 +201,7 @@ def main() throws:
             let out = tensor_linear_gpu(x, w4_packed, 20, bv, seq, d_model, d_out)
             let sink = passthrough(out)
             iter += 1
-        print "gpu.tensor.linear IQ4_NL, seq={seq} d_out={d_out}, {n_iter} iters: done"
+        print "kernel.tensors.linear IQ4_NL, seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q4nlbcast":
         while iter < n_iter:
             let out = q4nl_linear_warp_broadcast_gpu(x, w4_packed, bv, seq, d_model, d_out)

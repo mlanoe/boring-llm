@@ -3,7 +3,7 @@
 How much one kernel launch costs when launches are chained on resident data (what
 a decode token does: 435 kernels on the 0.5B model, 18 per layer).
 
-- `launch.br`: a Boring program (`gpu.thread`, a `'unified` output, a `req` wrapper) that
+- `launch.br`: a Boring program (`.thread`, a `'unified` output, a `req` wrapper) that
   runs N trivial kernels in a chain on a resident buffer and prints the time per launch.
   Build with `boring build --target metal launch.br` in a directory with a `boring.toml`
   (`[project] name = "launchcost"`, `main = "launch.br"`), then `cargo build --release` in
