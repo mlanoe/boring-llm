@@ -93,7 +93,7 @@ def write_floats(File& f, [float32]& xs, int count, int off) throws:
 pub int snapshot_bytes_per_token(int n_layer, int kv_dim):
     4 + n_layer * 2 * kv_dim * 4
 
-pub int kv_dim_of(QuantModel& model):
+pub int kv_dim_of(QuantModel model):
     model.config.n_kv_head * model.config.d_head
 
 # Identifies the weights a snapshot was computed with.
@@ -145,7 +145,7 @@ pub [DiskSnap] scan_snapshots(string dir, int fp, int n_layer, int kv_dim, int m
     found
 
 # Writes the first `tokens.length` positions of `cache` to file `slot`.
-pub def save_snapshot(string dir, int fp, int slot, int seq, QuantModel& model, GenCache cache, [int] tokens) throws:
+pub def save_snapshot(string dir, int fp, int slot, int seq, QuantModel model, GenCache cache, [int] tokens) throws:
     let n = tokens.length
     guard n > 0 and cache.pos >= n else throw "prompt cache: nothing to save"
     let kv_dim = kv_dim_of(model)
@@ -182,7 +182,7 @@ pub def save_snapshot(string dir, int fp, int slot, int seq, QuantModel& model, 
 
 # The first `common` positions of snapshot `snap`, uploaded to the GPU as a
 # cache ready to resume from.
-pub GenCache load_snapshot(string dir, DiskSnap snap, QuantModel& model, int common) throws:
+pub GenCache load_snapshot(string dir, DiskSnap snap, QuantModel model, int common) throws:
     let n_total = snap.tokens.length
     guard common > 0 and common <= n_total else throw "prompt cache: cannot restore {common} of {n_total} positions"
     let kv_dim = kv_dim_of(model)

@@ -464,7 +464,7 @@ pub [float32] forward_gpu(Model model, [int] tokens) throws:
 # Q8LinearKernel doc comment for the memory-savings rationale). Token
 # embedding lookup dequantizes just the one needed row per position (cheap,
 # CPU-side, quant.br's dequantize_q8_0) rather than the whole vocab table.
-pub [float32] forward_gpu_quantized(QuantModel& model, [int] tokens) throws:
+pub [float32] forward_gpu_quantized(QuantModel model, [int] tokens) throws:
     let seq = tokens.length
     let d = model.config.d_model
     let qkv_dim = model.config.n_head * model.config.d_head
@@ -540,7 +540,7 @@ pub SamplingParams greedy_params():
         i += 1
     out
 
-pub [int] generate(QuantModel& model, [int] prompt_tokens, int max_new_tokens, int eos_id,
+pub [int] generate(QuantModel model, [int] prompt_tokens, int max_new_tokens, int eos_id,
                     SamplingParams params) throws:
     mut [int] tokens = []
     for t in prompt_tokens:
@@ -645,7 +645,7 @@ let int TAIL_MAX = 64
 # single-token GPU dispatch sequences turned out to be *slower* wall-clock
 # than one batched 26-token forward, purely from per-kernel-launch overhead
 # at this model's small scale (confirmed empirically before adding this).
-pub ([float32], GenCache) prefill_gpu_quantized(QuantModel& model, [int] tokens) throws:
+pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) throws:
     let seq = tokens.length
     let d = model.config.d_model
     let qkv_dim = model.config.n_head * model.config.d_head
@@ -727,7 +727,7 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel& model, [int] tokens)
 # prefill_gpu_quantized, mirroring generate()/generate_kv()'s own existing
 # split, rather than unifying them behind an "empty vs non-empty cache"
 # branch — same GPU-orchestration code, same reasoning.
-pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel& model, GenCache cache0, [int] tokens) throws:
+pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache cache0, [int] tokens) throws:
     if cache0.pos == 0:
         return prefill_gpu_quantized(model, tokens)
     let cache = fold_cache(model, cache0)
@@ -808,7 +808,7 @@ pub GenCache empty_cache(int n_layer):
 
 # The cache with its tail folded into the main buffers (nothing to do when the
 # tail is empty): what prefill and the disk snapshots need, one buffer per layer.
-pub GenCache fold_cache(QuantModel& model, GenCache cache) throws:
+pub GenCache fold_cache(QuantModel model, GenCache cache) throws:
     if cache.tail == 0:
         return cache
     let kv_dim = model.config.n_kv_head * model.config.d_head
@@ -826,7 +826,7 @@ pub GenCache fold_cache(QuantModel& model, GenCache cache) throws:
 # Processes exactly one new token against the existing cache. Returns the
 # new token's own logits row (vocab_size long — there's only ever one
 # position per call) and the grown cache.
-pub ([float32], GenCache) forward_step(QuantModel& model, GenCache cache, int token) throws:
+pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int token) throws:
     guard cache.pos > 0 else throw "forward_step needs a prefilled cache"
     set_gpu_batch_limit(8)
     let d = model.config.d_model
@@ -839,6 +839,7 @@ pub ([float32], GenCache) forward_step(QuantModel& model, GenCache cache, int to
     # Residual stream: uploaded once, then it stays on the device — every
     # `add_gpu` below consumes and produces a resident buffer.
     var x = upload_floats_gpu(dequantize_row(model.tok_embd_type, model.tok_embd_q8, row_byte_offset, d))
+    var normed = rms_norm_gpu(x, model.layers[0].attn_norm_w, 1, d, model.config.rms_eps)
 
     mut [LayerCache] new_layers = []
     var int l = 0
@@ -846,43 +847,47 @@ pub ([float32], GenCache) forward_step(QuantModel& model, GenCache cache, int to
         let layer = model.layers[l]
         let lc = cache.layers[l]
 
-        let normed = rms_norm_gpu(x, layer.attn_norm_w, 1, d, model.config.rms_eps)
-        let (q0, k0, v_new) = project_qkv_decode_gpu(normed,
+        # Project and prepare Q/K/V as one resident pipeline. On the fused
+        # Q8_0 path this consumes slices of the joined projection directly,
+        # avoiding the decode-only QKV split kernel.
+        let tail_len = cache.tail
+        let ([float32]'kernel'unified q, [float32]'kernel'unified tk_new, [float32]'kernel'unified tv_new) = project_qkv_attention_decode_gpu(normed,
             layer.q_w_q8, layer.q_w_type, layer.q_b,
             layer.k_w_q8, layer.k_w_type, layer.k_b,
             layer.v_w_q8, layer.v_w_type, layer.v_b,
             layer.qkv_w_q8, layer.qkv_b, layer.qkv_fused,
-            d, qkv_dim, kv_dim)
-        var q = q0
-        var k_new = k0
-        if model.config.qk_norm:
-            q = rms_norm_gpu(q, layer.q_norm_w, 1 * model.config.n_head, model.config.d_head, model.config.rms_eps)
-            k_new = rms_norm_gpu(k_new, layer.k_norm_w, 1 * model.config.n_kv_head, model.config.d_head, model.config.rms_eps)
-
-        q = rope_apply_at_gpu(q, 1, model.config.n_head, model.config.d_head, model.config.rope_freq_base, pos, model.config.rope_neox)
-        let k_rope_raw = rope_apply_at_gpu(k_new, 1, model.config.n_kv_head, model.config.d_head, model.config.rope_freq_base, pos, model.config.rope_neox)
+            layer.q_norm_w, layer.k_norm_w, model.config.qk_norm,
+            lc.tk, lc.tv, tail_len,
+            d, qkv_dim, kv_dim, model.config.n_head, model.config.n_kv_head, model.config.d_head,
+            model.config.rms_eps, model.config.rope_freq_base, pos, model.config.rope_neox)
 
         # The new row goes to the tail (see LayerCache); the tail is folded into
         # the main buffers once it reaches TAIL_MAX rows.
         let seq_k = pos + 1
-        let tail_len = cache.tail
         let main_len = pos - tail_len
-        let tk_new = kv_tail_push(lc.tk, k_rope_raw, tail_len * kv_dim, kv_dim)
-        let tv_new = kv_tail_push(lc.tv, v_new, tail_len * kv_dim, kv_dim)
 
         # No causal mask: the single new query is always the most recent
         # position, so every key already in the cache (including the one
         # just appended) is a legitimate position to attend to.
         let attn_out = attention_gqa_tail_gpu(q, lc.k, lc.v, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
         let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, 1, qkv_dim, d)
-        x = add_gpu(x, attn_proj, d)
-
-        let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, 1, d, model.config.rms_eps)
+        let ([float32]'kernel'unified x_after_attn, [float32]'kernel'unified normed2) = add_rms_norm_decode_gpu(
+            x, attn_proj, layer.ffn_norm_w, d, model.config.rms_eps)
+        x = x_after_attn
         let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, 1, d, model.config.ffn_dim)
         let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, 1, d, model.config.ffn_dim)
         let hidden = swiglu_combine_gpu(gate, up)
         let ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, 1, model.config.ffn_dim, d)
-        x = add_gpu(x, ffn_out, d)
+        if l + 1 < model.config.n_layer:
+            let ([float32]'kernel'unified x_next, [float32]'kernel'unified normed_next) = add_rms_norm_decode_gpu(
+                x, ffn_out, model.layers[l + 1].attn_norm_w, d, model.config.rms_eps)
+            x = x_next
+            normed = normed_next
+        else:
+            let ([float32]'kernel'unified x_final, [float32]'kernel'unified normed_final) = add_rms_norm_decode_gpu(
+                x, ffn_out, model.output_norm_w, d, model.config.rms_eps)
+            x = x_final
+            normed = normed_final
 
         if tail_len + 1 >= TAIL_MAX:
             let full_k = kv_append_gpu(lc.k, tk_new, main_len * kv_dim, (tail_len + 1) * kv_dim)
@@ -893,8 +898,7 @@ pub ([float32], GenCache) forward_step(QuantModel& model, GenCache cache, int to
         l += 1
 
     let new_tail = if cache.tail + 1 >= TAIL_MAX: 0 else: cache.tail + 1
-    let final_normed = rms_norm_gpu(x, model.output_norm_w, 1, d, model.config.rms_eps)
-    let logits_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
+    let logits_raw = tensor_linear_nobias_gpu(normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
     set_gpu_batch_limit(1)
     # returned inside a tuple below, which — like a struct constructor —
     # doesn't trigger the GPU-result-to-array conversion automatically.
@@ -910,7 +914,7 @@ pub ([float32], GenCache) forward_step(QuantModel& model, GenCache cache, int to
 # A cache that is still empty is handled by prefill_step_gpu_quantized itself.
 let int PREFILL_CHUNK = 512
 
-pub ([float32], GenCache) prefill_chunked(QuantModel& model, GenCache cache0, [int] tokens) throws:
+pub ([float32], GenCache) prefill_chunked(QuantModel model, GenCache cache0, [int] tokens) throws:
     guard tokens.length > 0 else throw "prefill_chunked: no tokens"
     var cache = cache0
     var [float32] logits = []
@@ -925,7 +929,7 @@ pub ([float32], GenCache) prefill_chunked(QuantModel& model, GenCache cache0, [i
         start = end
     (logits, cache)
 
-pub [int] generate_kv(QuantModel& model, [int] prompt_tokens, int max_new_tokens, int eos_id,
+pub [int] generate_kv(QuantModel model, [int] prompt_tokens, int max_new_tokens, int eos_id,
                        SamplingParams params) throws:
     mut [int] tokens = []
     for t in prompt_tokens:
@@ -969,13 +973,13 @@ pub [int] generate_kv(QuantModel& model, [int] prompt_tokens, int max_new_tokens
 # every token that went through a forward pass: all but the last generated one
 # when the reply ended on EOS or a stop string (sampled, never fed back), so use
 # `cache.pos`, not the token count, as the number of valid cached positions.
-pub ([float32], GenCache) prefill_resume(QuantModel& model, GenCache cache, int reuse, [int] prompt_tokens) throws:
+pub ([float32], GenCache) prefill_resume(QuantModel model, GenCache cache, int reuse, [int] prompt_tokens) throws:
     let start_cache = resume_cache(model, cache, reuse, prompt_tokens.length)
     prefill_chunked(model, start_cache, prompt_tokens[reuse..<prompt_tokens.length])
 
 # The cache a resumed prefill starts from: `cache` truncated to its first
 # `reuse` positions (0 = a fresh one). `n_prompt` is only used to range-check.
-pub GenCache resume_cache(QuantModel& model, GenCache cache, int reuse, int n_prompt) throws:
+pub GenCache resume_cache(QuantModel model, GenCache cache, int reuse, int n_prompt) throws:
     guard reuse >= 0 and reuse < n_prompt else throw "prefill_resume: reuse {reuse} out of range for a {n_prompt}-token prompt"
     if reuse == 0:
         return empty_cache(model.config.n_layer)
@@ -1014,12 +1018,12 @@ pub int prefill_chunk_len():
 # prefill_step_gpu_quantized, instead of re-prefilling the whole
 # conversation-so-far). Both share this decode loop, which is otherwise
 # identical to generate_kv()'s own loop body.
-pub ([int], GenCache) generate_kv_chat_first(QuantModel& model, [int] prompt_tokens, int max_new_tokens,
+pub ([int], GenCache) generate_kv_chat_first(QuantModel model, [int] prompt_tokens, int max_new_tokens,
                                               int eos_id, SamplingParams params) throws:
     let (first_logits, cache0) = prefill_chunked(model, empty_cache(model.config.n_layer), prompt_tokens)
     generate_kv_chat_loop(model, first_logits, cache0, prompt_tokens, max_new_tokens, eos_id, params)
 
-pub ([int], GenCache) generate_kv_chat_continue(QuantModel& model, GenCache cache, [int] new_tokens,
+pub ([int], GenCache) generate_kv_chat_continue(QuantModel model, GenCache cache, [int] new_tokens,
                                                  [int] tokens_so_far, int max_new_tokens, int eos_id,
                                                  SamplingParams params) throws:
     let (first_logits, cache1) = prefill_chunked(model, cache, new_tokens)
@@ -1030,7 +1034,7 @@ pub ([int], GenCache) generate_kv_chat_continue(QuantModel& model, GenCache cach
         full_history.push(t)
     generate_kv_chat_loop(model, first_logits, cache1, full_history, max_new_tokens, eos_id, params)
 
-([int], GenCache) generate_kv_chat_loop(QuantModel& model, [float32] first_logits, GenCache cache0,
+([int], GenCache) generate_kv_chat_loop(QuantModel model, [float32] first_logits, GenCache cache0,
                                          [int] tokens_so_far, int max_new_tokens, int eos_id,
                                          SamplingParams params) throws:
     mut [int] tokens = []

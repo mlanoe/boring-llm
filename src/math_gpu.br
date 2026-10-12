@@ -1952,6 +1952,14 @@ pub req [float32]'kernel'unified rope_apply_gpu([float32]'kernel'global x, int s
 
 pub req [float32]'kernel'unified rope_apply_at_gpu([float32]'kernel'global x, int seq, int n_heads,
                        int d_head, float32 freq_base, int start_pos, int neox) throws:
+    rope_apply_slice_at_gpu(x, 0, seq, n_heads, d_head, freq_base, start_pos, neox)
+
+# Applies RoPE to a compact logical tensor starting at `input_offset` in a
+# larger resident buffer. Decode uses this to consume Q and K directly from a
+# concatenated QKV projection, without first launching a split/copy kernel.
+pub req [float32]'kernel'unified rope_apply_slice_at_gpu([float32]'kernel'global x, int input_offset,
+                       int seq, int n_heads, int d_head, float32 freq_base,
+                       int start_pos, int neox) throws:
     let int half_dim = d_head / 2
     let int total = seq * n_heads * half_dim
     let int blocks = (total + 255) / 256
@@ -1975,8 +1983,8 @@ pub req [float32]'kernel'unified rope_apply_at_gpu([float32]'kernel'global x, in
             if neox == 0:
                 idx0 = base_idx + 2 * j
                 idx1 = base_idx + 2 * j + 1
-            let x0 = x[idx0]
-            let x1 = x[idx1]
+            let x0 = x[input_offset + idx0]
+            let x1 = x[input_offset + idx1]
             out[idx0] = x0 * cos_a - x1 * sin_a
             out[idx1] = x0 * sin_a + x1 * cos_a
         out
@@ -2065,6 +2073,39 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
         let v = tensor_linear_gpu(x, vw, vt, vb, 1, d_in, kv_dim)
         (q, k, v)
 
+# Decode projection plus the transformations needed immediately before
+# attention. For the fused Q8_0 path, Q and K are read as slices of the joined
+# projection and V is appended to the cache from its slice. This removes the
+# QKV split dispatch and its three transient output buffers.
+pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'unified) project_qkv_attention_decode_gpu(
+        [float32]'kernel'global x,
+        [uint8]'kernel'global qw, int qt, [float32]'kernel'global qb,
+        [uint8]'kernel'global kw, int kt, [float32]'kernel'global kb,
+        [uint8]'kernel'global vw, int vt, [float32]'kernel'global vb,
+        [uint8]'kernel'global qkvw, [float32]'kernel'global qkvb, bool fused,
+        [float32]'kernel'global q_norm_w, [float32]'kernel'global k_norm_w, bool qk_norm,
+        [float32]'kernel'global prev_tk, [float32]'kernel'global prev_tv, int tail_len,
+        int d_in, int q_dim, int kv_dim, int n_head, int n_kv_head, int d_head,
+        float32 eps, float32 freq_base, int pos, int neox) throws:
+    if fused and not qk_norm:
+        let joined = tensor_linear_gpu(x, qkvw, 8, qkvb, 1, d_in, q_dim + 2 * kv_dim)
+        prepare_qkv_decode_slice(prev_tk, prev_tv, joined, tail_len * kv_dim,
+            n_head, n_kv_head, d_head, freq_base, pos, neox)
+    else:
+        let ([float32]'kernel'unified q0, [float32]'kernel'unified k0, [float32]'kernel'unified v) = project_qkv_decode_gpu(x,
+            qw, qt, qb, kw, kt, kb, vw, vt, vb, qkvw, qkvb, fused,
+            d_in, q_dim, kv_dim)
+        var q = q0
+        var k = k0
+        if qk_norm:
+            q = rms_norm_gpu(q, q_norm_w, n_head, d_head, eps)
+            k = rms_norm_gpu(k, k_norm_w, n_kv_head, d_head, eps)
+        q = rope_apply_at_gpu(q, 1, n_head, d_head, freq_base, pos, neox)
+        k = rope_apply_at_gpu(k, 1, n_kv_head, d_head, freq_base, pos, neox)
+        let tk = kv_tail_push(prev_tk, k, tail_len * kv_dim, kv_dim)
+        let tv = kv_tail_push(prev_tv, v, tail_len * kv_dim, kv_dim)
+        (q, tk, tv)
+
 # The first `n` floats of a device-resident buffer, read back to the host (the
 # KV cache saved to disk; a `'kernel'unified` struct field cannot be handed to
 # `passthrough`, which takes a host array).
@@ -2107,6 +2148,35 @@ pub req [float32]'kernel'unified add_gpu([float32]'kernel'global a, [float32]'ke
         if i < n:
             out[i] = a[i] + b[i]
         out
+
+# Decode-only residual add followed by RMSNorm. Both the residual stream and
+# its normalized FFN input are needed by the caller, so one SIMD-group pass
+# emits both and avoids launching/readback through a separate add kernel.
+pub req ([float32]'kernel'unified, [float32]'kernel'unified) add_rms_norm_decode_gpu(
+        [float32]'kernel'global a, [float32]'kernel'global b,
+        [float32]'kernel'global w, int d, float32 eps) throws:
+    kernel(block = 32, grid = 1):
+        mut [float32]'unified residual = [0.0 for ..<d]
+        mut [float32]'unified normed = [0.0 for ..<d]
+        let lane = .warp.lane
+        var float32 ss = 0.0
+        var int j = lane
+        while j < d:
+            let v = a[j] + b[j]
+            ss += v * v
+            j += .warp.size
+        var int offset = .warp.size / 2
+        while offset > 0:
+            ss += .warp.shuffle_xor(ss, offset)
+            offset = offset / 2
+        let inv_rms = 1.0 / (ss / (d as float32) + eps).sqrt()
+        j = lane
+        while j < d:
+            let v = a[j] + b[j]
+            residual[j] = v
+            normed[j] = v * inv_rms * w[j]
+            j += .warp.size
+        (residual, normed)
 
 # ── Kernel: KV-cache append ──────────────────────────────────────────────
 # New cache = old cache's `old_n` floats followed by `new_n` floats of fresh
@@ -3064,6 +3134,82 @@ pub req [float32]'kernel'unified kv_tail_push([float32]'kernel'global prev, [flo
         upload_floats_gpu(fresh)
     else:
         kv_append_gpu(prev, fresh, old_n, new_n)
+
+# Produces the rotated Q row and both updated cache tails in one dispatch from
+# a joined QKV projection. This is the complete decode epilogue for fused
+# Q8_0 projections: after the matvec, attention-ready buffers cost one launch.
+pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'unified) prepare_qkv_decode_slice(
+        [float32]'kernel'global prev_k, [float32]'kernel'global prev_v,
+        [float32]'kernel'global qkv, int old_n, int n_head, int n_kv_head,
+        int d_head, float32 freq_base, int pos, int neox) throws:
+    let int q_dim = n_head * d_head
+    let int kv_dim = n_kv_head * d_head
+    let int tail_n = old_n + kv_dim
+    let int half_dim = d_head / 2
+    let int q_pairs = n_head * half_dim
+    let int kv_pairs = n_kv_head * half_dim
+    var int work_n = old_n
+    if q_pairs > work_n:
+        work_n = q_pairs
+    if kv_pairs > work_n:
+        work_n = kv_pairs
+    kernel(block = 256, grid = (work_n + 255) / 256):
+        mut [float32]'unified out_q = [0.0 for ..<q_dim]
+        mut [float32]'unified out_k = [0.0 for ..<tail_n]
+        mut [float32]'unified out_v = [0.0 for ..<tail_n]
+        let i = .thread.x + .block.x * .block_dim.x
+        # Preserve the existing cache prefix. The same thread can also rotate
+        # a Q/K pair below; these writes target disjoint output positions.
+        if i < old_n:
+            out_k[i] = prev_k[i]
+            out_v[i] = prev_v[i]
+        # One thread owns both elements of a Q pair, so angle/sin/cos are
+        # evaluated once rather than once per output element.
+        if i < q_pairs:
+            let h = i / half_dim
+            let pair = i % half_dim
+            let head_base = h * d_head
+            var int first = head_base + pair
+            var int second = first + half_dim
+            if neox == 1:
+                first = head_base + pair
+                second = first + half_dim
+            else:
+                first = head_base + 2 * pair
+                second = first + 1
+            let freq_exp = (2.0 * (pair as float32)) / (d_head as float32)
+            let angle = (pos as float32) / freq_base.powf(freq_exp)
+            let cos_a = angle.cos()
+            let sin_a = angle.sin()
+            let x0 = qkv[first]
+            let x1 = qkv[second]
+            out_q[first] = x0 * cos_a - x1 * sin_a
+            out_q[second] = x0 * sin_a + x1 * cos_a
+        # K uses the same pair-wise rotation. V has no RoPE, so the owner of
+        # the pair copies its two adjacent/logically-paired values as well.
+        if i < kv_pairs:
+            let h = i / half_dim
+            let pair = i % half_dim
+            let head_base = h * d_head
+            var int first = head_base + pair
+            var int second = first + half_dim
+            if neox == 1:
+                first = head_base + pair
+                second = first + half_dim
+            else:
+                first = head_base + 2 * pair
+                second = first + 1
+            let freq_exp = (2.0 * (pair as float32)) / (d_head as float32)
+            let angle = (pos as float32) / freq_base.powf(freq_exp)
+            let cos_a = angle.cos()
+            let sin_a = angle.sin()
+            let x0 = qkv[q_dim + first]
+            let x1 = qkv[q_dim + second]
+            out_k[old_n + first] = x0 * cos_a - x1 * sin_a
+            out_k[old_n + second] = x0 * sin_a + x1 * cos_a
+            out_v[old_n + first] = qkv[q_dim + kv_dim + first]
+            out_v[old_n + second] = qkv[q_dim + kv_dim + second]
+        (out_q, out_k, out_v)
 
 # Grouped-query multi-head attention (GPU), all heads in one dispatch per
 # stage. `q` is (seq_q × n_head*d_head); `k`/`v` are (seq_k × n_kv_head*d_head).

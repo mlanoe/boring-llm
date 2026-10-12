@@ -46,6 +46,7 @@ All notable changes to boring-llm. The format follows [Keep a Changelog](https:/
 
 ### Fixed
 
+- **The fused Q/K/V decode result now stays GPU-resident after tuple destructuring.** Its three destructured slots are explicitly `'kernel'unified`; without those annotations the generated Metal host code downloaded Q and K after every layer before uploading them again for Q/K normalization or RoPE. The corrected `forward_step` contains no intermediate device-to-host copy, and the llama.cpp decode oracle remains unchanged (two complete 32-token agreements and the same accepted 0.01-logit near-tie on the third prompt).
 - **Generation printed random text after commit 1efb7c9 ("Fuse residual add with RMSNorm"), now fixed by removing that fusion.** The fused kernel declared its residual input `mut`, and a `mut` kernel field built from a resident argument is a copy (the generated wrapper calls `__boring_metal_buffer_copy`), so the attention output was added to a copy and every layer lost it. The kernel unit test only checked the normalized output, the model oracle uses a path the commit did not touch (`forward_gpu_quantized`), and the benchmarks count tokens, not their text; the 62.6 and 53.2 tok/s published for it were measured on a model that generated garbage. The fusion gave no speed anyway (14.7 ms/token with and without it on the 0.5B). The compiler gap that stops a correct version (two outputs through a tuple-returning `req`) is `boring` task `task_bfb8b121`.
 - Truncated or invalid UTF-8 in a streamed or `max_tokens`-cut reply no longer panics.
 
