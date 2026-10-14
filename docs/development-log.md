@@ -685,3 +685,72 @@ The next compiler pass landed as `boring` `a08df631`. The four-row Metal Q8_0 sc
 With resident buffers, 500 queued calls and `BORING_METAL_BATCH=8`, baseline/specialized results were: gate/up (4,864×896) 98.1/75.5 us, 47.2/61.3 GB/s; down (896×4,864) 93.1/70.1 us, 49.7/66.0 GB/s; tied head (151,936×896) 2,420/2,029 us, 59.8/71.3 GB/s. Across 24 layers, the seven projection shapes fall from 342.3 to 285.3 us/layer, about 1.37 ms/token; the head saves another 0.39 ms, for roughly 1.76 ms/token predicted in total. That closes more than half of the previously identified ~3 ms FFN opportunity, although 61-71 GB/s remains below the machine's 96 GB/s streaming ceiling.
 
 End-to-end timings were too noisy to use as the primary proof: three server runs with batching gave medians of 60.4 tok/s at the short prompt and 44.4 at the long prompt, but their ranges overlap earlier runs. Correctness is stronger: `tools/decode_vs_llamacpp.py` generated 32 tokens on three prompts; two continuations agreed completely and the third differed only at token 26 on a 0.01-logit llama.cpp near-tie. The next compiler target is therefore the small attention projections, whose compact path still has a sizable fixed cost; the remaining gap on the already-unrolled FFN shapes needs a different load or scheduling strategy rather than more loop unrolling.
+
+## 2026-10-13 — Fused decode epilogues and a new comparison
+
+Three engine-side passes remove most of the small pointwise dispatches around decode. `10309dd` consumes the existing concatenated 0.5B Q8_0 Q/K/V projection directly: one multi-output kernel applies RoPE and updates both KV tails, with no Q/K/V split buffers. `c2a8f69` fuses each residual addition with the RMSNorm that immediately follows it and carries the next layer's normalized input across the loop; the final FFN residual produces the output normalization too. `8a025b4` changes the joined QKV epilogue to one thread per RoPE pair, so each pair evaluates `powf`, `sin` and `cos` once rather than once per component. Around QKV, six launches became two; residual/normalization fusion removes another two launches per layer (48 per token on the 24-layer 0.5B).
+
+Correctness was checked after every stage with the Metal release build and the generated wgpu build. `tools/decode_vs_llamacpp.py` on Qwen2.5-0.5B Q8_0 still agrees with llama.cpp for all 32 tokens on two prompts; the third first differs at token 26 with the same accepted 0.01-logit near-tie. Inspection of generated Rust also confirms that the new tuple outputs remain GPU-resident and introduce no device-to-host copy.
+
+The final comparison used `tools/bench_vs_llamacpp.py`, Apple M3, the same GGUF, 128 requested generated tokens and three alternating repetitions. The system load was 5.4 down to 4.3, and one short boring-llm generation stopped at EOS after 101 tokens, so ranges are included rather than hidden:
+
+| Prompt | boring-llm prefill | llama.cpp prefill | boring-llm decode | llama.cpp decode | ratios prefill / decode |
+|---|---:|---:|---:|---:|---:|
+| 567-568 | 1,796 (1,560-1,831) | 2,781 (2,770-2,823) | 70.20 (51.78-70.72) | 117.28 (116.32-117.97) | 0.65x / 0.60x |
+| 4,147-4,148 | 1,095 (1,092-1,111) | 1,979 (1,952-1,982) | 44.64 (44.55-46.92) | 69.28 (67.28-78.59) | 0.55x / 0.64x |
+
+The directly comparable previously published server result was 52.2 tok/s and 0.42x llama.cpp at short context, so the new short-context median is about 34% faster and reaches 0.60x. Long-context boring-llm decode is essentially unchanged (44.0 to 44.6 tok/s); there, attention and the float32 cache dominate the pointwise savings.
+
+A 7B Q4_K_M run was attempted in the same session (64 generated tokens, three repetitions), but system contention made absolute results non-publishable: boring-llm short decode ranged 6.65-10.03 tok/s and llama.cpp 10.40-17.73; long decode ranged 5.50-9.08 and 8.73-11.52. Median ratios were 0.63x short and 0.71x long, but the README keeps the earlier idle-machine 7B rows until this run can be repeated without the roughly 50% spread.
+
+## 2026-10-14 — More memory-level parallelism for Q8_0 FFN decode
+
+This compiler pass landed in `boring` as `43dce613`.
+
+The Q8_0 decode microbenchmark now has the real 0.5B FFN shapes (`896 -> 4,864` and `4,864 -> 896`) and a `q8resident` mode: inputs are uploaded once, 5,001 projections are queued with eight launches per command buffer, and only the final result is read back. This removes the uploads and per-call synchronization that made the older benchmark unsuitable for compiler schedule work.
+
+On the existing four-row Metal schedule, three alternating repetitions measured medians of 63.6 us for gate/up and 67.0 us for down. Two rejected experiments were useful bounds: eight output rows per SIMD-group was neutral on gate/up but regressed down to 76.4 us, while halving the threadgroup from eight to four SIMD-groups regressed both projections to 127.6/109.1 us. The retained variant instead keeps four rows and eight SIMD-groups, but on the already-unrolled large-projection path consumes two Q8 block groups per loop iteration. That exposes eight independent weight streams without doubling the live output accumulators. Gate/up remains neutral at 62.7 us median; down improves to 58.9 us, about 12% faster. Across 24 layers this saves roughly 0.19 ms/token from the down projections alone.
+
+The compiler's Metal codegen regression test checks the paired block loop and its odd-tail path; the dynamic Q8 validation passes on all generated GPU targets. The 0.5B Q8_0 decode oracle still agrees for all 32 tokens on two prompts and differs only at token 26 with the accepted 0.01-logit llama.cpp near-tie on the third.
+
+Once the machine load fell below 4, a same-session A/B alternated separately compiled baseline and paired-block executables three times on the 567-token prompt. Baseline decode was 44.52/44.36/44.23 tok/s; paired-block decode was 58.60/58.19/57.62 tok/s, a 31% median gain. Diffing the generated Metal files confirmed that only the paired Q8 loop changed. The gain is much larger than the repeated-tensor microbenchmark predicts because that benchmark continually reuses one 4.6 MB matrix from cache, whereas a model token streams roughly 530 MB of distinct weights and benefits from the additional DRAM-level parallelism across gate, up, down and the vocabulary head.
+
+A final three-run comparison of the paired-block executable against llama.cpp measured median prefill/decode of 1,766/72.79 tok/s versus 2,824/114.88 tok/s, or 0.63x for both. The boring-llm decode range was 57.73-73.58 tok/s: the slow repetition stopped at EOS after 101 tokens while the other two completed all 128 requested tokens, so the range remains important alongside the median.
+
+## 2026-10-14 — Structural Q8_0 decode schedule comparison with llama.cpp
+
+The comparison below uses upstream llama.cpp revision `df18bee11e96557b07aa7b12db0976f3c7ac9165`, specifically `ggml-metal-impl.h`, `kernels/mul_mv.metal`, and `kernels/mul_mv_mma.metal`. It compares scheduling, not benchmark results.
+
+| property | Boring native Metal Q8_0 decode | llama.cpp `kernel_mul_mv_q8_0_f32` |
+|---|---|---|
+| output rows per SIMD group | 4 | 2 per threadgroup |
+| SIMD groups per threadgroup | 8 | 4 (`N_SG_Q8_0`) |
+| threads per threadgroup | 256 | 128 |
+| output rows per threadgroup | 32 | 2 (`N_R0_Q8_0`) |
+| input-dimension ownership | every SIMD group walks the complete `k` dimension | the four SIMD groups split the `k` blocks |
+| final reduction | `simd_sum`, no communication between SIMD groups | `simd_sum`, then threadgroup-memory reduction of the four partial sums |
+| reuse within a SIMD group | one activation slice is reused across four output rows; four block partitions, or eight weight streams on the paired large path | each SIMD group accumulates both output rows over its slice of `k` |
+
+This is a deliberate tradeoff rather than one universally better kernel. Boring amortizes activation and scale reads across four rows, keeps its reduction inside one SIMD group, and on large projections exposes eight independent weight streams. That matches the bandwidth-bound FFN, down and vocabulary matrices well. llama.cpp pays for a shared-memory reduction but creates much finer output tiles and uses otherwise-idle SIMD groups to split a row's input work.
+
+The difference is largest on the 0.5B model's small and medium projections. Ignoring the final partial tile, an `n = 128` output gets only 4 Boring threadgroups but about 64 llama.cpp threadgroups; `n = 896` gets 28 versus about 448. The joined QKV projection is wider than the former separate K/V projections, but it and the 896x896 attention output projection still expose much less grid-level parallelism under Boring's 32-row tile. Large `n = 4,864` FFN projections and the `n = 151,936` vocabulary head already provide enough independent output work, so copying llama.cpp's schedule wholesale would discard useful row reuse and is not justified by this comparison.
+
+The next compiler experiment should consequently be a second, shape-selected Q8_0 decode schedule, not a replacement for the current one:
+
+1. Assign two output rows to a threadgroup of four SIMD groups.
+2. Split Q8 blocks along `k` across those groups.
+3. Store one partial dot product per group and row in threadgroup memory, synchronize, and have one group perform the final reduction and stores.
+4. Select it for narrow and medium decode projections using both `n` and the Q8 block count; keep the four-row/eight-group paired-block path for the large FFN and head shapes.
+5. Validate the decision on the resident 128/896/joined-QKV shapes first, then with the decode oracle and an alternating end-to-end comparison. The resident benchmark is necessary for kernel diagnosis, but the paired-block result showed that repeatedly reading one cache-hot matrix can substantially underpredict whole-model DRAM gains.
+
+llama.cpp also has a separate few-row MMA family for `m >= 2`, with shape-dependent SIMD-group counts and explicit preloading of the next block. It is relevant to very small prefill batches, but it is not the kernel used for the single-token `m = 1` Q8_0 comparison above and should be investigated separately.
+
+### Narrow split-K implementation and boundary
+
+The experiment was implemented in `boring` rather than left as a paper comparison. For float32 native prefill, Q8_0 decode now selects a 128-thread split-K threadgroup only when `n <= 256` and `k <= 2048`. Four SIMD groups divide the input blocks, each processes eight Q8 blocks at a time with two `packed_char4` loads per lane, and threadgroup memory combines their partial sums for two output rows. Wider shapes retain the four-row/eight-SIMD-group schedule. The half-prefill variant retains the old decode schedule too: its prefill tile uses the full 32 KiB Metal threadgroup limit, so including another static reduction array in the same dynamic kernel is invalid without separating decode and prefill kernels.
+
+The experiment also found an independent resource bug: float32 prefill needs only 4,096 `uint`s (16 KiB) of scratch, but shared the half-prefill allocation of 8,192 `uint`s (32 KiB). Its allocation is now sized by precision. This changes GPU residency for every Q8_0 shape and must be kept separate from the split-K conclusion.
+
+Resident A/B checks with 500 queued calls and `BORING_METAL_BATCH=8` isolated three binaries: old compiler, corrected scratch without split-K, and corrected scratch with split-K. On the loaded machine, the most stable structural result was the boundary rather than an absolute time: 128x896 improved from about 7.5 us to 5.5-7.1 us, while applying split-K too broadly regressed 896x896 from 23.1 to 33.9 us and joined QKV 1,152x896 from 13.3 to 18.7 us. Consequently the original `n <= 2048` experiment was rejected and the retained selector is `n <= 256`. The generated sums, weighted sums, first and last values matched for every shape. The independent decode oracle on Qwen2.5-0.5B Q8_0 agrees with llama.cpp for all 32 tokens on two prompts and reaches the same accepted 0.01-logit near-tie at token 26 on the third.
+
+This does treat separate 128-row K/V projections, but boring-llm's current Qwen2.5 path joins Q, K and V into one 1,152-row matrix. That joined projection correctly stays on the existing row-reuse schedule; realizing a model-level gain from split-K would require either a better medium-width cooperative schedule or undoing the QKV fusion, and the measurements do not justify the latter.

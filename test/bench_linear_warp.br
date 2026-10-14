@@ -20,34 +20,39 @@
 #   boring build --target metal test/bench_linear_warp.br
 #   cd test/bench_linear_warp_metal && cargo build --release
 #   ./target/release/bench_linear_warp <kernel> <shape>
-#     kernel: tiled | warp | warpshared | q8 | q8tensor | q8warp | q8warpbcast |
+#     kernel: tiled | warp | warpshared | q8 | q8tensor | q8resident | q8warp | q8warpbcast |
 #             q5 | q5tensor | q5bcast | q4 | q4tensor | q4bcast |
 #             q4nl | q4nltensor | q4nlbcast
-#     shape:  small-seq26 | big-seq26 | small-seq1 | big-seq1
+#     shape:  small-seq26 | big-seq26 | small-seq1 | big-seq1 |
+#             ffn-gate-seq1 | ffn-down-seq1
 
 # Boring has no documented stopwatch-style elapsed-time API (Instant/
 # Duration are oriented around timeout/wait, not measurement) — timed via
 # separate process invocations + the shell's own `time` instead: pass
 # "<kernel> <shape>" as argv[1]/argv[2] to run just one section per
-# invocation.
+# invocation. `q8resident` uploads its three inputs once, queues 5,001 calls
+# eight launches at a time and reads only the final output; it is the mode for
+# comparing decode schedules without per-call upload or host synchronization.
 
 use math_gpu
 
 def main() throws:
     let [string] argv = args()
-    guard argv.length > 2 else throw "usage: bench_linear_warp <tiled|warp|warpshared> <small-seq26|big-seq26|small-seq1|big-seq1>"
+    guard argv.length > 2 else throw "usage: bench_linear_warp <kernel> <small-seq26|big-seq26|small-seq1|big-seq1|ffn-gate-seq1|ffn-down-seq1>"
     let kernel_name = argv[1]
     let shape = argv[2]
 
     let d_model = 896
+    let ffn_dim = 4864
     let vocab = 8192   # a representative large d_out without allocating the real 151936-wide bias/output arrays
 
-    let seq = if shape == "small-seq1" or shape == "big-seq1": 1 else: 26
+    let seq = if shape == "small-seq1" or shape == "big-seq1" or shape == "ffn-gate-seq1" or shape == "ffn-down-seq1": 1 else: 26
     let is_big = shape == "big-seq26" or shape == "big-seq1"
-    let d_out = if is_big: vocab else: d_model
+    let d_in = if shape == "ffn-down-seq1": ffn_dim else: d_model
+    let d_out = if shape == "ffn-gate-seq1": ffn_dim elif is_big: vocab else: d_model
 
-    mut [float32] x = [0.0 for i in 0..<(seq * d_model)]
-    mut [float32] w = [0.0 for i in 0..<(d_out * d_model)]
+    mut [float32] x = [0.0 for i in 0..<(seq * d_in)]
+    mut [float32] w = [0.0 for i in 0..<(d_out * d_in)]
     mut [float32] bv = [0.0 for i in 0..<d_out]
     var i = 0
     while i < x.length:
@@ -63,8 +68,8 @@ def main() throws:
     # real 34-byte blocks (2-byte f16 scale + 32 signed int8 values), same
     # shape real GGUF Q8_0 tensors use.
     mut [uint8] w_packed = []
-    if kernel_name == "q8" or kernel_name == "q8tensor" or kernel_name == "q8warp" or kernel_name == "q8warpbcast":
-        let n_blocks = (d_out * d_model) / 32
+    if kernel_name == "q8" or kernel_name == "q8tensor" or kernel_name == "q8resident" or kernel_name == "q8warp" or kernel_name == "q8warpbcast":
+        let n_blocks = (d_out * d_in) / 32
         var b = 0
         while b < n_blocks:
             w_packed.push(0x00 as uint8)
@@ -79,7 +84,7 @@ def main() throws:
     # qh + 16 bytes nibbles), same d_model-multiple-of-32 shape as above.
     mut [uint8] w5_packed = []
     if kernel_name == "q5" or kernel_name == "q5tensor" or kernel_name == "q5bcast":
-        let n_blocks5 = (d_out * d_model) / 32
+        let n_blocks5 = (d_out * d_in) / 32
         var b5 = 0
         while b5 < n_blocks5:
             w5_packed.push(0x00 as uint8)
@@ -98,7 +103,7 @@ def main() throws:
     # nibbles) — same layout shape as IQ4_NL (reused for both below).
     mut [uint8] w4_packed = []
     if kernel_name == "q4" or kernel_name == "q4tensor" or kernel_name == "q4bcast" or kernel_name == "q4nl" or kernel_name == "q4nltensor" or kernel_name == "q4nlbcast":
-        let n_blocks4 = (d_out * d_model) / 32
+        let n_blocks4 = (d_out * d_in) / 32
         var b4 = 0
         while b4 < n_blocks4:
             w4_packed.push(0x00 as uint8)
@@ -114,97 +119,110 @@ def main() throws:
 
     if kernel_name == "tiled":
         while iter < n_iter:
-            let out = linear_gpu(x, w, bv, seq, d_model, d_out)
+            let out = linear_gpu(x, w, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "linear_gpu (tiled), seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "warp":
         while iter < n_iter:
-            let out = linear_warp_gpu(x, w, bv, seq, d_model, d_out)
+            let out = linear_warp_gpu(x, w, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "linear_warp_gpu, seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "warpshared":
         while iter < n_iter:
-            let out = linear_warp_shared_gpu(x, w, bv, seq, d_model, d_out)
+            let out = linear_warp_shared_gpu(x, w, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "linear_warp_shared_gpu, seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q8":
         while iter < n_iter:
-            let out = q8_linear_gpu(x, w_packed, bv, seq, d_model, d_out)
+            let out = q8_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "q8_linear_gpu (tiled, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q8tensor":
         while iter < n_iter:
-            let out = tensor_linear_gpu(x, w_packed, 8, bv, seq, d_model, d_out)
+            let out = tensor_linear_gpu(x, w_packed, 8, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "kernel.tensors.linear Q8_0, seq={seq} d_out={d_out}, {n_iter} iters: done"
+    elif kernel_name == "q8resident":
+        let x_gpu = upload_floats_gpu(x)
+        let w_gpu = upload_bytes_gpu(w_packed)
+        let bv_gpu = upload_floats_gpu(bv)
+        set_gpu_batch_limit(8)
+        var out = tensor_linear_gpu(x_gpu, w_gpu, 8, bv_gpu, seq, d_in, d_out)
+        let resident_iters = 5000
+        while iter < resident_iters:
+            out = tensor_linear_gpu(x_gpu, w_gpu, 8, bv_gpu, seq, d_in, d_out)
+            iter += 1
+        set_gpu_batch_limit(1)
+        let sink = passthrough(out)
+        print "resident kernel.tensors.linear Q8_0, seq={seq} d_in={d_in} d_out={d_out}, {resident_iters + 1} iters: done"
     elif kernel_name == "q8warp":
         while iter < n_iter:
-            let out = q8_linear_warp_gpu(x, w_packed, bv, seq, d_model, d_out)
+            let out = q8_linear_warp_gpu(x, w_packed, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "q8_linear_warp_gpu (warp-shuffle, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q8warpbcast":
         while iter < n_iter:
-            let out = q8_linear_warp_broadcast_gpu(x, w_packed, bv, seq, d_model, d_out)
+            let out = q8_linear_warp_broadcast_gpu(x, w_packed, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "q8_linear_warp_broadcast_gpu (warp-shuffle + scale-broadcast, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q5":
         while iter < n_iter:
-            let out = q5_linear_gpu(x, w5_packed, bv, seq, d_model, d_out)
+            let out = q5_linear_gpu(x, w5_packed, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "q5_linear_gpu (tiled, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q5tensor":
         while iter < n_iter:
-            let out = tensor_linear_gpu(x, w5_packed, 6, bv, seq, d_model, d_out)
+            let out = tensor_linear_gpu(x, w5_packed, 6, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "kernel.tensors.linear Q5_0, seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q5bcast":
         while iter < n_iter:
-            let out = q5_linear_warp_broadcast_gpu(x, w5_packed, bv, seq, d_model, d_out)
+            let out = q5_linear_warp_broadcast_gpu(x, w5_packed, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "q5_linear_warp_broadcast_gpu (warp-shuffle + scale-broadcast, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q4":
         while iter < n_iter:
-            let out = q4_linear_gpu(x, w4_packed, bv, seq, d_model, d_out)
+            let out = q4_linear_gpu(x, w4_packed, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "q4_linear_gpu (tiled, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q4tensor":
         while iter < n_iter:
-            let out = tensor_linear_gpu(x, w4_packed, 2, bv, seq, d_model, d_out)
+            let out = tensor_linear_gpu(x, w4_packed, 2, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "kernel.tensors.linear Q4_0, seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q4bcast":
         while iter < n_iter:
-            let out = q4_linear_warp_broadcast_gpu(x, w4_packed, bv, seq, d_model, d_out)
+            let out = q4_linear_warp_broadcast_gpu(x, w4_packed, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "q4_linear_warp_broadcast_gpu (warp-shuffle + scale-broadcast, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q4nl":
         while iter < n_iter:
-            let out = q4nl_linear_gpu(x, w4_packed, bv, seq, d_model, d_out)
+            let out = q4nl_linear_gpu(x, w4_packed, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "q4nl_linear_gpu (tiled, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q4nltensor":
         while iter < n_iter:
-            let out = tensor_linear_gpu(x, w4_packed, 20, bv, seq, d_model, d_out)
+            let out = tensor_linear_gpu(x, w4_packed, 20, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "kernel.tensors.linear IQ4_NL, seq={seq} d_out={d_out}, {n_iter} iters: done"
     elif kernel_name == "q4nlbcast":
         while iter < n_iter:
-            let out = q4nl_linear_warp_broadcast_gpu(x, w4_packed, bv, seq, d_model, d_out)
+            let out = q4nl_linear_warp_broadcast_gpu(x, w4_packed, bv, seq, d_in, d_out)
             let sink = passthrough(out)
             iter += 1
         print "q4nl_linear_warp_broadcast_gpu (warp-shuffle + scale-broadcast, fused-dequant), seq={seq} d_out={d_out}, {n_iter} iters: done"
