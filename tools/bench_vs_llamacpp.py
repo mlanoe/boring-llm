@@ -23,6 +23,11 @@ Usage (repo root, a quiet machine; stop other heavy work first):
         --binary src/main_metal/target/release/main --prompt-tokens 512,4096 --reps 3
     tools/bench_vs_llamacpp.py --selftest        # checks the parsing and statistics, no model
 Needs llama-cpp-python (the project's .venv has it): run it with .venv/bin/python.
+
+With several prompt sizes, the report also converts decode throughput to milliseconds
+per token and prints the endpoint slope. This is the next-context-cost diagnostic: the
+short endpoint contains mostly fixed projection/launch work, while its growth towards
+4k/8k tokens points at attention and KV-cache work.
 """
 import argparse
 import http.client
@@ -48,6 +53,29 @@ def build_prompt(target_tokens, salt):
 def summarize(values):
     values = sorted(values)
     return {"min": values[0], "median": statistics.median(values), "max": values[-1], "n": len(values)}
+
+
+def median_decode_ms(results, engine, size):
+    runs = results.get((engine, size), [])
+    if not runs:
+        return None
+    return statistics.median(1000.0 / r["decode_tps"] for r in runs)
+
+
+def decode_slope(results, engine, sizes):
+    """Extra decode milliseconds per 1,000 cached prompt tokens, using endpoints."""
+    lo, hi = min(sizes), max(sizes)
+    if lo == hi:
+        return None
+    lo_ms = median_decode_ms(results, engine, lo)
+    hi_ms = median_decode_ms(results, engine, hi)
+    if lo_ms is None or hi_ms is None:
+        return None
+    return {
+        "low_size": lo, "high_size": hi, "low_ms": lo_ms, "high_ms": hi_ms,
+        "delta_ms": hi_ms - lo_ms,
+        "ms_per_1k_tokens": (hi_ms - lo_ms) * 1000.0 / (hi - lo),
+    }
 
 
 def rates(t_start, content_times, prompt_tokens):
@@ -198,6 +226,13 @@ def report(results, sizes):
         if len(row) == 2:
             b, l = row["boring-llm"], row["llama.cpp"]
             print(f"{'':>8}  boring-llm is {b[0] / l[0]:.2f}x llama.cpp on prefill, {b[1] / l[1]:.2f}x on decode (medians)")
+    if len(sizes) > 1:
+        print("\ndecode context cost (endpoint medians; descriptive, not a fitted model):")
+        for eng in ("boring-llm", "llama.cpp"):
+            slope = decode_slope(results, eng, sizes)
+            if slope:
+                print(f"  {eng:<11} {slope['low_ms']:.2f} -> {slope['high_ms']:.2f} ms/token "
+                      f"({slope['delta_ms']:+.2f} ms; {slope['ms_per_1k_tokens']:+.2f} ms per 1k prompt tokens)")
 
 
 def resolve_model(args):
@@ -226,6 +261,7 @@ def main():
     ap.add_argument("--ours-arg", action="append", default=[], help="extra argument for boring-llm (repeatable)")
     ap.add_argument("--max-load", type=float, default=4.0, help="refuse to start above this 1-minute load average")
     ap.add_argument("--json", help="also write the raw results here")
+    ap.add_argument("--label", default="", help="free-form run label stored in --json output")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
@@ -261,11 +297,27 @@ def main():
                           f"({r['generated']} tokens)", flush=True)
             finally:
                 eng.close()
-    print(f"\nload average before/after: {load:.1f} / {load_average():.1f}")
+    final_load = load_average()
+    print(f"\nload average before/after: {load:.1f} / {final_load:.1f}")
     report(results, sizes)
     if args.json:
+        parent = os.path.dirname(os.path.abspath(args.json))
+        os.makedirs(parent, exist_ok=True)
         with open(args.json, "w") as f:
-            json.dump({f"{e}|{s}": v for (e, s), v in results.items()}, f, indent=1)
+            json.dump({
+                "schema": 2, "label": args.label, "machine": machine(),
+                "load_average": {"before": load, "after": final_load},
+                "configuration": {
+                    "gguf": os.path.abspath(args.gguf),
+                    "binary": os.path.abspath(args.binary) if args.binary else None,
+                    "prompt_tokens": sizes, "generated_tokens": args.gen, "repetitions": args.reps,
+                    "context_size": args.ctx, "engines": engines, "llama_kv": args.llama_kv,
+                    "llama_flash_attn": args.llama_flash_attn, "ours_arg": args.ours_arg,
+                },
+                "results": {f"{e}|{s}": v for (e, s), v in results.items()},
+                "decode_slopes": {e: decode_slope(results, e, sizes)
+                                  for e in ("boring-llm", "llama.cpp")},
+            }, f, indent=1)
 
 
 def selftest():
@@ -297,6 +349,13 @@ def selftest():
         pass
     s = summarize([3.0, 1.0, 2.0])
     assert s == {"min": 1.0, "median": 2.0, "max": 3.0, "n": 3}
+    fake = {
+        ("boring-llm", 500): [{"decode_tps": 100.0}],
+        ("boring-llm", 4500): [{"decode_tps": 50.0}],
+    }
+    slope = decode_slope(fake, "boring-llm", [500, 4500])
+    assert slope == {"low_size": 500, "high_size": 4500, "low_ms": 10.0, "high_ms": 20.0,
+                     "delta_ms": 10.0, "ms_per_1k_tokens": 2.5}, slope
     print("selftest: ok")
 
 

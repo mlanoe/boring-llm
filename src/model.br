@@ -635,6 +635,15 @@ pub struct GenCache:
 
 let int TAIL_MAX = 64
 
+# Diagnostic marginal-cost mode. A non-zero value queues one extra copy of a
+# decode stage using the same resident inputs and discards its result. There is
+# deliberately no synchronization around the copy: the delta is measured in
+# the real pipelined command stream. See tools/profile_decode_marginal.py.
+static var int decode_profile_stage = 0
+
+pub def set_decode_profile_stage(int stage):
+    decode_profile_stage = stage
+
 # Batched prefill: processes the WHOLE prompt in one pass per layer (same
 # structure as forward_gpu_quantized — same kernels, same dispatch count
 # regardless of how many prompt tokens there are), instead of feeding
@@ -860,6 +869,16 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
             lc.tk, lc.tv, tail_len,
             d, qkv_dim, kv_dim, model.config.n_head, model.config.n_kv_head, model.config.d_head,
             model.config.rms_eps, model.config.rope_freq_base, pos, model.config.rope_neox)
+        if decode_profile_stage == 1:
+            let (_, _, _) = project_qkv_attention_decode_gpu(normed,
+                layer.q_w_q8, layer.q_w_type, layer.q_b,
+                layer.k_w_q8, layer.k_w_type, layer.k_b,
+                layer.v_w_q8, layer.v_w_type, layer.v_b,
+                layer.qkv_w_q8, layer.qkv_b, layer.qkv_fused,
+                layer.q_norm_w, layer.k_norm_w, model.config.qk_norm,
+                lc.tk, lc.tv, tail_len,
+                d, qkv_dim, kv_dim, model.config.n_head, model.config.n_kv_head, model.config.d_head,
+                model.config.rms_eps, model.config.rope_freq_base, pos, model.config.rope_neox)
 
         # The new row goes to the tail (see LayerCache); the tail is folded into
         # the main buffers once it reaches TAIL_MAX rows.
@@ -870,14 +889,33 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
         # position, so every key already in the cache (including the one
         # just appended) is a legitimate position to attend to.
         let attn_out = attention_gqa_tail_gpu(q, lc.k, lc.v, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
+        if decode_profile_stage == 2:
+            let _ = attention_gqa_tail_gpu(q, lc.k, lc.v, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
         let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, 1, qkv_dim, d)
+        if decode_profile_stage == 3:
+            let _ = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, 1, qkv_dim, d)
         let ([float32]'kernel'unified x_after_attn, [float32]'kernel'unified normed2) = add_rms_norm_decode_gpu(
             x, attn_proj, layer.ffn_norm_w, d, model.config.rms_eps)
+        if decode_profile_stage == 4:
+            let (_, _) = add_rms_norm_decode_gpu(x, attn_proj, layer.ffn_norm_w, d, model.config.rms_eps)
         x = x_after_attn
         let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, 1, d, model.config.ffn_dim)
+        if decode_profile_stage == 7:
+            let _ = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, 1, d, model.config.ffn_dim)
         let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, 1, d, model.config.ffn_dim)
+        if decode_profile_stage == 8:
+            let _ = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, 1, d, model.config.ffn_dim)
         let hidden = swiglu_combine_gpu(gate, up)
+        if decode_profile_stage == 9:
+            let _ = swiglu_combine_gpu(gate, up)
         let ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, 1, model.config.ffn_dim, d)
+        if decode_profile_stage == 10:
+            let _ = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, 1, model.config.ffn_dim, d)
+        if decode_profile_stage == 5:
+            let profile_gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, 1, d, model.config.ffn_dim)
+            let profile_up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, 1, d, model.config.ffn_dim)
+            let profile_hidden = swiglu_combine_gpu(profile_gate, profile_up)
+            let _ = tensor_linear_nobias_gpu(profile_hidden, layer.down_w_q8, layer.down_w_type, 1, model.config.ffn_dim, d)
         if l + 1 < model.config.n_layer:
             let ([float32]'kernel'unified x_next, [float32]'kernel'unified normed_next) = add_rms_norm_decode_gpu(
                 x, ffn_out, model.layers[l + 1].attn_norm_w, d, model.config.rms_eps)
@@ -899,6 +937,8 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
 
     let new_tail = if cache.tail + 1 >= TAIL_MAX: 0 else: cache.tail + 1
     let logits_raw = tensor_linear_nobias_gpu(normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
+    if decode_profile_stage == 6:
+        let _ = tensor_linear_nobias_gpu(normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
     set_gpu_batch_limit(1)
     # returned inside a tuple below, which — like a struct constructor —
     # doesn't trigger the GPU-result-to-array conversion automatically.

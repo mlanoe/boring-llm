@@ -48,6 +48,7 @@ jobs:
           # comparison tools (the tools themselves need llama-cpp-python and a
           # model, which CI does not have).
           python3 tools/bench_vs_llamacpp.py --selftest
+          python3 tools/profile_decode_marginal.py --selftest
           python3 tools/accuracy_vs_llamacpp.py --selftest
           python3 tools/decode_vs_llamacpp.py --selftest
           python3 tools/fetch_models.py --selftest

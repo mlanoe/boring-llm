@@ -456,6 +456,7 @@ def main() throws:
     var string prompt_cache_dir = ""
     var int prompt_cache_files = 2
     var int prompt_cache_max_mb = 4096
+    var int requested_profile_stage = 0
 
     var int i = 1
     while i < argv.length:
@@ -545,10 +546,26 @@ def main() throws:
         elif a == "--cache-slots" and i + 1 < argv.length:
             cache_slots = parse_int_arg("--cache-slots", argv[i + 1])
             i += 2
+        elif a == "--decode-profile-stage" and i + 1 < argv.length:
+            let stage = argv[i + 1]
+            if stage == "qkv": requested_profile_stage = 1
+            elif stage == "attention": requested_profile_stage = 2
+            elif stage == "attn-proj": requested_profile_stage = 3
+            elif stage == "residual-norm": requested_profile_stage = 4
+            elif stage == "ffn": requested_profile_stage = 5
+            elif stage == "output-head": requested_profile_stage = 6
+            elif stage == "ffn-gate": requested_profile_stage = 7
+            elif stage == "ffn-up": requested_profile_stage = 8
+            elif stage == "swiglu": requested_profile_stage = 9
+            elif stage == "ffn-down": requested_profile_stage = 10
+            else: throw "--decode-profile-stage expects qkv, attention, attn-proj, residual-norm, ffn, output-head, ffn-gate, ffn-up, swiglu, or ffn-down"
+            i += 2
         else:
             i += 1
 
-    guard gguf_path != "" else throw "usage: --gguf <path.gguf> [--dump-metadata] [--tokens 1,2,3 [--gpu|--quantized]] [--generate-tokens 1,2,3 --max-tokens N] [--prompt \"...\"|--chat [--system \"...\"] [--max-tokens N] [--kv-cache] [--temperature T --top-k K --top-p P --seed S --repeat-penalty R --repeat-last-n N]|--serve [--port N] [--ctx-size N] [--cache-slots N] [--prompt-cache DIR [--prompt-cache-files N] [--prompt-cache-max-mb N]] [--kquant-prefill tensor|handwritten] [--model-name NAME] [--max-tokens N default per request]]"
+    guard gguf_path != "" else throw "usage: --gguf <path.gguf> [--dump-metadata] [--tokens 1,2,3 [--gpu|--quantized]] [--generate-tokens 1,2,3 --max-tokens N] [--prompt \"...\"|--chat [--system \"...\"] [--max-tokens N] [--kv-cache] [--temperature T --top-k K --top-p P --seed S --repeat-penalty R --repeat-last-n N]|--serve [--port N] [--ctx-size N] [--cache-slots N] [--prompt-cache DIR [--prompt-cache-files N] [--prompt-cache-max-mb N]] [--kquant-prefill tensor|handwritten] [--decode-profile-stage STAGE] [--model-name NAME] [--max-tokens N default per request]]"
+
+    set_decode_profile_stage(requested_profile_stage)
 
     if serve_mode:
         # OpenAI-compatible HTTP server (see server.br) — always the packed-

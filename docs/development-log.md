@@ -754,3 +754,72 @@ The experiment also found an independent resource bug: float32 prefill needs onl
 Resident A/B checks with 500 queued calls and `BORING_METAL_BATCH=8` isolated three binaries: old compiler, corrected scratch without split-K, and corrected scratch with split-K. On the loaded machine, the most stable structural result was the boundary rather than an absolute time: 128x896 improved from about 7.5 us to 5.5-7.1 us, while applying split-K too broadly regressed 896x896 from 23.1 to 33.9 us and joined QKV 1,152x896 from 13.3 to 18.7 us. Consequently the original `n <= 2048` experiment was rejected and the retained selector is `n <= 256`. The generated sums, weighted sums, first and last values matched for every shape. The independent decode oracle on Qwen2.5-0.5B Q8_0 agrees with llama.cpp for all 32 tokens on two prompts and reaches the same accepted 0.01-logit near-tie at token 26 on the third.
 
 This does treat separate 128-row K/V projections, but boring-llm's current Qwen2.5 path joins Q, K and V into one 1,152-row matrix. That joined projection correctly stays on the existing row-reuse schedule; realizing a model-level gain from split-K would require either a better medium-width cooperative schedule or undoing the QKV fusion, and the measurements do not justify the latter.
+
+## 2026-10-16 — Separate Q8_0 decode and prefill Metal entrypoints
+
+The native dynamic Q8_0 tensor operation previously emitted one Metal entrypoint containing an `m == 1` decode branch and an `m > 1` prefill branch. Metal accounts for statically declared threadgroup memory at the entrypoint level, so every decode pipeline inherited the prefill tile: 16 KiB with float staging and the full 32 KiB with half staging. The latter also prevented the 256-byte split-K reduction array from compiling, which is why the first narrow schedule had disabled split-K whenever half prefill was configured.
+
+`boring` now synthesizes separate `...Decode` and `...Prefill` kernels and pipeline objects for each native Q8_0 call site. Their construction is inside the runtime `m` branch, so an invocation creates only the selected output buffer and pipeline wrapper. The generated host function carries the selected `c` buffer out of the branch as a resident `BoringGpuArg`; the codegen regression test explicitly rejects a device-to-host read in that wrapper. Decode has no prefill scratch at all: the ordinary four-row paths use no threadgroup array, while narrow split-K uses 64 floats (256 bytes). Half prefill can consequently use narrow split-K decode too, while its own entrypoint retains the complete 32 KiB tile.
+
+Validation did not depend on timing: the complete Metal codegen suite passes 113/113 including its real-GPU programs; the resident Q8 benchmark compiles and runs with two entrypoints and returns the same sums, weighted sums, and endpoint values for all six shapes; boring-llm builds with two Q8 entrypoints at both generated call sites. Its Qwen2.5-0.5B Q8_0 decode oracle still agrees with llama.cpp for all 32 tokens on two prompts and reaches the same accepted 0.01-logit near-tie at token 26 on the third. Performance is intentionally left for a quiet-machine A/B because the release compiler build itself took 2m15 under the current load.
+
+The quiet-machine schedule A/B used 500 resident calls per shape, five alternating repetitions and the engine's real `BORING_METAL_BATCH=8` policy. Split-K won on all six shapes: 128x896 5.8 vs 6.7 us (-13%), 896x896 7.9 vs 8.4 (-6%), joined QKV 1,152x896 9.8 vs 10.2 (-4%), gate/up 4,864x896 41.1 vs 45.0 (-9%), down 896x4,864 37.7 vs 54.8 (-31%), and the 151,936x896 head 1,655 vs 1,754 us (-6%). The down ranges did not overlap (35.7-38.9 vs 51.6-59.9 us); most other ranges favored split-K too. An initial batch-one pass gave a different and much noisier ordering because command submission dominated these microsecond kernels, which is why the benchmark tool now defaults to eight. `auto` consequently uses split-K for every Q8_0 decode shape and retains `rows` only as a diagnostic override. All six numeric summaries matched across schedules.
+
+The three-prompt decode oracle still agrees for all 32 tokens on two prompts and reaches the same accepted 0.01-logit near-tie at token 26 on the third. A three-repetition end-to-end run at the 567-token prompt measured boring-llm prefill 1,931.5-1,965.6 tok/s (median 1,935.2) and decode 80.04-102.66 (median 102.13), versus llama.cpp prefill 2,719.4-2,826.7 (median 2,821.3) and decode 104.12-116.40 (median 115.69). The first boring decode repetition ended after 159 tokens and was the slow outlier; the other two were 102.66 and 102.13. The median ratio is now 0.88x, up from the published 0.63x. Long-context decode has not yet been rerun with this schedule.
+
+### Quiet follow-up: fixed decode cost versus KV/attention growth
+
+`tools/bench_vs_llamacpp.py` now reports decode in milliseconds per token at every prompt size and the endpoint growth in milliseconds per 1,000 prompt tokens. Its JSON output is self-describing (machine, load before/after, arguments, raw samples and computed slopes), so a quiet run can be compared later without reconstructing its conditions from shell history. The intended next run is:
+
+```sh
+.venv/bin/python tools/bench_vs_llamacpp.py \
+  --gguf weights/qwen2.5-0.5b-instruct-q8_0.gguf \
+  --binary src/main_metal/target/release/main \
+  --prompt-tokens 512,2048,4096,7600 --ctx 8192 --gen 128 --reps 5 \
+  --label q8-split-k-context-slope --json results/q8-split-k-context-slope.json
+```
+
+The run completed on the Apple M3 with load average 2.5 before and 2.2 after. Five alternating repetitions gave these medians (minimum-maximum decode rates in parentheses):
+
+| prompt | boring-llm prefill | llama.cpp prefill | boring-llm decode | llama.cpp decode | decode ratio |
+|---:|---:|---:|---:|---:|---:|
+| 568 | 1,974 tok/s | 2,719 tok/s | 101.26 (75.70-103.12) | 116.96 (103.83-117.38) | 0.87x |
+| 2,098 | 1,537 tok/s | 2,354 tok/s | 69.78 (69.05-70.55) | 83.56 (80.17-95.60) | 0.84x |
+| 4,148 | 1,157 tok/s | 1,909 tok/s | 61.39 (60.58-62.26) | 68.68 (67.66-68.86) | 0.89x |
+| 7,658 | 793 tok/s | 1,336 tok/s | 47.06 (46.66-47.45) | 53.97 (44.95-58.82) | 0.87x |
+
+In time per token, boring-llm grows from 9.88 to 21.25 ms (+11.37 ms, or 1.60 ms per 1,000 prompt tokens); llama.cpp grows from 8.55 to 18.53 ms (+9.98 ms, or 1.41 ms per 1,000). The fixed/short-context deficit is therefore 1.33 ms/token and the extra context-dependent deficit accumulated over roughly 7,100 tokens is another 1.39 ms/token. Attention and the float32 KV cache are a real target, but no longer explain a catastrophic long-context divergence: the decode ratio remains 0.84-0.89x throughout. The more conspicuous remaining long-context problem is prefill, whose ratio falls from 0.73x to 0.59x. The raw samples and configuration are in `results/q8-split-k-context-slope.json`.
+
+### Automated marginal decode profiler
+
+The former manual source-edit procedure is now an opt-in diagnostic path. `--decode-profile-stage` queues one extra copy of `qkv`, `attention`, `attn-proj`, `residual-norm`, `ffn`, or `output-head`; every copy consumes the real resident inputs, its output is discarded, and no local clock or synchronization is introduced. `tools/profile_decode_marginal.py` rotates and reverses the variants across repetitions, starts and warms a fresh server for each sample, rejects a loaded machine, and reports both milliseconds per token and microseconds per layer. It stores the raw request timings and complete configuration with `--json`. The normal mode leaves the diagnostic integer at zero.
+
+```sh
+boring build --target metal src/main.br
+(cd src/main_metal && cargo build --release)
+.venv/bin/python tools/profile_decode_marginal.py \
+  --gguf weights/qwen2.5-0.5b-instruct-q8_0.gguf \
+  --binary src/main_metal/target/release/main --layers 24 --reps 5 \
+  --json results/q8-decode-marginal.json
+```
+
+The first full run exposed a build-environment trap before it produced a usable profile. Although the `boring` checkout contained `e28475d9`, the executable installed in `~/.cargo/bin` predated separate Q8 decode/prefill entrypoints and universal split-K. Both the instrumented binary and a clean archive of the preceding boring-llm commit consequently rebuilt at 42.9-43.0 tok/s instead of about 102 tok/s; this proved that the instrumentation itself was not the regression. Reinstalling with `cargo install --path . --force` made the generated kernel list contain `BoringTensorDynamicQ8Native{0,8}Decode/Prefill` again and restored the expected baseline. When compiler and engine are developed together, inspect the generated entrypoint list after rebuilding rather than assuming the installed `boring` matches its checkout.
+
+The valid five-repetition run started at load 3.8 and ended at 2.7. The first baseline was a 12.574 ms warm/short-generation outlier; the other four were 9.784-10.424 ms and the median was 9.889 ms (101.12 tok/s), matching the preceding quiet campaign. Marginal medians were:
+
+| duplicated stage | added ms/token | added us/layer |
+|---|---:|---:|
+| complete FFN (gate, up, SwiGLU, down) | 4.074 | 169.75 |
+| output vocabulary head | 1.663 | — |
+| joined QKV + RoPE/KV preparation | 1.265 | 52.73 |
+| attention | 0.972 | 40.51 |
+| residual + RMSNorm | 0.366 | 15.25 |
+| attention output projection | 0.166 | 6.93 |
+
+These marginal costs deliberately do not add to the token time: independent kernels overlap in the queued GPU stream, and duplicating a whole class changes that overlap. They rank optimization targets rather than partitioning wall time. The FFN is unambiguously first; the next refinement should split its gate, up, SwiGLU and down components, then decide between another Q8 schedule pass and an engine-side joined gate/up projection. The output head is already a single launch and its 1.663 ms marginal cost is close to the unavoidable read of its very large tied matrix, while attention becomes the priority only at longer context. Raw samples are in `results/q8-decode-marginal.json`.
+
+The profiler subsequently gained `ffn-gate`, `ffn-up`, `swiglu` and `ffn-down` variants. They duplicate one component per layer while retaining `ffn` as the whole-chain cross-check; the same rotating-order and raw-JSON protocol applies.
+
+The five-repetition refinement ran at load 1.9 to 2.5 with a 9.689 ms/token baseline median. The complete FFN added 4.157 ms/token (173.19 us/layer); gate added 1.143 ms (47.64 us/layer), up 1.025 ms (42.72 us/layer), down 1.044 ms (43.52 us/layer), and SwiGLU only 0.078 ms (3.27 us/layer). As with the broad profile, the component deltas do not sum exactly because queue overlap changes, but all three Q8 projections have the same order of cost and the pointwise activation is negligible. A standalone SwiGLU optimization cannot close the gap. The justified engine/compiler experiment is a paired gate/up projection with a SwiGLU epilogue: read both weight matrices, reuse the normalized activation, and emit only `hidden`, avoiding two resident intermediate arrays and two launches. Down remains an independent matrix-vector product. Raw samples are in `results/q8-decode-ffn-marginal.json`.
+
+That engine experiment was implemented and rejected. For the small Q8 model, loading row-concatenated gate/up weights allowed one 9,728-row projection followed by a SwiGLU kernel that read the two halves directly, versus two independent 4,864-row projections plus the existing SwiGLU. A seven-repetition alternating A/B at load 2.3 to 2.6 measured 9.895 ms/token for the joined path and 9.772 ms for the separate path: joining regressed by 0.122 ms/token. Removing one launch does not compensate for losing overlap between the two independent projections, and weight traffic is unchanged. The joined implementation was reverted; raw A/B samples are retained in `results/q8-decode-joined-gate-up-ab.json`. A useful fusion must therefore happen inside a compiler kernel that computes corresponding gate/up rows and applies SwiGLU before writing intermediates, not by concatenating the matrices at the engine level.
