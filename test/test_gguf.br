@@ -35,8 +35,8 @@ def main() throws:
     assert_eq(token_types[1], 2)
     assert_eq(token_types[2], 2)
 
-    # bool metadata isn't covered by gguf_get_int/gguf_get_string — read it
-    # directly through the raw metadata dict to also exercise GgufValue.Bool.
+    assert_eq(gguf_get_bool(file.metadata, "tinytest.flag") else false, true)
+    # Also exercise the raw tagged value.
     match file.metadata["tinytest.flag"]:
         GgufValue.Bool(v): assert(v, "tinytest.flag should be true")
         _: assert(false, "tinytest.flag should decode as GgufValue.Bool")

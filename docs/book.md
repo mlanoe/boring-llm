@@ -158,11 +158,12 @@ Without `--quantized`, `--chat` and `--prompt` dequantize every tensor to float3
 | `--temperature T` | `0` (greedy) | softmax temperature; 0 or less means greedy argmax |
 | `--top-k K` | `0` (off) | keep the K most likely tokens |
 | `--top-p P` | `1.0` | nucleus sampling threshold |
+| `--min-p P` | `0` (off) | keep tokens whose probability is at least this fraction of the most likely token's probability |
 | `--seed S` | `0` | PRNG seed (0 is replaced by a fixed constant) |
 | `--repeat-penalty R` | `1.0` (off) | llama.cpp-style repeat penalty |
 | `--repeat-last-n N` | `64` | window for the penalty; 0 or less means the whole history |
 
-For `--serve`, these set the server defaults; a request may override `temperature`, `top_p`, `top_k`, `seed` and `repeat_penalty`, and add `frequency_penalty` and `presence_penalty` (see [chapter 4](#4-the-http-server)).
+For `--serve`, these set the server defaults; a request may override `temperature`, `top_p`, `min_p`, `top_k`, `seed` and `repeat_penalty`, and add `frequency_penalty` and `presence_penalty` (see [chapter 4](#4-the-http-server)).
 
 ### Server flags
 
@@ -202,15 +203,21 @@ $BIN --gguf weights/model.gguf --render-request test/fixtures/requests/tools.jso
 
 `--serve` loads the model once, keeps it resident on the GPU and runs one blocking accept loop with plain `std::net`, with no extra crate and no thread pool. One request is processed at a time, which is exactly the serialization a single GPU needs. Every response carries `Connection: close`. CORS headers allow any origin.
 
-The server listens on `127.0.0.1` only and has no authentication. To reach it from another machine use an SSH tunnel or a port forward; do not expose the port.
+The server listens on `127.0.0.1` only and has no authentication. To reach it from another machine use an SSH tunnel or a port forward; do not expose the port. Request headers are limited to 64 KiB and request bodies to 16 MiB. Bodies must use `Content-Length`; chunked request bodies are rejected explicitly.
 
 ### Endpoints
 
 | Method and path | Purpose |
 |---|---|
-| `GET /v1/models` (also `/models`) | one model, its id is the GGUF `general.name` or `--model-name` |
+| `GET /v1/models` (also `/models`) | one model, its id is the GGUF `general.name` or `--model-name`; its llama-server-style `meta` reports vocabulary, context, embedding, parameter and file sizes |
 | `POST /v1/chat/completions` (also `/chat/completions`) | chat completion, JSON or SSE |
-| `GET /health` (also `/`) | `{"status": "ok"}` |
+| `POST /v1/completions` | OpenAI-compatible text completion from a raw string or token-ID array `prompt`, JSON or SSE; string prompts honor the GGUF tokenizer's automatic BOS setting |
+| `POST /completion` (also `/completions`) | llama-server native completion format, including `n_predict` (`-1` uses all context room and `0` only evaluates/caches the prompt), mixed token-ID/text sequences or `prompt_string` objects, generated token IDs and native SSE stop events; multimodal prompt data is rejected explicitly |
+| `POST /v1/chat/completions/input_tokens` (also `/chat/completions/input_tokens`) | render a chat request and count its input tokens without running the model |
+| `POST /tokenize`, `POST /detokenize` | llama-server-compatible text/token conversion, including `/tokenize`'s optional `with_pieces` output |
+| `POST /apply-template` | render messages with the model's embedded chat template without tokenizing or generating |
+| `GET /props` | llama-server-style model path, chat template and default generation settings |
+| `GET /health` (also `/v1/health` and `/`) | `{"status": "ok"}` |
 | `OPTIONS` anything | `204`, for browser preflight |
 
 Any other route returns `404` with an OpenAI-shaped error body.
@@ -219,19 +226,24 @@ Any other route returns `404` with an OpenAI-shaped error body.
 
 | Field | Behavior |
 |---|---|
-| `messages` | required, non-empty; roles `system`, `user`, `assistant`, `tool`; `content` may be a string or an array of typed parts (the text parts are concatenated) |
+| `messages` | required, non-empty; roles `system`, `developer`, `user`, `assistant`, `tool`; `developer` is normalized to `system` like llama.cpp does for Qwen/Llama templates; `content` may be a string or an array of typed parts (the text parts are concatenated) |
 | `tools` | handed to the model's own chat template as its `tools` variable |
 | `chat_template_kwargs` | an object whose keys become extra variables of the chat template; Qwen3's template reads `enable_thinking` (`false` starts the reply with an empty thinking block, so the model answers directly) |
+| `reasoning_effort` | exposed to the chat template like llama-server; `"none"` also supplies `enable_thinking: false` for Qwen3 unless explicitly overridden in `chat_template_kwargs` |
 | `max_tokens`, `max_completion_tokens` | reply length; the smaller of this and the room left in the context |
-| `temperature`, `top_p`, `top_k`, `seed` | override the server defaults |
+| `temperature`, `top_p`, `min_p`, `top_k`, `seed` | override the server defaults |
 | `repeat_penalty` | llama.cpp-style repeat penalty over the prompt and the reply so far (an extension of the OpenAI API) |
 | `frequency_penalty`, `presence_penalty` | OpenAI-style penalties over the reply so far: the logit of a token drops by its count times the frequency penalty plus the presence penalty (default 0, may be negative) |
-| `tool_choice` | `"none"` leaves the tool definitions out of the prompt and never returns tool calls; any other value is accepted but not enforced (the model decides, as with `"auto"`) |
+| `logit_bias` | OpenAI token-ID-to-bias object; values from -100 to 100 are added to logits before penalties and sampling |
+| `tool_choice` | `"none"` leaves tools out; `"auto"` exposes all tools; `"required"` requires a non-empty tool list but is not yet grammar-enforced; a named function is validated and becomes the only tool exposed to the template |
+| `parallel_tool_calls` | boolean exposed to the chat template like llama-server, allowing templates which support it to enable or suppress multiple calls |
 | `stop` | a string or an array of strings; the reply is cut at the earliest match |
 | `stream` | `true` for server-sent events |
 | `stream_options.include_usage` | adds a final usage chunk to a stream |
+| `response_format` | `{"type":"text"}` is accepted; structured JSON formats return 400 because they cannot be guaranteed without constrained decoding |
+| `logprobs`, `top_logprobs` | disabled forms (`false` or `0`) are accepted; effective requests return 400 because token probabilities are not serialized yet |
 
-Other fields (`n`, `logprobs`, `response_format`, ...) are ignored. A `null` or missing `content` (an assistant message that only carries tool calls) is read as an empty string, because templates do string operations on it. An assistant message's `tool_calls[i].function.arguments` may be a JSON string (as OpenAI sends it) or an object; it is normalized for the template.
+Other unknown fields are ignored for forward compatibility. A `null` or missing `content` (an assistant message that only carries tool calls) is read as an empty string, because templates do string operations on it. An assistant message's `tool_calls[i].function.arguments` may be a JSON string (as OpenAI sends it) or an object; it is normalized for the template.
 
 ### Responses
 
@@ -264,6 +276,8 @@ The tool definitions are rendered by the model's own chat template, so each mode
 ```
 
 The server parses these blocks back into OpenAI `tool_calls` (id, type `function`, name, arguments as a JSON string). A block that is not valid JSON with a `name` stays in `content` verbatim rather than being dropped.
+
+Before returning a call, the server validates its function name and arguments against the supplied tool definition. The supported JSON Schema subset covers the structures used by OpenCode: objects, arrays, primitive `type` values, `properties`, `required`, `items` and `enum`. Unknown schema keywords are left permissive. An invalid call remains visible as ordinary content instead of being executed as a tool call.
 
 Small models, especially under a long prompt, often get the closing braces wrong, because Qwen2.5's template shows its own example with doubled braces. When a strict parse fails, the parser takes the balanced object that starts at each of the first three `{` and keeps the first that is an object with a `name`. A legitimate nested `}}` inside an object is never touched, and trailing junk is ignored.
 
@@ -519,7 +533,7 @@ A stage-by-stage profile of the prefill matrix multiply lives in `tools/metal_pr
 | `src/quant.br` | CPU reference dequantization for every format |
 | `src/model.br` | configuration, weight loading, forward passes, KV cache, prefill and decode |
 | `src/math.br`, `src/math_gpu.br` | CPU reference math; GPU kernels and their host wrappers |
-| `src/sampling.br` | greedy, temperature, top-k, top-p, repeat penalty, PRNG |
+| `src/sampling.br` | greedy, temperature, top-k, top-p, min-p, repeat penalty, PRNG |
 | `src/openai.br` | message normalization, tool-call parsing, JSON and SSE bodies (pure) |
 | `src/cache_policy.br` | the disk-cache decisions (pure) |
 | `src/prompt_cache.br` | reading and writing the disk snapshots |
@@ -844,6 +858,7 @@ The header is written last. A file whose size does not equal header plus tokens 
 | `tools/accuracy_vs_llamacpp.py` | whole forward pass against llama.cpp, position by position |
 | `tools/decode_vs_llamacpp.py` | generation (the decode path) against llama.cpp, token by token |
 | `tools/bench_vs_llamacpp.py` | prefill and decode speed against llama.cpp |
+| `tools/compare_servers.py` | template rendering, token ids, raw token pieces, detokenization and input counts against a running llama-server |
 | `tools/reference_logits.py` | llama.cpp's own logits for a fixed prompt |
 | `tools/oracle_encode.py` | tokenization against llama.cpp |
 | `tools/oracle_render_request.py` | chat-template rendering against `jinja2`; with `--binary` it compares a build on every request file |

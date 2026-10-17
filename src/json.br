@@ -74,36 +74,63 @@ int json_hex4([string] cs, int pos) throws:
             elif e == "u":
                 var int cp = json_hex4(cs, p + 2)
                 p += 6
-                if cp >= 0xD800 and cp <= 0xDBFF and p + 1 < cs.length and cs[p] == "\\" and cs[p + 1] == "u":
+                if cp >= 0xD800 and cp <= 0xDBFF:
+                    guard p + 1 < cs.length and cs[p] == "\\" and cs[p + 1] == "u" else throw "json: high surrogate without a low surrogate"
                     let lo = json_hex4(cs, p + 2)
-                    if lo >= 0xDC00 and lo <= 0xDFFF:
-                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
-                        p += 6
+                    guard lo >= 0xDC00 and lo <= 0xDFFF else throw "json: invalid low surrogate"
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+                    p += 6
+                elif cp >= 0xDC00 and cp <= 0xDFFF:
+                    throw "json: low surrogate without a high surrogate"
                 out = "{out}{chr(cp)}"
-            else:
-                # \" \\ \/ — the escaped char is itself
+            elif e == "\"" or e == "\\" or e == "/":
                 out = "{out}{e}"
                 p += 2
+            else:
+                throw "json: invalid escape '\\{e}'"
         else:
+            guard ord(ch) >= 0x20 else throw "json: unescaped control character in string"
             out = "{out}{ch}"
             p += 1
     ("", p)
 
 (JValue, int) json_parse_number([string] cs, int pos) throws:
-    var string text = ""
     var bool is_float = false
     var int p = pos
-    while p < cs.length:
-        let ch = cs[p]
-        if (ch >= "0" and ch <= "9") or ch == "-" or ch == "+":
-            text = "{text}{ch}"
-        elif ch == "." or ch == "e" or ch == "E":
-            text = "{text}{ch}"
-            is_float = true
-        else:
-            break
+
+    if p < cs.length and cs[p] == "-":
         p += 1
-    guard text != "" else throw "json: unexpected character '{cs[pos]}' at {pos}"
+    guard p < cs.length else throw "json: truncated number"
+    if cs[p] == "0":
+        p += 1
+    elif cs[p] >= "1" and cs[p] <= "9":
+        p += 1
+        while p < cs.length and cs[p] >= "0" and cs[p] <= "9":
+            p += 1
+    else:
+        throw "json: invalid number at {pos}"
+
+    if p < cs.length and cs[p] == ".":
+        is_float = true
+        p += 1
+        guard p < cs.length and cs[p] >= "0" and cs[p] <= "9" else throw "json: expected digit after decimal point"
+        while p < cs.length and cs[p] >= "0" and cs[p] <= "9":
+            p += 1
+
+    if p < cs.length and (cs[p] == "e" or cs[p] == "E"):
+        is_float = true
+        p += 1
+        if p < cs.length and (cs[p] == "+" or cs[p] == "-"):
+            p += 1
+        guard p < cs.length and cs[p] >= "0" and cs[p] <= "9" else throw "json: expected exponent digits"
+        while p < cs.length and cs[p] >= "0" and cs[p] <= "9":
+            p += 1
+
+    var string text = ""
+    var int i = pos
+    while i < p:
+        text = "{text}{cs[i]}"
+        i += 1
     if not is_float:
         # An integer too large for int64 falls through to a float below.
         if let n = (text as int):
@@ -186,6 +213,200 @@ pub JValue json_parse(string src) throws:
     let tail = json_skip_ws(cs, end)
     guard tail == cs.length else throw "json: trailing characters at {tail}"
     v
+
+# Classifies a JSON prefix without throwing: -1 is irrecoverably invalid, 0 can
+# still become one valid document by appending characters, and 1 is already a
+# complete document (optionally followed by whitespace). This is deliberately
+# syntax-only; schema constraints are layered on top by the decoder.
+pub int json_prefix_state(string src):
+    let cs = src.chars()
+    # 0 root value, 1 object key/end, 2 colon, 3 object value,
+    # 4 object comma/end, 5 array value/end, 6 array comma/end, 7 root done.
+    mut [int] states = [0]
+    var int p = 0
+    while p < cs.length:
+        let state = states[states.length - 1]
+        let ch = cs[p]
+        if is_json_ws(ch):
+            p += 1
+        elif state == 7:
+            return -1
+        elif state == 2:
+            if ch != ":": return -1
+            let top = states.length - 1
+            states[top] = 3
+            p += 1
+        elif state == 4:
+            if ch == ",":
+                let top = states.length - 1
+                states[top] = 1
+                p += 1
+            elif ch == "}}":
+                states.pop()
+                p += 1
+            else:
+                return -1
+        elif state == 6:
+            if ch == ",":
+                let top = states.length - 1
+                states[top] = 5
+                p += 1
+            elif ch == "]":
+                states.pop()
+                p += 1
+            else:
+                return -1
+        elif state == 1:
+            if ch == "}}":
+                states.pop()
+                p += 1
+            elif ch != "\"":
+                return -1
+            else:
+                p += 1
+                var bool closed = false
+                while p < cs.length and not closed:
+                    let c = cs[p]
+                    if c == "\"":
+                        closed = true
+                        p += 1
+                    elif c == "\\":
+                        p += 1
+                        if p >= cs.length: return 0
+                        let e = cs[p]
+                        if e == "u":
+                            var int h = 0
+                            while h < 4:
+                                p += 1
+                                if p >= cs.length: return 0
+                                let x = cs[p]
+                                if not ((x >= "0" and x <= "9") or (x >= "a" and x <= "f") or (x >= "A" and x <= "F")): return -1
+                                h += 1
+                            p += 1
+                        elif e == "\"" or e == "\\" or e == "/" or e == "b" or e == "f" or e == "n" or e == "r" or e == "t":
+                            p += 1
+                        else:
+                            return -1
+                    elif ord(c) < 0x20:
+                        return -1
+                    else:
+                        p += 1
+                if not closed: return 0
+                let top = states.length - 1
+                states[top] = 2
+        else:
+            # A value is expected at the root, after an object colon, or at an
+            # array element. Mark its parent complete before pushing a nested
+            # container; the parent is hidden until that container closes.
+            if state != 0 and state != 3 and state != 5: return -1
+            if ch == "]" and state == 5:
+                states.pop()
+                p += 1
+            else:
+                let after = if state == 0: 7 elif state == 3: 4 else: 6
+                let top = states.length - 1
+                states[top] = after
+                if ch == "{{":
+                    states.push(1)
+                    p += 1
+                elif ch == "[":
+                    states.push(5)
+                    p += 1
+                elif ch == "\"":
+                    p += 1
+                    var bool closed = false
+                    while p < cs.length and not closed:
+                        let c = cs[p]
+                        if c == "\"":
+                            closed = true
+                            p += 1
+                        elif c == "\\":
+                            p += 1
+                            if p >= cs.length: return 0
+                            let e = cs[p]
+                            if e == "u":
+                                var int h = 0
+                                while h < 4:
+                                    p += 1
+                                    if p >= cs.length: return 0
+                                    let x = cs[p]
+                                    if not ((x >= "0" and x <= "9") or (x >= "a" and x <= "f") or (x >= "A" and x <= "F")): return -1
+                                    h += 1
+                                p += 1
+                            elif e == "\"" or e == "\\" or e == "/" or e == "b" or e == "f" or e == "n" or e == "r" or e == "t":
+                                p += 1
+                            else:
+                                return -1
+                        elif ord(c) < 0x20:
+                            return -1
+                        else:
+                            p += 1
+                    if not closed: return 0
+                elif ch == "t" or ch == "f" or ch == "n":
+                    let word = if ch == "t": "true" elif ch == "f": "false" else: "null"
+                    let wc = word.chars()
+                    var int i = 0
+                    while i < wc.length:
+                        if p + i >= cs.length: return 0
+                        if cs[p + i] != wc[i]: return -1
+                        i += 1
+                    p += wc.length
+                else:
+                    var int q = p
+                    if cs[q] == "-":
+                        q += 1
+                        if q >= cs.length: return 0
+                    if cs[q] == "0":
+                        q += 1
+                    elif cs[q] >= "1" and cs[q] <= "9":
+                        q += 1
+                        while q < cs.length and cs[q] >= "0" and cs[q] <= "9": q += 1
+                    else:
+                        return -1
+                    if q < cs.length and cs[q] == ".":
+                        q += 1
+                        if q >= cs.length: return 0
+                        if cs[q] < "0" or cs[q] > "9": return -1
+                        while q < cs.length and cs[q] >= "0" and cs[q] <= "9": q += 1
+                    if q < cs.length and (cs[q] == "e" or cs[q] == "E"):
+                        q += 1
+                        if q >= cs.length: return 0
+                        if cs[q] == "+" or cs[q] == "-":
+                            q += 1
+                            if q >= cs.length: return 0
+                        if cs[q] < "0" or cs[q] > "9": return -1
+                        while q < cs.length and cs[q] >= "0" and cs[q] <= "9": q += 1
+                    p = q
+        if states.length == 0:
+            # A closed top-level container is a complete root value.
+            states.push(7)
+    if states.length == 1 and states[0] == 7: 1 else: 0
+
+# `response_format: {type: json_object}` is stricter than generic JSON: a
+# scalar or top-level array is not a valid result. Leading whitespace remains
+# legal, matching the JSON grammar and llama.cpp's grammar-constrained output.
+pub int json_object_prefix_state(string src):
+    let cs = src.chars()
+    var int p = 0
+    while p < cs.length and is_json_ws(cs[p]):
+        p += 1
+    if p == cs.length:
+        return 0
+    if cs[p] != "{{":
+        return -1
+    json_prefix_state(src)
+
+# Pure candidate policy used by the future constrained sampler. A normal token
+# is allowed when appending its piece keeps the prefix viable. EOS is allowed
+# only after a complete object, so truncation can never masquerade as success.
+pub bool json_object_candidate_allowed(string prefix, string piece, bool is_eos):
+    let before = json_object_prefix_state(prefix)
+    if before < 0:
+        false
+    elif is_eos:
+        before == 1
+    else:
+        json_object_prefix_state("{prefix}{piece}") >= 0
 
 # ── Typed accessors for pulling request fields out of a parsed object ─────
 

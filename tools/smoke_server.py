@@ -35,6 +35,20 @@ def call(path, body=None, raw=False):
         return e.code, e.headers, e.read().decode()
 
 
+def raw_http(request):
+    """Send an intentionally malformed request that urllib would normalize."""
+    u = urllib.parse.urlparse(BASE)
+    conn = http.client.HTTPConnection(u.hostname, u.port, timeout=30)
+    conn.sock = None
+    conn.connect()
+    conn.sock.sendall(request)
+    response = conn.response_class(conn.sock, method="POST")
+    response.begin()
+    result = response.status, response.read().decode()
+    conn.close()
+    return result
+
+
 def check(name, cond, detail=""):
     print(("PASS  " if cond else "FAIL  ") + name + ("" if cond else f"  -- {detail}"))
     if not cond:
@@ -49,6 +63,44 @@ s, h, b = call("/v1/models")
 m = json.loads(b)
 check("GET /v1/models lists one model", s == 200 and m["object"] == "list" and len(m["data"]) == 1, b)
 model_id = m["data"][0]["id"]
+meta = m["data"][0].get("meta", {})
+check("GET /v1/models exposes llama-server metadata",
+      meta.get("vocab_type") in (1, 2) and meta.get("n_vocab", 0) > 0
+      and meta.get("n_ctx") == CTX and meta.get("n_ctx_train", 0) > 0
+      and meta.get("n_embd", 0) > 0 and meta.get("n_params", 0) > 0
+      and meta.get("size", 0) > 0, b)
+
+s, h, b = call("/v1/health")
+check("GET /v1/health", s == 200 and json.loads(b).get("status") == "ok", b)
+s, h, b = call("/props")
+props = json.loads(b)
+check("GET /props exposes llama-server diagnostics", s == 200 and props.get("model_path")
+      and props.get("chat_template") and props.get("default_generation_settings", {}).get("n_ctx") == CTX, b)
+
+count_body = {"model": model_id, "messages": [{"role": "user", "content": "Say hi."}], "chat_template_kwargs": NO_THINK}
+s, h, b = call("/v1/chat/completions/input_tokens", count_body)
+counted = json.loads(b)
+check("chat input token counting endpoint", s == 200 and counted["object"] == "response.input_tokens" and counted["input_tokens"] > 0, b)
+s, h, b = call("/v1/chat/completions/input_tokens", {
+    "model": model_id,
+    "messages": [{"role": "developer", "content": "Answer briefly."},
+                 {"role": "user", "content": "Say hi."}],
+})
+check("developer role is accepted", s == 200 and json.loads(b).get("input_tokens", 0) > 0, b)
+
+s, h, b = call("/apply-template", count_body)
+applied = json.loads(b)
+check("apply-template returns the rendered prompt", s == 200 and isinstance(applied.get("prompt"), str) and applied["prompt"], b)
+s, h, b = call("/tokenize", {"content": applied["prompt"], "parse_special": True})
+prompt_ids = json.loads(b).get("tokens", [])
+check("tokenize agrees with chat input token count", s == 200 and len(prompt_ids) == counted["input_tokens"], b)
+s, h, b = call("/tokenize", {"content": applied["prompt"], "parse_special": True, "with_pieces": True})
+pieces = json.loads(b).get("tokens", [])
+check("tokenize with_pieces returns llama-server objects", s == 200 and len(pieces) == len(prompt_ids)
+      and [piece.get("id") for piece in pieces] == prompt_ids
+      and all(isinstance(piece.get("piece"), (str, list)) for piece in pieces), b)
+s, h, b = call("/detokenize", {"tokens": prompt_ids})
+check("detokenize accepts the prompt tokens", s == 200 and isinstance(json.loads(b).get("content"), str), b)
 
 s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "Say hi."}], "max_tokens": 8, "temperature": 0, "chat_template_kwargs": NO_THINK})
 r = json.loads(b)
@@ -56,6 +108,53 @@ ch = r["choices"][0]
 check("chat completion shape", s == 200 and r["object"] == "chat.completion" and ch["message"]["role"] == "assistant"
       and ch["finish_reason"] in ("stop", "length") and r["usage"]["total_tokens"] == r["usage"]["prompt_tokens"] + r["usage"]["completion_tokens"], b)
 check("content-type is JSON", h.get("Content-Type", "").startswith("application/json"))
+
+completion_body = {"model": model_id, "prompt": "The capital of France is", "max_tokens": 8, "temperature": 0}
+s, h, b = call("/v1/completions", completion_body)
+classic = json.loads(b)
+check("legacy text completion shape", s == 200 and classic.get("object") == "text_completion"
+      and isinstance(classic.get("choices", [])[0].get("text"), str)
+      and classic["choices"][0].get("finish_reason") in ("stop", "length"), b)
+s, h, b = call("/tokenize", {"content": completion_body["prompt"], "parse_special": True})
+completion_prompt_ids = json.loads(b).get("tokens", [])
+s, h, b = call("/v1/completions", dict(completion_body, prompt=completion_prompt_ids))
+token_classic = json.loads(b)
+check("legacy text completion accepts prompt token ids", s == 200
+      and token_classic["choices"][0]["text"] == classic["choices"][0]["text"], b)
+s, h, b = call("/v1/completions", dict(completion_body, stream=True, stream_options={"include_usage": True}))
+classic_events = [e for e in b.split("\n\n") if e.strip()]
+classic_chunks = [json.loads(e[len("data: "):]) for e in classic_events[:-1]]
+classic_choice_chunks = [c for c in classic_chunks if c.get("choices")]
+classic_usage_chunks = [c for c in classic_chunks if not c.get("choices")]
+check("legacy text completion streams", s == 200 and classic_events[-1] == "data: [DONE]"
+      and all(c.get("object") == "text_completion" for c in classic_chunks)
+      and "".join(c["choices"][0]["text"] for c in classic_choice_chunks) == classic["choices"][0]["text"], b)
+check("legacy text completion stream includes usage", len(classic_usage_chunks) == 1
+      and classic_usage_chunks[0]["usage"] == classic["usage"], b)
+
+native_body = {"prompt": completion_body["prompt"], "n_predict": 8, "temperature": 0}
+s, h, b = call("/completion", native_body)
+native = json.loads(b)
+check("llama native completion shape", s == 200 and native.get("content") == classic["choices"][0]["text"]
+      and native.get("tokens_predicted") == 8 and len(native.get("tokens", [])) == 8
+      and native.get("stop_type") in ("eos", "word", "limit"), b)
+s, h, b = call("/completion", {"prompt": "cache this prompt", "n_predict": 0})
+native_zero = json.loads(b)
+check("llama native zero-token completion", s == 200 and native_zero.get("content") == ""
+      and native_zero.get("tokens") == [] and native_zero.get("tokens_predicted") == 0, b)
+s, h, b = call("/completion", dict(native_body, prompt=completion_prompt_ids[:2] + [" of France is"]))
+mixed_native = json.loads(b)
+check("llama native completion accepts mixed token and text prompts", s == 200
+      and isinstance(mixed_native.get("content"), str) and mixed_native.get("tokens_predicted") == 8, b)
+s, h, b = call("/completion", dict(native_body, prompt={"prompt_string": completion_body["prompt"]}))
+object_native = json.loads(b)
+check("llama native completion accepts prompt_string objects", s == 200
+      and object_native.get("content") == native.get("content"), b)
+s, h, b = call("/completions", dict(native_body, stream=True))
+native_events = [json.loads(e[len("data: "):]) for e in b.split("\n\n") if e.strip()]
+check("llama native completion streams", s == 200 and native_events[-1].get("stop") is True
+      and "".join(e.get("content", "") for e in native_events) == native["content"]
+      and sum(len(e.get("tokens", [])) for e in native_events) == len(native["tokens"]), b)
 
 s, h, b = call("/v1/chat/completions", {"model": model_id, "stream": True, "stream_options": {"include_usage": True},
                                           "messages": [{"role": "user", "content": "Say hi."}], "max_tokens": 8, "temperature": 0, "chat_template_kwargs": NO_THINK})
@@ -94,8 +193,36 @@ s, h, b = call("/nope")
 check("404 JSON error", s == 404 and json.loads(b)["error"]["code"] == "not_found", b)
 s, h, b = call("/v1/chat/completions", b"{not json")
 check("400 on invalid JSON", s == 400 and json.loads(b)["error"]["code"] == "invalid_json", b)
+s, h, b = call("/v1/chat/completions", b'{"messages":[{"role":"user","content":"bad\\q"}]}')
+check("400 on invalid JSON escape", s == 400 and json.loads(b)["error"]["code"] == "invalid_json", b)
+s, h, b = call("/v1/chat/completions", b'{"messages":[{"role":"user","content":"\\ud800"}]}')
+check("400 on invalid JSON surrogate", s == 400 and json.loads(b)["error"]["code"] == "invalid_json", b)
 s, h, b = call("/v1/chat/completions", {"model": "x"})
 check("400 on missing messages", s == 400 and json.loads(b)["error"]["code"] == "missing_messages", b)
+s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]})
+check("400 on unsupported message content", s == 400 and json.loads(b)["error"]["code"] == "invalid_request", b)
+s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 0})
+check("400 on invalid generation parameter", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
+s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "n": 2})
+check("400 on unsupported multiple choices", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
+s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "json"}],
+                                         "response_format": {"type": "json_object"}, "max_tokens": 1})
+check("400 on unsupported structured response format", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter"
+      and "constrained decoding" in json.loads(b)["error"]["message"], b)
+s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "hi"}],
+                                         "logprobs": True, "top_logprobs": 3, "max_tokens": 1})
+check("400 on unsupported requested logprobs", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter"
+      and "logprobs" in json.loads(b)["error"]["message"], b)
+s, h, b = call("/v1/completions", {"model": model_id, "prompt": [0, "bad"], "max_tokens": 1})
+check("400 on invalid completion prompt tokens", s == 400 and json.loads(b)["error"]["code"] == "invalid_prompt", b)
+s, h, b = call("/v1/completions", {"model": model_id, "prompt": [1 << 30], "max_tokens": 1})
+check("400 on out-of-vocabulary completion token", s == 400 and json.loads(b)["error"]["code"] == "invalid_prompt_token", b)
+s, h, b = call("/completion", {"prompt": {"prompt_string": "look", "multimodal_data": ["AA=="]}, "n_predict": 1})
+check("400 on unsupported multimodal native prompt", s == 400 and json.loads(b)["error"]["code"] == "unsupported_multimodal_prompt", b)
+status, b = raw_http(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: nope\r\n\r\n")
+check("400 on invalid Content-Length", status == 400 and json.loads(b)["error"]["code"] == "malformed_http_request", b)
+status, b = raw_http(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+check("400 on unsupported chunked request", status == 400 and json.loads(b)["error"]["code"] == "malformed_http_request", b)
 s, h, b = call("/v1/chat/completions", {"model": "x", "messages": [{"role": "user", "content": "word " * (CTX * 3 // 2)}]})
 check("400 context_length_exceeded", s == 400 and json.loads(b)["error"]["code"] == "context_length_exceeded", b)
 e = json.loads(b).get("error", {})
@@ -196,8 +323,9 @@ REP = {"model": model_id, "temperature": 0, "max_tokens": 40, "chat_template_kwa
        "messages": [{"role": "user", "content": "Repeat the word 'echo' twenty times, separated by spaces."}]}
 s8, h8, b8 = call("/v1/chat/completions", REP)
 base_text = json.loads(b8)["choices"][0]["message"]["content"]
-s9, h9, b9 = call("/v1/chat/completions", dict(REP, frequency_penalty=3.0, presence_penalty=1.0, top_k=5, repeat_penalty=1.1))
-check("top_k, repeat_penalty, frequency and presence penalty are accepted", s9 == 200, b9)
+s9, h9, b9 = call("/v1/chat/completions", dict(REP, frequency_penalty=2.0, presence_penalty=1.0,
+                                                 top_k=5, min_p=0.05, repeat_penalty=1.1, logit_bias={"0": 0}))
+check("sampling parameters, penalties and logit_bias are accepted", s9 == 200, b9)
 if s9 == 200:
     check("a strong frequency penalty changes a repetitive greedy reply",
           json.loads(b9)["choices"][0]["message"]["content"] != base_text, base_text)

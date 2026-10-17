@@ -278,6 +278,14 @@ pub int? gguf_get_int({string=GgufValue} metadata, string key):
     else:
         nil
 
+pub bool? gguf_get_bool({string=GgufValue} metadata, string key):
+    if metadata.contains(key):
+        match metadata[key]:
+            GgufValue.Bool(v): v
+            _: nil
+    else:
+        nil
+
 pub float32? gguf_get_f32({string=GgufValue} metadata, string key):
     if metadata.contains(key):
         match metadata[key]:

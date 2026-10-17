@@ -48,10 +48,50 @@ def main() throws:
 
     # Malformed input is a clean error, never a crash.
     var int errors = 0
-    for bad in ["", "{{", "[1, 2", "{{\"a\" 1}}", "{{\"a\": }}", "\"abc", "[1] x", "tru", "{{'a': 1}}", "\"\\u12\""]:
+    for bad in ["", "{{", "[1, 2", "{{\"a\" 1}}", "{{\"a\": }}", "\"abc", "[1] x", "tru", "{{'a': 1}}", "\"\\u12\"",
+                "\"bad\\q\"", "\"raw{chr(10)}newline\"", "+1", "01", "-01", "1.", "1e", "1e+", "--1"]:
         try:
             let _ = json_parse(bad)
         catch:
             errors += 1
-    assert_eq(errors, 10 as int)
+    assert_eq(errors, 19 as int)
+
+    var int surrogate_errors = 0
+    for bad_surrogate in ["\"\\ud800\"", "\"\\ud800\\u0041\"", "\"\\udc00\""]:
+        try:
+            let _ = json_parse(bad_surrogate)
+        catch:
+            surrogate_errors += 1
+    assert_eq(surrogate_errors, 3 as int)
+
+    # Incremental classifier used by constrained decoding: every proper prefix
+    # stays viable, a full document is complete, and impossible continuations
+    # are rejected immediately.
+    let constrained = "{{\"name\": \"café\", \"args\": [1, -2.5e+3, true, null]}}"
+    let constrained_chars = constrained.chars()
+    var int prefix_len = 0
+    while prefix_len < constrained_chars.length:
+        var string prefix = ""
+        var int pi = 0
+        while pi < prefix_len:
+            prefix = "{prefix}{constrained_chars[pi]}"
+            pi += 1
+        assert_eq(json_prefix_state(prefix), 0 as int)
+        prefix_len += 1
+    assert_eq(json_prefix_state(constrained), 1 as int)
+    assert_eq(json_prefix_state("  {constrained} \n\t"), 1 as int)
+    for impossible in ["{{]", "[}}", "{{\"a\",", "{{\"a\": truX", "{{\"a\": 01", "{{\"a\": \"bad\\q"]:
+        assert_eq(json_prefix_state(impossible), -1 as int)
+    for possible in ["", "  ", "{{", "{{\"a", "{{\"a\":", "{{\"a\": [1,", "{{\"a\": 1e+"]:
+        assert_eq(json_prefix_state(possible), 0 as int)
+
+    assert_eq(json_object_prefix_state("  {{\"ok\": true}}"), 1 as int)
+    assert_eq(json_object_prefix_state("[1, 2]"), -1 as int)
+    assert_eq(json_object_prefix_state("\"scalar\""), -1 as int)
+    assert_eq(json_object_candidate_allowed("", "  {{", false), true)
+    assert_eq(json_object_candidate_allowed("{{\"a\":", " 1", false), true)
+    assert_eq(json_object_candidate_allowed("{{\"a\":", " nope", false), false)
+    assert_eq(json_object_candidate_allowed("{{\"a\": 1}}", "", true), true)
+    assert_eq(json_object_candidate_allowed("{{\"a\": 1", "", true), false)
+    assert_eq(json_object_candidate_allowed("{{\"a\": 1}}", " trailing", false), false)
     print "test_json: ok"

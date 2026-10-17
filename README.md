@@ -12,7 +12,7 @@ Full documentation: [the book](docs/book.md) ([HTML](docs/book.html)): command l
 
 - **Runs real models.** Qwen2.5 (0.5B, 3B, 7B tested), Qwen3 (4B tested) and Llama-architecture models (TinyLlama 1.1B tested), in F32, F16, Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q6_K and IQ4_NL, including the mixed-format files llama.cpp produces (`*-Q4_K_M.gguf`). Weights stay quantized on the GPU; there is no dequantized copy.
 - **Needs little memory.** Tensors are read from disk one at a time, then live on the GPU: a 3B Q4_K_M server starts in ~5 s and holds ~3.1 GB.
-- **Serves the OpenAI API.** `GET /v1/models` and `POST /v1/chat/completions`, JSON or streamed (SSE, token by token, with `stream_options.include_usage`), `stop` strings, `max_tokens`, sampling parameters, `top_k`, `repeat_penalty`, `frequency_penalty` and `presence_penalty`, and **tool calling** through the model's own chat template (Hermes-style `<tool_call>` output is parsed back into `tool_calls`; `tool_choice: "none"` leaves the tools out). Reasoning models (Qwen3) have their `<think>` text returned as `reasoning_content`, streamed too, and `chat_template_kwargs` (e.g. `{"enable_thinking": false}`) reaches the chat template.
+- **Serves the OpenAI and llama-server APIs.** `GET /v1/models`, `POST /v1/chat/completions`, OpenAI `POST /v1/completions`, native `POST /completion`, and chat input-token counting, plus llama-server's `/tokenize`, `/detokenize` and `/apply-template` diagnostics; completions are JSON or streamed (SSE, token by token, with `stream_options.include_usage` on OpenAI streams), with `stop` strings, reply-length controls, sampling parameters, `top_k`, `min_p`, `repeat_penalty`, OpenAI penalties and `logit_bias`, and **tool calling** through the model's own chat template (Hermes-style `<tool_call>` output is parsed back into `tool_calls`; `tool_choice: "none"` leaves the tools out). Reasoning models (Qwen3) have their `<think>` text returned as `reasoning_content`, streamed too, and `chat_template_kwargs` (e.g. `{"enable_thinking": false}`) reaches the chat template.
 - **Is fast enough for agents.** An agent resends its whole history every turn, so the server keeps the KV caches of its recent requests in memory (`--cache-slots`) and, with `--prompt-cache DIR`, on disk across restarts: only the tokens after the shared prefix are processed.
 - **Has two GPU backends**, Metal and wgpu (Vulkan, DirectX 12, Metal), producing the same output. CUDA and ROCm share the source but have never been run (no hardware).
 - **Is checked against llama.cpp.** Tokenization and chat-template rendering are compared token for token with `llama-cpp-python`/`jinja2`, and greedy generation matches llama.cpp's on real weights (identical text on Qwen2.5 0.5B Q8_0 and Q4_K_M and on 7B Q4_K_M for the prompts checked; the 3B was checked for consistency across backends and compilers, not against llama.cpp).
@@ -92,7 +92,7 @@ The first request of a session is the slow one, because the ~7.5k-token prompt h
 | `--prompt-cache-files N` | `2` | snapshots kept on disk |
 | `--prompt-cache-max-mb N` | `4096` | cap on all snapshots together (`0` = none) |
 | `--kquant-prefill handwritten` | `tensor` | wgpu/CUDA/ROCm: keep the hand-written Q4_K/Q6_K prefill kernels (faster there today) |
-| `--temperature`, `--top-k`, `--top-p`, `--seed`, `--repeat-penalty`, `--repeat-last-n` | greedy | sampling defaults; a request can override temperature, top_p, top_k, seed and repeat_penalty, and add frequency_penalty and presence_penalty |
+| `--temperature`, `--top-k`, `--top-p`, `--min-p`, `--seed`, `--repeat-penalty`, `--repeat-last-n` | greedy | sampling defaults; a request can override temperature, top_p, min_p, top_k, seed and repeat_penalty, and add frequency_penalty and presence_penalty |
 
 One request is served at a time (one GPU). Every response is `Connection: close`.
 
@@ -129,9 +129,10 @@ On wgpu the portable K-quant prefill is still ~3x slower than the hand-written k
 for t in test/test_*.br; do case $t in *_real.br) ;; *) boring run $t;; esac; done   # interpreter tests, no model needed
 tools/smoke_server.py http://127.0.0.1:8080                                         # wire-format checks against a running server
 tools/profile_decode_marginal.py --selftest                                        # marginal profiler driver, no model
+tools/compare_servers.py --selftest                                                # differential HTTP driver, no servers
 ```
 
-The `test/*_real.br` programs need a compiled build and real weights (each lists the files it expects). The models are not in the repository (`weights/` is git-ignored): `tools/fetch_models.py list` shows what the tests and tools use and what is present, `ensure NAME` downloads one, and `tools/accuracy_vs_llamacpp.py --model NAME --fetch` fetches a missing one first. `tools/` holds the oracles that compare against llama.cpp: `accuracy_vs_llamacpp.py` (the whole forward pass, position by position: run it on a Q8_0 and a Q4_K_M model after any change to the GPU kernels or to `boring`), `decode_vs_llamacpp.py` (generation through the KV-cache decode path, which the logits check never runs: run it with the accuracy check), `reference_logits.py` (logits), `oracle_encode.py` (tokenization), `oracle_render_request.py` (chat-template rendering), `inspect_gguf.py` (metadata).
+The `test/*_real.br` programs need a compiled build and real weights (each lists the files it expects). The models are not in the repository (`weights/` is git-ignored): `tools/fetch_models.py list` shows what the tests and tools use and what is present, `ensure NAME` downloads one, and `tools/accuracy_vs_llamacpp.py --model NAME --fetch` fetches a missing one first. `tools/` holds the oracles that compare against llama.cpp: `accuracy_vs_llamacpp.py` (the whole forward pass, position by position: run it on a Q8_0 and a Q4_K_M model after any change to the GPU kernels or to `boring`), `decode_vs_llamacpp.py` (generation through the KV-cache decode path, which the logits check never runs: run it with the accuracy check), `compare_servers.py` (template rendering, token ids, raw token pieces, detokenization and input counts against two running servers), `reference_logits.py` (logits), `oracle_encode.py` (tokenization), `oracle_render_request.py` (chat-template rendering), `inspect_gguf.py` (metadata).
 
 ## Repository layout
 
@@ -143,7 +144,7 @@ src/
   quant.br                CPU reference dequantization for every supported format
   model.br                config and weight loading, forward pass, KV cache, prefill/decode
   math.br, math_gpu.br    CPU reference math; GPU kernels (attention, norms, RoPE, copies, quantized GEMM)
-  sampling.br             greedy, temperature, top-k, top-p, repeat penalty
+  sampling.br             greedy, temperature, top-k, top-p, min-p, repeat penalty
   openai.br               message normalization, tool-call parsing, JSON/SSE bodies (pure)
   cache_policy.br         what the disk prompt cache keeps and when it is used (pure)
   prompt_cache.br         reading and writing the disk snapshots

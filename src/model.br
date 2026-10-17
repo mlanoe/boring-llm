@@ -521,15 +521,16 @@ pub [float32] forward_gpu_quantized(QuantModel model, [int] tokens) throws:
 # and short generations, a real cost KV-cache would remove (a documented,
 # deliberate Phase 4 stretch item, not fixed here).
 pub struct SamplingParams:
-    float32 temperature   # <= 0 -> greedy argmax, ignores top_k/top_p entirely
+    float32 temperature   # <= 0 -> greedy argmax, ignores top_k/top_p/min_p entirely
     int top_k             # <= 0 -> defaults to 50 (see sampling.br's own doc comment)
     float32 top_p         # >= 1.0 -> no nucleus filtering (keep the whole top-k set)
+    float32 min_p         # <= 0 -> disabled; keep tokens at least min_p * max probability
     int seed
     float32 repeat_penalty  # == 1.0 -> disabled (this project's own default; llama.cpp's own default is 1.1)
     int repeat_last_n       # <= 0 -> penalize the whole history; llama.cpp's own default is 64
 
 pub SamplingParams greedy_params():
-    SamplingParams(0.0 as float32, 0, 1.0 as float32, 0, 1.0 as float32, 64)
+    SamplingParams(0.0 as float32, 0, 1.0 as float32, 0.0 as float32, 0, 1.0 as float32, 64)
 
 [float32] extract_row([float32] logits, int row, int vocab):
     mut [float32] out = [0.0 for i in 0..<vocab]
@@ -554,7 +555,7 @@ pub [int] generate(QuantModel model, [int] prompt_tokens, int max_new_tokens, in
         let seq = tokens.length
         let last_logits = extract_row(logits, seq - 1, vocab)
 
-        let (next_tok, new_rng) = sample(rng, last_logits, vocab, params.temperature, params.top_k, params.top_p, tokens, params.repeat_penalty, params.repeat_last_n)
+        let (next_tok, new_rng) = sample(rng, last_logits, vocab, params.temperature, params.top_k, params.top_p, params.min_p, tokens, params.repeat_penalty, params.repeat_last_n)
         rng = new_rng
 
         tokens.push(next_tok)
@@ -583,7 +584,7 @@ pub [int] generate_f32(Model model, [int] prompt_tokens, int max_new_tokens, int
         let seq = tokens.length
         let last_logits = extract_row(logits, seq - 1, vocab)
 
-        let (next_tok, new_rng) = sample(rng, last_logits, vocab, params.temperature, params.top_k, params.top_p, tokens, params.repeat_penalty, params.repeat_last_n)
+        let (next_tok, new_rng) = sample(rng, last_logits, vocab, params.temperature, params.top_k, params.top_p, params.min_p, tokens, params.repeat_penalty, params.repeat_last_n)
         rng = new_rng
 
         tokens.push(next_tok)
@@ -983,7 +984,7 @@ pub [int] generate_kv(QuantModel model, [int] prompt_tokens, int max_new_tokens,
     let vocab = model.config.vocab_size
     var int generated = 0
     while generated < max_new_tokens:
-        let (next_tok, new_rng) = sample(rng, logits, vocab, params.temperature, params.top_k, params.top_p, tokens, params.repeat_penalty, params.repeat_last_n)
+        let (next_tok, new_rng) = sample(rng, logits, vocab, params.temperature, params.top_k, params.top_p, params.min_p, tokens, params.repeat_penalty, params.repeat_last_n)
         rng = new_rng
 
         tokens.push(next_tok)
@@ -1089,7 +1090,7 @@ pub ([int], GenCache) generate_kv_chat_continue(QuantModel model, GenCache cache
     var int generated = 0
     var bool hit_eos = false
     while generated < max_new_tokens and not hit_eos:
-        let (next_tok, new_rng) = sample(rng, logits, vocab, params.temperature, params.top_k, params.top_p, tokens, params.repeat_penalty, params.repeat_last_n)
+        let (next_tok, new_rng) = sample(rng, logits, vocab, params.temperature, params.top_k, params.top_p, params.min_p, tokens, params.repeat_penalty, params.repeat_last_n)
         rng = new_rng
 
         tokens.push(next_tok)

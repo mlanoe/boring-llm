@@ -72,7 +72,15 @@ def main() throws:
     vocab["e"] = 5
     mut {string=int} special = {=}
     special["<SPECIAL>"] = 999
-    let tok = Tokenizer(vocab, {=}, {=}, byte_to_uni, uni_to_byte, 0, 0, false, [], [], special)
+    mut {int=string} reverse = {=}
+    reverse[1] = "h"
+    reverse[2] = "i"
+    reverse[3] = "b"
+    reverse[4] = "y"
+    reverse[5] = "e"
+    reverse[6] = byte_to_uni[0xC3]
+    reverse[999] = "<SPECIAL>"
+    let tok = Tokenizer(vocab, reverse, {=}, byte_to_uni, uni_to_byte, 0, 0, false, false, [], [], special)
     let ids = tok.encode_with_specials("hi<SPECIAL>bye")
     assert_eq(ids.length, 6)
     assert_eq(ids[0], 1)
@@ -81,13 +89,29 @@ def main() throws:
     assert_eq(ids[3], 3)
     assert_eq(ids[4], 4)
     assert_eq(ids[5], 5)
+    assert_eq(tok.decode(ids), "hi<SPECIAL>bye" as string)
+    assert_eq(tok.encode_completion_prompt("hi")[0], 1 as int)
+    let tok_bos = Tokenizer(vocab, reverse, {=}, byte_to_uni, uni_to_byte, 42, 0, true, false, [], [], special)
+    let bos_ids = tok_bos.encode_completion_prompt("hi")
+    assert_eq(bos_ids.length, 3 as int)
+    assert_eq(bos_ids[0], 42 as int)
+    assert_eq(bos_ids[1], 1 as int)
+    assert_eq(bos_ids[2], 2 as int)
+    let h_piece = tok.piece_bytes(1)
+    assert_eq(h_piece.length, 1)
+    assert_eq(int(h_piece[0]), 104)
+    let partial_piece = tok.piece_bytes(6)
+    assert_eq(partial_piece.length, 1)
+    assert_eq(int(partial_piece[0]), 0xC3)
+    let special_piece = tok.piece_bytes(999)
+    assert_eq(bytes_to_str(special_piece), "<SPECIAL>" as string)
 
     # Longest-match preference: "<ab>" must win over the shorter "<a>" even
     # though both match starting at the same position.
     mut {string=int} overlapping = {=}
     overlapping["<a>"] = 900
     overlapping["<ab>"] = 901
-    let tok2 = Tokenizer({=}, {=}, {=}, byte_to_uni, uni_to_byte, 0, 0, false, [], [], overlapping)
+    let tok2 = Tokenizer({=}, {=}, {=}, byte_to_uni, uni_to_byte, 0, 0, false, false, [], [], overlapping)
     let ids2 = tok2.encode_with_specials("<ab>")
     assert_eq(ids2.length, 1)
     assert_eq(ids2[0], 901)

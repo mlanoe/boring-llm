@@ -30,6 +30,7 @@ pub struct ServerCtx:
     GgufFile file
     Tokenizer tok
     QuantModel model
+    string model_path
     string model_name
     int max_ctx             # prompt + generated tokens must fit in this
     int default_max_tokens  # used when a request sets no max_tokens
@@ -60,6 +61,54 @@ pub struct HttpRequest:
     string path
     string body
 
+# llama_model_n_params() is the sum of the element counts of the tensors
+# actually stored in the GGUF (shared/tied weights therefore stay shared).
+int gguf_parameter_count(GgufFile file):
+    var int total = 0
+    for tensor in file.tensors:
+        var int count = 1
+        for dim in tensor.dims:
+            count *= dim
+        total += count
+    total
+
+({int=float32}, int) request_logit_bias(JValue body, int vocab):
+    mut {int=float32} out = {=}
+    match json_get(body, "logit_bias"):
+        JDict(fields, keys):
+            for key in keys:
+                if let token = (key as int):
+                    if token >= vocab:
+                        return (out, token)
+                    let value = fields[key] else JValue.JUndefined
+                    match value:
+                        JInt(n): out[token] = n as float32
+                        JFloat(f): out[token] = f as float32
+                        _: true
+        _: true
+    (out, -1)
+
+string tokens_with_pieces_json(Tokenizer tok, [int] ids):
+    var string out = "["
+    var int i = 0
+    while i < ids.length:
+        if i > 0: out = "{out}, "
+        let bytes = tok.piece_bytes(ids[i])
+        var string piece = ""
+        if is_valid_utf8(bytes):
+            piece = "\"{json_escape(bytes_to_str(bytes))}\""
+        else:
+            piece = "["
+            var int j = 0
+            while j < bytes.length:
+                if j > 0: piece = "{piece}, "
+                piece = "{piece}{int(bytes[j])}"
+                j += 1
+            piece = "{piece}]"
+        out = "{out}{{\"id\": {ids[i]}, \"piece\": {piece}}}"
+        i += 1
+    "{{\"tokens\": {out}]}}"
+
 # ── Socket helpers ───────────────────────────────────────────────────────
 
 int read_some(var TcpStream sock, mut [uint8] b) throws:
@@ -87,18 +136,29 @@ def respond_stream_head(var TcpStream sock) throws:
 def respond_json(var TcpStream sock, int status, string reason, string body) throws:
     respond(sock, status, reason, "application/json", body)
 
-int parse_content_length(string head):
+int parse_content_length(string head) throws:
     for line in head.split("\r\n"):
         let low = line.toLower()
         if low.startsWith("content-length:"):
             let v = low.replace("content-length:", "").trim()
-            return (v as int) else 0
+            guard let n = (v as int) else throw "http_400:invalid Content-Length"
+            guard n >= 0 else throw "http_400:invalid Content-Length"
+            return n
     0
+
+bool has_chunked_transfer(string head):
+    for line in head.split("\r\n"):
+        let low = line.toLower()
+        if low.startsWith("transfer-encoding:") and low.contains("chunked"):
+            return true
+    false
 
 # Reads one HTTP request: accumulates raw bytes until the blank line ending
 # the headers, then until `Content-Length` body bytes have arrived. Decoded as
 # UTF-8 only once complete (a multi-byte character can straddle two reads).
 HttpRequest read_http_request(var TcpStream sock) throws:
+    let max_header_bytes = 65536
+    let max_body_bytes = 16 * 1024 * 1024
     mut [uint8] chunk = [0 as uint8 for i in 0..<65536]
     mut [uint8] data = []
     var int scan = 0
@@ -114,6 +174,8 @@ HttpRequest read_http_request(var TcpStream sock) throws:
             data.push(chunk[k])
             k += 1
         if header_end < 0:
+            if data.length > max_header_bytes:
+                throw "http_431:request headers are too large"
             while scan + 3 < data.length:
                 if int(data[scan]) == 13 and int(data[scan + 1]) == 10 and int(data[scan + 2]) == 13 and int(data[scan + 3]) == 10:
                     header_end = scan + 4
@@ -121,7 +183,11 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                 scan += 1
             if header_end >= 0:
                 head = bytes_to_str(read_bytes(data, 0, header_end))
+                if has_chunked_transfer(head):
+                    throw "http_400:chunked request bodies are not supported"
                 content_length = parse_content_length(head)
+                if content_length > max_body_bytes:
+                    throw "http_413:request body is too large"
         if header_end >= 0 and data.length >= header_end + content_length:
             break
     guard header_end >= 0 else throw "malformed request: no end of headers"
@@ -147,34 +213,111 @@ HttpRequest read_http_request(var TcpStream sock) throws:
 # `slots` are the KV caches left by earlier requests; the returned list
 # replaces them. A new prompt only pays for the tokens after its longest common
 # prefix with the best slot.
-[CacheSlot] handle_chat(ServerCtx& ctx, var TcpStream sock, string body_text, int counter,
-                        [CacheSlot] slots, [DiskSnap] disk) throws:
+[CacheSlot] handle_completion(ServerCtx& ctx, var TcpStream sock, string body_text, int counter,
+                              [CacheSlot] slots, [DiskSnap] disk, bool is_chat, bool is_native) throws:
     let parsed = try? json_parse(body_text)
     guard let body = parsed else:
         respond_json(sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
         return slots
-    let messages = normalize_messages(json_get_list(body, "messages"))
-    if messages.length == 0:
-        respond_json(sock, 400, "Bad Request", error_json("`messages` is required and must be a non-empty array", "invalid_request_error", "missing_messages"))
+    let invalid = request_validation_error(body)
+    if invalid != "":
+        respond_json(sock, 400, "Bad Request", error_json(invalid, "invalid_request_error", "invalid_parameter"))
         return slots
-    let tools = if tools_disabled(body): [] else: json_get_list(body, "tools")
-    let prompt_tokens = render_chat_prompt_messages_kw(ctx.file, ctx.tok, messages, tools, true, json_get(body, "chat_template_kwargs"))
+    mut [JValue] messages = []
+    mut [JValue] tools = []
+    mut [int] prompt_tokens = []
+    if is_chat:
+        let invalid_shape = request_shape_error(body)
+        if invalid_shape != "":
+            let code = if invalid_shape.startsWith("`messages` is required"): "missing_messages" else: "invalid_request"
+            respond_json(sock, 400, "Bad Request", error_json(invalid_shape, "invalid_request_error", code))
+            return slots
+        let raw_tools = json_get_list(body, "tools")
+        let invalid_choice = tool_choice_validation_error(body, raw_tools)
+        if invalid_choice != "":
+            respond_json(sock, 400, "Bad Request", error_json(invalid_choice, "invalid_request_error", "invalid_tool_choice"))
+            return slots
+        messages = normalize_messages(json_get_list(body, "messages"))
+        tools = tools_for_request(body, raw_tools)
+        prompt_tokens = render_chat_prompt_messages_kw(ctx.file, ctx.tok, messages, tools, true, chat_template_variables(body))
+    else:
+        let prompt_value = json_get(body, "prompt")
+        match prompt_value:
+            JStr(prompt):
+                if prompt.chars().length > 0:
+                    prompt_tokens = ctx.tok.encode_completion_prompt(prompt)
+            JList(items):
+                var bool first_item = true
+                for item in items:
+                    match item:
+                        JInt(id):
+                            if id < 0 or id >= ctx.model.config.vocab_size:
+                                respond_json(sock, 400, "Bad Request", error_json("prompt token id {id} is outside the vocabulary", "invalid_request_error", "invalid_prompt_token"))
+                                return slots
+                            prompt_tokens.push(id)
+                        JStr(fragment):
+                            if not is_native:
+                                respond_json(sock, 400, "Bad Request", error_json("OpenAI `prompt` token arrays must contain only integer token ids", "invalid_request_error", "invalid_prompt"))
+                                return slots
+                            let fragment_tokens = if first_item: ctx.tok.encode_completion_prompt(fragment) else: ctx.tok.encode_with_specials(fragment)
+                            for id in fragment_tokens:
+                                prompt_tokens.push(id)
+                        _:
+                            let expected = if is_native: "integer token ids or string fragments" else: "integer token ids"
+                            respond_json(sock, 400, "Bad Request", error_json("`prompt` arrays must contain only {expected}", "invalid_request_error", "invalid_prompt"))
+                            return slots
+                    first_item = false
+            JDict(fields, keys):
+                if not is_native:
+                    respond_json(sock, 400, "Bad Request", error_json("OpenAI `prompt` must be a string or an array of token ids", "invalid_request_error", "invalid_prompt"))
+                    return slots
+                let media = json_get(prompt_value, "multimodal_data")
+                if not request_value_is_undefined(media):
+                    match media:
+                        JList(items):
+                            if items.length > 0:
+                                respond_json(sock, 400, "Bad Request", error_json("multimodal completion prompts are not supported", "invalid_request_error", "unsupported_multimodal_prompt"))
+                                return slots
+                        _:
+                            respond_json(sock, 400, "Bad Request", error_json("`prompt.multimodal_data` must be an array", "invalid_request_error", "invalid_prompt"))
+                            return slots
+                let prompt_string = json_get(prompt_value, "prompt_string")
+                if not jv_is_str(prompt_string):
+                    respond_json(sock, 400, "Bad Request", error_json("native prompt objects require a string `prompt_string`", "invalid_request_error", "invalid_prompt"))
+                    return slots
+                let text = json_get_str(prompt_value, "prompt_string", "")
+                if text.chars().length > 0:
+                    prompt_tokens = ctx.tok.encode_completion_prompt(text)
+            _:
+                respond_json(sock, 400, "Bad Request", error_json("`prompt` is required and must be a string, token array, or native prompt object", "invalid_request_error", "missing_prompt"))
+                return slots
+        if prompt_tokens.length == 0:
+            respond_json(sock, 400, "Bad Request", error_json("`prompt` must not be empty", "invalid_request_error", "missing_prompt"))
+            return slots
 
     let room = ctx.max_ctx - prompt_tokens.length
     if room <= 0:
         respond_json(sock, 400, "Bad Request", context_exceeded_json(prompt_tokens.length, ctx.max_ctx))
         return slots
-    let asked = json_get_int(body, "max_tokens", json_get_int(body, "max_completion_tokens", ctx.default_max_tokens))
-    let max_new = if asked < room: asked else: room
+    let default_asked = if is_native: json_get_int(body, "n_predict", ctx.default_max_tokens) else: json_get_int(body, "max_completion_tokens", ctx.default_max_tokens)
+    let asked = json_get_int(body, "max_tokens", default_asked)
+    # llama-server uses -1 for unbounded native completion. With context shift
+    # disabled, "unbounded" means all positions still available in this context.
+    let max_new = if asked < 0 or asked > room: room else: asked
 
     let temperature = json_get_float(body, "temperature", ctx.defaults.temperature as float)
     let top_p = json_get_float(body, "top_p", ctx.defaults.top_p as float)
+    let min_p = json_get_float(body, "min_p", ctx.defaults.min_p as float)
     let seed = json_get_int(body, "seed", ctx.defaults.seed)
     let top_k = json_get_int(body, "top_k", ctx.defaults.top_k)
     let repeat_penalty = json_get_float(body, "repeat_penalty", ctx.defaults.repeat_penalty as float)
     let frequency_penalty = json_get_float(body, "frequency_penalty", 0.0) as float32
     let presence_penalty = json_get_float(body, "presence_penalty", 0.0) as float32
-    let params = SamplingParams(temperature as float32, top_k, top_p as float32, seed, repeat_penalty as float32, ctx.defaults.repeat_last_n)
+    let params = SamplingParams(temperature as float32, top_k, top_p as float32, min_p as float32, seed, repeat_penalty as float32, ctx.defaults.repeat_last_n)
+    let (logit_bias, invalid_bias_token) = request_logit_bias(body, ctx.model.config.vocab_size)
+    if invalid_bias_token >= 0:
+        respond_json(sock, 400, "Bad Request", error_json("logit_bias token id {invalid_bias_token} is outside the vocabulary", "invalid_request_error", "invalid_logit_bias"))
+        return slots
 
     let started = Instant.now()
     let stops = stop_list(body)
@@ -204,7 +347,8 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     # noticed by the failing write, so its prefill stops early.
     if streaming:
         respond_stream_head(sock)
-        write_text(sock, sse_role_event(id, ctx.model_name))
+        if is_chat:
+            write_text(sock, sse_role_event(id, ctx.model_name))
     var base_cache = empty_cache(ctx.model.config.n_layer)
     var bool restored = false
     if from_disk:
@@ -251,13 +395,15 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     var int read_off = 0
     var int emitted = 0
     var int emitted_r = 0
+    var int emitted_tokens = 0
     var bool hit_eos = false
     var bool stopped = false
     var int generated = 0
     var int first_token_ms = -1
     while generated < max_new and not hit_eos and not stopped:
-        let penalized = apply_presence_frequency_penalty(logits, reply_tokens, frequency_penalty, presence_penalty)
-        let (next_tok, new_rng) = sample(rng, penalized, vocab, params.temperature, params.top_k, params.top_p, tokens, params.repeat_penalty, params.repeat_last_n)
+        let biased = apply_logit_bias(logits, logit_bias)
+        let penalized = apply_presence_frequency_penalty(biased, reply_tokens, frequency_penalty, presence_penalty)
+        let (next_tok, new_rng) = sample(rng, penalized, vocab, params.temperature, params.top_k, params.top_p, params.min_p, tokens, params.repeat_penalty, params.repeat_last_n)
         rng = new_rng
         tokens.push(next_tok)
         generated += 1
@@ -286,12 +432,16 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                     text = cut
                     stopped = true
             if streaming:
-                let (reasoning_now, content_now) = stream_split(text)
+                let (split_reasoning_now, split_content_now) = stream_split(text)
+                let reasoning_now = if is_chat: split_reasoning_now else: ""
+                let content_now = if is_chat: split_content_now else: text
                 let n_reasoning = reasoning_now.chars().length
                 if n_reasoning > emitted_r:
                     write_text(sock, sse_reasoning_event(id, ctx.model_name, chars_from(reasoning_now, emitted_r)))
                     emitted_r = n_reasoning
-                let (vs, vl) = stream_bounds(content_now, stops)
+                let (chat_vs, chat_vl) = stream_bounds(content_now, stops)
+                let vs = if is_chat: chat_vs else: 0
+                let vl = if is_chat: chat_vl else: text_stream_limit(content_now, stops)
                 if vl > vs + emitted:
                     let tcs = content_now.chars()
                     var string delta = ""
@@ -299,7 +449,13 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                     while q2 < vl:
                         delta = "{delta}{tcs[q2]}"
                         q2 += 1
-                    write_text(sock, sse_content_event(id, ctx.model_name, delta))
+                    if is_chat:
+                        write_text(sock, sse_content_event(id, ctx.model_name, delta))
+                    elif is_native:
+                        write_text(sock, native_completion_sse_event(delta, reply_tokens[emitted_tokens..<reply_tokens.length], false))
+                        emitted_tokens = reply_tokens.length
+                    else:
+                        write_text(sock, text_completion_sse_event(id, ctx.model_name, delta, ""))
                     emitted = vl - vs
             if not stopped:
                 let (step_logits, step_cache) = forward_step(ctx.model, cur, next_tok)
@@ -311,14 +467,17 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     # (what a non-streaming reply is built from; the incremental text above is
     # only a prefix-safe preview of it).
     let (final_text, stopped_full) = apply_stop(ctx.tok.decode(reply_tokens), stops)
-    let (final_reasoning, final_rest) = split_reasoning(final_text)
-    let reply = if tools_disabled(body): ParsedReply(final_rest.trim(), []) else: parse_reply(final_rest)
+    let (chat_reasoning, chat_rest) = split_reasoning(final_text)
+    let final_reasoning = if is_chat: chat_reasoning else: ""
+    let final_rest = if is_chat: chat_rest else: final_text
+    let reply = if not is_chat: ParsedReply(final_rest, []) elif tools_disabled(body): ParsedReply(final_rest.trim(), []) else: parse_reply_for_tools(final_rest, body, tools)
     let finish = if reply.calls.length > 0: "tool_calls" elif hit_eos or stopped or stopped_full: "stop" else: "length"
     let completion_tokens = generated
 
     let mode = if streaming: "streamed" else: "buffered"
     let reuse_src = if restored: "disk" else: "cache"
-    print "[serve] chat: {messages.length} messages, {tools.length} tools, prompt {prompt_tokens.length} tokens ({reuse} reused from {reuse_src}), generated {completion_tokens}, finish={finish}, {gen_ms} ms total (prefill {prefill_ms} ms, first token {first_token_ms} ms, {mode})"
+    let request_kind = if is_chat: "chat" elif is_native: "native completion" else: "completion"
+    print "[serve] {request_kind}: {messages.length} messages, {tools.length} tools, prompt {prompt_tokens.length} tokens ({reuse} reused from {reuse_src}), generated {completion_tokens}, finish={finish}, {gen_ms} ms total (prefill {prefill_ms} ms, first token {first_token_ms} ms, {mode})"
     if streaming:
         # whatever of the final content was held back (or arrived after the last
         # preview), then the tool calls, finish reason, usage and end marker
@@ -331,16 +490,37 @@ HttpRequest read_http_request(var TcpStream sock) throws:
             tail = "{tail}{content_chars[q3]}"
             q3 += 1
         if tail != "":
-            write_text(sock, sse_content_event(id, ctx.model_name, tail))
-        if reply.calls.length > 0:
+            if is_chat:
+                write_text(sock, sse_content_event(id, ctx.model_name, tail))
+            elif is_native:
+                write_text(sock, native_completion_sse_event(tail, reply_tokens[emitted_tokens..<reply_tokens.length], false))
+                emitted_tokens = reply_tokens.length
+            else:
+                write_text(sock, text_completion_sse_event(id, ctx.model_name, tail, ""))
+        if is_chat and reply.calls.length > 0:
             write_text(sock, sse_tool_calls_event(id, ctx.model_name, reply.calls))
-        write_text(sock, sse_finish_event(id, ctx.model_name, finish))
-        if include_usage:
-            write_text(sock, sse_usage_event(id, ctx.model_name, prompt_tokens.length, completion_tokens))
-        write_text(sock, sse_done_event())
+        if is_chat:
+            write_text(sock, sse_finish_event(id, ctx.model_name, finish))
+        elif is_native:
+            write_text(sock, native_completion_sse_event("", [], true))
+        else:
+            write_text(sock, text_completion_sse_event(id, ctx.model_name, "", finish))
+        if include_usage and not is_native:
+            if is_chat:
+                write_text(sock, sse_usage_event(id, ctx.model_name, prompt_tokens.length, completion_tokens))
+            else:
+                write_text(sock, text_completion_usage_sse_event(id, ctx.model_name, prompt_tokens.length, completion_tokens))
+        if not is_native:
+            write_text(sock, sse_done_event())
         response_state = 2
     else:
-        respond_json(sock, 200, "OK", completion_json_r(id, ctx.model_name, reply, final_reasoning, finish, prompt_tokens.length, completion_tokens))
+        if is_chat:
+            respond_json(sock, 200, "OK", completion_json_r(id, ctx.model_name, reply, final_reasoning, finish, prompt_tokens.length, completion_tokens))
+        elif is_native:
+            let native_stop_type = if hit_eos: "eos" elif stopped or stopped_full: "word" else: "limit"
+            respond_json(sock, 200, "OK", native_completion_json(ctx.model_name, reply.content, reply_tokens, true, native_stop_type, prompt_tokens.length, completion_tokens, reuse))
+        else:
+            respond_json(sock, 200, "OK", text_completion_json(id, ctx.model_name, reply.content, finish, prompt_tokens.length, completion_tokens))
     # `cur` covers cur.pos tokens: every token that was fed through the model
     # (the final EOS, or the token that completed a stop string, is sampled but
     # never fed back).
@@ -373,17 +553,139 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         out[lru] = fresh
     out
 
+# llama-server exposes this lightweight companion to chat completions.  It
+# runs the exact same normalization and embedded chat template as generation,
+# but never touches the GPU or the prompt cache.
+[CacheSlot] handle_input_tokens(ServerCtx& ctx, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
+    let parsed = try? json_parse(body_text)
+    guard let body = parsed else:
+        respond_json(sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
+        return slots
+    let invalid_shape = request_shape_error(body)
+    if invalid_shape != "":
+        let code = if invalid_shape.startsWith("`messages` is required"): "missing_messages" else: "invalid_request"
+        respond_json(sock, 400, "Bad Request", error_json(invalid_shape, "invalid_request_error", code))
+        return slots
+    let raw_tools = json_get_list(body, "tools")
+    let invalid_choice = tool_choice_validation_error(body, raw_tools)
+    if invalid_choice != "":
+        respond_json(sock, 400, "Bad Request", error_json(invalid_choice, "invalid_request_error", "invalid_tool_choice"))
+        return slots
+    let messages = normalize_messages(json_get_list(body, "messages"))
+    if messages.length == 0:
+        respond_json(sock, 400, "Bad Request", error_json("`messages` is required and must be a non-empty array", "invalid_request_error", "missing_messages"))
+        return slots
+    let tools = tools_for_request(body, raw_tools)
+    let prompt_tokens = render_chat_prompt_messages_kw(ctx.file, ctx.tok, messages, tools, true, chat_template_variables(body))
+    respond_json(sock, 200, "OK", input_tokens_json(prompt_tokens.length))
+    slots
+
+[CacheSlot] handle_tokenize(ServerCtx& ctx, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
+    let parsed = try? json_parse(body_text)
+    guard let body = parsed else:
+        respond_json(sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
+        return slots
+    let content_value = json_get(body, "content")
+    guard jv_is_str(content_value) else:
+        respond_json(sock, 400, "Bad Request", error_json("`content` is required and must be a string", "invalid_request_error", "missing_content"))
+        return slots
+    let content = json_get_str(body, "content", "")
+    let parse_special = json_get_bool(body, "parse_special", true)
+    mut [int] ids = if parse_special: ctx.tok.encode_with_specials(content) else: ctx.tok.encode(content)
+    if json_get_bool(body, "add_special", false):
+        mut [int] with_bos = [ctx.tok.bos_token_id]
+        for id in ids:
+            with_bos.push(id)
+        ids = with_bos
+    if json_get_bool(body, "with_pieces", false):
+        respond_json(sock, 200, "OK", tokens_with_pieces_json(ctx.tok, ids))
+    else:
+        respond_json(sock, 200, "OK", tokens_json(ids))
+    slots
+
+[CacheSlot] handle_detokenize(ServerCtx& ctx, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
+    let parsed = try? json_parse(body_text)
+    guard let body = parsed else:
+        respond_json(sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
+        return slots
+    mut [int] ids = []
+    let raw = json_get(body, "tokens")
+    match raw:
+        JList(items):
+            for item in items:
+                match item:
+                    JInt(id):
+                        if id < 0 or id >= ctx.model.config.vocab_size:
+                            respond_json(sock, 400, "Bad Request", error_json("token id {id} is outside the vocabulary", "invalid_request_error", "invalid_token"))
+                            return slots
+                        ids.push(id)
+                    _:
+                        respond_json(sock, 400, "Bad Request", error_json("`tokens` must contain only integer token ids", "invalid_request_error", "invalid_tokens"))
+                        return slots
+        _:
+            respond_json(sock, 400, "Bad Request", error_json("`tokens` is required and must be an array", "invalid_request_error", "missing_tokens"))
+            return slots
+    respond_json(sock, 200, "OK", content_json(ctx.tok.decode(ids)))
+    slots
+
+[CacheSlot] handle_apply_template(ServerCtx& ctx, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
+    let parsed = try? json_parse(body_text)
+    guard let body = parsed else:
+        respond_json(sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
+        return slots
+    let invalid_shape = request_shape_error(body)
+    if invalid_shape != "":
+        let code = if invalid_shape.startsWith("`messages` is required"): "missing_messages" else: "invalid_request"
+        respond_json(sock, 400, "Bad Request", error_json(invalid_shape, "invalid_request_error", code))
+        return slots
+    let raw_tools = json_get_list(body, "tools")
+    let invalid_choice = tool_choice_validation_error(body, raw_tools)
+    if invalid_choice != "":
+        respond_json(sock, 400, "Bad Request", error_json(invalid_choice, "invalid_request_error", "invalid_tool_choice"))
+        return slots
+    let messages = normalize_messages(json_get_list(body, "messages"))
+    if messages.length == 0:
+        respond_json(sock, 400, "Bad Request", error_json("`messages` is required and must be a non-empty array", "invalid_request_error", "missing_messages"))
+        return slots
+    let tools = tools_for_request(body, raw_tools)
+    let add_generation_prompt = json_get_bool(body, "add_generation_prompt", true)
+    let prompt = render_chat_prompt_text_messages_kw(ctx.file, ctx.tok, messages, tools, add_generation_prompt, chat_template_variables(body))
+    respond_json(sock, 200, "OK", prompt_json(prompt))
+    slots
+
 [CacheSlot] handle_request(ServerCtx& ctx, var TcpStream sock, int counter, [CacheSlot] slots, [DiskSnap] disk) throws:
     let r = read_http_request(sock)
     print "[serve] {r.method} {r.path}"
     if r.method == "OPTIONS":
         respond(sock, 204, "No Content", "text/plain", "")
     elif r.method == "GET" and (r.path == "/v1/models" or r.path == "/models"):
-        respond_json(sock, 200, "OK", models_json(ctx.model_name))
-    elif r.method == "GET" and (r.path == "/health" or r.path == "/"):
+        let arch = gguf_get_string(ctx.file.metadata, "general.architecture") else ""
+        let n_ctx_train = gguf_get_int(ctx.file.metadata, "{arch}.context_length") else 0
+        let vocab_type = if ctx.tok.is_spm: 1 else: 2
+        respond_json(sock, 200, "OK", models_json_meta(ctx.model_name, vocab_type,
+                     ctx.model.config.vocab_size, ctx.max_ctx, n_ctx_train,
+                     ctx.model.config.d_model, gguf_parameter_count(ctx.file), ctx.file.file_size))
+    elif r.method == "GET" and (r.path == "/health" or r.path == "/v1/health" or r.path == "/"):
         respond_json(sock, 200, "OK", "{{\"status\": \"ok\"}}")
+    elif r.method == "GET" and r.path == "/props":
+        let template = gguf_get_string(ctx.file.metadata, "tokenizer.chat_template") else ""
+        respond_json(sock, 200, "OK", props_json(ctx.model_path, template, ctx.max_ctx, ctx.default_max_tokens,
+                     ctx.defaults.temperature, ctx.defaults.top_k, ctx.defaults.top_p, ctx.defaults.min_p, ctx.defaults.seed,
+                     ctx.defaults.repeat_penalty, ctx.defaults.repeat_last_n))
     elif r.method == "POST" and (r.path == "/v1/chat/completions" or r.path == "/chat/completions"):
-        return handle_chat(ctx, sock, r.body, counter, slots, disk)
+        return handle_completion(ctx, sock, r.body, counter, slots, disk, true, false)
+    elif r.method == "POST" and r.path == "/v1/completions":
+        return handle_completion(ctx, sock, r.body, counter, slots, disk, false, false)
+    elif r.method == "POST" and (r.path == "/completion" or r.path == "/completions"):
+        return handle_completion(ctx, sock, r.body, counter, slots, disk, false, true)
+    elif r.method == "POST" and (r.path == "/v1/chat/completions/input_tokens" or r.path == "/chat/completions/input_tokens"):
+        return handle_input_tokens(ctx, sock, r.body, slots)
+    elif r.method == "POST" and r.path == "/tokenize":
+        return handle_tokenize(ctx, sock, r.body, slots)
+    elif r.method == "POST" and r.path == "/detokenize":
+        return handle_detokenize(ctx, sock, r.body, slots)
+    elif r.method == "POST" and r.path == "/apply-template":
+        return handle_apply_template(ctx, sock, r.body, slots)
     else:
         respond_json(sock, 404, "Not Found", error_json("no route for {r.method} {r.path}", "invalid_request_error", "not_found"))
     slots
@@ -436,7 +738,18 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     catch:
         print "[serve] request {counter} failed: {error}"
         if response_state == 0:
-            let sent = try? respond_json(sock, 500, "Internal Server Error", error_json(error, "server_error", "internal_error"))
+            let error_text = "{error}"
+            if error_text.startsWith("http_400:"):
+                let message = error_text.replace("http_400:", "")
+                let sent = try? respond_json(sock, 400, "Bad Request", error_json(message, "invalid_request_error", "malformed_http_request"))
+            elif error_text.startsWith("http_413:"):
+                let message = error_text.replace("http_413:", "")
+                let sent = try? respond_json(sock, 413, "Content Too Large", error_json(message, "invalid_request_error", "request_too_large"))
+            elif error_text.startsWith("http_431:"):
+                let message = error_text.replace("http_431:", "")
+                let sent = try? respond_json(sock, 431, "Request Header Fields Too Large", error_json(message, "invalid_request_error", "headers_too_large"))
+            else:
+                let sent = try? respond_json(sock, 500, "Internal Server Error", error_json(error_text, "server_error", "internal_error"))
         elif response_state == 1:
             # a stream is open (or the client left): end it with an error event
             let sent = try? write_text(sock, "{sse_error_event(error)}{sse_done_event()}")

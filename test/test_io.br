@@ -31,6 +31,11 @@ assert_eq(read_f32_le(bf32, 0), 1.0)
 
 let bstr = [0x68 as uint8, 0x69 as uint8]  # "hi"
 assert_eq(read_utf8(bstr, 0, 2), "hi")
+assert(is_valid_utf8([0x68 as uint8, 0xC3 as uint8, 0xA9 as uint8]), "valid UTF-8")
+assert(is_valid_utf8([0xF0 as uint8, 0x9F as uint8, 0x98 as uint8, 0x80 as uint8]), "valid four-byte UTF-8")
+assert(not is_valid_utf8([0xC3 as uint8]), "truncated UTF-8")
+assert(not is_valid_utf8([0x80 as uint8]), "orphan continuation byte")
+assert(not is_valid_utf8([0xED as uint8, 0xA0 as uint8, 0x80 as uint8]), "UTF-8 surrogate")
 
 # --- f16 bit-decode ----------------------------------------------------------
 # Reference bit patterns from the IEEE 754 half-precision format.

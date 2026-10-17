@@ -36,6 +36,7 @@ pub struct Tokenizer:
     {string=int} uni_to_byte
     int bos_token_id
     int eos_token_id
+    bool add_bos_token       # tokenizer.ggml.add_bos_token; raw string prompts honor it
     bool is_spm             # true = SentencePiece (Llama/Mistral), false = GPT-2/Qwen2 BPE
     [float32] scores        # SentencePiece per-token merge priority (empty when is_spm is false)
     [int] byte_token_id     # SentencePiece byte-fallback: raw byte value -> "<0xXX>" token id (-1 if absent)
@@ -107,6 +108,31 @@ pub struct Tokenizer:
         else:
             self.decode_bpe(ids)
 
+    # Raw bytes produced by one token, equivalent to llama.cpp's
+    # common_token_to_piece(). Keeping bytes (rather than immediately making a
+    # string) preserves partial UTF-8 tokens for `/tokenize?with_pieces`.
+    req [uint8] piece_bytes(int id):
+        mut [uint8] bytes = []
+        let piece = self.reverse[id] else ""
+        if self.is_spm:
+            let fallback = byte_fallback_value(piece)
+            if fallback >= 0:
+                bytes.push(fallback as uint8)
+            else:
+                for ch in piece.chars():
+                    if ch == chr(9601):
+                        bytes.push(32 as uint8)
+                    else:
+                        for b in utf8_encode_char(ch): bytes.push(b as uint8)
+        elif self.special_tokens.contains(piece):
+            for ch in piece.chars():
+                for b in utf8_encode_char(ch): bytes.push(b as uint8)
+        else:
+            for ch in piece.chars():
+                let b = self.uni_to_byte["{ch}"] else -1
+                if b >= 0: bytes.push(b as uint8)
+        bytes
+
     # Splits `text` on any literal occurrence of a special token's own
     # string (e.g. "<|im_start|>", "<s>") and encodes each such span as
     # that single atomic vocab id, running ordinary encode() (BPE or SPM,
@@ -165,6 +191,17 @@ pub struct Tokenizer:
             for t in self.encode(plain): ids.push(t)
         ids
 
+    # Raw string completions honor the GGUF tokenizer policy. Explicit token
+    # arrays bypass this helper, so clients retain exact control of their ids.
+    req [int] encode_completion_prompt(string text):
+        let ids = self.encode_with_specials(text)
+        if not self.add_bos_token:
+            return ids
+        mut [int] with_bos = [self.bos_token_id]
+        for id in ids:
+            with_bos.push(id)
+        with_bos
+
     req [int] encode_bpe(string text):
         mut [int] ids = []
         for segment in pretokenize(text):
@@ -178,10 +215,15 @@ pub struct Tokenizer:
         mut [uint8] bytes = []
         for id in ids:
             let tok = self.reverse[id] else ""
-            for ch in tok.chars():
-                let b = self.uni_to_byte["{ch}"] else -1
-                if b >= 0:
-                    bytes.push(b as uint8)
+            if self.special_tokens.contains(tok):
+                for ch in tok.chars():
+                    for b in utf8_encode_char(ch):
+                        bytes.push(b as uint8)
+            else:
+                for ch in tok.chars():
+                    let b = self.uni_to_byte["{ch}"] else -1
+                    if b >= 0:
+                        bytes.push(b as uint8)
         bytes_to_str(bytes)
 
     # SentencePiece BPE (Llama/Mistral): a from-scratch, greedy
@@ -623,6 +665,7 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
 
     let bos = gguf_get_int(file.metadata, "tokenizer.ggml.bos_token_id") else 0
     let eos = gguf_get_int(file.metadata, "tokenizer.ggml.eos_token_id") else 0
+    let add_bos = gguf_get_bool(file.metadata, "tokenizer.ggml.add_bos_token") else false
 
     let byte_to_uni = build_byte_to_unicode()
     let uni_to_byte = build_unicode_to_byte()
@@ -649,7 +692,7 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
             special_tokens[tokens[ti]] = ti
         ti += 1
 
-    Tokenizer(vocab, reverse, merge_rank, byte_to_uni, uni_to_byte, bos, eos, is_spm, scores, byte_token_id, special_tokens)
+    Tokenizer(vocab, reverse, merge_rank, byte_to_uni, uni_to_byte, bos, eos, add_bos, is_spm, scores, byte_token_id, special_tokens)
 
 # Builds the full prompt token sequence for a chat turn using the GGUF's
 # own embedded `tokenizer.chat_template` (any architecture, any template —
@@ -693,6 +736,14 @@ pub [int] render_chat_prompt_messages(GgufFile file, Tokenizer tok, [JValue] mes
 # adds nothing.
 pub [int] render_chat_prompt_messages_kw(GgufFile file, Tokenizer tok, [JValue] messages, [JValue] tools,
                                           bool add_generation_prompt, JValue kwargs) throws:
+    let prompt_text = render_chat_prompt_text_messages_kw(file, tok, messages, tools, add_generation_prompt, kwargs)
+    tok.encode_with_specials(prompt_text)
+
+# Text form used by llama-server's `/apply-template` compatibility endpoint.
+# Keeping it beside the token-returning function guarantees that applying a
+# template and counting/generating from it use the identical environment.
+pub string render_chat_prompt_text_messages_kw(GgufFile file, Tokenizer tok, [JValue] messages, [JValue] tools,
+                                                 bool add_generation_prompt, JValue kwargs) throws:
     guard let template = gguf_get_string(file.metadata, "tokenizer.chat_template") else throw "tokenizer: GGUF has no tokenizer.chat_template"
     let bos = tok.reverse[tok.bos_token_id] else ""
     let eos = tok.reverse[tok.eos_token_id] else ""
@@ -703,5 +754,4 @@ pub [int] render_chat_prompt_messages_kw(GgufFile file, Tokenizer tok, [JValue] 
             for key in keys:
                 env[key] = fields[key] else JValue.JUndefined
         _: env["tools"] = JValue.JList(tools)
-    let prompt_text = render_jinja(template, env)
-    tok.encode_with_specials(prompt_text)
+    render_jinja(template, env)
