@@ -125,7 +125,7 @@ pub int sample_greedy([float32] logits, int vocab):
 # `print_top5` already uses, just generalized to an arbitrary k instead of
 # a fixed 5. O(vocab * k), fine for k in the tens-to-low-hundreds range
 # sampling actually needs (no reason to fully sort 150k-entry logit rows).
-([float32], [int]) top_k_select([float32] logits, int vocab, int k):
+pub ([float32], [int]) top_k_select([float32] logits, int vocab, int k):
     let kk = if k > vocab: vocab else: k
     mut [float32] top_val = [-1.0e30 as float32 for i in 0..<kk]
     mut [int] top_idx = [0 for i in 0..<kk]
@@ -157,15 +157,15 @@ pub int sample_greedy([float32] logits, int vocab):
 # the whole top-k set). `repeat_penalty == 1.0` disables the penalty
 # entirely (this project's own default — see main.br's CLI help for why it
 # doesn't default to llama.cpp's own 1.1).
-pub (int, Rng) sample(Rng rng, [float32] logits, int vocab, float32 temperature,
-                       int top_k, float32 top_p, float32 min_p, [int] history, float32 repeat_penalty,
-                       int repeat_last_n) throws:
-    let penalized = apply_repeat_penalty(logits, history, repeat_penalty, repeat_last_n)
+# Samples from an already-ranked candidate list. Keeping this phase separate
+# lets grammar constraints remove invalid token pieces after top-k selection
+# but before top-p/min-p and the random draw.
+pub (int, Rng) sample_candidates(Rng rng, [float32] top_val, [int] top_idx,
+                                 float32 temperature, float32 top_p, float32 min_p) throws:
+    guard top_val.length > 0 and top_val.length == top_idx.length else throw "sample_candidates: empty or mismatched candidates"
     if temperature <= 0.0 as float32:
-        (sample_greedy(penalized, vocab), rng)
+        (top_idx[0], rng)
     else:
-        let k = if top_k > 0: top_k else: 50
-        let (top_val, top_idx) = top_k_select(penalized, vocab, k)
         let n = top_val.length
 
         mut [float32] scaled = [0.0 for i in 0..<n]
@@ -236,3 +236,14 @@ pub (int, Rng) sample(Rng rng, [float32] logits, int vocab, float32 temperature,
             s += 1
 
         (top_idx[chosen_slot], new_rng)
+
+pub (int, Rng) sample(Rng rng, [float32] logits, int vocab, float32 temperature,
+                       int top_k, float32 top_p, float32 min_p, [int] history, float32 repeat_penalty,
+                       int repeat_last_n) throws:
+    let penalized = apply_repeat_penalty(logits, history, repeat_penalty, repeat_last_n)
+    if temperature <= 0.0 as float32:
+        (sample_greedy(penalized, vocab), rng)
+    else:
+        let k = if top_k > 0: top_k else: 50
+        let (top_val, top_idx) = top_k_select(penalized, vocab, k)
+        sample_candidates(rng, top_val, top_idx, temperature, top_p, min_p)

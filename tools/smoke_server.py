@@ -13,6 +13,7 @@ Usage:
 """
 import http.client
 import json
+import socket
 import sys
 import time
 import urllib.error
@@ -42,6 +43,7 @@ def raw_http(request):
     conn.sock = None
     conn.connect()
     conn.sock.sendall(request)
+    conn.sock.shutdown(socket.SHUT_WR)
     response = conn.response_class(conn.sock, method="POST")
     response.begin()
     result = response.status, response.read().decode()
@@ -69,6 +71,16 @@ check("GET /v1/models exposes llama-server metadata",
       and meta.get("n_ctx") == CTX and meta.get("n_ctx_train", 0) > 0
       and meta.get("n_embd", 0) > 0 and meta.get("n_params", 0) > 0
       and meta.get("size", 0) > 0, b)
+s, h, b = call("/v1/models/" + urllib.parse.quote(model_id, safe=""))
+retrieved = json.loads(b)
+check("GET /v1/models/{model} retrieves the loaded model",
+      s == 200 and retrieved.get("object") == "model" and retrieved.get("id") == model_id
+      and retrieved.get("meta") == meta, b)
+s, h, b = call("/v1/models/not-the-loaded-model")
+check("GET /v1/models/{unknown} returns 404",
+      s == 404 and json.loads(b)["error"]["code"] == "not_found", b)
+s, h, b = call("/v1/health?probe=1")
+check("routes ignore the query string", s == 200 and json.loads(b)["status"] == "ok", b)
 
 s, h, b = call("/v1/health")
 check("GET /v1/health", s == 200 and json.loads(b).get("status") == "ok", b)
@@ -188,6 +200,21 @@ s, h, b = call("/v1/chat/completions", {"model": model_id, "temperature": 0, "ma
                      {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]},
                      {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 21C"}]})
 check("tool-result turn accepted", s == 200 and json.loads(b)["choices"][0]["message"]["role"] == "assistant", b)
+s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "tool", "content": "Sunny"}]})
+check("400 on tool result without tool_call_id",
+      s == 400 and json.loads(b)["error"]["code"] == "invalid_request", b)
+s, h, b = call("/v1/chat/completions", {"model": model_id,
+        "messages": [{"role": "user", "content": "hi", "tool_calls": []}]})
+check("400 on tool_calls outside assistant message",
+      s == 400 and json.loads(b)["error"]["code"] == "invalid_request", b)
+s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "bad", "parameters": {"required": "x"}}}]})
+check("400 on malformed tool JSON Schema",
+      s == 400 and json.loads(b)["error"]["code"] == "invalid_request", b)
+s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "hi"}],
+        "tools": [TOOL, TOOL]})
+check("400 on duplicate tool function names",
+      s == 400 and json.loads(b)["error"]["code"] == "invalid_request", b)
 
 s, h, b = call("/nope")
 check("404 JSON error", s == 404 and json.loads(b)["error"]["code"] == "not_found", b)
@@ -201,13 +228,27 @@ s, h, b = call("/v1/chat/completions", {"model": "x"})
 check("400 on missing messages", s == 400 and json.loads(b)["error"]["code"] == "missing_messages", b)
 s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]})
 check("400 on unsupported message content", s == 400 and json.loads(b)["error"]["code"] == "invalid_request", b)
+s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "function", "content": "x"}]})
+check("400 on unsupported message role", s == 400 and json.loads(b)["error"]["code"] == "invalid_request", b)
+s, h, b = call("/v1/chat/completions", {"model": 7, "messages": [{"role": "user", "content": "hi"}]})
+check("400 on non-string model", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
 s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 0})
 check("400 on invalid generation parameter", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
 s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "n": 2})
 check("400 on unsupported multiple choices", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
+s, h, b = call("/v1/chat/completions", {"model": model_id,
+                                         "messages": [{"role": "user", "content": 'Return exactly {"ok":true} and no prose.'}],
+                                         "response_format": {"type": "json_object"}, "temperature": 0,
+                                         "max_tokens": 64, "chat_template_kwargs": NO_THINK})
+structured = json.loads(b)["choices"][0]["message"]["content"] if s == 200 else ""
+try:
+    structured_value = json.loads(structured)
+except (TypeError, json.JSONDecodeError):
+    structured_value = None
+check("constrained JSON-object response", s == 200 and isinstance(structured_value, dict), b)
 s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "json"}],
-                                         "response_format": {"type": "json_object"}, "max_tokens": 1})
-check("400 on unsupported structured response format", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter"
+                                         "response_format": {"type": "json_schema"}, "max_tokens": 1})
+check("400 on unsupported JSON Schema response format", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter"
       and "constrained decoding" in json.loads(b)["error"]["message"], b)
 s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "hi"}],
                                          "logprobs": True, "top_logprobs": 3, "max_tokens": 1})
@@ -221,8 +262,30 @@ s, h, b = call("/completion", {"prompt": {"prompt_string": "look", "multimodal_d
 check("400 on unsupported multimodal native prompt", s == 400 and json.loads(b)["error"]["code"] == "unsupported_multimodal_prompt", b)
 status, b = raw_http(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: nope\r\n\r\n")
 check("400 on invalid Content-Length", status == 400 and json.loads(b)["error"]["code"] == "malformed_http_request", b)
+status, b = raw_http(b"BROKEN\r\n\r\n")
+check("400 on malformed HTTP request line", status == 400 and json.loads(b)["error"]["code"] == "malformed_http_request", b)
+status, b = raw_http(b"GET /v1/health HTTP/1.1\r\nHost: localhost\r\n")
+check("400 on incomplete HTTP headers", status == 400 and json.loads(b)["error"]["code"] == "malformed_http_request", b)
+status, b = raw_http(b"GET /v1/health HTTP/2.0\r\nHost: localhost\r\n\r\n")
+check("400 on unsupported HTTP version", status == 400 and json.loads(b)["error"]["code"] == "malformed_http_request", b)
+status, b = raw_http(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n")
+check("400 on duplicate Content-Length", status == 400 and json.loads(b)["error"]["code"] == "malformed_http_request", b)
+status, b = raw_http(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\n\r\n{{}}")
+check("400 on truncated request body", status == 400 and json.loads(b)["error"]["code"] == "malformed_http_request", b)
+status, b = raw_http(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{{}}extra")
+check("400 on bytes after request body", status == 400 and json.loads(b)["error"]["code"] == "malformed_http_request", b)
 status, b = raw_http(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
 check("400 on unsupported chunked request", status == 400 and json.loads(b)["error"]["code"] == "malformed_http_request", b)
+status, b = raw_http(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\n")
+check("400 on unsupported transfer encoding", status == 400 and json.loads(b)["error"]["code"] == "malformed_http_request", b)
+status, b = raw_http(b"POST /v1/chat/completions HTTP/1.1\r\nHost: bad\xff\r\nContent-Length: 0\r\n\r\n")
+check("400 on invalid UTF-8 request headers", status == 400 and json.loads(b)["error"]["code"] == "malformed_http_request", b)
+invalid_utf8 = b'{"messages":[{"role":"user","content":"\xff"}]}'
+request = (b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: "
+           + str(len(invalid_utf8)).encode() + b"\r\n\r\n" + invalid_utf8)
+status, b = raw_http(request)
+check("400 on invalid UTF-8 request body", status == 400
+      and json.loads(b)["error"]["code"] == "malformed_http_request", b)
 s, h, b = call("/v1/chat/completions", {"model": "x", "messages": [{"role": "user", "content": "word " * (CTX * 3 // 2)}]})
 check("400 context_length_exceeded", s == 400 and json.loads(b)["error"]["code"] == "context_length_exceeded", b)
 e = json.loads(b).get("error", {})

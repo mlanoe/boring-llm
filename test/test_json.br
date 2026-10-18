@@ -94,4 +94,7 @@ def main() throws:
     assert_eq(json_object_candidate_allowed("{{\"a\": 1}}", "", true), true)
     assert_eq(json_object_candidate_allowed("{{\"a\": 1", "", true), false)
     assert_eq(json_object_candidate_allowed("{{\"a\": 1}}", " trailing", false), false)
+    assert_eq(json_object_decoded_candidate_allowed("{{\"x\": \"caf�", "{{\"x\": \"café", false), true)
+    assert_eq(json_object_decoded_candidate_allowed("{{\"x\": 1}}", "", true), true)
+    assert_eq(json_object_decoded_candidate_allowed("{{\"x\": 1", "", true), false)
     print "test_json: ok"

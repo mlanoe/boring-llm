@@ -111,6 +111,61 @@ string tokens_with_pieces_json(Tokenizer tok, [int] ids):
 
 # ── Socket helpers ───────────────────────────────────────────────────────
 
+# Applies the JSON-object grammar after top-k ranking and before top-p/min-p.
+# If the current top-k has no viable token, progressively widen it: a grammar
+# must not fail merely because every unconstrained favourite is invalid.
+pub (int, Rng) sample_json_object_token(Tokenizer tok, Rng rng, [float32] logits,
+                                        int vocab, [int] history, [int] reply_tokens,
+                                        SamplingParams params) throws:
+    let decoded_before = tok.decode(reply_tokens)
+    if json_object_prefix_state(decoded_before) == 1:
+        return (tok.eos_token_id, rng)
+
+    let penalized = apply_repeat_penalty(logits, history, params.repeat_penalty, params.repeat_last_n)
+    var int k = if params.top_k > 0: params.top_k else: 50
+    if k > vocab: k = vocab
+    while true:
+        let (ranked_values, ranked_ids) = top_k_select(penalized, vocab, k)
+        mut [float32] allowed_values = []
+        mut [int] allowed_ids = []
+        var int i = 0
+        while i < ranked_ids.length:
+            let candidate = ranked_ids[i]
+            var bool allowed = false
+            if candidate == tok.eos_token_id:
+                allowed = json_object_decoded_candidate_allowed(decoded_before, "", true)
+            else:
+                mut [int] candidate_reply = []
+                for id in reply_tokens:
+                    candidate_reply.push(id)
+                candidate_reply.push(candidate)
+                let decoded_after = tok.decode(candidate_reply)
+                allowed = json_object_decoded_candidate_allowed(decoded_before, decoded_after, false)
+            if allowed:
+                allowed_values.push(ranked_values[i])
+                allowed_ids.push(candidate)
+            i += 1
+        if allowed_ids.length > 0:
+            return sample_candidates(rng, allowed_values, allowed_ids, params.temperature, params.top_p, params.min_p)
+        guard k < vocab else throw "JSON-object grammar rejected every vocabulary token"
+        k = if k * 4 < vocab: k * 4 else: vocab
+
+# RFC 3986 path-segment encoding used by `GET /v1/models/{model}`. Work on
+# UTF-8 bytes so non-ASCII ids round-trip through ordinary OpenAI SDKs too.
+string url_path_segment(string text):
+    let hex = "0123456789ABCDEF".chars()
+    var string out = ""
+    let bytes = text.asBytes()
+    var int i = 0
+    while i < bytes.length:
+        let b = int(bytes[i])
+        if (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or (b >= 48 and b <= 57) or b == 45 or b == 46 or b == 95 or b == 126:
+            out = "{out}{chr(b)}"
+        else:
+            out = "{out}%{hex[b / 16]}{hex[b % 16]}"
+        i += 1
+    out
+
 int read_some(var TcpStream sock, mut [uint8] b) throws:
     let n = try? sock.read(b)
     guard let n else throw "socket read failed"
@@ -137,19 +192,24 @@ def respond_json(var TcpStream sock, int status, string reason, string body) thr
     respond(sock, status, reason, "application/json", body)
 
 int parse_content_length(string head) throws:
+    var int found = 0
+    var int value = 0
     for line in head.split("\r\n"):
         let low = line.toLower()
         if low.startsWith("content-length:"):
+            found += 1
+            if found > 1:
+                throw "http_400:multiple Content-Length headers are not supported"
             let v = low.replace("content-length:", "").trim()
             guard let n = (v as int) else throw "http_400:invalid Content-Length"
             guard n >= 0 else throw "http_400:invalid Content-Length"
-            return n
-    0
+            value = n
+    value
 
-bool has_chunked_transfer(string head):
+bool has_transfer_encoding(string head):
     for line in head.split("\r\n"):
         let low = line.toLower()
-        if low.startsWith("transfer-encoding:") and low.contains("chunked"):
+        if low.startsWith("transfer-encoding:"):
             return true
     false
 
@@ -182,18 +242,30 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                     break
                 scan += 1
             if header_end >= 0:
-                head = bytes_to_str(read_bytes(data, 0, header_end))
-                if has_chunked_transfer(head):
-                    throw "http_400:chunked request bodies are not supported"
+                let head_bytes = read_bytes(data, 0, header_end)
+                if not is_valid_utf8(head_bytes):
+                    throw "http_400:request headers are not valid UTF-8"
+                head = bytes_to_str(head_bytes)
+                if has_transfer_encoding(head):
+                    throw "http_400:Transfer-Encoding request bodies are not supported"
                 content_length = parse_content_length(head)
                 if content_length > max_body_bytes:
                     throw "http_413:request body is too large"
         if header_end >= 0 and data.length >= header_end + content_length:
             break
-    guard header_end >= 0 else throw "malformed request: no end of headers"
+    guard header_end >= 0 else throw "http_400:request has no complete header section"
+    if data.length < header_end + content_length:
+        throw "http_400:request body is shorter than Content-Length"
+    if data.length > header_end + content_length:
+        throw "http_400:request contains bytes after the declared body"
     let request_line = head.split("\r\n")[0].split(" ")
-    guard request_line.length >= 2 else throw "malformed request line"
-    let body = bytes_to_str(read_bytes(data, header_end, content_length))
+    guard request_line.length == 3 else throw "http_400:malformed HTTP request line"
+    guard request_line[0] != "" and request_line[1].startsWith("/") else throw "http_400:malformed HTTP request line"
+    guard request_line[2] == "HTTP/1.1" or request_line[2] == "HTTP/1.0" else throw "http_400:unsupported HTTP version"
+    let body_bytes = read_bytes(data, header_end, content_length)
+    if not is_valid_utf8(body_bytes):
+        throw "http_400:request body is not valid UTF-8"
+    let body = bytes_to_str(body_bytes)
     HttpRequest(request_line[0], request_line[1].split("?")[0], body)
 
 # ── Chat completions ─────────────────────────────────────────────────────
@@ -322,6 +394,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     let started = Instant.now()
     let stops = stop_list(body)
     let streaming = json_get_bool(body, "stream", false)
+    let json_object_mode = json_get_str(json_get(body, "response_format"), "type", "") == "json_object"
     let include_usage = json_get_bool(json_get(body, "stream_options"), "include_usage", false)
     let id = "{counter}"
     # The last prompt token always goes through the model (its logits pick the
@@ -403,7 +476,10 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     while generated < max_new and not hit_eos and not stopped:
         let biased = apply_logit_bias(logits, logit_bias)
         let penalized = apply_presence_frequency_penalty(biased, reply_tokens, frequency_penalty, presence_penalty)
-        let (next_tok, new_rng) = sample(rng, penalized, vocab, params.temperature, params.top_k, params.top_p, params.min_p, tokens, params.repeat_penalty, params.repeat_last_n)
+        let (next_tok, new_rng) = if json_object_mode:
+            sample_json_object_token(ctx.tok, rng, penalized, vocab, tokens, reply_tokens, params)
+        else:
+            sample(rng, penalized, vocab, params.temperature, params.top_k, params.top_p, params.min_p, tokens, params.repeat_penalty, params.repeat_last_n)
         rng = new_rng
         tokens.push(next_tok)
         generated += 1
@@ -656,35 +732,43 @@ HttpRequest read_http_request(var TcpStream sock) throws:
 [CacheSlot] handle_request(ServerCtx& ctx, var TcpStream sock, int counter, [CacheSlot] slots, [DiskSnap] disk) throws:
     let r = read_http_request(sock)
     print "[serve] {r.method} {r.path}"
+    let path = r.path.split("?")[0]
     if r.method == "OPTIONS":
         respond(sock, 204, "No Content", "text/plain", "")
-    elif r.method == "GET" and (r.path == "/v1/models" or r.path == "/models"):
+    elif r.method == "GET" and (path == "/v1/models" or path == "/models"):
         let arch = gguf_get_string(ctx.file.metadata, "general.architecture") else ""
         let n_ctx_train = gguf_get_int(ctx.file.metadata, "{arch}.context_length") else 0
         let vocab_type = if ctx.tok.is_spm: 1 else: 2
         respond_json(sock, 200, "OK", models_json_meta(ctx.model_name, vocab_type,
                      ctx.model.config.vocab_size, ctx.max_ctx, n_ctx_train,
                      ctx.model.config.d_model, gguf_parameter_count(ctx.file), ctx.file.file_size))
-    elif r.method == "GET" and (r.path == "/health" or r.path == "/v1/health" or r.path == "/"):
+    elif r.method == "GET" and (path == "/v1/models/{url_path_segment(ctx.model_name)}" or path == "/v1/models/{ctx.model_name}"):
+        let arch = gguf_get_string(ctx.file.metadata, "general.architecture") else ""
+        let n_ctx_train = gguf_get_int(ctx.file.metadata, "{arch}.context_length") else 0
+        let vocab_type = if ctx.tok.is_spm: 1 else: 2
+        respond_json(sock, 200, "OK", model_json_meta(ctx.model_name, vocab_type,
+                     ctx.model.config.vocab_size, ctx.max_ctx, n_ctx_train,
+                     ctx.model.config.d_model, gguf_parameter_count(ctx.file), ctx.file.file_size))
+    elif r.method == "GET" and (path == "/health" or path == "/v1/health" or path == "/"):
         respond_json(sock, 200, "OK", "{{\"status\": \"ok\"}}")
-    elif r.method == "GET" and r.path == "/props":
+    elif r.method == "GET" and path == "/props":
         let template = gguf_get_string(ctx.file.metadata, "tokenizer.chat_template") else ""
         respond_json(sock, 200, "OK", props_json(ctx.model_path, template, ctx.max_ctx, ctx.default_max_tokens,
                      ctx.defaults.temperature, ctx.defaults.top_k, ctx.defaults.top_p, ctx.defaults.min_p, ctx.defaults.seed,
                      ctx.defaults.repeat_penalty, ctx.defaults.repeat_last_n))
-    elif r.method == "POST" and (r.path == "/v1/chat/completions" or r.path == "/chat/completions"):
+    elif r.method == "POST" and (path == "/v1/chat/completions" or path == "/chat/completions"):
         return handle_completion(ctx, sock, r.body, counter, slots, disk, true, false)
-    elif r.method == "POST" and r.path == "/v1/completions":
+    elif r.method == "POST" and path == "/v1/completions":
         return handle_completion(ctx, sock, r.body, counter, slots, disk, false, false)
-    elif r.method == "POST" and (r.path == "/completion" or r.path == "/completions"):
+    elif r.method == "POST" and (path == "/completion" or path == "/completions"):
         return handle_completion(ctx, sock, r.body, counter, slots, disk, false, true)
-    elif r.method == "POST" and (r.path == "/v1/chat/completions/input_tokens" or r.path == "/chat/completions/input_tokens"):
+    elif r.method == "POST" and (path == "/v1/chat/completions/input_tokens" or path == "/chat/completions/input_tokens"):
         return handle_input_tokens(ctx, sock, r.body, slots)
-    elif r.method == "POST" and r.path == "/tokenize":
+    elif r.method == "POST" and path == "/tokenize":
         return handle_tokenize(ctx, sock, r.body, slots)
-    elif r.method == "POST" and r.path == "/detokenize":
+    elif r.method == "POST" and path == "/detokenize":
         return handle_detokenize(ctx, sock, r.body, slots)
-    elif r.method == "POST" and r.path == "/apply-template":
+    elif r.method == "POST" and path == "/apply-template":
         return handle_apply_template(ctx, sock, r.body, slots)
     else:
         respond_json(sock, 404, "Not Found", error_json("no route for {r.method} {r.path}", "invalid_request_error", "not_found"))

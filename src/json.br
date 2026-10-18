@@ -408,6 +408,15 @@ pub bool json_object_candidate_allowed(string prefix, string piece, bool is_eos)
     else:
         json_object_prefix_state("{prefix}{piece}") >= 0
 
+# Variant for tokenizers whose byte-level token boundary can split one UTF-8
+# character. `decoded_after` is the whole reply decoded after appending the
+# candidate, so a formerly truncated character has already been reconstructed.
+pub bool json_object_decoded_candidate_allowed(string decoded_before, string decoded_after, bool is_eos):
+    if is_eos:
+        json_object_prefix_state(decoded_before) == 1
+    else:
+        json_object_prefix_state(decoded_after) >= 0
+
 # ── Typed accessors for pulling request fields out of a parsed object ─────
 
 pub JValue json_get(JValue v, string key):

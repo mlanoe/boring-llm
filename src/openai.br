@@ -36,6 +36,55 @@ bool request_value_is_undefined(JValue v):
         JUndefined: true
         _: false
 
+# JSON Schema equality is structural: object key order is irrelevant and the
+# mathematical numbers 1 and 1.0 compare equal even if the parser stored them
+# in different variants.
+pub bool json_values_equal(JValue a, JValue b):
+    match a:
+        JUndefined:
+            match b:
+                JUndefined: true
+                _: false
+        JBool(av):
+            match b:
+                JBool(bv): av == bv
+                _: false
+        JInt(av):
+            match b:
+                JInt(bv): av == bv
+                JFloat(bv): av as float == bv
+                _: false
+        JFloat(av):
+            match b:
+                JInt(bv): av == bv as float
+                JFloat(bv): av == bv
+                _: false
+        JStr(av):
+            match b:
+                JStr(bv): av == bv
+                _: false
+        JList(a_items):
+            match b:
+                JList(b_items):
+                    if a_items.length != b_items.length: return false
+                    var int i = 0
+                    while i < a_items.length:
+                        if not json_values_equal(a_items[i], b_items[i]): return false
+                        i += 1
+                    true
+                _: false
+        JDict(a_fields, a_keys):
+            match b:
+                JDict(b_fields, b_keys):
+                    if a_keys.length != b_keys.length: return false
+                    for key in a_keys:
+                        if not b_fields.contains(key): return false
+                        let av = a_fields[key] else JValue.JUndefined
+                        let bv = b_fields[key] else JValue.JUndefined
+                        if not json_values_equal(av, bv): return false
+                    true
+                _: false
+
 # Returns `d` with `key` set to `value` (appended to the key order if new).
 pub JValue jv_set(JValue d, string key, JValue value):
     match d:
@@ -146,6 +195,96 @@ pub [JValue] normalize_messages([JValue] messages) throws:
         out.push(nm)
     out
 
+# Checks the JSON Schema subset enforced later by `tool_schema_matches`.
+# Rejecting malformed recognized keywords avoids silently weakening a tool's
+# argument contract while leaving unknown keywords forward-compatible.
+pub string tool_schema_validation_error(JValue schema):
+    match schema:
+        JDict(fields, keys):
+            let schema_type = json_get(schema, "type")
+            match schema_type:
+                JUndefined:
+                    if fields.contains("type"): return "JSON Schema `type` must not be null"
+                JStr(name):
+                    if name != "object" and name != "array" and name != "string" and name != "integer" and name != "number" and name != "boolean" and name != "null":
+                        return "JSON Schema `type` `{name}` is not supported"
+                JList(types):
+                    if types.length == 0:
+                        return "JSON Schema `type` array must not be empty"
+                    for item in types:
+                        match item:
+                            JStr(name):
+                                if name != "object" and name != "array" and name != "string" and name != "integer" and name != "number" and name != "boolean" and name != "null":
+                                    return "JSON Schema `type` `{name}` is not supported"
+                            _: return "JSON Schema `type` array must contain only strings"
+                _: return "JSON Schema `type` must be a string or array of strings"
+
+            let properties = json_get(schema, "properties")
+            if fields.contains("properties"):
+                match properties:
+                    JDict(prop_fields, prop_keys):
+                        for key in prop_keys:
+                            let child = prop_fields[key] else JValue.JUndefined
+                            let invalid = tool_schema_validation_error(child)
+                            if invalid != "": return invalid
+                    _: return "JSON Schema `properties` must be an object"
+            let required = json_get(schema, "required")
+            if fields.contains("required"):
+                match required:
+                    JList(items):
+                        for item in items:
+                            if not jv_is_str(item): return "JSON Schema `required` must contain only strings"
+                    _: return "JSON Schema `required` must be an array"
+            let additional = json_get(schema, "additionalProperties")
+            if fields.contains("additionalProperties"):
+                match additional:
+                    JBool(allowed): true
+                    JDict(extra_fields, extra_keys):
+                        let invalid = tool_schema_validation_error(additional)
+                        if invalid != "": return invalid
+                    _: return "JSON Schema `additionalProperties` must be a boolean or object"
+            let items_schema = json_get(schema, "items")
+            if fields.contains("items"):
+                let invalid = tool_schema_validation_error(items_schema)
+                if invalid != "": return invalid
+            for key in ["anyOf", "oneOf", "allOf"]:
+                let composition = json_get(schema, key)
+                if fields.contains(key):
+                    match composition:
+                        JList(alternatives):
+                            if alternatives.length == 0: return "JSON Schema `{key}` must not be empty"
+                            for alternative in alternatives:
+                                let invalid = tool_schema_validation_error(alternative)
+                                if invalid != "": return invalid
+                        _: return "JSON Schema `{key}` must be an array"
+            if fields.contains("not"):
+                let invalid = tool_schema_validation_error(json_get(schema, "not"))
+                if invalid != "": return invalid
+            let enum_value = json_get(schema, "enum")
+            if fields.contains("enum"):
+                match enum_value:
+                    JList(items):
+                        if items.length == 0: return "JSON Schema `enum` must not be empty"
+                    _: return "JSON Schema `enum` must be an array"
+            for key in ["minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"]:
+                let limit = json_get(schema, key)
+                if fields.contains(key):
+                    match limit:
+                        JInt(n):
+                            if n < 0: return "JSON Schema `{key}` must not be negative"
+                        _: return "JSON Schema `{key}` must be an integer"
+            for key in ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"]:
+                let bound = json_get(schema, key)
+                if fields.contains(key) and not jv_is_number(bound):
+                    return "JSON Schema `{key}` must be a number"
+            let unique_items = json_get(schema, "uniqueItems")
+            if fields.contains("uniqueItems"):
+                match unique_items:
+                    JBool(enabled): true
+                    _: return "JSON Schema `uniqueItems` must be a boolean"
+        _: return "tool function `parameters` must be a JSON Schema object"
+    ""
+
 # Structural validation before a request reaches a model-specific Jinja
 # template. This keeps malformed or unsupported client input as a stable 400
 # instead of surfacing a template exception as a 500.
@@ -158,8 +297,13 @@ pub string request_shape_error(JValue body):
             for message in messages:
                 match message:
                     JDict(fields, keys):
-                        if json_get_str(message, "role", "") == "":
+                        let role = json_get_str(message, "role", "")
+                        if role == "":
                             return "every message must have a non-empty string `role`"
+                        if role != "system" and role != "developer" and role != "user" and role != "assistant" and role != "tool":
+                            return "message role `{role}` is not supported"
+                        if role == "tool" and json_get_str(message, "tool_call_id", "") == "":
+                            return "a tool message must have a non-empty string `tool_call_id`"
                         let content = json_get(message, "content")
                         match content:
                             JStr(s): true
@@ -174,9 +318,24 @@ pub string request_shape_error(JValue body):
                             _: return "message `content` must be a string, null, or an array of text parts"
                         let raw_calls = json_get(message, "tool_calls")
                         if not request_value_is_undefined(raw_calls):
+                            if role != "assistant":
+                                return "only assistant messages may contain `tool_calls`"
                             match raw_calls:
                                 JList(calls):
-                                    for call in calls:
+                                    if calls.length == 0:
+                                        return "message `tool_calls` must not be empty"
+                                    var int call_index = 0
+                                    while call_index < calls.length:
+                                        let call = calls[call_index]
+                                        if json_get_str(call, "id", "") == "":
+                                            return "every tool call must have a non-empty string `id`"
+                                        var int previous_call = 0
+                                        while previous_call < call_index:
+                                            if json_get_str(calls[previous_call], "id", "") == json_get_str(call, "id", ""):
+                                                return "tool call ids must be unique within an assistant message"
+                                            previous_call += 1
+                                        if json_get_str(call, "type", "") != "function":
+                                            return "only function tool calls are supported"
                                         let function = json_get(call, "function")
                                         if json_get_str(function, "name", "") == "":
                                             return "every tool call must have a function name"
@@ -185,6 +344,7 @@ pub string request_shape_error(JValue body):
                                             JStr(s): true
                                             JDict(arg_fields, arg_keys): true
                                             _: return "tool call arguments must be a JSON string or object"
+                                        call_index += 1
                                 _: return "message `tool_calls` must be an array"
                     _: return "every message must be an object"
         _: return "`messages` is required and must be a non-empty array"
@@ -193,17 +353,26 @@ pub string request_shape_error(JValue body):
     if not request_value_is_undefined(raw_tools):
         match raw_tools:
             JList(tools):
-                for tool in tools:
+                var int tool_index = 0
+                while tool_index < tools.length:
+                    let tool = tools[tool_index]
                     if json_get_str(tool, "type", "") != "function":
                         return "only function tools are supported"
                     let function = json_get(tool, "function")
-                    if json_get_str(function, "name", "") == "":
+                    let function_name = json_get_str(function, "name", "")
+                    if function_name == "":
                         return "every tool must have a non-empty function name"
+                    var int previous_tool = 0
+                    while previous_tool < tool_index:
+                        if json_get_str(json_get(tools[previous_tool], "function"), "name", "") == function_name:
+                            return "tool function names must be unique"
+                        previous_tool += 1
                     let parameters = json_get(function, "parameters")
                     if not request_value_is_undefined(parameters):
-                        match parameters:
-                            JDict(fields, keys): true
-                            _: return "tool function `parameters` must be a JSON Schema object"
+                        let invalid_schema = tool_schema_validation_error(parameters)
+                        if invalid_schema != "":
+                            return invalid_schema
+                    tool_index += 1
             _: return "`tools` must be an array"
     ""
 
@@ -382,6 +551,9 @@ bool schema_type_matches(string kind, JValue value):
     elif kind == "integer":
         match value:
             JInt(n): true
+            # JSON Schema classifies numbers mathematically rather than by
+            # their JSON spelling, so 1.0 is an integer but 1.5 is not.
+            JFloat(f): floor(f) as float == f
             _: false
     elif kind == "number":
         jv_is_number(value)
@@ -393,6 +565,11 @@ bool schema_type_matches(string kind, JValue value):
         request_value_is_undefined(value)
     else:
         true
+
+bool json_object_has_key(JValue value, string key):
+    match value:
+        JDict(fields, keys): fields.contains(key)
+        _: false
 
 # The JSON Schema subset used by OpenCode tool definitions. Unknown schema
 # keywords remain permissive; recognized constraints must match.
@@ -412,8 +589,9 @@ pub bool tool_schema_matches(JValue schema, JValue value):
         if not type_ok:
             return false
 
+    let has_const = json_object_has_key(schema, "const")
     let const_value = json_get(schema, "const")
-    if not request_value_is_undefined(const_value) and jv_to_json(const_value) != jv_to_json(value):
+    if has_const and not json_values_equal(const_value, value):
         return false
 
     let any_of = json_get_list(schema, "anyOf")
@@ -432,19 +610,29 @@ pub bool tool_schema_matches(JValue schema, JValue value):
                 matches += 1
         if matches != 1:
             return false
+    for constraint in json_get_list(schema, "allOf"):
+        if not tool_schema_matches(constraint, value):
+            return false
+    if json_object_has_key(schema, "not") and tool_schema_matches(json_get(schema, "not"), value):
+        return false
 
     let enums = json_get_list(schema, "enum")
     if enums.length > 0:
         var bool found = false
-        let actual = jv_to_json(value)
         for item in enums:
-            if jv_to_json(item) == actual:
+            if json_values_equal(item, value):
                 found = true
         if not found:
             return false
 
     match value:
         JDict(fields, keys):
+            let min_properties = json_get_int(schema, "minProperties", -1)
+            let max_properties = json_get_int(schema, "maxProperties", -1)
+            if min_properties >= 0 and keys.length < min_properties:
+                return false
+            if max_properties >= 0 and keys.length > max_properties:
+                return false
             for required in json_get_list(schema, "required"):
                 match required:
                     JStr(name):
@@ -452,6 +640,7 @@ pub bool tool_schema_matches(JValue schema, JValue value):
                             return false
                     _: return false
             let properties = json_get(schema, "properties")
+            let additional = json_get(schema, "additionalProperties")
             match properties:
                 JDict(prop_fields, prop_keys):
                     for key in prop_keys:
@@ -460,11 +649,28 @@ pub bool tool_schema_matches(JValue schema, JValue value):
                             let child_value = fields[key] else JValue.JUndefined
                             if not tool_schema_matches(child_schema, child_value):
                                 return false
-                    if not json_get_bool(schema, "additionalProperties", true):
-                        for key in keys:
-                            if not prop_fields.contains(key):
-                                return false
-                _: true
+                    for key in keys:
+                        if not prop_fields.contains(key):
+                            let child_value = fields[key] else JValue.JUndefined
+                            match additional.clone():
+                                JBool(allowed):
+                                    if not allowed:
+                                        return false
+                                JDict(extra_fields, extra_keys):
+                                    if not tool_schema_matches(additional, child_value):
+                                        return false
+                                _: true
+                _:
+                    for key in keys:
+                        let child_value = fields[key] else JValue.JUndefined
+                        match additional.clone():
+                            JBool(allowed):
+                                if not allowed:
+                                    return false
+                            JDict(extra_fields, extra_keys):
+                                if not tool_schema_matches(additional, child_value):
+                                    return false
+                            _: true
         JList(items):
             let min_items = json_get_int(schema, "minItems", -1)
             let max_items = json_get_int(schema, "maxItems", -1)
@@ -472,6 +678,15 @@ pub bool tool_schema_matches(JValue schema, JValue value):
                 return false
             if max_items >= 0 and items.length > max_items:
                 return false
+            if json_get_bool(schema, "uniqueItems", false):
+                var int item_index = 0
+                while item_index < items.length:
+                    var int previous_item = 0
+                    while previous_item < item_index:
+                        if json_values_equal(items[previous_item], items[item_index]):
+                            return false
+                        previous_item += 1
+                    item_index += 1
             let item_schema = json_get(schema, "items")
             if not request_value_is_undefined(item_schema):
                 for item in items:
@@ -491,10 +706,18 @@ pub bool tool_schema_matches(JValue schema, JValue value):
             let maximum = json_get_float(schema, "maximum", value_n)
             if value_n < minimum or value_n > maximum:
                 return false
+            if json_object_has_key(schema, "exclusiveMinimum") and value_n <= json_get_float(schema, "exclusiveMinimum", value_n):
+                return false
+            if json_object_has_key(schema, "exclusiveMaximum") and value_n >= json_get_float(schema, "exclusiveMaximum", value_n):
+                return false
         JFloat(f):
             let minimum = json_get_float(schema, "minimum", f)
             let maximum = json_get_float(schema, "maximum", f)
             if f < minimum or f > maximum:
+                return false
+            if json_object_has_key(schema, "exclusiveMinimum") and f <= json_get_float(schema, "exclusiveMinimum", f):
+                return false
+            if json_object_has_key(schema, "exclusiveMaximum") and f >= json_get_float(schema, "exclusiveMaximum", f):
                 return false
         _: true
     true
@@ -565,6 +788,14 @@ pub ParsedReply parse_reply_for_tools(string text, JValue body, [JValue] tools):
 # requests fail like llama-server/OpenAI requests do.  Unknown fields remain
 # allowed for forward compatibility.
 pub string request_validation_error(JValue body):
+    let model = json_get(body, "model")
+    if not request_value_is_undefined(model):
+        match model:
+            JStr(name):
+                if name == "":
+                    return "`model` must be a non-empty string"
+            _: return "`model` must be a non-empty string"
+
     let n_choices = json_get(body, "n")
     if not request_value_is_undefined(n_choices):
         match n_choices:
@@ -695,7 +926,7 @@ pub string request_validation_error(JValue body):
                 let format_type = json_get_str(response_format, "type", "")
                 if format_type == "":
                     return "`response_format.type` is required and must be a string"
-                if format_type != "text":
+                if format_type != "text" and format_type != "json_object":
                     return "`response_format.type` `{format_type}` requires constrained decoding, which is not supported"
             _: return "`response_format` must be an object"
     let logprobs = json_get(body, "logprobs")
@@ -776,12 +1007,16 @@ pub string context_exceeded_json(int n_prompt, int n_ctx):
 pub string models_json(string model_id):
     "{{\"object\": \"list\", \"data\": [{{\"id\": \"{json_escape(model_id)}\", \"object\": \"model\", \"created\": 0, \"owned_by\": \"boring-llm\"}}]}}"
 
+pub string model_json_meta(string model_id, int vocab_type, int n_vocab, int n_ctx,
+                           int n_ctx_train, int n_embd, int n_params, int size):
+    "{{\"id\": \"{json_escape(model_id)}\", \"aliases\": [\"{json_escape(model_id)}\"], \"tags\": [], \"object\": \"model\", \"created\": 0, \"owned_by\": \"boring-llm\", \"meta\": {{\"vocab_type\": {vocab_type}, \"n_vocab\": {n_vocab}, \"n_ctx\": {n_ctx}, \"n_ctx_train\": {n_ctx_train}, \"n_embd\": {n_embd}, \"n_params\": {n_params}, \"size\": {size}}}}}"
+
 # llama-server exposes these GGUF/model facts in a non-standard `meta` object.
 # They are useful to clients which choose a context window or sanity-check the
 # loaded model, while the surrounding response remains OpenAI-compatible.
 pub string models_json_meta(string model_id, int vocab_type, int n_vocab, int n_ctx,
                             int n_ctx_train, int n_embd, int n_params, int size):
-    "{{\"object\": \"list\", \"data\": [{{\"id\": \"{json_escape(model_id)}\", \"aliases\": [\"{json_escape(model_id)}\"], \"tags\": [], \"object\": \"model\", \"created\": 0, \"owned_by\": \"boring-llm\", \"meta\": {{\"vocab_type\": {vocab_type}, \"n_vocab\": {n_vocab}, \"n_ctx\": {n_ctx}, \"n_ctx_train\": {n_ctx_train}, \"n_embd\": {n_embd}, \"n_params\": {n_params}, \"size\": {size}}}}}]}}"
+    "{{\"object\": \"list\", \"data\": [{model_json_meta(model_id, vocab_type, n_vocab, n_ctx, n_ctx_train, n_embd, n_params, size)}]}}"
 
 pub string input_tokens_json(int input_tokens):
     "{{\"object\": \"response.input_tokens\", \"input_tokens\": {input_tokens}}}"

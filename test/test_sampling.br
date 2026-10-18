@@ -30,6 +30,19 @@ def main() throws:
     assert_eq(vals[1], 5.0 as float32)
     assert_eq(vals[2], 3.0 as float32)
 
+    # Ranked candidates can be filtered by a grammar before sampling without
+    # changing the probability phase. Greedy picks the first remaining token.
+    let (filtered_greedy, filtered_rng) = sample_candidates(seed_rng(9), [5.0 as float32, 3.0 as float32], [7, 2], 0.0 as float32, 1.0 as float32, 0.0 as float32)
+    assert_eq(filtered_greedy, 7)
+    let (filtered_before, _) = rng_next_u64(seed_rng(9))
+    let (filtered_after, _) = rng_next_u64(filtered_rng)
+    assert_eq(filtered_before, filtered_after)
+    var int filtered_seed = 1
+    while filtered_seed <= 10:
+        let (filtered_sample, _) = sample_candidates(seed_rng(filtered_seed), [30.0 as float32, 0.0 as float32], [4, 8], 1.0 as float32, 1.0 as float32, 0.0 as float32)
+        assert_eq(filtered_sample, 4)
+        filtered_seed += 1
+
     # --- sample: temperature <= 0 behaves as greedy, RNG untouched ---
     let rng0 = seed_rng(1)
     let (tok0, rng0b) = sample(rng0, [1.0, 5.0, 3.0, -2.0], 4, 0.0 as float32, 0, 1.0 as float32, 0.0 as float32, [], 1.0 as float32, 64)
