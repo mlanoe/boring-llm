@@ -120,6 +120,30 @@ pub int sample_greedy([float32] logits, int vocab):
         v += 1
     best
 
+# Stable log-softmax for one token. This scans the complete vocabulary rather
+# than a sampling top-k, because OpenAI logprobs describe the model's actual
+# distribution after request penalties, not the truncated sampling pool.
+pub (float32, float32) logprob_normalizer([float32] logits, int vocab):
+    var float32 maximum = logits[0]
+    var int i = 1
+    while i < vocab:
+        if logits[i] > maximum:
+            maximum = logits[i]
+        i += 1
+    var float32 sum_exp = 0.0
+    i = 0
+    while i < vocab:
+        sum_exp += (logits[i] - maximum).exp()
+        i += 1
+    (maximum, sum_exp.ln())
+
+pub float32 normalized_token_logprob([float32] logits, int token, float32 maximum, float32 log_sum_exp):
+    logits[token] - maximum - log_sum_exp
+
+pub float32 token_logprob([float32] logits, int vocab, int token):
+    let (maximum, log_sum_exp) = logprob_normalizer(logits, vocab)
+    normalized_token_logprob(logits, token, maximum, log_sum_exp)
+
 # Finds the top `k` (value, original-index) pairs from logits[0..vocab),
 # sorted descending by value — same insertion-sort selection main.br's own
 # `print_top5` already uses, just generalized to an arbitrary k instead of
@@ -240,10 +264,16 @@ pub (int, Rng) sample_candidates(Rng rng, [float32] top_val, [int] top_idx,
 pub (int, Rng) sample(Rng rng, [float32] logits, int vocab, float32 temperature,
                        int top_k, float32 top_p, float32 min_p, [int] history, float32 repeat_penalty,
                        int repeat_last_n) throws:
-    let penalized = apply_repeat_penalty(logits, history, repeat_penalty, repeat_last_n)
+    let penalized = sampling_logits(logits, history, repeat_penalty, repeat_last_n)
     if temperature <= 0.0 as float32:
         (sample_greedy(penalized, vocab), rng)
     else:
         let k = if top_k > 0: top_k else: 50
         let (top_val, top_idx) = top_k_select(penalized, vocab, k)
         sample_candidates(rng, top_val, top_idx, temperature, top_p, min_p)
+
+# The exact logits consumed by `sample`. Kept public so optional API
+# instrumentation (notably OpenAI logprobs) can describe the same distribution
+# without reproducing penalty rules beside the sampler.
+pub [float32] sampling_logits([float32] logits, [int] history, float32 repeat_penalty, int repeat_last_n):
+    apply_repeat_penalty(logits, history, repeat_penalty, repeat_last_n)

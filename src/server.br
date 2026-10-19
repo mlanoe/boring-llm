@@ -41,6 +41,7 @@ pub struct ServerCtx:
     int cache_files         # how many snapshots to keep on disk
     int cache_max_bytes     # cap on all snapshots together; 0 = none
     int cache_bpt           # bytes one token adds to a snapshot
+    bool metrics_enabled    # expose Prometheus counters at GET /metrics
 
 # A finished request's KV cache and the token ids it covers. A later prompt
 # starts from the slot sharing the longest prefix with it (an agent client
@@ -55,6 +56,14 @@ pub struct CacheSlot:
 # (a failure then must not write a second HTTP response into it), 2 = a complete
 # response was written.
 static var int response_state = 0
+
+# Process-wide counters are sufficient because the server deliberately owns
+# one model and handles one connection at a time.
+static var int metric_prompt_tokens = 0
+static var int metric_prompt_ms = 0
+static var int metric_predicted_tokens = 0
+static var int metric_predicted_ms = 0
+static var int metric_n_tokens_max = 0
 
 pub struct HttpRequest:
     string method
@@ -114,11 +123,11 @@ string tokens_with_pieces_json(Tokenizer tok, [int] ids):
 # Applies the JSON-object grammar after top-k ranking and before top-p/min-p.
 # If the current top-k has no viable token, progressively widen it: a grammar
 # must not fail merely because every unconstrained favourite is invalid.
-pub (int, Rng) sample_json_object_token(Tokenizer tok, Rng rng, [float32] logits,
-                                        int vocab, [int] history, [int] reply_tokens,
-                                        SamplingParams params) throws:
+pub (int, Rng) sample_json_token(Tokenizer tok, Rng rng, [float32] logits,
+                                  int vocab, [int] history, [int] reply_tokens,
+                                  SamplingParams params, JValue schema) throws:
     let decoded_before = tok.decode(reply_tokens)
-    if json_object_prefix_state(decoded_before) == 1:
+    if json_object_prefix_state(decoded_before) == 1 and (request_value_is_undefined(schema) or json_schema_decoded_candidate_allowed(schema, decoded_before, "", true)):
         return (tok.eos_token_id, rng)
 
     let penalized = apply_repeat_penalty(logits, history, params.repeat_penalty, params.repeat_last_n)
@@ -133,21 +142,60 @@ pub (int, Rng) sample_json_object_token(Tokenizer tok, Rng rng, [float32] logits
             let candidate = ranked_ids[i]
             var bool allowed = false
             if candidate == tok.eos_token_id:
-                allowed = json_object_decoded_candidate_allowed(decoded_before, "", true)
+                allowed = if request_value_is_undefined(schema): json_object_decoded_candidate_allowed(decoded_before, "", true) else: json_schema_decoded_candidate_allowed(schema, decoded_before, "", true)
             else:
                 mut [int] candidate_reply = []
                 for id in reply_tokens:
                     candidate_reply.push(id)
                 candidate_reply.push(candidate)
                 let decoded_after = tok.decode(candidate_reply)
-                allowed = json_object_decoded_candidate_allowed(decoded_before, decoded_after, false)
+                allowed = if request_value_is_undefined(schema): json_object_decoded_candidate_allowed(decoded_before, decoded_after, false) else: json_schema_decoded_candidate_allowed(schema, decoded_before, decoded_after, false)
             if allowed:
                 allowed_values.push(ranked_values[i])
                 allowed_ids.push(candidate)
             i += 1
         if allowed_ids.length > 0:
             return sample_candidates(rng, allowed_values, allowed_ids, params.temperature, params.top_p, params.min_p)
-        guard k < vocab else throw "JSON-object grammar rejected every vocabulary token"
+        guard k < vocab else throw "JSON response grammar rejected every vocabulary token"
+        k = if k * 4 < vocab: k * 4 else: vocab
+
+# Constrained compact tool-call form. Named choices generate only their
+# arguments object; `required` generates {name, arguments}. openai.br turns
+# either form back into the model-independent OpenAI tool_calls response.
+pub (int, Rng) sample_tool_choice_token(Tokenizer tok, Rng rng, [float32] logits,
+                                         int vocab, [int] history, [int] reply_tokens,
+                                         SamplingParams params, JValue body,
+                                         [JValue] tools) throws:
+    let decoded_before = tok.decode(reply_tokens)
+    if tool_choice_decoded_candidate_allowed(body, tools, decoded_before, "", true):
+        return (tok.eos_token_id, rng)
+
+    let penalized = apply_repeat_penalty(logits, history, params.repeat_penalty, params.repeat_last_n)
+    var int k = if params.top_k > 0: params.top_k else: 50
+    if k > vocab: k = vocab
+    while true:
+        let (ranked_values, ranked_ids) = top_k_select(penalized, vocab, k)
+        mut [float32] allowed_values = []
+        mut [int] allowed_ids = []
+        var int i = 0
+        while i < ranked_ids.length:
+            let candidate = ranked_ids[i]
+            var bool allowed = false
+            if candidate == tok.eos_token_id:
+                allowed = tool_choice_decoded_candidate_allowed(body, tools, decoded_before, "", true)
+            else:
+                mut [int] candidate_reply = []
+                for id in reply_tokens:
+                    candidate_reply.push(id)
+                candidate_reply.push(candidate)
+                allowed = tool_choice_decoded_candidate_allowed(body, tools, decoded_before, tok.decode(candidate_reply), false)
+            if allowed:
+                allowed_values.push(ranked_values[i])
+                allowed_ids.push(candidate)
+            i += 1
+        if allowed_ids.length > 0:
+            return sample_candidates(rng, allowed_values, allowed_ids, params.temperature, params.top_p, params.min_p)
+        guard k < vocab else throw "tool_choice grammar rejected every vocabulary token"
         k = if k * 4 < vocab: k * 4 else: vocab
 
 # RFC 3986 path-segment encoding used by `GET /v1/models/{model}`. Work on
@@ -392,9 +440,31 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         return slots
 
     let started = Instant.now()
+    let created = unix_timestamp()
     let stops = stop_list(body)
     let streaming = json_get_bool(body, "stream", false)
     let json_object_mode = json_get_str(json_get(body, "response_format"), "type", "") == "json_object"
+    let json_schema = response_json_schema(body)
+    let json_mode = json_object_mode or not request_value_is_undefined(json_schema)
+    let constrained_tool_choice = is_chat and tool_choice_required(body)
+    let wants_chat_logprobs = is_chat and json_get_bool(body, "logprobs", false)
+    var bool wants_completion_logprobs = false
+    var int completion_top_logprobs = 0
+    if not is_chat and not is_native:
+        match json_get(body, "logprobs"):
+            JInt(count):
+                wants_completion_logprobs = true
+                completion_top_logprobs = count
+            _: true
+    let requested_native_logprobs = if is_native: json_get_int(body, "n_probs", 0) else: 0
+    let wants_native_logprobs = requested_native_logprobs > 0
+    let wants_logprobs = wants_chat_logprobs or wants_completion_logprobs or wants_native_logprobs
+    let requested_top_logprobs = if wants_chat_logprobs:
+        json_get_int(body, "top_logprobs", 0)
+    elif wants_native_logprobs:
+        requested_native_logprobs
+    else:
+        completion_top_logprobs
     let include_usage = json_get_bool(json_get(body, "stream_options"), "include_usage", false)
     let id = "{counter}"
     # The last prompt token always goes through the model (its logits pick the
@@ -421,7 +491,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     if streaming:
         respond_stream_head(sock)
         if is_chat:
-            write_text(sock, sse_role_event(id, ctx.model_name))
+            write_text(sock, sse_role_event(id, ctx.model_name, created))
     var base_cache = empty_cache(ctx.model.config.n_layer)
     var bool restored = false
     if from_disk:
@@ -459,6 +529,10 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     for pt in prompt_tokens:
         tokens.push(pt)
     mut [int] reply_tokens = []
+    mut [string] reply_logprob_tokens = []
+    mut [[uint8]] reply_logprob_bytes = []
+    mut [float32] reply_logprobs = []
+    mut [[TokenLogprobAlternative]] reply_top_logprobs = []
     var logits = first_logits
     var cur = cache0
     var rng = seed_rng(params.seed)
@@ -476,8 +550,14 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     while generated < max_new and not hit_eos and not stopped:
         let biased = apply_logit_bias(logits, logit_bias)
         let penalized = apply_presence_frequency_penalty(biased, reply_tokens, frequency_penalty, presence_penalty)
-        let (next_tok, new_rng) = if json_object_mode:
-            sample_json_object_token(ctx.tok, rng, penalized, vocab, tokens, reply_tokens, params)
+        let effective_logits = if wants_logprobs:
+            sampling_logits(penalized, tokens, params.repeat_penalty, params.repeat_last_n)
+        else:
+            []
+        let (next_tok, new_rng) = if constrained_tool_choice:
+            sample_tool_choice_token(ctx.tok, rng, penalized, vocab, tokens, reply_tokens, params, body, tools)
+        elif json_mode:
+            sample_json_token(ctx.tok, rng, penalized, vocab, tokens, reply_tokens, params, json_schema)
         else:
             sample(rng, penalized, vocab, params.temperature, params.top_k, params.top_p, params.min_p, tokens, params.repeat_penalty, params.repeat_last_n)
         rng = new_rng
@@ -488,6 +568,20 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         if next_tok == ctx.tok.eos_token_id:
             hit_eos = true
         else:
+            if wants_logprobs:
+                let (lp_maximum, lp_sum) = logprob_normalizer(effective_logits, vocab)
+                reply_logprob_tokens.push(ctx.tok.decode([next_tok]))
+                reply_logprob_bytes.push(ctx.tok.piece_bytes(next_tok))
+                reply_logprobs.push(normalized_token_logprob(effective_logits, next_tok, lp_maximum, lp_sum))
+                mut [TokenLogprobAlternative] alternatives = []
+                if requested_top_logprobs > 0:
+                    let (top_values, top_ids) = top_k_select(effective_logits, vocab, requested_top_logprobs)
+                    var int top_index = 0
+                    while top_index < top_ids.length:
+                        let top_id = top_ids[top_index]
+                        alternatives.push(TokenLogprobAlternative(top_id, ctx.tok.decode([top_id]), ctx.tok.piece_bytes(top_id), normalized_token_logprob(effective_logits, top_id, lp_maximum, lp_sum)))
+                        top_index += 1
+                reply_top_logprobs.push(alternatives)
             reply_tokens.push(next_tok)
             let n_reply = reply_tokens.length
             let window_before = ctx.tok.decode(reply_tokens[prefix_off..<read_off])
@@ -513,7 +607,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                 let content_now = if is_chat: split_content_now else: text
                 let n_reasoning = reasoning_now.chars().length
                 if n_reasoning > emitted_r:
-                    write_text(sock, sse_reasoning_event(id, ctx.model_name, chars_from(reasoning_now, emitted_r)))
+                    write_text(sock, sse_reasoning_event(id, ctx.model_name, chars_from(reasoning_now, emitted_r), created))
                     emitted_r = n_reasoning
                 let (chat_vs, chat_vl) = stream_bounds(content_now, stops)
                 let vs = if is_chat: chat_vs else: 0
@@ -526,12 +620,12 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                         delta = "{delta}{tcs[q2]}"
                         q2 += 1
                     if is_chat:
-                        write_text(sock, sse_content_event(id, ctx.model_name, delta))
+                        write_text(sock, sse_content_event(id, ctx.model_name, delta, created))
                     elif is_native:
                         write_text(sock, native_completion_sse_event(delta, reply_tokens[emitted_tokens..<reply_tokens.length], false))
                         emitted_tokens = reply_tokens.length
                     else:
-                        write_text(sock, text_completion_sse_event(id, ctx.model_name, delta, ""))
+                        write_text(sock, text_completion_sse_event(id, ctx.model_name, delta, "", created))
                     emitted = vl - vs
             if not stopped:
                 let (step_logits, step_cache) = forward_step(ctx.model, cur, next_tok)
@@ -550,6 +644,17 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     let finish = if reply.calls.length > 0: "tool_calls" elif hit_eos or stopped or stopped_full: "stop" else: "length"
     let completion_tokens = generated
 
+    if ctx.metrics_enabled:
+        metric_prompt_tokens += pending.length
+        metric_prompt_ms += prefill_ms
+        metric_predicted_tokens += completion_tokens
+        let decode_ms = gen_ms - prefill_ms
+        if decode_ms > 0:
+            metric_predicted_ms += decode_ms
+        let occupied = prompt_tokens.length + completion_tokens
+        if occupied > metric_n_tokens_max:
+            metric_n_tokens_max = occupied
+
     let mode = if streaming: "streamed" else: "buffered"
     let reuse_src = if restored: "disk" else: "cache"
     let request_kind = if is_chat: "chat" elif is_native: "native completion" else: "completion"
@@ -558,7 +663,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         # whatever of the final content was held back (or arrived after the last
         # preview), then the tool calls, finish reason, usage and end marker
         if final_reasoning.chars().length > emitted_r:
-            write_text(sock, sse_reasoning_event(id, ctx.model_name, chars_from(final_reasoning, emitted_r)))
+            write_text(sock, sse_reasoning_event(id, ctx.model_name, chars_from(final_reasoning, emitted_r), created))
         let content_chars = reply.content.chars()
         var string tail = ""
         var int q3 = emitted
@@ -567,36 +672,45 @@ HttpRequest read_http_request(var TcpStream sock) throws:
             q3 += 1
         if tail != "":
             if is_chat:
-                write_text(sock, sse_content_event(id, ctx.model_name, tail))
+                write_text(sock, sse_content_event(id, ctx.model_name, tail, created))
             elif is_native:
                 write_text(sock, native_completion_sse_event(tail, reply_tokens[emitted_tokens..<reply_tokens.length], false))
                 emitted_tokens = reply_tokens.length
             else:
-                write_text(sock, text_completion_sse_event(id, ctx.model_name, tail, ""))
+                write_text(sock, text_completion_sse_event(id, ctx.model_name, tail, "", created))
         if is_chat and reply.calls.length > 0:
-            write_text(sock, sse_tool_calls_event(id, ctx.model_name, reply.calls))
+            write_text(sock, sse_tool_calls_event(id, ctx.model_name, reply.calls, created))
         if is_chat:
-            write_text(sock, sse_finish_event(id, ctx.model_name, finish))
+            write_text(sock, sse_finish_event(id, ctx.model_name, finish, created))
         elif is_native:
             write_text(sock, native_completion_sse_event("", [], true))
         else:
-            write_text(sock, text_completion_sse_event(id, ctx.model_name, "", finish))
+            write_text(sock, text_completion_sse_event(id, ctx.model_name, "", finish, created))
         if include_usage and not is_native:
             if is_chat:
-                write_text(sock, sse_usage_event(id, ctx.model_name, prompt_tokens.length, completion_tokens))
+                write_text(sock, sse_usage_event(id, ctx.model_name, prompt_tokens.length, completion_tokens, created))
             else:
-                write_text(sock, text_completion_usage_sse_event(id, ctx.model_name, prompt_tokens.length, completion_tokens))
+                write_text(sock, text_completion_usage_sse_event(id, ctx.model_name, prompt_tokens.length, completion_tokens, created))
         if not is_native:
             write_text(sock, sse_done_event())
         response_state = 2
     else:
         if is_chat:
-            respond_json(sock, 200, "OK", completion_json_r(id, ctx.model_name, reply, final_reasoning, finish, prompt_tokens.length, completion_tokens))
+            if wants_chat_logprobs:
+                respond_json(sock, 200, "OK", completion_json_r_logprobs(id, ctx.model_name, reply, final_reasoning, finish, prompt_tokens.length, completion_tokens, created, reply_logprob_tokens, reply_logprob_bytes, reply_logprobs, reply_top_logprobs))
+            else:
+                respond_json(sock, 200, "OK", completion_json_r(id, ctx.model_name, reply, final_reasoning, finish, prompt_tokens.length, completion_tokens, created))
         elif is_native:
             let native_stop_type = if hit_eos: "eos" elif stopped or stopped_full: "word" else: "limit"
-            respond_json(sock, 200, "OK", native_completion_json(ctx.model_name, reply.content, reply_tokens, true, native_stop_type, prompt_tokens.length, completion_tokens, reuse))
+            if wants_native_logprobs:
+                respond_json(sock, 200, "OK", native_completion_json_logprobs(ctx.model_name, reply.content, reply_tokens, true, native_stop_type, prompt_tokens.length, completion_tokens, reuse, reply_logprob_tokens, reply_logprobs, reply_logprob_bytes, reply_top_logprobs))
+            else:
+                respond_json(sock, 200, "OK", native_completion_json(ctx.model_name, reply.content, reply_tokens, true, native_stop_type, prompt_tokens.length, completion_tokens, reuse))
         else:
-            respond_json(sock, 200, "OK", text_completion_json(id, ctx.model_name, reply.content, finish, prompt_tokens.length, completion_tokens))
+            if wants_completion_logprobs:
+                respond_json(sock, 200, "OK", text_completion_json_logprobs(id, ctx.model_name, reply.content, finish, prompt_tokens.length, completion_tokens, created, reply_logprob_tokens, reply_logprobs, reply_top_logprobs))
+            else:
+                respond_json(sock, 200, "OK", text_completion_json(id, ctx.model_name, reply.content, finish, prompt_tokens.length, completion_tokens, created))
     # `cur` covers cur.pos tokens: every token that was fed through the model
     # (the final EOS, or the token that completed a stop string, is sampled but
     # never fed back).
@@ -741,21 +855,31 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         let vocab_type = if ctx.tok.is_spm: 1 else: 2
         respond_json(sock, 200, "OK", models_json_meta(ctx.model_name, vocab_type,
                      ctx.model.config.vocab_size, ctx.max_ctx, n_ctx_train,
-                     ctx.model.config.d_model, gguf_parameter_count(ctx.file), ctx.file.file_size))
+                     ctx.model.config.d_model, gguf_parameter_count(ctx.file), ctx.file.file_size, unix_timestamp()))
     elif r.method == "GET" and (path == "/v1/models/{url_path_segment(ctx.model_name)}" or path == "/v1/models/{ctx.model_name}"):
         let arch = gguf_get_string(ctx.file.metadata, "general.architecture") else ""
         let n_ctx_train = gguf_get_int(ctx.file.metadata, "{arch}.context_length") else 0
         let vocab_type = if ctx.tok.is_spm: 1 else: 2
         respond_json(sock, 200, "OK", model_json_meta(ctx.model_name, vocab_type,
                      ctx.model.config.vocab_size, ctx.max_ctx, n_ctx_train,
-                     ctx.model.config.d_model, gguf_parameter_count(ctx.file), ctx.file.file_size))
+                     ctx.model.config.d_model, gguf_parameter_count(ctx.file), ctx.file.file_size, unix_timestamp()))
     elif r.method == "GET" and (path == "/health" or path == "/v1/health" or path == "/"):
         respond_json(sock, 200, "OK", "{{\"status\": \"ok\"}}")
     elif r.method == "GET" and path == "/props":
         let template = gguf_get_string(ctx.file.metadata, "tokenizer.chat_template") else ""
-        respond_json(sock, 200, "OK", props_json(ctx.model_path, template, ctx.max_ctx, ctx.default_max_tokens,
+        respond_json(sock, 200, "OK", props_json(ctx.model_path, template, ctx.max_ctx, ctx.cache_slots, ctx.default_max_tokens,
                      ctx.defaults.temperature, ctx.defaults.top_k, ctx.defaults.top_p, ctx.defaults.min_p, ctx.defaults.seed,
                      ctx.defaults.repeat_penalty, ctx.defaults.repeat_last_n))
+    elif r.method == "POST" and path == "/props":
+        respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("props"))
+    elif r.method == "GET" and path == "/metrics":
+        if ctx.metrics_enabled:
+            respond(sock, 200, "OK", "text/plain; version=0.0.4", metrics_text(metric_prompt_tokens, metric_prompt_ms,
+                    metric_predicted_tokens, metric_predicted_ms, metric_n_tokens_max))
+        else:
+            respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("metrics"))
+    elif r.method == "GET" and path == "/slots":
+        respond_json(sock, 200, "OK", slots_json(ctx.cache_slots, ctx.max_ctx))
     elif r.method == "POST" and (path == "/v1/chat/completions" or path == "/chat/completions"):
         return handle_completion(ctx, sock, r.body, counter, slots, disk, true, false)
     elif r.method == "POST" and path == "/v1/completions":
@@ -850,6 +974,11 @@ pub def serve(ServerCtx& ctx, int port, [DiskSnap] disk0) throws:
     var int counter = 0
     var [CacheSlot] slots = []
     var [DiskSnap] disk = disk0
+    metric_prompt_tokens = 0
+    metric_prompt_ms = 0
+    metric_predicted_tokens = 0
+    metric_predicted_ms = 0
+    metric_n_tokens_max = 0
     for conn in listener.incoming():
         let c = try? conn
         guard let c else:

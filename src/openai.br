@@ -12,6 +12,8 @@
 
 use jinja
 use json
+use std.time.SystemTime
+use std.time.UNIX_EPOCH
 
 # ── JValue helpers ───────────────────────────────────────────────────────
 
@@ -23,6 +25,11 @@ bool jv_is_list(JValue v):
 bool jv_is_str(JValue v):
     match v:
         JStr(s): true
+        _: false
+
+bool jv_is_bool(JValue v):
+    match v:
+        JBool(b): true
         _: false
 
 bool jv_is_number(JValue v):
@@ -195,12 +202,62 @@ pub [JValue] normalize_messages([JValue] messages) throws:
         out.push(nm)
     out
 
+# Resolve a JSON Pointer inside one schema document.  Tool contracts are data,
+# not URLs: only local references are supported, so validation and generation
+# never perform I/O for a `$ref`.
+JValue json_schema_local_ref(JValue root, string reference):
+    if reference == "#":
+        return root
+    if not reference.startsWith("#/"):
+        return JValue.JUndefined
+    var JValue current = root
+    for encoded in reference.split("#/")[1].split("/"):
+        let key = encoded.replace("~1", "/").replace("~0", "~")
+        match current:
+            JDict(fields, keys):
+                current = fields[key] else JValue.JUndefined
+            JList(items):
+                if let index = (key as int):
+                    if index < 0 or index >= items.length:
+                        return JValue.JUndefined
+                    current = items[index]
+                else:
+                    return JValue.JUndefined
+            _:
+                return JValue.JUndefined
+        if request_value_is_undefined(current):
+            return current
+    current
+
 # Checks the JSON Schema subset enforced later by `tool_schema_matches`.
 # Rejecting malformed recognized keywords avoids silently weakening a tool's
 # argument contract while leaving unknown keywords forward-compatible.
 pub string tool_schema_validation_error(JValue schema):
+    tool_schema_validation_error_root(schema, schema)
+
+string tool_schema_validation_error_root(JValue root, JValue schema):
     match schema:
+        JBool(allowed):
+            return ""
         JDict(fields, keys):
+            let reference = json_get(schema, "$ref")
+            if fields.contains("$ref"):
+                match reference:
+                    JStr(text):
+                        if not text.startsWith("#"):
+                            return "JSON Schema `$ref` must be a local reference"
+                        if request_value_is_undefined(json_schema_local_ref(root, text)):
+                            return "JSON Schema `$ref` does not resolve"
+                    _: return "JSON Schema `$ref` must be a string"
+            for definitions_key in ["$defs", "definitions"]:
+                let definitions = json_get(schema, definitions_key)
+                if fields.contains(definitions_key):
+                    match definitions:
+                        JDict(def_fields, def_keys):
+                            for key in def_keys:
+                                let invalid = tool_schema_validation_error_root(root, def_fields[key] else JValue.JUndefined)
+                                if invalid != "": return invalid
+                        _: return "JSON Schema `{definitions_key}` must be an object"
             let schema_type = json_get(schema, "type")
             match schema_type:
                 JUndefined:
@@ -225,7 +282,7 @@ pub string tool_schema_validation_error(JValue schema):
                     JDict(prop_fields, prop_keys):
                         for key in prop_keys:
                             let child = prop_fields[key] else JValue.JUndefined
-                            let invalid = tool_schema_validation_error(child)
+                            let invalid = tool_schema_validation_error_root(root, child)
                             if invalid != "": return invalid
                     _: return "JSON Schema `properties` must be an object"
             let required = json_get(schema, "required")
@@ -235,18 +292,60 @@ pub string tool_schema_validation_error(JValue schema):
                         for item in items:
                             if not jv_is_str(item): return "JSON Schema `required` must contain only strings"
                     _: return "JSON Schema `required` must be an array"
+            let dependent_required = json_get(schema, "dependentRequired")
+            if fields.contains("dependentRequired"):
+                match dependent_required:
+                    JDict(deps, dep_keys):
+                        for key in dep_keys:
+                            match deps[key] else JValue.JUndefined:
+                                JList(names):
+                                    for name in names:
+                                        if not jv_is_str(name): return "JSON Schema `dependentRequired` values must contain only strings"
+                                _: return "JSON Schema `dependentRequired` values must be arrays"
+                    _: return "JSON Schema `dependentRequired` must be an object"
+            let dependent_schemas = json_get(schema, "dependentSchemas")
+            if fields.contains("dependentSchemas"):
+                match dependent_schemas:
+                    JDict(deps, dep_keys):
+                        for key in dep_keys:
+                            let invalid = tool_schema_validation_error_root(root, deps[key] else JValue.JUndefined)
+                            if invalid != "": return invalid
+                    _: return "JSON Schema `dependentSchemas` must be an object"
+            let property_names = json_get(schema, "propertyNames")
+            if fields.contains("propertyNames"):
+                let invalid = tool_schema_validation_error_root(root, property_names)
+                if invalid != "": return invalid
             let additional = json_get(schema, "additionalProperties")
             if fields.contains("additionalProperties"):
                 match additional:
                     JBool(allowed): true
                     JDict(extra_fields, extra_keys):
-                        let invalid = tool_schema_validation_error(additional)
+                        let invalid = tool_schema_validation_error_root(root, additional)
                         if invalid != "": return invalid
                     _: return "JSON Schema `additionalProperties` must be a boolean or object"
             let items_schema = json_get(schema, "items")
             if fields.contains("items"):
-                let invalid = tool_schema_validation_error(items_schema)
+                let invalid = tool_schema_validation_error_root(root, items_schema)
                 if invalid != "": return invalid
+            let prefix_items = json_get(schema, "prefixItems")
+            if fields.contains("prefixItems"):
+                match prefix_items:
+                    JList(items):
+                        for item in items:
+                            let invalid = tool_schema_validation_error_root(root, item)
+                            if invalid != "": return invalid
+                    _: return "JSON Schema `prefixItems` must be an array"
+            let contains_schema = json_get(schema, "contains")
+            if fields.contains("contains"):
+                let invalid = tool_schema_validation_error_root(root, contains_schema)
+                if invalid != "": return invalid
+            for key in ["minContains", "maxContains"]:
+                let limit = json_get(schema, key)
+                if fields.contains(key):
+                    match limit:
+                        JInt(n):
+                            if n < 0: return "JSON Schema `{key}` must not be negative"
+                        _: return "JSON Schema `{key}` must be an integer"
             for key in ["anyOf", "oneOf", "allOf"]:
                 let composition = json_get(schema, key)
                 if fields.contains(key):
@@ -254,11 +353,15 @@ pub string tool_schema_validation_error(JValue schema):
                         JList(alternatives):
                             if alternatives.length == 0: return "JSON Schema `{key}` must not be empty"
                             for alternative in alternatives:
-                                let invalid = tool_schema_validation_error(alternative)
+                                let invalid = tool_schema_validation_error_root(root, alternative)
                                 if invalid != "": return invalid
                         _: return "JSON Schema `{key}` must be an array"
+            for key in ["if", "then", "else"]:
+                if fields.contains(key):
+                    let invalid = tool_schema_validation_error_root(root, json_get(schema, key))
+                    if invalid != "": return invalid
             if fields.contains("not"):
-                let invalid = tool_schema_validation_error(json_get(schema, "not"))
+                let invalid = tool_schema_validation_error_root(root, json_get(schema, "not"))
                 if invalid != "": return invalid
             let enum_value = json_get(schema, "enum")
             if fields.contains("enum"):
@@ -277,12 +380,16 @@ pub string tool_schema_validation_error(JValue schema):
                 let bound = json_get(schema, key)
                 if fields.contains(key) and not jv_is_number(bound):
                     return "JSON Schema `{key}` must be a number"
+            let multiple_of = json_get(schema, "multipleOf")
+            if fields.contains("multipleOf"):
+                if not jv_is_number(multiple_of) or json_get_float(schema, "multipleOf", 0.0) <= 0.0:
+                    return "JSON Schema `multipleOf` must be a number greater than 0"
             let unique_items = json_get(schema, "uniqueItems")
             if fields.contains("uniqueItems"):
                 match unique_items:
                     JBool(enabled): true
                     _: return "JSON Schema `uniqueItems` must be a boolean"
-        _: return "tool function `parameters` must be a JSON Schema object"
+        _: return "tool function `parameters` must be a JSON Schema object or boolean"
     ""
 
 # Structural validation before a request reaches a model-specific Jinja
@@ -476,9 +583,8 @@ pub ParsedReply parse_reply(string text):
 
 # `"tool_choice": "none"`: the model must not call tools, so the tool
 # definitions are left out of the prompt and `<tool_call>` text in the reply is
-# plain content. Other values ("auto", "required", a named function) are
-# accepted; they are not enforced (that needs constrained decoding), the
-# model decides as with "auto".
+# plain content. `required` and named choices are grammar-enforced by server.br;
+# `auto` leaves the decision to the model.
 pub bool tools_disabled(JValue body):
     json_get_str(body, "tool_choice", "") == "none"
 
@@ -489,9 +595,8 @@ pub string named_tool_choice(JValue body):
         _: ""
 
 # Validates tool_choice and returns the tool list that should reach the chat
-# template.  A named choice exposes only that function to the model; `none`
-# exposes none. `required` still needs constrained decoding to guarantee that
-# the model emits a call, but unlike the former behavior it is validated.
+# template. A named choice exposes only that function to the model; `none`
+# exposes none. `required` is also validated here before constrained decoding.
 pub string tool_choice_validation_error(JValue body, [JValue] tools):
     let choice = json_get(body, "tool_choice")
     if request_value_is_undefined(choice):
@@ -528,8 +633,43 @@ pub [JValue] tools_for_request(JValue body, [JValue] tools):
             out.push(tool)
     out
 
-bool tool_choice_required(JValue body):
+pub bool tool_choice_required(JValue body):
     json_get_str(body, "tool_choice", "") == "required" or named_tool_choice(body) != ""
+
+# A bare JSON object is the compact constrained form for an explicit tool
+# choice. Named choices use it directly as arguments; `required` uses the
+# usual {name, arguments} object. The final value is checked with exactly the
+# same schema matcher as parsed tool-call text.
+pub bool tool_choice_value_matches(JValue body, [JValue] tools, JValue value):
+    let forced = named_tool_choice(body)
+    match value:
+        JDict(fields, keys):
+            var string name = json_get_str(value, "name", "")
+            var JValue args = json_get(value, "arguments")
+            if forced != "":
+                name = forced
+                if request_value_is_undefined(args):
+                    args = value
+            if name == "" or request_value_is_undefined(args):
+                return false
+            tool_calls_match([ParsedToolCall(name, jv_to_json(args))], tools)
+        _: false
+
+pub bool tool_choice_decoded_candidate_allowed(JValue body, [JValue] tools, string decoded_before, string decoded_after, bool is_eos):
+    if is_eos:
+        let complete = try? json_parse(decoded_before)
+        if let value = complete:
+            return tool_choice_value_matches(body, tools, value)
+        return false
+    let state = json_object_prefix_state(decoded_after)
+    if state < 0:
+        return false
+    if state == 1:
+        let complete = try? json_parse(decoded_after)
+        if let value = complete:
+            return tool_choice_value_matches(body, tools, value)
+        return false
+    true
 
 string sole_tool_name([JValue] tools):
     if tools.length == 1:
@@ -571,9 +711,41 @@ bool json_object_has_key(JValue value, string key):
         JDict(fields, keys): fields.contains(key)
         _: false
 
+# JSON numbers are represented as binary floats internally.  A direct
+# `value / multipleOf == integer` test therefore rejects ordinary decimal
+# values such as 0.3 with multipleOf 0.1 on some platforms.  Keep a very
+# small relative allowance for that representation error, not for a genuine
+# near-miss such as 0.31.
+bool json_number_is_multiple_of(float value, float divisor):
+    let quotient = value / divisor
+    let nearest = if quotient >= 0.0:
+        floor(quotient + 0.5)
+    else:
+        -floor(-quotient + 0.5)
+    let delta = quotient - nearest
+    let tolerance = (if nearest >= 0.0: nearest else: -nearest) * 0.0000001 + 0.0000001
+    delta <= tolerance and delta >= -tolerance
+
 # The JSON Schema subset used by OpenCode tool definitions. Unknown schema
 # keywords remain permissive; recognized constraints must match.
 pub bool tool_schema_matches(JValue schema, JValue value):
+    tool_schema_matches_root(schema, schema, value, 0)
+
+bool tool_schema_matches_root(JValue root, JValue schema, JValue value, int ref_depth):
+    # JSON values are finite, but malformed schemas can make `$ref` chase
+    # itself without descending into a value. Bound that path so one request
+    # cannot exhaust the server stack; ordinary nested API schemas are tiny.
+    if ref_depth > 128:
+        return false
+    match schema:
+        JBool(allowed): return allowed
+        _: true
+    let reference = json_get_str(schema, "$ref", "")
+    if reference != "":
+        let target = json_schema_local_ref(root, reference)
+        if request_value_is_undefined(target):
+            return false
+        return tool_schema_matches_root(root, target, value, ref_depth + 1)
     let kind = json_get_str(schema, "type", "")
     if kind != "" and not schema_type_matches(kind, value):
         return false
@@ -598,7 +770,7 @@ pub bool tool_schema_matches(JValue schema, JValue value):
     if any_of.length > 0:
         var bool any_ok = false
         for alternative in any_of:
-            if tool_schema_matches(alternative, value):
+            if tool_schema_matches_root(root, alternative, value, ref_depth + 1):
                 any_ok = true
         if not any_ok:
             return false
@@ -606,14 +778,24 @@ pub bool tool_schema_matches(JValue schema, JValue value):
     if one_of.length > 0:
         var int matches = 0
         for alternative in one_of:
-            if tool_schema_matches(alternative, value):
+            if tool_schema_matches_root(root, alternative, value, ref_depth + 1):
                 matches += 1
         if matches != 1:
             return false
     for constraint in json_get_list(schema, "allOf"):
-        if not tool_schema_matches(constraint, value):
+        if not tool_schema_matches_root(root, constraint, value, ref_depth + 1):
             return false
-    if json_object_has_key(schema, "not") and tool_schema_matches(json_get(schema, "not"), value):
+    let condition = json_get(schema, "if")
+    if not request_value_is_undefined(condition):
+        if tool_schema_matches_root(root, condition, value, ref_depth + 1):
+            let then_schema = json_get(schema, "then")
+            if not request_value_is_undefined(then_schema) and not tool_schema_matches_root(root, then_schema, value, ref_depth + 1):
+                return false
+        else:
+            let else_schema = json_get(schema, "else")
+            if not request_value_is_undefined(else_schema) and not tool_schema_matches_root(root, else_schema, value, ref_depth + 1):
+                return false
+    if json_object_has_key(schema, "not") and tool_schema_matches_root(root, json_get(schema, "not"), value, ref_depth + 1):
         return false
 
     let enums = json_get_list(schema, "enum")
@@ -627,6 +809,11 @@ pub bool tool_schema_matches(JValue schema, JValue value):
 
     match value:
         JDict(fields, keys):
+            let property_names = json_get(schema, "propertyNames")
+            if not request_value_is_undefined(property_names):
+                for key in keys:
+                    if not tool_schema_matches_root(root, property_names, JValue.JStr(key), ref_depth + 1):
+                        return false
             let min_properties = json_get_int(schema, "minProperties", -1)
             let max_properties = json_get_int(schema, "maxProperties", -1)
             if min_properties >= 0 and keys.length < min_properties:
@@ -639,6 +826,22 @@ pub bool tool_schema_matches(JValue schema, JValue value):
                         if not fields.contains(name):
                             return false
                     _: return false
+            match json_get(schema, "dependentRequired"):
+                JDict(deps, dep_keys):
+                    for key in dep_keys:
+                        if fields.contains(key):
+                            for required_name in json_get_list(JValue.JDict(deps, dep_keys), key):
+                                match required_name:
+                                    JStr(name):
+                                        if not fields.contains(name): return false
+                                    _: return false
+                _: true
+            match json_get(schema, "dependentSchemas"):
+                JDict(deps, dep_keys):
+                    for key in dep_keys:
+                        if fields.contains(key) and not tool_schema_matches_root(root, deps[key] else JValue.JUndefined, value, ref_depth + 1):
+                            return false
+                _: true
             let properties = json_get(schema, "properties")
             let additional = json_get(schema, "additionalProperties")
             match properties:
@@ -647,7 +850,7 @@ pub bool tool_schema_matches(JValue schema, JValue value):
                         if fields.contains(key):
                             let child_schema = prop_fields[key] else JValue.JUndefined
                             let child_value = fields[key] else JValue.JUndefined
-                            if not tool_schema_matches(child_schema, child_value):
+                            if not tool_schema_matches_root(root, child_schema, child_value, ref_depth + 1):
                                 return false
                     for key in keys:
                         if not prop_fields.contains(key):
@@ -657,7 +860,7 @@ pub bool tool_schema_matches(JValue schema, JValue value):
                                     if not allowed:
                                         return false
                                 JDict(extra_fields, extra_keys):
-                                    if not tool_schema_matches(additional, child_value):
+                                    if not tool_schema_matches_root(root, additional, child_value, ref_depth + 1):
                                         return false
                                 _: true
                 _:
@@ -668,7 +871,7 @@ pub bool tool_schema_matches(JValue schema, JValue value):
                                 if not allowed:
                                     return false
                             JDict(extra_fields, extra_keys):
-                                if not tool_schema_matches(additional, child_value):
+                                if not tool_schema_matches_root(root, additional, child_value, ref_depth + 1):
                                     return false
                             _: true
         JList(items):
@@ -687,11 +890,33 @@ pub bool tool_schema_matches(JValue schema, JValue value):
                             return false
                         previous_item += 1
                     item_index += 1
+            let prefix_items = json_get_list(schema, "prefixItems")
+            var prefix_index = 0
+            while prefix_index < prefix_items.length and prefix_index < items.length:
+                if not tool_schema_matches_root(root, prefix_items[prefix_index], items[prefix_index], ref_depth + 1):
+                    return false
+                prefix_index += 1
+            # In JSON Schema 2020-12, `items` constrains only the suffix after
+            # `prefixItems`; without a prefix it still applies to every item.
             let item_schema = json_get(schema, "items")
             if not request_value_is_undefined(item_schema):
-                for item in items:
-                    if not tool_schema_matches(item_schema, item):
+                var int item_index = prefix_items.length
+                if item_index > items.length:
+                    item_index = items.length
+                while item_index < items.length:
+                    if not tool_schema_matches_root(root, item_schema, items[item_index], ref_depth + 1):
                         return false
+                    item_index += 1
+            let contains_schema = json_get(schema, "contains")
+            if not request_value_is_undefined(contains_schema):
+                var int contains_matches = 0
+                for item in items:
+                    if tool_schema_matches_root(root, contains_schema, item, ref_depth + 1):
+                        contains_matches += 1
+                let min_contains = json_get_int(schema, "minContains", 1)
+                let max_contains = json_get_int(schema, "maxContains", -1)
+                if contains_matches < min_contains or (max_contains >= 0 and contains_matches > max_contains):
+                    return false
         JStr(text):
             let n = text.chars().length
             let min_length = json_get_int(schema, "minLength", -1)
@@ -702,6 +927,9 @@ pub bool tool_schema_matches(JValue schema, JValue value):
                 return false
         JInt(n):
             let value_n = n as float
+            let multiple_of = json_get_float(schema, "multipleOf", 0.0)
+            if multiple_of > 0.0 and not json_number_is_multiple_of(value_n, multiple_of):
+                return false
             let minimum = json_get_float(schema, "minimum", value_n)
             let maximum = json_get_float(schema, "maximum", value_n)
             if value_n < minimum or value_n > maximum:
@@ -711,6 +939,9 @@ pub bool tool_schema_matches(JValue schema, JValue value):
             if json_object_has_key(schema, "exclusiveMaximum") and value_n >= json_get_float(schema, "exclusiveMaximum", value_n):
                 return false
         JFloat(f):
+            let multiple_of = json_get_float(schema, "multipleOf", 0.0)
+            if multiple_of > 0.0 and not json_number_is_multiple_of(f, multiple_of):
+                return false
             let minimum = json_get_float(schema, "minimum", f)
             let maximum = json_get_float(schema, "maximum", f)
             if f < minimum or f > maximum:
@@ -721,6 +952,36 @@ pub bool tool_schema_matches(JValue schema, JValue value):
                 return false
         _: true
     true
+
+# The response-format schema uses the same JSON Schema subset as tool
+# arguments. A token remains eligible while its decoded text is a viable JSON
+# object prefix. Once it closes an object, it must already satisfy the schema;
+# EOS is likewise available only for a complete matching object. This is the
+# safe common denominator for arbitrary tokenizer pieces (including pieces
+# that split UTF-8 characters).
+pub bool json_schema_decoded_candidate_allowed(JValue schema, string decoded_before, string decoded_after, bool is_eos):
+    if is_eos:
+        if json_object_prefix_state(decoded_before) != 1:
+            return false
+        let complete = try? json_parse(decoded_before)
+        if let value = complete:
+            return tool_schema_matches(schema, value)
+        return false
+    let state = json_object_prefix_state(decoded_after)
+    if state < 0:
+        return false
+    if state == 1:
+        let complete = try? json_parse(decoded_after)
+        if let value = complete:
+            return tool_schema_matches(schema, value)
+        return false
+    true
+
+pub JValue response_json_schema(JValue body):
+    let response_format = json_get(body, "response_format")
+    if json_get_str(response_format, "type", "") == "json_schema":
+        return json_get(json_get(response_format, "json_schema"), "schema")
+    JValue.JUndefined
 
 bool tool_call_matches(ParsedToolCall call, [JValue] tools):
     var JValue schema = JValue.JUndefined
@@ -926,26 +1187,54 @@ pub string request_validation_error(JValue body):
                 let format_type = json_get_str(response_format, "type", "")
                 if format_type == "":
                     return "`response_format.type` is required and must be a string"
-                if format_type != "text" and format_type != "json_object":
+                if format_type != "text" and format_type != "json_object" and format_type != "json_schema":
                     return "`response_format.type` `{format_type}` requires constrained decoding, which is not supported"
+                if format_type == "json_schema":
+                    let json_schema = json_get(response_format, "json_schema")
+                    match json_schema:
+                        JDict(schema_fields, schema_keys):
+                            let name = json_get(json_schema, "name")
+                            if not jv_is_str(name) or json_get_str(json_schema, "name", "") == "":
+                                return "`response_format.json_schema.name` must be a non-empty string"
+                            let strict = json_get(json_schema, "strict")
+                            if not request_value_is_undefined(strict) and not jv_is_bool(strict):
+                                return "`response_format.json_schema.strict` must be a boolean"
+                            let schema = json_get(json_schema, "schema")
+                            let invalid = tool_schema_validation_error(schema)
+                            if invalid != "":
+                                return "`response_format.json_schema.schema` is invalid: {invalid}"
+                        _: return "`response_format.json_schema` must be an object"
             _: return "`response_format` must be an object"
     let logprobs = json_get(body, "logprobs")
     if not request_value_is_undefined(logprobs):
         match logprobs:
             JBool(enabled):
-                if enabled:
-                    return "requested `logprobs` are not supported"
+                if enabled and json_get_bool(body, "stream", false):
+                    return "streaming `logprobs` are not supported yet"
             JInt(count):
-                if count != 0:
-                    return "requested `logprobs` are not supported"
+                if count < 0 or count > 5:
+                    return "integer `logprobs` must be between 0 and 5"
+                if json_get_bool(body, "stream", false):
+                    return "streaming `logprobs` are not supported yet"
             _: return "`logprobs` must be a boolean or integer"
     let top_logprobs = json_get(body, "top_logprobs")
     if not request_value_is_undefined(top_logprobs):
         match top_logprobs:
             JInt(count):
-                if count != 0:
-                    return "requested `top_logprobs` are not supported"
+                if count < 0 or count > 20:
+                    return "`top_logprobs` must be between 0 and 20"
+                if count > 0 and not json_get_bool(body, "logprobs", false):
+                    return "`top_logprobs` requires `logprobs: true`"
             _: return "`top_logprobs` must be an integer"
+    let n_probs = json_get(body, "n_probs")
+    if not request_value_is_undefined(n_probs):
+        match n_probs:
+            JInt(count):
+                if count < 0 or count > 20:
+                    return "`n_probs` must be between 0 and 20"
+                if count > 0 and json_get_bool(body, "stream", false):
+                    return "streaming `n_probs` are not supported yet"
+            _: return "`n_probs` must be an integer"
     let logit_bias = json_get(body, "logit_bias")
     if not request_value_is_undefined(logit_bias):
         match logit_bias:
@@ -995,6 +1284,20 @@ string usage_json(int prompt_tokens, int completion_tokens):
 pub string error_json(string message, string kind, string code):
     "{{\"error\": {{\"message\": \"{json_escape(message)}\", \"type\": \"{kind}\", \"code\": \"{code}\"}}}}"
 
+# llama-server uses a numeric code for optional endpoints which are compiled
+# in but disabled. Keep this separate from OpenAI request errors, whose codes
+# are stable strings consumed by SDKs.
+pub string endpoint_not_supported_json(string endpoint):
+    "{{\"error\": {{\"code\": 501, \"message\": \"This server does not support {json_escape(endpoint)} endpoint.\", \"type\": \"not_supported_error\"}}}}"
+
+pub string metrics_text(int prompt_tokens, int prompt_ms, int predicted_tokens,
+                         int predicted_ms, int n_tokens_max):
+    let prompt_seconds = prompt_ms as float / 1000.0
+    let predicted_seconds = predicted_ms as float / 1000.0
+    let prompt_rate = if prompt_ms > 0: prompt_tokens as float * 1000.0 / prompt_ms as float else: 0.0
+    let predicted_rate = if predicted_ms > 0: predicted_tokens as float * 1000.0 / predicted_ms as float else: 0.0
+    "# TYPE llamacpp:prompt_tokens_total counter\nllamacpp:prompt_tokens_total {prompt_tokens}\n# TYPE llamacpp:prompt_seconds_total counter\nllamacpp:prompt_seconds_total {prompt_seconds}\n# TYPE llamacpp:prompt_tokens_seconds gauge\nllamacpp:prompt_tokens_seconds {prompt_rate}\n# TYPE llamacpp:tokens_predicted_total counter\nllamacpp:tokens_predicted_total {predicted_tokens}\n# TYPE llamacpp:tokens_predicted_seconds_total counter\nllamacpp:tokens_predicted_seconds_total {predicted_seconds}\n# TYPE llamacpp:predicted_tokens_seconds gauge\nllamacpp:predicted_tokens_seconds {predicted_rate}\n# TYPE llamacpp:requests_processing gauge\nllamacpp:requests_processing 0\n# TYPE llamacpp:requests_deferred gauge\nllamacpp:requests_deferred 0\n# TYPE llamacpp:n_tokens_max counter\nllamacpp:n_tokens_max {n_tokens_max}\n"
+
 # The 400 for a prompt that does not fit the context (`--ctx-size`). Clients
 # detect an overflow from the error code (OpenAI's `context_length_exceeded`)
 # or from phrases in the message ("maximum context length", llama.cpp's
@@ -1004,19 +1307,22 @@ pub string context_exceeded_json(int n_prompt, int n_ctx):
     let message = "This model's maximum context length is {n_ctx} tokens. The request exceeds the available context size: your messages resulted in {n_prompt} tokens (the reply needs room too). Shorten the conversation or start the server with a larger --ctx-size."
     "{{\"error\": {{\"message\": \"{json_escape(message)}\", \"type\": \"invalid_request_error\", \"code\": \"context_length_exceeded\", \"param\": \"messages\", \"n_prompt_tokens\": {n_prompt}, \"n_ctx\": {n_ctx}}}}}"
 
-pub string models_json(string model_id):
-    "{{\"object\": \"list\", \"data\": [{{\"id\": \"{json_escape(model_id)}\", \"object\": \"model\", \"created\": 0, \"owned_by\": \"boring-llm\"}}]}}"
+pub uint64 unix_timestamp() throws:
+    SystemTime.now().durationSince(UNIX_EPOCH).asSecs()
+
+pub string models_json(string model_id, uint64 created):
+    "{{\"object\": \"list\", \"data\": [{{\"id\": \"{json_escape(model_id)}\", \"object\": \"model\", \"created\": {created}, \"owned_by\": \"boring-llm\"}}]}}"
 
 pub string model_json_meta(string model_id, int vocab_type, int n_vocab, int n_ctx,
-                           int n_ctx_train, int n_embd, int n_params, int size):
-    "{{\"id\": \"{json_escape(model_id)}\", \"aliases\": [\"{json_escape(model_id)}\"], \"tags\": [], \"object\": \"model\", \"created\": 0, \"owned_by\": \"boring-llm\", \"meta\": {{\"vocab_type\": {vocab_type}, \"n_vocab\": {n_vocab}, \"n_ctx\": {n_ctx}, \"n_ctx_train\": {n_ctx_train}, \"n_embd\": {n_embd}, \"n_params\": {n_params}, \"size\": {size}}}}}"
+                           int n_ctx_train, int n_embd, int n_params, int size, uint64 created):
+    "{{\"id\": \"{json_escape(model_id)}\", \"aliases\": [\"{json_escape(model_id)}\"], \"tags\": [], \"object\": \"model\", \"created\": {created}, \"owned_by\": \"boring-llm\", \"meta\": {{\"vocab_type\": {vocab_type}, \"n_vocab\": {n_vocab}, \"n_ctx\": {n_ctx}, \"n_ctx_train\": {n_ctx_train}, \"n_embd\": {n_embd}, \"n_params\": {n_params}, \"size\": {size}}}}}"
 
 # llama-server exposes these GGUF/model facts in a non-standard `meta` object.
 # They are useful to clients which choose a context window or sanity-check the
 # loaded model, while the surrounding response remains OpenAI-compatible.
 pub string models_json_meta(string model_id, int vocab_type, int n_vocab, int n_ctx,
-                            int n_ctx_train, int n_embd, int n_params, int size):
-    "{{\"object\": \"list\", \"data\": [{model_json_meta(model_id, vocab_type, n_vocab, n_ctx, n_ctx_train, n_embd, n_params, size)}]}}"
+                            int n_ctx_train, int n_embd, int n_params, int size, uint64 created):
+    "{{\"object\": \"list\", \"data\": [{model_json_meta(model_id, vocab_type, n_vocab, n_ctx, n_ctx_train, n_embd, n_params, size, created)}]}}"
 
 pub string input_tokens_json(int input_tokens):
     "{{\"object\": \"response.input_tokens\", \"input_tokens\": {input_tokens}}}"
@@ -1037,64 +1343,158 @@ pub string content_json(string content):
 pub string prompt_json(string prompt):
     "{{\"prompt\": \"{json_escape(prompt)}\"}}"
 
-pub string props_json(string model_path, string chat_template, int n_ctx, int max_tokens,
+pub string props_json(string model_path, string chat_template, int n_ctx, int total_slots, int max_tokens,
                          float32 temperature, int top_k, float32 top_p, float32 min_p, int seed,
                          float32 repeat_penalty, int repeat_last_n):
-    "{{\"default_generation_settings\": {{\"n_ctx\": {n_ctx}, \"params\": {{\"n_predict\": {max_tokens}, \"seed\": {seed}, \"temperature\": {temperature}, \"top_k\": {top_k}, \"top_p\": {top_p}, \"min_p\": {min_p}, \"repeat_penalty\": {repeat_penalty}, \"repeat_last_n\": {repeat_last_n}}}}}, \"total_slots\": 1, \"model_path\": \"{json_escape(model_path)}\", \"chat_template\": \"{json_escape(chat_template)}\", \"chat_template_caps\": {{\"supports_tools\": true}}, \"modalities\": {{\"vision\": false}}, \"is_sleeping\": false}}"
+    "{{\"default_generation_settings\": {{\"n_ctx\": {n_ctx}, \"params\": {{\"n_predict\": {max_tokens}, \"seed\": {seed}, \"temperature\": {temperature}, \"top_k\": {top_k}, \"top_p\": {top_p}, \"min_p\": {min_p}, \"repeat_penalty\": {repeat_penalty}, \"repeat_last_n\": {repeat_last_n}}}}}, \"total_slots\": {total_slots}, \"model_path\": \"{json_escape(model_path)}\", \"chat_template\": \"{json_escape(chat_template)}\", \"chat_template_caps\": {{\"supports_tools\": true}}, \"modalities\": {{\"vision\": false}}, \"is_sleeping\": false}}"
+
+# llama-server's `/slots` monitor reports one item per configured KV-cache
+# slot. This server handles one request at a time, so a monitoring request can
+# only observe idle slots; there is no concurrent task id or timing metric to
+# expose truthfully.
+pub string slots_json(int n_slots, int n_ctx):
+    var string out = "["
+    var int slot = 0
+    while slot < n_slots:
+        if slot > 0:
+            out = "{out}, "
+        out = "{out}{{\"id\": {slot}, \"n_ctx\": {n_ctx}, \"speculative\": false, \"is_processing\": false}}"
+        slot += 1
+    "{out}]"
 
 pub string completion_json(string id, string model, ParsedReply reply, string finish_reason,
-                            int prompt_tokens, int completion_tokens):
-    completion_json_r(id, model, reply, "", finish_reason, prompt_tokens, completion_tokens)
+                            int prompt_tokens, int completion_tokens, uint64 created):
+    completion_json_r(id, model, reply, "", finish_reason, prompt_tokens, completion_tokens, created)
 
 # The same with `reasoning`, the model's `<think>` text (Qwen3 and other
 # reasoning models), returned as `message.reasoning_content` like llama.cpp and
 # DeepSeek's API do, when there is any.
 pub string completion_json_r(string id, string model, ParsedReply reply, string reasoning, string finish_reason,
-                              int prompt_tokens, int completion_tokens):
+                              int prompt_tokens, int completion_tokens, uint64 created):
     let content = if reply.content == "" and reply.calls.length > 0: "null" else: "\"{json_escape(reply.content)}\""
     let thinking = if reasoning != "": ", \"reasoning_content\": \"{json_escape(reasoning)}\"" else: ""
     let calls = if reply.calls.length > 0: ", \"tool_calls\": {tool_calls_json(id, reply.calls, false)}" else: ""
-    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": 0, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{thinking}{calls}}}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}"
+    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{thinking}{calls}}}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}"
+
+pub struct TokenLogprobAlternative:
+    int id
+    string token
+    [uint8] bytes
+    float32 logprob
+
+string logprob_bytes_json([uint8] bytes):
+    var string out = "["
+    var int i = 0
+    while i < bytes.length:
+        if i > 0:
+            out = "{out}, "
+        out = "{out}{int(bytes[i])}"
+        i += 1
+    "{out}]"
+
+pub string chat_logprobs_json([string] tokens, [[uint8]] token_bytes, [float32] values,
+                               [[TokenLogprobAlternative]] alternatives):
+    var string out = "{{\"content\": ["
+    var int i = 0
+    while i < tokens.length:
+        if i > 0:
+            out = "{out}, "
+        var string tops = "["
+        var int j = 0
+        while j < alternatives[i].length:
+            if j > 0:
+                tops = "{tops}, "
+            let alternative = alternatives[i][j]
+            tops = "{tops}{{\"token\": \"{json_escape(alternative.token)}\", \"logprob\": {alternative.logprob}, \"bytes\": {logprob_bytes_json(alternative.bytes)}}}"
+            j += 1
+        out = "{out}{{\"token\": \"{json_escape(tokens[i])}\", \"logprob\": {values[i]}, \"bytes\": {logprob_bytes_json(token_bytes[i])}, \"top_logprobs\": {tops}]}}"
+        i += 1
+    "{out}]}}"
+
+pub string completion_json_r_logprobs(string id, string model, ParsedReply reply, string reasoning,
+                                       string finish_reason, int prompt_tokens, int completion_tokens,
+                                       uint64 created, [string] tokens, [[uint8]] token_bytes, [float32] values,
+                                       [[TokenLogprobAlternative]] alternatives):
+    let content = if reply.content == "" and reply.calls.length > 0: "null" else: "\"{json_escape(reply.content)}\""
+    let thinking = if reasoning != "": ", \"reasoning_content\": \"{json_escape(reasoning)}\"" else: ""
+    let calls = if reply.calls.length > 0: ", \"tool_calls\": {tool_calls_json(id, reply.calls, false)}" else: ""
+    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{thinking}{calls}}}, \"logprobs\": {chat_logprobs_json(tokens, token_bytes, values, alternatives)}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}"
 
 pub string text_completion_json(string id, string model, string content, string finish_reason,
-                                int prompt_tokens, int completion_tokens):
-    "{{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": 0, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(content)}\", \"index\": 0, \"logprobs\": null, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}"
+                                int prompt_tokens, int completion_tokens, uint64 created):
+    "{{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(content)}\", \"index\": 0, \"logprobs\": null, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}"
 
-string sse_chunk(string id, string model, string delta, string finish_reason):
+pub string completion_logprobs_json([string] tokens, [float32] values,
+                                     [[TokenLogprobAlternative]] alternatives):
+    var string token_json = "["
+    var string value_json = "["
+    var string top_json = "["
+    var string offset_json = "["
+    var int offset = 0
+    var int i = 0
+    while i < tokens.length:
+        if i > 0:
+            token_json = "{token_json}, "
+            value_json = "{value_json}, "
+            top_json = "{top_json}, "
+            offset_json = "{offset_json}, "
+        token_json = "{token_json}\"{json_escape(tokens[i])}\""
+        value_json = "{value_json}{values[i]}"
+        var string top = "{{"
+        var int j = 0
+        while j < alternatives[i].length:
+            if j > 0:
+                top = "{top}, "
+            let alternative = alternatives[i][j]
+            top = "{top}\"{json_escape(alternative.token)}\": {alternative.logprob}"
+            j += 1
+        top_json = "{top_json}{top}}}"
+        offset_json = "{offset_json}{offset}"
+        offset += tokens[i].chars().length
+        i += 1
+    "{{\"tokens\": {token_json}], \"token_logprobs\": {value_json}], \"top_logprobs\": {top_json}], \"text_offset\": {offset_json}]}}"
+
+pub string text_completion_json_logprobs(string id, string model, string content, string finish_reason,
+                                          int prompt_tokens, int completion_tokens, uint64 created,
+                                          [string] tokens, [float32] values,
+                                          [[TokenLogprobAlternative]] alternatives):
+    "{{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(content)}\", \"index\": 0, \"logprobs\": {completion_logprobs_json(tokens, values, alternatives)}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}"
+
+string sse_chunk(string id, string model, string delta, string finish_reason, uint64 created):
     let fr = if finish_reason == "": "null" else: "\"{finish_reason}\""
-    "data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"delta\": {delta}, \"finish_reason\": {fr}}}]}}\n\n"
+    "data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"delta\": {delta}, \"finish_reason\": {fr}}}]}}\n\n"
 
 # ── SSE events ───────────────────────────────────────────────────────────
 # One function per event so the server can write them as tokens arrive;
 # completion_sse (below) composes the same events into a complete body.
 
-pub string sse_role_event(string id, string model):
-    sse_chunk(id, model, "{{\"role\": \"assistant\", \"content\": \"\"}}", "")
+pub string sse_role_event(string id, string model, uint64 created):
+    sse_chunk(id, model, "{{\"role\": \"assistant\", \"content\": \"\"}}", "", created)
 
-pub string sse_content_event(string id, string model, string text):
-    sse_chunk(id, model, "{{\"content\": \"{json_escape(text)}\"}}", "")
+pub string sse_content_event(string id, string model, string text, uint64 created):
+    sse_chunk(id, model, "{{\"content\": \"{json_escape(text)}\"}}", "", created)
 
-pub string sse_reasoning_event(string id, string model, string text):
-    sse_chunk(id, model, "{{\"reasoning_content\": \"{json_escape(text)}\"}}", "")
+pub string sse_reasoning_event(string id, string model, string text, uint64 created):
+    sse_chunk(id, model, "{{\"reasoning_content\": \"{json_escape(text)}\"}}", "", created)
 
-pub string sse_tool_calls_event(string id, string model, [ParsedToolCall] calls):
-    sse_chunk(id, model, "{{\"tool_calls\": {tool_calls_json(id, calls, true)}}}", "")
+pub string sse_tool_calls_event(string id, string model, [ParsedToolCall] calls, uint64 created):
+    sse_chunk(id, model, "{{\"tool_calls\": {tool_calls_json(id, calls, true)}}}", "", created)
 
-pub string sse_finish_event(string id, string model, string finish_reason):
-    sse_chunk(id, model, "{{}}", finish_reason)
+pub string sse_finish_event(string id, string model, string finish_reason, uint64 created):
+    sse_chunk(id, model, "{{}}", finish_reason, created)
 
-pub string sse_usage_event(string id, string model, int prompt_tokens, int completion_tokens):
-    "data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"{json_escape(model)}\", \"choices\": [], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}\n\n"
+pub string sse_usage_event(string id, string model, int prompt_tokens, int completion_tokens, uint64 created):
+    "data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}\n\n"
 
 pub string sse_done_event():
     "data: [DONE]\n\n"
 
-pub string text_completion_sse_event(string id, string model, string text, string finish_reason):
+pub string text_completion_sse_event(string id, string model, string text, string finish_reason, uint64 created):
     let fr = if finish_reason == "": "null" else: "\"{finish_reason}\""
-    "data: {{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": 0, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(text)}\", \"index\": 0, \"logprobs\": null, \"finish_reason\": {fr}}}]}}\n\n"
+    "data: {{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(text)}\", \"index\": 0, \"logprobs\": null, \"finish_reason\": {fr}}}]}}\n\n"
 
-pub string text_completion_usage_sse_event(string id, string model, int prompt_tokens, int completion_tokens):
-    "data: {{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": 0, \"model\": \"{json_escape(model)}\", \"choices\": [], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}\n\n"
+pub string text_completion_usage_sse_event(string id, string model, int prompt_tokens, int completion_tokens, uint64 created):
+    "data: {{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}\n\n"
 
 string token_ids_json([int] tokens):
     var string out = "["
@@ -1110,6 +1510,32 @@ pub string native_completion_json(string model, string content, [int] tokens, bo
     let stop_value = if stopped: "true" else: "false"
     "{{\"index\": 0, \"content\": \"{json_escape(content)}\", \"tokens\": {token_ids_json(tokens)}, \"id_slot\": 0, \"stop\": {stop_value}, \"model\": \"{json_escape(model)}\", \"tokens_predicted\": {completion_tokens}, \"tokens_evaluated\": {prompt_tokens}, \"truncated\": false, \"stop_type\": \"{stop_type}\", \"stopping_word\": \"\", \"tokens_cached\": {cached_tokens}}}"
 
+string native_logprobs_json([int] ids, [string] tokens, [float32] values,
+                            [[uint8]] token_bytes, [[TokenLogprobAlternative]] alternatives):
+    var string out = "["
+    var int i = 0
+    while i < tokens.length:
+        if i > 0:
+            out = "{out}, "
+        var string tops = "["
+        var int j = 0
+        while j < alternatives[i].length:
+            if j > 0:
+                tops = "{tops}, "
+            let alternative = alternatives[i][j]
+            tops = "{tops}{{\"id\": {alternative.id}, \"token\": \"{json_escape(alternative.token)}\", \"bytes\": {logprob_bytes_json(alternative.bytes)}, \"logprob\": {alternative.logprob}}}"
+            j += 1
+        out = "{out}{{\"id\": {ids[i]}, \"token\": \"{json_escape(tokens[i])}\", \"bytes\": {logprob_bytes_json(token_bytes[i])}, \"logprob\": {values[i]}, \"top_logprobs\": {tops}]}}"
+        i += 1
+    "{out}]"
+
+pub string native_completion_json_logprobs(string model, string content, [int] tokens, bool stopped,
+                                             string stop_type, int prompt_tokens, int completion_tokens,
+                                             int cached_tokens, [string] prob_tokens, [float32] values,
+                                             [[uint8]] token_bytes, [[TokenLogprobAlternative]] alternatives):
+    let stop_value = if stopped: "true" else: "false"
+    "{{\"index\": 0, \"content\": \"{json_escape(content)}\", \"tokens\": {token_ids_json(tokens)}, \"id_slot\": 0, \"stop\": {stop_value}, \"model\": \"{json_escape(model)}\", \"tokens_predicted\": {completion_tokens}, \"tokens_evaluated\": {prompt_tokens}, \"truncated\": false, \"stop_type\": \"{stop_type}\", \"stopping_word\": \"\", \"tokens_cached\": {cached_tokens}, \"completion_probabilities\": {native_logprobs_json(tokens, prob_tokens, values, token_bytes, alternatives)}}}"
+
 pub string native_completion_sse_event(string content, [int] tokens, bool stopped):
     let stop_value = if stopped: "true" else: "false"
     "data: {{\"index\": 0, \"content\": \"{json_escape(content)}\", \"tokens\": {token_ids_json(tokens)}, \"stop\": {stop_value}}}\n\n"
@@ -1122,15 +1548,15 @@ pub string sse_error_event(string message):
 # role chunk, one content chunk, optional tool-call chunk, a finish chunk and
 # (when asked via `stream_options.include_usage`) a usage chunk.
 pub string completion_sse(string id, string model, ParsedReply reply, string finish_reason,
-                           int prompt_tokens, int completion_tokens, bool include_usage):
-    var string out = sse_role_event(id, model)
+                           int prompt_tokens, int completion_tokens, bool include_usage, uint64 created):
+    var string out = sse_role_event(id, model, created)
     if reply.content != "":
-        out = "{out}{sse_content_event(id, model, reply.content)}"
+        out = "{out}{sse_content_event(id, model, reply.content, created)}"
     if reply.calls.length > 0:
-        out = "{out}{sse_tool_calls_event(id, model, reply.calls)}"
-    out = "{out}{sse_finish_event(id, model, finish_reason)}"
+        out = "{out}{sse_tool_calls_event(id, model, reply.calls, created)}"
+    out = "{out}{sse_finish_event(id, model, finish_reason, created)}"
     if include_usage:
-        out = "{out}{sse_usage_event(id, model, prompt_tokens, completion_tokens)}"
+        out = "{out}{sse_usage_event(id, model, prompt_tokens, completion_tokens, created)}"
     "{out}{sse_done_event()}"
 
 # ── Incremental streaming of the reply text ──────────────────────────────

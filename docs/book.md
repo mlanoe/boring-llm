@@ -173,6 +173,7 @@ For `--serve`, these set the server defaults; a request may override `temperatur
 | `--ctx-size N` | `4096` | prompt plus reply tokens one request may use |
 | `--model-name NAME` | GGUF `general.name` | id returned by `/v1/models` |
 | `--cache-slots N` | `4` | KV caches kept in memory (least recently used evicted) |
+| `--metrics` | off | expose llama-server-compatible Prometheus counters at `GET /metrics` |
 | `--prompt-cache DIR` | off | also keep KV caches on disk, reused after a restart |
 | `--prompt-cache-files N` | `2` | snapshot files kept on disk |
 | `--prompt-cache-max-mb N` | `4096` | size cap on all snapshots together; 0 means none |
@@ -213,11 +214,14 @@ The server listens on `127.0.0.1` only and has no authentication. To reach it fr
 | `GET /v1/models/{model}` | retrieve that model by its URL-encoded id, in the standard OpenAI single-model shape |
 | `POST /v1/chat/completions` (also `/chat/completions`) | chat completion, JSON or SSE |
 | `POST /v1/completions` | OpenAI-compatible text completion from a raw string or token-ID array `prompt`, JSON or SSE; string prompts honor the GGUF tokenizer's automatic BOS setting |
-| `POST /completion` (also `/completions`) | llama-server native completion format, including `n_predict` (`-1` uses all context room and `0` only evaluates/caches the prompt), mixed token-ID/text sequences or `prompt_string` objects, generated token IDs and native SSE stop events; multimodal prompt data is rejected explicitly |
+| `POST /completion` (also `/completions`) | llama-server native completion format, including `n_predict` (`-1` uses all context room and `0` only evaluates/caches the prompt), mixed token-ID/text sequences or `prompt_string` objects, generated token IDs, non-streaming `n_probs` token probabilities, and native SSE stop events; multimodal prompt data is rejected explicitly |
 | `POST /v1/chat/completions/input_tokens` (also `/chat/completions/input_tokens`) | render a chat request and count its input tokens without running the model |
 | `POST /tokenize`, `POST /detokenize` | llama-server-compatible text/token conversion, including `/tokenize`'s optional `with_pieces` output |
 | `POST /apply-template` | render messages with the model's embedded chat template without tokenizing or generating |
 | `GET /props` | llama-server-style model path, chat template and default generation settings |
+| `GET /slots` | llama-server-style status for each configured KV-cache slot; because requests are serialized, reported slots are idle |
+| `GET /metrics` | Prometheus counters when the server starts with `--metrics`; otherwise 501, as with llama-server's disabled endpoint |
+| `POST /props` | recognized as an optional llama-server endpoint and returns 501; mutable global properties are not enabled |
 | `GET /health` (also `/v1/health` and `/`) | `{"status": "ok"}` |
 | `OPTIONS` anything | `204`, for browser preflight |
 
@@ -237,19 +241,19 @@ Any other route returns `404` with an OpenAI-shaped error body.
 | `repeat_penalty` | llama.cpp-style repeat penalty over the prompt and the reply so far (an extension of the OpenAI API) |
 | `frequency_penalty`, `presence_penalty` | OpenAI-style penalties over the reply so far: the logit of a token drops by its count times the frequency penalty plus the presence penalty (default 0, may be negative) |
 | `logit_bias` | OpenAI token-ID-to-bias object; values from -100 to 100 are added to logits before penalties and sampling |
-| `tool_choice` | `"none"` leaves tools out; `"auto"` exposes all tools; `"required"` requires a non-empty tool list but is not yet grammar-enforced; a named function is validated and becomes the only tool exposed to the template |
+| `tool_choice` | `"none"` leaves tools out; `"auto"` exposes all tools; `"required"` grammar-enforces a valid `{name, arguments}` call; a named function becomes the only exposed tool and grammar-enforces an arguments object matching its schema |
 | `parallel_tool_calls` | boolean exposed to the chat template like llama-server, allowing templates which support it to enable or suppress multiple calls |
 | `stop` | a string or an array of strings; the reply is cut at the earliest match |
 | `stream` | `true` for server-sent events |
 | `stream_options.include_usage` | adds a final usage chunk to a stream |
-| `response_format` | `{"type":"text"}` and `{"type":"json_object"}` are accepted; JSON objects use token-level constrained decoding, while `json_schema` still returns 400 |
-| `logprobs`, `top_logprobs` | disabled forms (`false` or `0`) are accepted; effective requests return 400 because token probabilities are not serialized yet |
+| `response_format` | `{"type":"text"}`, `{"type":"json_object"}`, and OpenAI's `{"type":"json_schema", "json_schema":{"name", "schema", "strict"}}` form are accepted. JSON responses use token-level constrained decoding; a completed object and EOS are allowed only when the schema matches. |
+| `logprobs`, `top_logprobs` | non-streaming Chat requests support `logprobs: true` and return each generated token's full-vocabulary log-probability; `top_logprobs` may request 0–20 alternatives. Non-streaming text Completions support the legacy integer `logprobs` count from 0 to 5. Disabled Chat forms are accepted; streaming logprobs still return 400. |
 
 Other unknown fields are ignored for forward compatibility. A `null` or missing `content` (an assistant message that only carries tool calls) is read as an empty string, because templates do string operations on it. Only assistant messages may carry a non-empty `tool_calls` array; every call needs an id unique within that message, and every `tool` result needs the corresponding non-empty `tool_call_id`. An assistant message's `tool_calls[i].function.arguments` may be a JSON string (as OpenAI sends it) or an object; it is normalized for the template.
 
 ### Responses
 
-A non-streaming reply is a normal `chat.completion` object with `usage` filled in. When the model reasons (`<think>...</think>`, Qwen3's default), the reasoning is returned apart as `message.reasoning_content` (as llama.cpp and DeepSeek's API do) and `content` holds only the answer; the markers never appear in either. `finish_reason` is `tool_calls` when the reply contains tool calls, `stop` when the model ended or a stop string matched, and `length` when `max_tokens` or the context ran out.
+A non-streaming reply is a normal `chat.completion` object with `usage` filled in and `created` set to the request's Unix timestamp. Every chunk of one streamed reply carries that same timestamp. When the model reasons (`<think>...</think>`, Qwen3's default), the reasoning is returned apart as `message.reasoning_content` (as llama.cpp and DeepSeek's API do) and `content` holds only the answer; the markers never appear in either. `finish_reason` is `tool_calls` when the reply contains tool calls, `stop` when the model ended or a stop string matched, and `length` when `max_tokens` or the context ran out.
 
 ### Context overflow
 
@@ -279,7 +283,7 @@ The tool definitions are rendered by the model's own chat template, so each mode
 
 The server parses these blocks back into OpenAI `tool_calls` (id, type `function`, name, arguments as a JSON string). A block that is not valid JSON with a `name` stays in `content` verbatim rather than being dropped.
 
-Before generation, malformed values for the recognized JSON Schema keywords return 400 instead of silently weakening a tool contract. Before returning a call, the server then validates its function name and arguments against the supplied tool definition. The supported subset covers the structures used by OpenCode: objects, arrays, primitive `type` values, `properties`, `required`, boolean or schema-valued `additionalProperties`, `items`, `uniqueItems`, `enum`, `const`, `anyOf`, `oneOf`, `allOf` and `not`, plus basic length, property-count, item-count and inclusive or exclusive numeric bounds. Schema equality is structural (object key order is irrelevant, and `1` equals `1.0`); likewise, an integral JSON number such as `1.0` satisfies `type: "integer"`. Unknown schema keywords are left permissive. An invalid call remains visible as ordinary content instead of being executed as a tool call.
+Before generation, malformed values for the recognized JSON Schema keywords return 400 instead of silently weakening a tool contract. Before returning a call, the server then validates its function name and arguments against the supplied tool definition. The supported subset covers the structures used by OpenCode: boolean schemas; local `$defs`, legacy `definitions`, and `$ref` JSON Pointers (external references are rejected, and reference traversal is bounded); objects and arrays with `properties`, `required`, `dependentRequired`, `dependentSchemas`, `propertyNames`, boolean or schema-valued `additionalProperties`, `items`, `prefixItems`, `contains` with `minContains` / `maxContains`, and `uniqueItems`; primitive or array-valued `type`; `enum`, `const`, `anyOf`, `oneOf`, `allOf`, `not`, and conditional `if` / `then` / `else`; `multipleOf`; and basic length, property-count, item-count and inclusive or exclusive numeric bounds. Schema equality is structural (object key order is irrelevant, and `1` equals `1.0`); likewise, an integral JSON number such as `1.0` satisfies `type: "integer"`. Unknown schema keywords are left permissive. An invalid call remains visible as ordinary content instead of being executed as a tool call.
 
 Small models, especially under a long prompt, often get the closing braces wrong, because Qwen2.5's template shows its own example with doubled braces. When a strict parse fails, the parser takes the balanced object that starts at each of the first three `{` and keeps the first that is an object with a `name`. A legitimate nested `}}` inside an object is never touched, and trailing junk is ignored.
 

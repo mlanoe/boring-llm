@@ -369,7 +369,7 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
     let tok = load_tokenizer(file)
     (file, m, tok)
 
-def run_serve(string path, string model_name, int ctx_size, int max_tokens, int cache_slots, string prompt_cache_dir, int prompt_cache_files, int prompt_cache_max_mb, int port, SamplingParams params) throws:
+def run_serve(string path, string model_name, int ctx_size, int max_tokens, int cache_slots, string prompt_cache_dir, int prompt_cache_files, int prompt_cache_max_mb, int port, bool metrics_enabled, SamplingParams params) throws:
     guard cache_slots >= 1 else throw "--cache-slots must be at least 1"
     guard prompt_cache_files >= 1 else throw "--prompt-cache-files must be at least 1"
     guard prompt_cache_max_mb >= 0 else throw "--prompt-cache-max-mb must not be negative"
@@ -388,7 +388,7 @@ def run_serve(string path, string model_name, int ctx_size, int max_tokens, int 
             print "[serve] prompt cache: file {d.slot} holds {d.tokens.length} tokens"
         let cap = if prompt_cache_max_mb > 0: "{prompt_cache_max_mb} MB" else: "no size cap"
         print "[serve] prompt cache: {prompt_cache_dir} ({disk.length} snapshot(s), keeping up to {prompt_cache_files} files, {cap})"
-    let ctx = ServerCtx(file, tok, m, path, name, ctx_size, max_tokens, cache_slots, params, prompt_cache_dir, fp, prompt_cache_files, prompt_cache_max_mb * 1048576, bpt)
+    let ctx = ServerCtx(file, tok, m, path, name, ctx_size, max_tokens, cache_slots, params, prompt_cache_dir, fp, prompt_cache_files, prompt_cache_max_mb * 1048576, bpt, metrics_enabled)
     serve(ctx, port, disk)
 
 def run_render_request(GgufFile file, string path) throws:
@@ -458,6 +458,7 @@ def main() throws:
     var int prompt_cache_files = 2
     var int prompt_cache_max_mb = 4096
     var int requested_profile_stage = 0
+    var bool metrics_enabled = false
 
     var int i = 1
     while i < argv.length:
@@ -550,6 +551,9 @@ def main() throws:
         elif a == "--cache-slots" and i + 1 < argv.length:
             cache_slots = parse_int_arg("--cache-slots", argv[i + 1])
             i += 2
+        elif a == "--metrics":
+            metrics_enabled = true
+            i += 1
         elif a == "--decode-profile-stage" and i + 1 < argv.length:
             let stage = argv[i + 1]
             if stage == "qkv": requested_profile_stage = 1
@@ -567,7 +571,7 @@ def main() throws:
         else:
             i += 1
 
-    guard gguf_path != "" else throw "usage: --gguf <path.gguf> [--dump-metadata] [--tokens 1,2,3 [--gpu|--quantized]] [--generate-tokens 1,2,3 --max-tokens N] [--prompt \"...\"|--chat [--system \"...\"] [--max-tokens N] [--kv-cache] [--temperature T --top-k K --top-p P --min-p P --seed S --repeat-penalty R --repeat-last-n N]|--serve [--port N] [--ctx-size N] [--cache-slots N] [--prompt-cache DIR [--prompt-cache-files N] [--prompt-cache-max-mb N]] [--kquant-prefill tensor|handwritten] [--decode-profile-stage STAGE] [--model-name NAME] [--max-tokens N default per request]]"
+    guard gguf_path != "" else throw "usage: --gguf <path.gguf> [--dump-metadata] [--tokens 1,2,3 [--gpu|--quantized]] [--generate-tokens 1,2,3 --max-tokens N] [--prompt \"...\"|--chat [--system \"...\"] [--max-tokens N] [--kv-cache] [--temperature T --top-k K --top-p P --min-p P --seed S --repeat-penalty R --repeat-last-n N]|--serve [--port N] [--ctx-size N] [--cache-slots N] [--metrics] [--prompt-cache DIR [--prompt-cache-files N] [--prompt-cache-max-mb N]] [--kquant-prefill tensor|handwritten] [--decode-profile-stage STAGE] [--model-name NAME] [--max-tokens N default per request]]"
 
     set_decode_profile_stage(requested_profile_stage)
 
@@ -576,7 +580,7 @@ def main() throws:
         # weight quantized GPU path, with the model loaded once up front and
         # kept resident for every request. Handled before the generic parse
         # below (which would also be fine now: no mode holds the file in memory).
-        run_serve(gguf_path, model_name, ctx_size, max_tokens, cache_slots, prompt_cache_dir, prompt_cache_files, prompt_cache_max_mb, port, SamplingParams(temperature, top_k, top_p, min_p, seed, repeat_penalty, repeat_last_n))
+        run_serve(gguf_path, model_name, ctx_size, max_tokens, cache_slots, prompt_cache_dir, prompt_cache_files, prompt_cache_max_mb, port, metrics_enabled, SamplingParams(temperature, top_k, top_p, min_p, seed, repeat_penalty, repeat_last_n))
         return
 
     print "[diag] parsing {gguf_path}..."

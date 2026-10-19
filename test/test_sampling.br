@@ -7,6 +7,16 @@ def main() throws:
     # --- sample_greedy: plain argmax ---
     assert_eq(sample_greedy([1.0, 5.0, 3.0, -2.0], 4), 1)
 
+    # --- exact full-vocabulary log-softmax, used by OpenAI logprobs ---
+    let equal_logprob = token_logprob([0.0, 0.0], 2, 0)
+    assert(equal_logprob < -0.69 as float32 and equal_logprob > -0.70 as float32, "equal logits logprob: {equal_logprob}")
+    let high_logprob = token_logprob([0.0, 2.0], 2, 1)
+    let low_logprob = token_logprob([0.0, 2.0], 2, 0)
+    assert(high_logprob > low_logprob, "higher logit has higher logprob")
+    let (lp_maximum, lp_sum) = logprob_normalizer([0.0, 2.0], 2)
+    assert_eq(normalized_token_logprob([0.0, 2.0], 1, lp_maximum, lp_sum), high_logprob)
+    assert_eq(sampling_logits([2.0, -2.0], [0], 2.0 as float32, 64), apply_repeat_penalty([2.0, -2.0], [0], 2.0 as float32, 64))
+
     # --- RNG: deterministic (same seed -> same sequence), in-range ---
     let rng_a = seed_rng(42)
     let rng_b = seed_rng(42)
