@@ -30,6 +30,10 @@ def main() throws:
     assert_eq(bytes_to_str([0xF0 as uint8, 0x9F as uint8, 0x98 as uint8, 0x80 as uint8]), "😀")
     assert_eq(bytes_to_str([0x80 as uint8, 66 as uint8]), "{fffd}B")
     assert_eq(bytes_to_str([0xE6 as uint8, 0x97 as uint8, 0xA5 as uint8]), "日")
+    assert_eq(add_configured_special_tokens([4, 5], 1, 2, true, false, true), [1, 4, 5])
+    assert_eq(add_configured_special_tokens([4, 5], 1, 2, false, true, true), [4, 5, 2])
+    assert_eq(add_configured_special_tokens([4, 5], 1, 2, true, true, true), [1, 4, 5, 2])
+    assert_eq(add_configured_special_tokens([4, 5], 1, 2, true, true, false), [4, 5])
 
     # --- byte-to-unicode: space (32) -> U+0120 'Ġ'; 'A' (65) -> identity ---
     let b2u = build_byte_to_unicode()
@@ -80,7 +84,7 @@ def main() throws:
     reverse[5] = "e"
     reverse[6] = byte_to_uni[0xC3]
     reverse[999] = "<SPECIAL>"
-    let tok = Tokenizer(vocab, reverse, {=}, byte_to_uni, uni_to_byte, 0, 0, false, false, [], [], special)
+    let tok = Tokenizer(vocab, reverse, {=}, byte_to_uni, uni_to_byte, 0, 0, false, false, false, [], [], special)
     let ids = tok.encode_with_specials("hi<SPECIAL>bye")
     assert_eq(ids.length, 6)
     assert_eq(ids[0], 1)
@@ -91,7 +95,7 @@ def main() throws:
     assert_eq(ids[5], 5)
     assert_eq(tok.decode(ids), "hi<SPECIAL>bye" as string)
     assert_eq(tok.encode_completion_prompt("hi")[0], 1 as int)
-    let tok_bos = Tokenizer(vocab, reverse, {=}, byte_to_uni, uni_to_byte, 42, 0, true, false, [], [], special)
+    let tok_bos = Tokenizer(vocab, reverse, {=}, byte_to_uni, uni_to_byte, 42, 0, true, false, false, [], [], special)
     let bos_ids = tok_bos.encode_completion_prompt("hi")
     assert_eq(bos_ids.length, 3 as int)
     assert_eq(bos_ids[0], 42 as int)
@@ -111,7 +115,7 @@ def main() throws:
     mut {string=int} overlapping = {=}
     overlapping["<a>"] = 900
     overlapping["<ab>"] = 901
-    let tok2 = Tokenizer({=}, {=}, {=}, byte_to_uni, uni_to_byte, 0, 0, false, false, [], [], overlapping)
+    let tok2 = Tokenizer({=}, {=}, {=}, byte_to_uni, uni_to_byte, 0, 0, false, false, false, [], [], overlapping)
     let ids2 = tok2.encode_with_specials("<ab>")
     assert_eq(ids2.length, 1)
     assert_eq(ids2[0], 901)

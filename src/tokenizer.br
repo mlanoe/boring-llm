@@ -28,6 +28,20 @@ use gguf
 use io
 use jinja
 
+pub [int] add_configured_special_tokens([int] ids, int bos_token_id, int eos_token_id,
+                                         bool tokenizer_adds_bos, bool tokenizer_adds_eos,
+                                         bool add_special):
+    if not add_special or (not tokenizer_adds_bos and not tokenizer_adds_eos):
+        return ids
+    mut [int] with_specials = []
+    if tokenizer_adds_bos:
+        with_specials.push(bos_token_id)
+    for id in ids:
+        with_specials.push(id)
+    if tokenizer_adds_eos:
+        with_specials.push(eos_token_id)
+    with_specials
+
 pub struct Tokenizer:
     {string=int} vocab
     {int=string} reverse
@@ -37,6 +51,7 @@ pub struct Tokenizer:
     int bos_token_id
     int eos_token_id
     bool add_bos_token       # tokenizer.ggml.add_bos_token; raw string prompts honor it
+    bool add_eos_token       # tokenizer.ggml.add_eos_token; `/tokenize` add_special honors it
     bool is_spm             # true = SentencePiece (Llama/Mistral), false = GPT-2/Qwen2 BPE
     [float32] scores        # SentencePiece per-token merge priority (empty when is_spm is false)
     [int] byte_token_id     # SentencePiece byte-fallback: raw byte value -> "<0xXX>" token id (-1 if absent)
@@ -195,12 +210,8 @@ pub struct Tokenizer:
     # arrays bypass this helper, so clients retain exact control of their ids.
     req [int] encode_completion_prompt(string text):
         let ids = self.encode_with_specials(text)
-        if not self.add_bos_token:
-            return ids
-        mut [int] with_bos = [self.bos_token_id]
-        for id in ids:
-            with_bos.push(id)
-        with_bos
+        add_configured_special_tokens(ids, self.bos_token_id, self.eos_token_id,
+                                      self.add_bos_token, self.add_eos_token, true)
 
     req [int] encode_bpe(string text):
         mut [int] ids = []
@@ -666,6 +677,7 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
     let bos = gguf_get_int(file.metadata, "tokenizer.ggml.bos_token_id") else 0
     let eos = gguf_get_int(file.metadata, "tokenizer.ggml.eos_token_id") else 0
     let add_bos = gguf_get_bool(file.metadata, "tokenizer.ggml.add_bos_token") else false
+    let add_eos = gguf_get_bool(file.metadata, "tokenizer.ggml.add_eos_token") else false
 
     let byte_to_uni = build_byte_to_unicode()
     let uni_to_byte = build_unicode_to_byte()
@@ -692,7 +704,7 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
             special_tokens[tokens[ti]] = ti
         ti += 1
 
-    Tokenizer(vocab, reverse, merge_rank, byte_to_uni, uni_to_byte, bos, eos, add_bos, is_spm, scores, byte_token_id, special_tokens)
+    Tokenizer(vocab, reverse, merge_rank, byte_to_uni, uni_to_byte, bos, eos, add_bos, add_eos, is_spm, scores, byte_token_id, special_tokens)
 
 # Builds the full prompt token sequence for a chat turn using the GGUF's
 # own embedded `tokenizer.chat_template` (any architecture, any template —

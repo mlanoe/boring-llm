@@ -2,11 +2,11 @@
 """Protocol smoke test for `main --serve` (stdlib only, no model-quality claims).
 
 Checks the OpenAI wire format an OpenAI-compatible client (OpenCode, the Vercel
-AI SDK, curl) relies on: /v1/models, a plain chat completion, an SSE stream
-(role chunk .. finish chunk .. usage chunk .. [DONE]) that really arrives token by token, error shapes (404, bad
-JSON, missing messages, context exceeded), and a tool-calling round trip's
-JSON shape. Generation is real, so it is slow (seconds per request); keep
-`max_tokens` small.
+AI SDK, curl) relies on: /v1/models, Chat Completions and Responses in buffered
+and SSE forms, a Chat stream that really arrives token by token, error shapes
+(404, bad JSON, missing messages, context exceeded), and a tool-calling round
+trip's JSON shape. Generation is real, so it is slow (seconds per request);
+keep token limits small.
 
 Usage:
     tools/smoke_server.py [http://127.0.0.1:8080 [ctx_size]]   # ctx_size: the server's --ctx-size (default 4096)
@@ -86,8 +86,17 @@ s, h, b = call("/v1/health")
 check("GET /v1/health", s == 200 and json.loads(b).get("status") == "ok", b)
 s, h, b = call("/props")
 props = json.loads(b)
+props_defaults = props.get("default_generation_settings", {})
 check("GET /props exposes llama-server diagnostics", s == 200 and props.get("model_path")
-      and props.get("chat_template") and props.get("default_generation_settings", {}).get("n_ctx") == CTX, b)
+      and props.get("chat_template") and props.get("build_info") == "boring-llm"
+      and props_defaults.get("n_ctx") == CTX
+      and props_defaults.get("id") == 0 and props_defaults.get("id_task") == -1
+      and props_defaults.get("speculative") is False and props_defaults.get("is_processing") is False
+      and props_defaults.get("prompt") == ""
+      and props_defaults.get("next_token", {}).get("n_remain")
+      == props_defaults.get("params", {}).get("max_tokens")
+      and props_defaults.get("params", {}).get("samplers")
+      == ["dry", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"], b)
 
 count_body = {"model": model_id, "messages": [{"role": "user", "content": "Say hi."}], "chat_template_kwargs": NO_THINK}
 s, h, b = call("/v1/chat/completions/input_tokens", count_body)
@@ -121,6 +130,47 @@ check("chat completion shape", s == 200 and r["object"] == "chat.completion" and
       and ch["finish_reason"] in ("stop", "length") and r["usage"]["total_tokens"] == r["usage"]["prompt_tokens"] + r["usage"]["completion_tokens"], b)
 check("content-type is JSON", h.get("Content-Type", "").startswith("application/json"))
 
+responses_body = {"model": model_id, "input": "Say hi.", "store": False,
+                  "metadata": {"smoke": "responses"},
+                  "reasoning": {"effort": "none"}, "max_output_tokens": 8, "temperature": 0}
+s, h, b = call("/v1/responses", responses_body)
+response = json.loads(b)
+response_messages = [item for item in response.get("output", []) if item.get("type") == "message"]
+response_text = "".join(part.get("text", "") for item in response_messages for part in item.get("content", []))
+check("Responses buffered shape", s == 200 and response.get("object") == "response"
+      and response.get("status") in ("completed", "incomplete") and response_messages
+      and response.get("metadata") == {"smoke": "responses"}
+      and response.get("input") == "Say hi."
+      and response.get("max_output_tokens") == 8 and response.get("temperature") == 0
+      and response.get("store") is False and response.get("truncation") == "disabled"
+      and response.get("created_at", 0) <= response.get("completed_at", 0)
+      and response.get("usage", {}).get("total_tokens") == response.get("usage", {}).get("input_tokens", 0)
+      + response.get("usage", {}).get("output_tokens", 0), b)
+
+s, h, b = call("/responses", dict(responses_body, stream=True))
+responses_events = []
+for block in b.split("\n\n"):
+    lines = [line for line in block.splitlines() if line]
+    event_name = next((line[len("event: "):] for line in lines if line.startswith("event: ")), None)
+    data = next((line[len("data: "):] for line in lines if line.startswith("data: ")), None)
+    if event_name and data:
+        responses_events.append((event_name, json.loads(data)))
+response_deltas = [event.get("delta", "") for name, event in responses_events
+                   if name == "response.output_text.delta"]
+response_terminals = [(name, event) for name, event in responses_events
+                      if name in ("response.completed", "response.incomplete")]
+check("Responses SSE lifecycle", s == 200 and h.get("Content-Type", "").startswith("text/event-stream")
+      and len(responses_events) >= 2 and responses_events[0][0] == "response.created"
+      and responses_events[1][0] == "response.in_progress"
+      and responses_events[0][1].get("response", {}).get("metadata") == {"smoke": "responses"}
+      and responses_events[0][1].get("response", {}).get("input") == "Say hi."
+      and responses_events[0][1].get("response", {}).get("max_output_tokens") == 8
+      and any(name == "response.output_item.added" for name, _ in responses_events)
+      and any(name == "response.output_item.done" for name, _ in responses_events)
+      and len(response_terminals) == 1 and "[DONE]" not in b, b)
+check("Responses SSE deltas rebuild buffered text", "".join(response_deltas) == response_text,
+      f"{''.join(response_deltas)!r} vs {response_text!r}")
+
 completion_body = {"model": model_id, "prompt": "The capital of France is", "max_tokens": 8, "temperature": 0}
 s, h, b = call("/v1/completions", completion_body)
 classic = json.loads(b)
@@ -142,14 +192,18 @@ check("legacy text completion streams", s == 200 and classic_events[-1] == "data
       and all(c.get("object") == "text_completion" for c in classic_chunks)
       and "".join(c["choices"][0]["text"] for c in classic_choice_chunks) == classic["choices"][0]["text"], b)
 check("legacy text completion stream includes usage", len(classic_usage_chunks) == 1
-      and classic_usage_chunks[0]["usage"] == classic["usage"], b)
+      and classic_usage_chunks[0]["usage"]["prompt_tokens"] == classic["usage"]["prompt_tokens"]
+      and classic_usage_chunks[0]["usage"]["completion_tokens"] == classic["usage"]["completion_tokens"]
+      and classic_usage_chunks[0]["usage"]["total_tokens"] == classic["usage"]["total_tokens"], b)
 
-native_body = {"prompt": completion_body["prompt"], "n_predict": 8, "temperature": 0}
+native_body = {"prompt": completion_body["prompt"], "n_predict": 8, "temperature": 0, "return_tokens": True}
 s, h, b = call("/completion", native_body)
 native = json.loads(b)
 check("llama native completion shape", s == 200 and native.get("content") == classic["choices"][0]["text"]
       and native.get("tokens_predicted") == 8 and len(native.get("tokens", [])) == 8
-      and native.get("stop_type") in ("eos", "word", "limit"), b)
+      and native.get("stop_type") in ("eos", "word", "limit")
+      and "generation_settings" in native and isinstance(native.get("prompt"), str)
+      and isinstance(native.get("has_new_line"), bool), b)
 s, h, b = call("/completion", {"prompt": "cache this prompt", "n_predict": 0})
 native_zero = json.loads(b)
 check("llama native zero-token completion", s == 200 and native_zero.get("content") == ""
@@ -162,11 +216,19 @@ s, h, b = call("/completion", dict(native_body, prompt={"prompt_string": complet
 object_native = json.loads(b)
 check("llama native completion accepts prompt_string objects", s == 200
       and object_native.get("content") == native.get("content"), b)
-s, h, b = call("/completions", dict(native_body, stream=True))
+s, h, b = call("/completions", dict(native_body, stream=True, timings_per_token=True))
 native_events = [json.loads(e[len("data: "):]) for e in b.split("\n\n") if e.strip()]
 check("llama native completion streams", s == 200 and native_events[-1].get("stop") is True
       and "".join(e.get("content", "") for e in native_events) == native["content"]
-      and sum(len(e.get("tokens", [])) for e in native_events) == len(native["tokens"]), b)
+      and sum(len(e.get("tokens", [])) for e in native_events) == len(native["tokens"])
+      and all("timings" in e for e in native_events if e.get("content")), b)
+s, h, b = call("/completion", dict(native_body, n_predict=0, stream=True, return_progress=True))
+progress_events = [json.loads(e[len("data: "):]) for e in b.split("\n\n") if e.strip()]
+progress = [e["prompt_progress"] for e in progress_events if "prompt_progress" in e]
+check("llama native completion streams prompt progress", s == 200 and len(progress) >= 1
+      and progress[-1]["processed"] == progress[-1]["total"]
+      and progress[-1]["cache"] <= progress[-1]["processed"]
+      and progress[-1]["time_ms"] >= 0, b)
 
 s, h, b = call("/v1/chat/completions", {"model": model_id, "stream": True, "stream_options": {"include_usage": True},
                                           "messages": [{"role": "user", "content": "Say hi."}], "max_tokens": 8, "temperature": 0, "chat_template_kwargs": NO_THINK})
@@ -234,8 +296,16 @@ s, h, b = call("/v1/chat/completions", {"model": 7, "messages": [{"role": "user"
 check("400 on non-string model", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
 s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 0})
 check("400 on invalid generation parameter", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
+s, h, b = call("/completion", {"prompt": "hi", "n_predict": 0, "min_keep": -1})
+check("400 on invalid min_keep", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
 s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "n": 2})
 check("400 on unsupported multiple choices", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
+s, h, b = call("/v1/responses", {"model": model_id, "input": "hi", "metadata": {"attempt": 1}})
+check("400 on non-string Responses metadata",
+      s == 400 and json.loads(b)["error"]["code"] == "invalid_request", b)
+s, h, b = call("/v1/responses", {"model": model_id, "input": "hi", "truncation": "auto"})
+check("400 on unsupported Responses truncation",
+      s == 400 and json.loads(b)["error"]["code"] == "invalid_request", b)
 s, h, b = call("/v1/chat/completions", {"model": model_id,
                                          "messages": [{"role": "user", "content": 'Return exactly {"ok":true} and no prose.'}],
                                          "response_format": {"type": "json_object"}, "temperature": 0,
@@ -248,18 +318,40 @@ except (TypeError, json.JSONDecodeError):
 check("constrained JSON-object response", s == 200 and isinstance(structured_value, dict), b)
 s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "json"}],
                                          "response_format": {"type": "json_schema"}, "max_tokens": 1})
-check("400 on unsupported JSON Schema response format", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter"
-      and "constrained decoding" in json.loads(b)["error"]["message"], b)
+check("400 on JSON Schema response without a schema", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter"
+      and "schema" in json.loads(b)["error"]["message"], b)
+s, h, b = call("/completion", {"prompt": "json", "json_schema": "object", "n_predict": 1})
+check("400 on invalid native JSON Schema", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
+s, h, b = call("/completion", {"prompt": "grammar", "grammar": 'root ::= "ok"', "n_predict": 1})
+check("400 on unsupported native grammar", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter"
+      and "not supported" in json.loads(b)["error"]["message"], b)
 s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "hi"}],
                                          "logprobs": True, "top_logprobs": 3, "max_tokens": 1})
-check("400 on unsupported requested logprobs", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter"
-      and "logprobs" in json.loads(b)["error"]["message"], b)
+logprob_response = json.loads(b)
+logprob_content = logprob_response.get("choices", [{}])[0].get("logprobs", {}).get("content", [])
+check("Chat completion logprobs", s == 200 and len(logprob_content) == 1
+      and isinstance(logprob_content[0].get("logprob"), (int, float))
+      and len(logprob_content[0].get("top_logprobs", [])) == 3, b)
 s, h, b = call("/v1/completions", {"model": model_id, "prompt": [0, "bad"], "max_tokens": 1})
 check("400 on invalid completion prompt tokens", s == 400 and json.loads(b)["error"]["code"] == "invalid_prompt", b)
 s, h, b = call("/v1/completions", {"model": model_id, "prompt": [1 << 30], "max_tokens": 1})
 check("400 on out-of-vocabulary completion token", s == 400 and json.loads(b)["error"]["code"] == "invalid_prompt_token", b)
 s, h, b = call("/completion", {"prompt": {"prompt_string": "look", "multimodal_data": ["AA=="]}, "n_predict": 1})
 check("400 on unsupported multimodal native prompt", s == 400 and json.loads(b)["error"]["code"] == "unsupported_multimodal_prompt", b)
+s, h, b = call("/completion", {"prompt": "slot", "n_predict": 0, "id_slot": 2})
+check("native completion honors id_slot", s == 200 and json.loads(b).get("id_slot") == 2, b)
+s, h, b = call("/completion", {"prompt": "slot", "n_predict": 0, "id_slot": 999})
+check("400 on out-of-range native slot", s == 400 and json.loads(b)["error"]["code"] == "invalid_slot_id", b)
+s, h, b = call("/completion", {"prompt": "slot", "n_predict": 0, "cache_prompt": 1})
+check("400 on invalid cache_prompt", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
+s, h, b = call("/completion", {"prompt": "slot", "n_predict": 0, "return_tokens": 1})
+check("400 on invalid return_tokens", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
+s, h, b = call("/completion", {"prompt": "slot", "n_predict": 0, "t_max_predict_ms": -2})
+check("400 on invalid prediction timeout", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
+s, h, b = call("/completion", {"prompt": "slot", "n_predict": 0, "return_progress": 1})
+check("400 on invalid return_progress", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
+s, h, b = call("/completion", {"prompt": "slot", "n_predict": 0, "timings_per_token": 1})
+check("400 on invalid timings_per_token", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
 status, b = raw_http(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: nope\r\n\r\n")
 check("400 on invalid Content-Length", status == 400 and json.loads(b)["error"]["code"] == "malformed_http_request", b)
 status, b = raw_http(b"BROKEN\r\n\r\n")

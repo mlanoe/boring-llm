@@ -22,10 +22,54 @@ bool jv_is_list(JValue v):
         JList(items): true
         _: false
 
+bool jv_is_dict(JValue v):
+    match v:
+        JDict(fields, keys): true
+        _: false
+
 bool jv_is_str(JValue v):
     match v:
         JStr(s): true
         _: false
+
+pub int sampler_order_rank(string name):
+    if name == "penalties": 0
+    elif name == "dry": 1
+    elif name == "top_n_sigma": 2
+    elif name == "top_k": 3
+    elif name == "typ_p" or name == "typical_p": 4
+    elif name == "top_p": 5
+    elif name == "min_p": 6
+    elif name == "xtc": 7
+    elif name == "temperature" or name == "temp": 8
+    else: -1
+
+pub string sampler_list_validation_error([string] names):
+    var int previous_rank = -1
+    for name in names:
+        let rank = sampler_order_rank(name)
+        if rank < 0: return "unsupported sampler `{name}`"
+        if rank <= previous_rank: return "samplers must follow llama.cpp's canonical order without duplicates"
+        previous_rank = rank
+    ""
+
+pub [string] request_samplers(JValue body, [string] defaults):
+    var [string] names = defaults
+    match json_get(body, "samplers"):
+        JList(items):
+            names = []
+            for item in items:
+                match item:
+                    JStr(name): names.push(name)
+                    _: true
+        _: true
+    names
+
+pub bool sampler_enabled([string] names, string wanted):
+    let wanted_rank = sampler_order_rank(wanted)
+    for name in names:
+        if sampler_order_rank(name) == wanted_rank: return true
+    false
 
 bool jv_is_bool(JValue v):
     match v:
@@ -104,15 +148,41 @@ pub JValue jv_set(JValue d, string key, JValue value):
             JValue.JDict(nf, nk)
         _: d
 
+# llama-server's native `response_fields` projects a completion response onto
+# a caller-selected set of fields. Slash-separated paths are looked up in
+# nested objects and flattened under their final component at the root.
+pub string native_response_fields_json(string response, JValue requested) throws:
+    match requested:
+        JList(items):
+            let source = json_parse(response)
+            var JValue out = JValue.JDict({=}, [])
+            for item in items:
+                match item:
+                    JStr(path):
+                        let parts = path.split("/")
+                        var JValue value = source.clone()
+                        for part in parts:
+                            value = json_get(value, part)
+                        if not request_value_is_undefined(value):
+                            out = jv_set(out, parts[parts.length - 1], value)
+                    _: true
+            jv_to_json(out)
+        _: response
+
 # Template variables derived from the OpenAI request. llama-server exposes
 # `reasoning_effort` directly to the Jinja template. Qwen3 templates predate
 # that name and read `enable_thinking`, so effort `none` also supplies false
 # unless the caller explicitly set that lower-level variable.
-pub JValue chat_template_variables(JValue body):
-    let raw = json_get(body, "chat_template_kwargs")
-    var JValue out = match raw:
-        JDict(fields, keys): raw.clone()
+pub JValue chat_template_variables_with_defaults(JValue body, JValue defaults):
+    var JValue out = match defaults:
+        JDict(fields, keys): defaults.clone()
         _: JValue.JDict({=}, [])
+    let raw = json_get(body, "chat_template_kwargs")
+    match raw:
+        JDict(fields, keys):
+            for key in keys:
+                out = jv_set(out, key, fields[key])
+        _: true
     let effort = json_get(body, "reasoning_effort")
     if jv_is_str(effort):
         out = jv_set(out, "reasoning_effort", effort)
@@ -123,6 +193,21 @@ pub JValue chat_template_variables(JValue body):
         JBool(enabled): out = jv_set(out, "parallel_tool_calls", JValue.JBool(enabled))
         _: true
     out
+
+pub JValue chat_template_variables(JValue body):
+    chat_template_variables_with_defaults(body, JValue.JDict({=}, []))
+
+pub JValue chat_template_variables_default(JValue body, string server_default):
+    chat_template_variables_server_default(body, JValue.JDict({=}, []), server_default)
+
+pub JValue chat_template_variables_server_default(JValue body, JValue server_kwargs, string server_default):
+    if server_default == "" or server_default == "default" or not request_value_is_undefined(json_get(body, "reasoning_effort")):
+        return chat_template_variables_with_defaults(body, server_kwargs)
+    var JValue defaults = server_kwargs.clone()
+    defaults = jv_set(defaults, "reasoning_effort", JValue.JStr(server_default))
+    if server_default == "none" and request_value_is_undefined(json_get(defaults, "enable_thinking")):
+        defaults = jv_set(defaults, "enable_thinking", JValue.JBool(false))
+    chat_template_variables_with_defaults(body, defaults)
 
 # ── Prompt-prefix reuse ──────────────────────────────────────────────────
 
@@ -200,6 +285,407 @@ pub [JValue] normalize_messages([JValue] messages) throws:
                 calls.push(normalize_tool_call(c))
             nm = jv_set(nm, "tool_calls", JValue.JList(calls))
         out.push(nm)
+    out
+
+JValue text_message(string role, string content):
+    var JValue message = JValue.JDict({=}, [])
+    message = jv_set(message, "role", JValue.JStr(role))
+    jv_set(message, "content", JValue.JStr(content))
+
+string anthropic_text_content(JValue content):
+    match content:
+        JStr(text): text
+        JList(parts):
+            var string out = ""
+            for part in parts:
+                out = "{out}{json_get_str(part, "text", "")}"
+            out
+        _: ""
+
+string anthropic_tool_result_text(JValue content):
+    match content:
+        JStr(text): text
+        JList(parts): anthropic_text_content(content)
+        _: ""
+
+pub string anthropic_input_validation_error(JValue body):
+    let system = json_get(body, "system")
+    if not request_value_is_undefined(system):
+        match system:
+            JStr(text): true
+            JList(parts):
+                for part in parts:
+                    if json_get_str(part, "type", "") != "text" or not jv_is_str(json_get(part, "text")):
+                        return "Anthropic `system` only supports text blocks"
+            _: return "Anthropic `system` must be a string or an array of text blocks"
+    match json_get(body, "messages"):
+        JList(messages):
+            if messages.length == 0: return "Anthropic `messages` must not be empty"
+            mut [string] tool_ids = []
+            for message in messages:
+                let role = json_get_str(message, "role", "")
+                if role != "user" and role != "assistant": return "Anthropic message role `{role}` is not supported"
+                match json_get(message, "content"):
+                    JStr(text): true
+                    JList(parts):
+                        for part in parts:
+                            let kind = json_get_str(part, "type", "")
+                            if kind == "text":
+                                if not jv_is_str(json_get(part, "text")): return "an Anthropic text block must contain string `text`"
+                            elif kind == "tool_use" and role == "assistant":
+                                let id = json_get_str(part, "id", "")
+                                if id == "": return "an Anthropic tool_use block must have a non-empty `id`"
+                                if tool_ids.contains(id): return "Anthropic tool_use ids must be unique"
+                                if json_get_str(part, "name", "") == "": return "an Anthropic tool_use block must have a non-empty `name`"
+                                if not jv_is_dict(json_get(part, "input")): return "an Anthropic tool_use block must contain object `input`"
+                                tool_ids.push(id)
+                            elif kind == "tool_result" and role == "user":
+                                let id = json_get_str(part, "tool_use_id", "")
+                                if id == "" or not tool_ids.contains(id): return "an Anthropic tool_result must reference a preceding tool_use id"
+                                match json_get(part, "content"):
+                                    JStr(text): true
+                                    JList(result_parts):
+                                        for result_part in result_parts:
+                                            if json_get_str(result_part, "type", "") != "text" or not jv_is_str(json_get(result_part, "text")):
+                                                return "Anthropic tool_result content currently supports only text blocks"
+                                    _: return "Anthropic tool_result `content` must be a string or an array of text blocks"
+                            else: return "Anthropic `{kind}` content is not supported for role `{role}`"
+                    _: return "Anthropic message `content` must be a string or an array of text blocks"
+        _: return "Anthropic `messages` is required and must be an array"
+    match json_get(body, "tools"):
+        JUndefined: true
+        JList(tools):
+            for tool in tools:
+                if json_get_str(tool, "name", "") == "": return "every Anthropic tool must have a non-empty `name`"
+                if request_value_is_undefined(json_get(tool, "input_schema")): return "every Anthropic tool must have an `input_schema`"
+        _: return "Anthropic `tools` must be an array"
+    let choice = json_get(body, "tool_choice")
+    if not request_value_is_undefined(choice):
+        match choice:
+            JDict(fields, keys):
+                let kind = json_get_str(choice, "type", "")
+                if kind != "auto" and kind != "any" and kind != "none" and kind != "tool": return "Anthropic `tool_choice.type` must be auto, any, none, or tool"
+                if kind == "tool" and json_get_str(choice, "name", "") == "": return "Anthropic named tool choice requires a non-empty `name`"
+                let disable_parallel = json_get(choice, "disable_parallel_tool_use")
+                if not request_value_is_undefined(disable_parallel) and not jv_is_bool(disable_parallel):
+                    return "Anthropic `tool_choice.disable_parallel_tool_use` must be a boolean"
+            _: return "Anthropic `tool_choice` must be an object"
+    ""
+
+pub JValue anthropic_chat_body(JValue body):
+    var JValue out = body.clone()
+    mut [JValue] messages = []
+    let system_text = anthropic_text_content(json_get(body, "system"))
+    if system_text != "": messages.push(text_message("system", system_text))
+    for message in json_get_list(body, "messages"):
+        let role = json_get_str(message, "role", "")
+        let content = json_get(message, "content")
+        if role == "assistant" and jv_is_list(content):
+            var JValue converted = text_message("assistant", anthropic_text_content(content))
+            mut [JValue] calls = []
+            for part in json_get_list(message, "content"):
+                if json_get_str(part, "type", "") == "tool_use":
+                    var JValue function = JValue.JDict({=}, [])
+                    function = jv_set(function, "name", json_get(part, "name"))
+                    function = jv_set(function, "arguments", json_get(part, "input"))
+                    var JValue call = JValue.JDict({=}, [])
+                    call = jv_set(call, "id", json_get(part, "id"))
+                    call = jv_set(call, "type", JValue.JStr("function"))
+                    calls.push(jv_set(call, "function", function))
+            if calls.length > 0: converted = jv_set(converted, "tool_calls", JValue.JList(calls))
+            messages.push(converted)
+        elif role == "user" and jv_is_list(content):
+            let text = anthropic_text_content(content)
+            if text != "": messages.push(text_message("user", text))
+            var bool had_result = false
+            for part in json_get_list(message, "content"):
+                if json_get_str(part, "type", "") == "tool_result":
+                    var JValue result = text_message("tool", anthropic_tool_result_text(json_get(part, "content")))
+                    result = jv_set(result, "tool_call_id", json_get(part, "tool_use_id"))
+                    messages.push(result)
+                    had_result = true
+            if text == "" and not had_result: messages.push(text_message("user", ""))
+        else:
+            messages.push(text_message(role, anthropic_text_content(content)))
+    out = jv_set(out, "messages", JValue.JList(messages))
+    mut [JValue] tools = []
+    for tool in json_get_list(body, "tools"):
+        var JValue function = JValue.JDict({=}, [])
+        function = jv_set(function, "name", json_get(tool, "name"))
+        if not request_value_is_undefined(json_get(tool, "description")):
+            function = jv_set(function, "description", json_get(tool, "description"))
+        function = jv_set(function, "parameters", json_get(tool, "input_schema"))
+        var JValue wrapped = JValue.JDict({=}, [])
+        wrapped = jv_set(wrapped, "type", JValue.JStr("function"))
+        tools.push(jv_set(wrapped, "function", function))
+    out = jv_set(out, "tools", JValue.JList(tools))
+    let choice = json_get(body, "tool_choice")
+    if not request_value_is_undefined(choice):
+        let kind = json_get_str(choice, "type", "")
+        if kind == "any": out = jv_set(out, "tool_choice", JValue.JStr("required"))
+        elif kind == "auto": out = jv_set(out, "tool_choice", JValue.JStr("auto"))
+        elif kind == "none": out = jv_set(out, "tool_choice", JValue.JStr("none"))
+        elif kind == "tool":
+            var JValue function = JValue.JDict({=}, [])
+            function = jv_set(function, "name", json_get(choice, "name"))
+            var JValue named = JValue.JDict({=}, [])
+            named = jv_set(named, "type", JValue.JStr("function"))
+            out = jv_set(out, "tool_choice", jv_set(named, "function", function))
+        if json_get_bool(choice, "disable_parallel_tool_use", false):
+            out = jv_set(out, "parallel_tool_calls", JValue.JBool(false))
+    out
+
+pub string responses_input_validation_error(JValue body):
+    let instructions = json_get(body, "instructions")
+    if not request_value_is_undefined(instructions) and not jv_is_str(instructions):
+        return "`instructions` must be a string"
+    let store = json_get(body, "store")
+    if not request_value_is_undefined(store):
+        match store:
+            JBool(enabled):
+                if enabled: return "stored Responses are not supported; use `store: false`"
+            _: return "`store` must be a boolean"
+    let background = json_get(body, "background")
+    if not request_value_is_undefined(background):
+        match background:
+            JBool(enabled):
+                if enabled: return "background Responses are not supported"
+            _: return "`background` must be a boolean"
+    if not request_value_is_undefined(json_get(body, "previous_response_id")):
+        return "`previous_response_id` is not supported because Responses are not stored"
+    if not request_value_is_undefined(json_get(body, "conversation")):
+        return "stored Responses conversations are not supported"
+    let truncation = json_get(body, "truncation")
+    if not request_value_is_undefined(truncation):
+        match truncation:
+            JStr(mode):
+                if mode == "auto":
+                    return "automatic Responses truncation is not supported; use `truncation: disabled`"
+                if mode != "disabled":
+                    return "`truncation` must be auto or disabled"
+            _: return "`truncation` must be a string"
+    let prompt_cache_key = json_get(body, "prompt_cache_key")
+    if not request_value_is_undefined(prompt_cache_key) and not jv_is_str(prompt_cache_key):
+        return "`prompt_cache_key` must be a string"
+    let metadata = json_get(body, "metadata")
+    if not request_value_is_undefined(metadata):
+        match metadata:
+            JDict(fields, keys):
+                if keys.length > 16:
+                    return "`metadata` must not contain more than 16 entries"
+                for key in keys:
+                    if key.chars().length > 64:
+                        return "`metadata` keys must not exceed 64 characters"
+                    let value = fields[key] else JValue.JUndefined
+                    match value:
+                        JStr(text):
+                            if text.chars().length > 512:
+                                return "`metadata` values must not exceed 512 characters"
+                        _: return "`metadata` values must be strings"
+            _: return "`metadata` must be an object"
+    let include = json_get(body, "include")
+    if not request_value_is_undefined(include):
+        match include:
+            JList(items):
+                for item in items:
+                    if not jv_is_str(item): return "`include` must contain only strings"
+            _: return "`include` must be an array"
+    let reasoning = json_get(body, "reasoning")
+    if not request_value_is_undefined(reasoning):
+        match reasoning:
+            JDict(fields, keys):
+                let effort = json_get(reasoning, "effort")
+                if not request_value_is_undefined(effort) and not jv_is_str(effort):
+                    return "`reasoning.effort` must be a string"
+                let summary = json_get(reasoning, "summary")
+                if not request_value_is_undefined(summary) and not jv_is_str(summary):
+                    return "`reasoning.summary` must be a string"
+            _: return "`reasoning` must be an object"
+    let text = json_get(body, "text")
+    if not request_value_is_undefined(text):
+        match text:
+            JDict(fields, keys):
+                let verbosity = json_get(text, "verbosity")
+                if not request_value_is_undefined(verbosity):
+                    match verbosity:
+                        JStr(level):
+                            if level != "low" and level != "medium" and level != "high":
+                                return "`text.verbosity` must be low, medium, or high"
+                        _: return "`text.verbosity` must be a string"
+                let format = json_get(text, "format")
+                if not request_value_is_undefined(format) and not jv_is_dict(format):
+                    return "`text.format` must be an object"
+            _: return "`text` must be an object"
+    match json_get(body, "input"):
+        JStr(text): true
+        JList(items):
+            if items.length == 0: return "`input` must not be empty"
+            mut [string] call_ids = []
+            for item in items:
+                match item:
+                    JDict(fields, keys):
+                        let item_type = json_get_str(item, "type", "message")
+                        if item_type == "message":
+                            let role = json_get_str(item, "role", "")
+                            if role != "system" and role != "developer" and role != "user" and role != "assistant":
+                                return "Responses message role `{role}` is not supported"
+                            match json_get(item, "content"):
+                                JStr(text): true
+                                JList(parts):
+                                    for part in parts:
+                                        let part_type = json_get_str(part, "type", "")
+                                        if part_type != "input_text" and part_type != "output_text" and part_type != "text":
+                                            return "Responses content part type `{part_type}` is not supported"
+                                        if not jv_is_str(json_get(part, "text")):
+                                            return "a Responses text content part must contain a string `text`"
+                                _: return "Responses message `content` must be a string or an array of text parts"
+                        elif item_type == "function_call":
+                            let call_id = json_get_str(item, "call_id", "")
+                            if call_id == "":
+                                return "a Responses function call must have a non-empty `call_id`"
+                            if call_ids.contains(call_id):
+                                return "Responses function call ids must be unique"
+                            if json_get_str(item, "name", "") == "":
+                                return "a Responses function call must have a non-empty `name`"
+                            if not jv_is_str(json_get(item, "arguments")):
+                                return "Responses function call `arguments` must be a JSON string"
+                            call_ids.push(call_id)
+                        elif item_type == "function_call_output":
+                            let call_id = json_get_str(item, "call_id", "")
+                            if call_id == "":
+                                return "a Responses function output must have a non-empty `call_id`"
+                            if not call_ids.contains(call_id):
+                                return "Responses function output must reference a preceding function call"
+                            match json_get(item, "output"):
+                                JStr(text): true
+                                JList(parts):
+                                    for part in parts:
+                                        if json_get_str(part, "type", "") != "input_text":
+                                            return "Responses function output content only supports `input_text`"
+                                        if not jv_is_str(json_get(part, "text")):
+                                            return "a Responses function output text part must contain a string `text`"
+                                _: return "Responses function call `output` must be a string or an array of text parts"
+                        else:
+                            return "Responses input item type `{item_type}` is not supported"
+                    _: return "Responses `input` items must be message objects"
+        _: return "`input` is required and must be a string or an array of messages"
+    let tools = json_get(body, "tools")
+    if not request_value_is_undefined(tools):
+        match tools:
+            JList(items):
+                for tool in items:
+                    if json_get_str(tool, "type", "") != "function":
+                        return "only Responses function tools are supported"
+                    if json_get_str(tool, "name", "") == "":
+                        return "every Responses function tool must have a non-empty `name`"
+                    let parameters = json_get(tool, "parameters")
+                    if not request_value_is_undefined(parameters):
+                        let invalid = tool_schema_validation_error(parameters)
+                        if invalid != "": return invalid
+            _: return "`tools` must be an array"
+    let choice = json_get(body, "tool_choice")
+    if not request_value_is_undefined(choice):
+        match choice:
+            JStr(name):
+                if name != "auto" and name != "none" and name != "required":
+                    return "Responses `tool_choice` must be auto, none, required, or a named function"
+            JDict(fields, keys):
+                if json_get_str(choice, "type", "") != "function" or json_get_str(choice, "name", "") == "":
+                    return "a named Responses `tool_choice` requires type function and a non-empty name"
+                var bool found = false
+                for tool in json_get_list(body, "tools"):
+                    if json_get_str(tool, "name", "") == json_get_str(choice, "name", ""): found = true
+                if not found: return "named Responses `tool_choice` does not match a supplied function"
+            _: return "Responses `tool_choice` must be a string or object"
+    ""
+
+pub [JValue] responses_input_messages(JValue body):
+    mut [JValue] messages = []
+    let instructions = json_get_str(body, "instructions", "")
+    if instructions != "": messages.push(text_message("system", instructions))
+    match json_get(body, "input"):
+        JStr(text): messages.push(text_message("user", text))
+        JList(items):
+            for item in items:
+                let item_type = json_get_str(item, "type", "message")
+                if item_type == "function_call":
+                    var JValue function = JValue.JDict({=}, [])
+                    function = jv_set(function, "name", JValue.JStr(json_get_str(item, "name", "")))
+                    function = jv_set(function, "arguments", JValue.JStr(json_get_str(item, "arguments", "")))
+                    var JValue call = JValue.JDict({=}, [])
+                    call = jv_set(call, "id", JValue.JStr(json_get_str(item, "call_id", "")))
+                    call = jv_set(call, "type", JValue.JStr("function"))
+                    call = jv_set(call, "function", function)
+                    var JValue message = text_message("assistant", "")
+                    message = jv_set(message, "tool_calls", JValue.JList([call]))
+                    messages.push(message)
+                elif item_type == "function_call_output":
+                    var JValue message = text_message("tool", content_to_text(json_get(item, "output")))
+                    message = jv_set(message, "tool_call_id", JValue.JStr(json_get_str(item, "call_id", "")))
+                    messages.push(message)
+                else:
+                    messages.push(text_message(json_get_str(item, "role", "user"), content_to_text(json_get(item, "content"))))
+        _: true
+    messages
+
+pub [JValue] responses_input_tools(JValue body):
+    mut [JValue] tools = []
+    let choice = json_get(body, "tool_choice")
+    if json_get_str(body, "tool_choice", "") == "none": return tools
+    let selected = if jv_is_str(json_get(choice, "name")): json_get_str(choice, "name", "") else: ""
+    for tool in json_get_list(body, "tools"):
+        if selected != "" and json_get_str(tool, "name", "") != selected:
+            continue
+        var JValue function = JValue.JDict({=}, [])
+        function = jv_set(function, "name", JValue.JStr(json_get_str(tool, "name", "")))
+        let description = json_get(tool, "description")
+        if jv_is_str(description): function = jv_set(function, "description", description)
+        let parameters = json_get(tool, "parameters")
+        if not request_value_is_undefined(parameters): function = jv_set(function, "parameters", parameters)
+        var JValue wrapped = JValue.JDict({=}, [])
+        wrapped = jv_set(wrapped, "type", JValue.JStr("function"))
+        wrapped = jv_set(wrapped, "function", function)
+        tools.push(wrapped)
+    tools
+
+# Normalize the overlapping Responses generation fields to the Chat
+# Completions dialect used by the inference path. The original fields remain
+# present as harmless forward-compatible extras; the canonical fields below
+# are the ones generation consumes.
+pub JValue responses_chat_body(JValue body):
+    var JValue out = body.clone()
+    # Preserve the public Responses spelling before replacing these fields
+    # with the wrapped Chat Completions representation used by generation.
+    out = jv_set(out, "responses_tools", json_get(body, "tools"))
+    out = jv_set(out, "responses_tool_choice", json_get(body, "tool_choice"))
+    out = jv_set(out, "messages", JValue.JList(responses_input_messages(body)))
+    out = jv_set(out, "tools", JValue.JList(responses_input_tools(body)))
+    let max_output = json_get(body, "max_output_tokens")
+    if not request_value_is_undefined(max_output):
+        out = jv_set(out, "max_completion_tokens", max_output)
+    let effort = json_get(json_get(body, "reasoning"), "effort")
+    if jv_is_str(effort):
+        out = jv_set(out, "reasoning_effort", effort)
+    let format = json_get(json_get(body, "text"), "format")
+    if not request_value_is_undefined(format):
+        if json_get_str(format, "type", "") == "json_schema":
+            var JValue response_format = JValue.JDict({=}, [])
+            response_format = jv_set(response_format, "type", JValue.JStr("json_schema"))
+            response_format = jv_set(response_format, "json_schema", format)
+            out = jv_set(out, "response_format", response_format)
+        else:
+            out = jv_set(out, "response_format", format)
+    let choice = json_get(body, "tool_choice")
+    match choice:
+        JDict(fields, keys):
+            if json_get_str(choice, "type", "") == "function":
+                var JValue function = JValue.JDict({=}, [])
+                function = jv_set(function, "name", JValue.JStr(json_get_str(choice, "name", "")))
+                var JValue chat_choice = JValue.JDict({=}, [])
+                chat_choice = jv_set(chat_choice, "type", JValue.JStr("function"))
+                chat_choice = jv_set(chat_choice, "function", function)
+                out = jv_set(out, "tool_choice", chat_choice)
+        _: true
     out
 
 # Resolve a JSON Pointer inside one schema document.  Tool contracts are data,
@@ -955,19 +1441,19 @@ bool tool_schema_matches_root(JValue root, JValue schema, JValue value, int ref_
 
 # The response-format schema uses the same JSON Schema subset as tool
 # arguments. A token remains eligible while its decoded text is a viable JSON
-# object prefix. Once it closes an object, it must already satisfy the schema;
-# EOS is likewise available only for a complete matching object. This is the
+# value prefix. Once it completes a value, it must already satisfy the schema;
+# EOS is likewise available only for a complete matching value. This is the
 # safe common denominator for arbitrary tokenizer pieces (including pieces
 # that split UTF-8 characters).
 pub bool json_schema_decoded_candidate_allowed(JValue schema, string decoded_before, string decoded_after, bool is_eos):
     if is_eos:
-        if json_object_prefix_state(decoded_before) != 1:
+        if json_prefix_state(decoded_before) != 1:
             return false
         let complete = try? json_parse(decoded_before)
         if let value = complete:
             return tool_schema_matches(schema, value)
         return false
-    let state = json_object_prefix_state(decoded_after)
+    let state = json_prefix_state(decoded_after)
     if state < 0:
         return false
     if state == 1:
@@ -977,10 +1463,35 @@ pub bool json_schema_decoded_candidate_allowed(JValue schema, string decoded_bef
         return false
     true
 
+# A closed container/string/literal cannot become a different JSON value by
+# appending another non-whitespace token, so the sampler can finish eagerly.
+# A root number is different: `1` may still grow into `123`, `1.5` or `1e3`.
+# Keep EOS as an ordinary allowed candidate instead of forcing it immediately.
+pub bool json_schema_should_stop(JValue schema, string decoded):
+    if json_prefix_state(decoded) != 1:
+        return false
+    let parsed = try? json_parse(decoded)
+    guard let value = parsed else return false
+    if not tool_schema_matches(schema, value):
+        return false
+    not jv_is_number(value)
+
 pub JValue response_json_schema(JValue body):
+    let native_schema = json_get(body, "json_schema")
+    if not request_value_is_undefined(native_schema):
+        if jv_is_dict(native_schema) and jv_to_json(native_schema) == "{{}}":
+            var JValue object_schema = JValue.JDict({=}, [])
+            object_schema = jv_set(object_schema, "type", JValue.JStr("object"))
+            return object_schema
+        return native_schema
     let response_format = json_get(body, "response_format")
-    if json_get_str(response_format, "type", "") == "json_schema":
-        return json_get(json_get(response_format, "json_schema"), "schema")
+    let format_type = json_get_str(response_format, "type", "")
+    if format_type == "json_schema":
+        let envelope = json_get(response_format, "json_schema")
+        if not request_value_is_undefined(envelope):
+            return json_get(envelope, "schema")
+    if format_type == "json_schema" or format_type == "json_object":
+        return json_get(response_format, "schema")
     JValue.JUndefined
 
 bool tool_call_matches(ParsedToolCall call, [JValue] tools):
@@ -1098,6 +1609,18 @@ pub string request_validation_error(JValue body):
         let v = json_get_float(body, "temperature", 0.0)
         if v < 0.0 or v > 2.0:
             return "`temperature` must be between 0 and 2"
+    let dynatemp_range = json_get(body, "dynatemp_range")
+    if not request_value_is_undefined(dynatemp_range):
+        if not jv_is_number(dynatemp_range):
+            return "`dynatemp_range` must be a number"
+        if json_get_float(body, "dynatemp_range", 0.0) < 0.0:
+            return "`dynatemp_range` must be non-negative"
+    let dynatemp_exponent = json_get(body, "dynatemp_exponent")
+    if not request_value_is_undefined(dynatemp_exponent):
+        if not jv_is_number(dynatemp_exponent):
+            return "`dynatemp_exponent` must be a number"
+        if json_get_float(body, "dynatemp_exponent", 1.0) <= 0.0:
+            return "`dynatemp_exponent` must be positive"
     let tp = json_get(body, "top_p")
     if not request_value_is_undefined(tp):
         if not jv_is_number(tp):
@@ -1105,6 +1628,24 @@ pub string request_validation_error(JValue body):
         let v = json_get_float(body, "top_p", 1.0)
         if v <= 0.0 or v > 1.0:
             return "`top_p` must be greater than 0 and at most 1"
+    let typical = json_get(body, "typical_p")
+    if not request_value_is_undefined(typical):
+        if not jv_is_number(typical):
+            return "`typical_p` must be a number"
+        let v = json_get_float(body, "typical_p", 1.0)
+        if v <= 0.0 or v > 1.0:
+            return "`typical_p` must be greater than 0 and at most 1"
+    let top_n_sigma = json_get(body, "top_n_sigma")
+    if not request_value_is_undefined(top_n_sigma) and not jv_is_number(top_n_sigma):
+        return "`top_n_sigma` must be a number"
+    for key in ["xtc_probability", "xtc_threshold"]:
+        let value = json_get(body, key)
+        if not request_value_is_undefined(value):
+            if not jv_is_number(value):
+                return "`{key}` must be a number"
+            let numeric = json_get_float(body, key, 0.0)
+            if numeric < 0.0 or numeric > 1.0:
+                return "`{key}` must be between 0 and 1"
     let mp = json_get(body, "min_p")
     if not request_value_is_undefined(mp):
         if not jv_is_number(mp):
@@ -1112,12 +1653,23 @@ pub string request_validation_error(JValue body):
         let v = json_get_float(body, "min_p", 0.0)
         if v < 0.0 or v > 1.0:
             return "`min_p` must be between 0 and 1"
+    let min_keep = json_get(body, "min_keep")
+    if not request_value_is_undefined(min_keep):
+        match min_keep:
+            JInt(value):
+                if value < 0:
+                    return "`min_keep` must be a non-negative integer"
+            _: return "`min_keep` must be an integer"
+    let n_indent = json_get(body, "n_indent")
+    if not request_value_is_undefined(n_indent):
+        match n_indent:
+            JInt(value):
+                if value < 0: return "`n_indent` must be a non-negative integer"
+            _: return "`n_indent` must be an integer"
     let tk = json_get(body, "top_k")
     if not request_value_is_undefined(tk):
         match tk:
-            JInt(n):
-                if n < 0:
-                    return "`top_k` must not be negative"
+            JInt(n): true
             _:
                 return "`top_k` must be an integer"
     let seed = json_get(body, "seed")
@@ -1140,12 +1692,88 @@ pub string request_validation_error(JValue body):
             return "`repeat_penalty` must be a number"
         if json_get_float(body, "repeat_penalty", 1.0) <= 0.0:
             return "`repeat_penalty` must be greater than 0"
+    let rln = json_get(body, "repeat_last_n")
+    if not request_value_is_undefined(rln):
+        match rln:
+            JInt(n):
+                if n < -1:
+                    return "`repeat_last_n` must be -1 or greater"
+            _: return "`repeat_last_n` must be an integer"
+    let samplers = json_get(body, "samplers")
+    if not request_value_is_undefined(samplers):
+        match samplers:
+            JList(items):
+                var int previous_rank = -1
+                for item in items:
+                    match item:
+                        JStr(name):
+                            let rank = sampler_order_rank(name)
+                            if rank < 0: return "unsupported sampler `{name}`"
+                            if rank <= previous_rank:
+                                return "`samplers` must follow llama.cpp's canonical order"
+                            previous_rank = rank
+                        _: return "`samplers` must be an array of strings"
+            _: return "`samplers` must be an array of strings"
+    let dry_multiplier = json_get(body, "dry_multiplier")
+    if not request_value_is_undefined(dry_multiplier):
+        if not jv_is_number(dry_multiplier):
+            return "`dry_multiplier` must be a number"
+        if json_get_float(body, "dry_multiplier", 0.0) < 0.0:
+            return "`dry_multiplier` must be non-negative"
+    let dry_base = json_get(body, "dry_base")
+    if not request_value_is_undefined(dry_base) and not jv_is_number(dry_base):
+        return "`dry_base` must be a number"
+    for key in ["dry_allowed_length", "dry_penalty_last_n"]:
+        let value = json_get(body, key)
+        if not request_value_is_undefined(value):
+            match value:
+                JInt(n):
+                    if n < 0: return "`{key}` must be a non-negative integer"
+                _: return "`{key}` must be an integer"
+    let dry_breakers = json_get(body, "dry_sequence_breakers")
+    if not request_value_is_undefined(dry_breakers):
+        match dry_breakers:
+            JList(items):
+                if items.length == 0:
+                    return "`dry_sequence_breakers` must be a non-empty array of strings"
+                for item in items:
+                    match item:
+                        JStr(value):
+                            if value == "": return "`dry_sequence_breakers` entries must not be empty"
+                        _: return "`dry_sequence_breakers` must be a non-empty array of strings"
+            _: return "`dry_sequence_breakers` must be a non-empty array of strings"
+    let mirostat = json_get(body, "mirostat")
+    if not request_value_is_undefined(mirostat):
+        match mirostat:
+            JInt(mode):
+                if mode < 0 or mode > 2: return "`mirostat` must be 0, 1, or 2"
+            _: return "`mirostat` must be an integer"
+    for key in ["mirostat_tau", "mirostat_eta"]:
+        let value = json_get(body, key)
+        if not request_value_is_undefined(value):
+            if not jv_is_number(value): return "`{key}` must be a number"
+            if json_get_float(body, key, 0.0) <= 0.0: return "`{key}` must be positive"
+    let adaptive_target = json_get(body, "adaptive_target")
+    if not request_value_is_undefined(adaptive_target):
+        if not jv_is_number(adaptive_target): return "`adaptive_target` must be a number"
+        let value = json_get_float(body, "adaptive_target", -1.0)
+        if value > 1.0: return "`adaptive_target` must be at most 1"
+    let adaptive_decay = json_get(body, "adaptive_decay")
+    if not request_value_is_undefined(adaptive_decay):
+        if not jv_is_number(adaptive_decay): return "`adaptive_decay` must be a number"
+        let value = json_get_float(body, "adaptive_decay", 0.9)
+        if value < 0.0 or value > 0.99: return "`adaptive_decay` must be between 0 and 0.99"
+    if json_get_int(body, "mirostat", 0) != 0 and json_get_float(body, "adaptive_target", -1.0) >= 0.0:
+        return "`mirostat` and `adaptive_target` cannot be enabled together"
 
     let stream_value = json_get(body, "stream")
     if not request_value_is_undefined(stream_value):
         match stream_value:
             JBool(b): true
             _: return "`stream` must be a boolean"
+    let ignore_eos = json_get(body, "ignore_eos")
+    if not request_value_is_undefined(ignore_eos) and not jv_is_bool(ignore_eos):
+        return "`ignore_eos` must be a boolean"
     let stream_options = json_get(body, "stream_options")
     if not request_value_is_undefined(stream_options):
         match stream_options:
@@ -1175,12 +1803,70 @@ pub string request_validation_error(JValue body):
     let reasoning_effort = json_get(body, "reasoning_effort")
     if not request_value_is_undefined(reasoning_effort) and not jv_is_str(reasoning_effort):
         return "`reasoning_effort` must be a string"
+    let reasoning_format = json_get(body, "reasoning_format")
+    if not request_value_is_undefined(reasoning_format):
+        match reasoning_format:
+            JStr(format):
+                if format != "auto" and format != "deepseek" and format != "deepseek-legacy" and format != "none":
+                    return "`reasoning_format` must be one of auto, deepseek, deepseek-legacy, or none"
+            _: return "`reasoning_format` must be a string"
     let parallel_tool_calls = json_get(body, "parallel_tool_calls")
     if not request_value_is_undefined(parallel_tool_calls):
         match parallel_tool_calls:
             JBool(enabled): true
             _: return "`parallel_tool_calls` must be a boolean"
+    let cache_prompt = json_get(body, "cache_prompt")
+    if not request_value_is_undefined(cache_prompt) and not jv_is_bool(cache_prompt):
+        return "`cache_prompt` must be a boolean"
+    let return_tokens = json_get(body, "return_tokens")
+    if not request_value_is_undefined(return_tokens) and not jv_is_bool(return_tokens):
+        return "`return_tokens` must be a boolean"
+    let predict_timeout = json_get(body, "t_max_predict_ms")
+    if not request_value_is_undefined(predict_timeout):
+        match predict_timeout:
+            JInt(value):
+                if value < -1:
+                    return "`t_max_predict_ms` must be -1 or a non-negative integer"
+            _: return "`t_max_predict_ms` must be an integer"
+    let return_progress = json_get(body, "return_progress")
+    if not request_value_is_undefined(return_progress) and not jv_is_bool(return_progress):
+        return "`return_progress` must be a boolean"
+    let timings_per_token = json_get(body, "timings_per_token")
+    if not request_value_is_undefined(timings_per_token) and not jv_is_bool(timings_per_token):
+        return "`timings_per_token` must be a boolean"
+    let sse_ping_interval = json_get(body, "sse_ping_interval")
+    if not request_value_is_undefined(sse_ping_interval):
+        match sse_ping_interval:
+            JInt(value):
+                if value < -1: return "`sse_ping_interval` must be -1 or a non-negative integer"
+            _: return "`sse_ping_interval` must be an integer"
+    let post_sampling_probs = json_get(body, "post_sampling_probs")
+    if not request_value_is_undefined(post_sampling_probs) and not jv_is_bool(post_sampling_probs):
+        return "`post_sampling_probs` must be a boolean"
+    let response_fields = json_get(body, "response_fields")
+    if not request_value_is_undefined(response_fields):
+        match response_fields:
+            JList(items):
+                for item in items:
+                    match item:
+                        JStr(path):
+                            if path == "" or path.startsWith("/") or path.endsWith("/") or path.contains("//"):
+                                return "`response_fields` entries must be non-empty field paths"
+                        _: return "`response_fields` must be an array of strings"
+            _: return "`response_fields` must be an array of strings"
     let response_format = json_get(body, "response_format")
+    let native_schema = json_get(body, "json_schema")
+    if not request_value_is_undefined(native_schema):
+        let invalid = tool_schema_validation_error(native_schema)
+        if invalid != "":
+            return "`json_schema` is invalid: {invalid}"
+    let grammar = json_get(body, "grammar")
+    if not request_value_is_undefined(grammar):
+        match grammar:
+            JStr(value):
+                if value != "" and request_value_is_undefined(native_schema):
+                    return "native `grammar` is not supported; use `json_schema` or `response_format`"
+            _: return "`grammar` must be a string"
     if not request_value_is_undefined(response_format):
         match response_format:
             JDict(fields, keys):
@@ -1189,33 +1875,46 @@ pub string request_validation_error(JValue body):
                     return "`response_format.type` is required and must be a string"
                 if format_type != "text" and format_type != "json_object" and format_type != "json_schema":
                     return "`response_format.type` `{format_type}` requires constrained decoding, which is not supported"
+                let direct_schema = json_get(response_format, "schema")
+                if format_type == "json_object" and not request_value_is_undefined(direct_schema):
+                    let invalid = tool_schema_validation_error(direct_schema)
+                    if invalid != "":
+                        return "`response_format.schema` is invalid: {invalid}"
                 if format_type == "json_schema":
                     let json_schema = json_get(response_format, "json_schema")
-                    match json_schema:
-                        JDict(schema_fields, schema_keys):
-                            let name = json_get(json_schema, "name")
-                            if not jv_is_str(name) or json_get_str(json_schema, "name", "") == "":
-                                return "`response_format.json_schema.name` must be a non-empty string"
-                            let strict = json_get(json_schema, "strict")
-                            if not request_value_is_undefined(strict) and not jv_is_bool(strict):
-                                return "`response_format.json_schema.strict` must be a boolean"
-                            let schema = json_get(json_schema, "schema")
-                            let invalid = tool_schema_validation_error(schema)
-                            if invalid != "":
-                                return "`response_format.json_schema.schema` is invalid: {invalid}"
-                        _: return "`response_format.json_schema` must be an object"
+                    if request_value_is_undefined(json_schema):
+                        if request_value_is_undefined(direct_schema):
+                            return "`response_format.json_schema` or `response_format.schema` is required"
+                        let invalid = tool_schema_validation_error(direct_schema)
+                        if invalid != "":
+                            return "`response_format.schema` is invalid: {invalid}"
+                    else:
+                        match json_schema:
+                            JDict(schema_fields, schema_keys):
+                                let name = json_get(json_schema, "name")
+                                if not jv_is_str(name) or json_get_str(json_schema, "name", "") == "":
+                                    return "`response_format.json_schema.name` must be a non-empty string"
+                                let strict = json_get(json_schema, "strict")
+                                if not request_value_is_undefined(strict) and not jv_is_bool(strict):
+                                    return "`response_format.json_schema.strict` must be a boolean"
+                                let schema = json_get(json_schema, "schema")
+                                let invalid = tool_schema_validation_error(schema)
+                                if invalid != "":
+                                    return "`response_format.json_schema.schema` is invalid: {invalid}"
+                            _: return "`response_format.json_schema` must be an object"
             _: return "`response_format` must be an object"
     let logprobs = json_get(body, "logprobs")
     if not request_value_is_undefined(logprobs):
         match logprobs:
             JBool(enabled):
                 if enabled and json_get_bool(body, "stream", false):
-                    return "streaming `logprobs` are not supported yet"
+                    if json_get_str(body, "reasoning_format", "auto") != "none":
+                        return "streaming Chat `logprobs` require `reasoning_format: none`"
+                    if json_get_list(body, "tools").length > 0 and not tools_disabled(body):
+                        return "streaming Chat `logprobs` require tools to be absent or `tool_choice: none`"
             JInt(count):
                 if count < 0 or count > 5:
                     return "integer `logprobs` must be between 0 and 5"
-                if json_get_bool(body, "stream", false):
-                    return "streaming `logprobs` are not supported yet"
             _: return "`logprobs` must be a boolean or integer"
     let top_logprobs = json_get(body, "top_logprobs")
     if not request_value_is_undefined(top_logprobs):
@@ -1232,38 +1931,344 @@ pub string request_validation_error(JValue body):
             JInt(count):
                 if count < 0 or count > 20:
                     return "`n_probs` must be between 0 and 20"
-                if count > 0 and json_get_bool(body, "stream", false):
-                    return "streaming `n_probs` are not supported yet"
             _: return "`n_probs` must be an integer"
     let logit_bias = json_get(body, "logit_bias")
     if not request_value_is_undefined(logit_bias):
         match logit_bias:
             JDict(fields, keys):
                 for key in keys:
-                    guard let token = (key as int) else return "`logit_bias` keys must be token IDs"
-                    if token < 0:
-                        return "`logit_bias` keys must be non-negative token IDs"
+                    if key == "": return "native `logit_bias` text keys must not be empty"
                     let value = fields[key] else JValue.JUndefined
-                    if not jv_is_number(value):
-                        return "`logit_bias` values must be numbers"
                     let bias = match value:
                         JInt(n): n as float
                         JFloat(f): f
+                        JBool(enabled):
+                            if enabled: return "native `logit_bias` boolean values may only be false"
+                            -100.0
                         _: 0.0
+                    if not jv_is_number(value) and not jv_is_bool(value):
+                        return "native `logit_bias` values must be numbers or false"
                     if bias < -100.0 or bias > 100.0:
-                        return "`logit_bias` values must be between -100 and 100"
-            _: return "`logit_bias` must be an object"
+                        return "native `logit_bias` values must be between -100 and 100"
+            JList(items):
+                for item in items:
+                    match item:
+                        JList(pair):
+                            if pair.length != 2: return "native `logit_bias` entries must be [token_id, bias] pairs"
+                            match pair[0]:
+                                JInt(token): true
+                                JStr(text):
+                                    if text == "": return "native `logit_bias` text entries must not be empty"
+                                _: return "native `logit_bias` entries require a token ID or text"
+                            match pair[1]:
+                                JInt(n):
+                                    if n < -100 or n > 100: return "native `logit_bias` values must be between -100 and 100"
+                                JFloat(f):
+                                    if f < -100.0 or f > 100.0: return "native `logit_bias` values must be between -100 and 100"
+                                JBool(enabled):
+                                    if enabled: return "native `logit_bias` boolean values may only be false"
+                                _: return "native `logit_bias` values must be numbers or false"
+                        _: return "native `logit_bias` entries must be [token_id, bias] pairs"
+            _: return "`logit_bias` must be an object or an array of pairs"
+    ""
+
+# `logprobs` has two incompatible OpenAI spellings: Chat uses a boolean plus
+# `top_logprobs`, while legacy Text Completions uses an integer count.  Native
+# llama-server requests use `n_probs` instead.  Keep the common validator
+# usable by small unit tests, then reject fields that the selected endpoint
+# would otherwise accept and silently ignore.
+pub string endpoint_request_validation_error(JValue body, bool is_chat, bool is_native):
+    let invalid = request_validation_error(body)
+    if invalid != "":
+        return invalid
+    let logprobs = json_get(body, "logprobs")
+    let lora = json_get(body, "lora")
+    if not request_value_is_undefined(lora):
+        match lora:
+            JList(items):
+                if items.length > 0:
+                    return "per-request LoRA adapters are not supported because no adapters are loaded"
+            _: return "`lora` must be an array"
+    if not is_chat:
+        for key in ["tools", "tool_choice", "parallel_tool_calls", "chat_template_kwargs", "reasoning_effort", "reasoning_format"]:
+            if not request_value_is_undefined(json_get(body, key)):
+                return "non-chat completions do not support `{key}`"
+    if not is_native:
+        match json_get(body, "logit_bias"):
+            JList(items): return "OpenAI endpoints require `logit_bias` to be an object"
+            JDict(fields, keys):
+                for key in keys:
+                    guard let token = (key as int) else return "OpenAI `logit_bias` keys must be token IDs"
+                    if token < 0: return "OpenAI `logit_bias` keys must be non-negative token IDs"
+                    let value = fields[key] else JValue.JUndefined
+                    if not jv_is_number(value): return "OpenAI `logit_bias` values must be numbers"
+            _: true
+        for key in ["id_slot", "return_tokens", "return_progress", "timings_per_token"]:
+            if not request_value_is_undefined(json_get(body, key)):
+                return "OpenAI endpoints do not support native `{key}`"
+    if is_chat:
+        if not request_value_is_undefined(json_get(body, "n_keep")) or not request_value_is_undefined(json_get(body, "n_discard")) or not request_value_is_undefined(json_get(body, "n_cache_reuse")):
+            return "Chat completions do not support native context-shift options"
+        if not request_value_is_undefined(json_get(body, "n_cmpl")):
+            return "Chat completions use `n`, not native `n_cmpl`"
+        if not request_value_is_undefined(json_get(body, "post_sampling_probs")):
+            return "Chat completions do not support native `post_sampling_probs`"
+        if not request_value_is_undefined(json_get(body, "response_fields")):
+            return "Chat completions do not support native `response_fields`"
+        if not request_value_is_undefined(logprobs) and not jv_is_bool(logprobs):
+            return "Chat `logprobs` must be a boolean"
+        if not request_value_is_undefined(json_get(body, "n_probs")):
+            return "Chat completions do not support `n_probs`; use `logprobs` and `top_logprobs`"
+    elif is_native:
+        for key in ["n", "max_completion_tokens", "stream_options"]:
+            if not request_value_is_undefined(json_get(body, key)):
+                return "native completions do not support OpenAI `{key}`"
+        for key in ["n_keep", "n_discard", "n_cache_reuse"]:
+            let value = json_get(body, key)
+            if not request_value_is_undefined(value):
+                match value:
+                    JInt(count):
+                        if count != 0:
+                            return "native `{key}` requires context shifting, which is not supported"
+                    _: return "native `{key}` must be an integer"
+        let n_cmpl = json_get(body, "n_cmpl")
+        if not request_value_is_undefined(n_cmpl):
+            match n_cmpl:
+                JInt(value):
+                    if value != 1:
+                        return "native `n_cmpl` must be 1; multiple completions are not supported"
+                _: return "native `n_cmpl` must be an integer"
+        if not request_value_is_undefined(logprobs):
+            return "native completions do not support `logprobs`; use `n_probs`"
+        if not request_value_is_undefined(json_get(body, "top_logprobs")):
+            return "native completions do not support `top_logprobs`; use `n_probs`"
+        let id_slot = json_get(body, "id_slot")
+        if not request_value_is_undefined(id_slot):
+            match id_slot:
+                JInt(value):
+                    if value < -1:
+                        return "native `id_slot` must be -1 or a non-negative integer"
+                _: return "native `id_slot` must be an integer"
+    else:
+        if not request_value_is_undefined(json_get(body, "n_keep")) or not request_value_is_undefined(json_get(body, "n_discard")) or not request_value_is_undefined(json_get(body, "n_cache_reuse")):
+            return "Text Completions do not support native context-shift options"
+        if not request_value_is_undefined(json_get(body, "n_cmpl")):
+            return "Text Completions use `n`, not native `n_cmpl`"
+        if not request_value_is_undefined(json_get(body, "post_sampling_probs")):
+            return "Text Completions do not support native `post_sampling_probs`"
+        if not request_value_is_undefined(json_get(body, "response_fields")):
+            return "Text Completions do not support native `response_fields`"
+        if not request_value_is_undefined(logprobs) and jv_is_bool(logprobs):
+            return "Text Completion `logprobs` must be an integer"
+        if not request_value_is_undefined(json_get(body, "top_logprobs")):
+            return "Text Completions use the integer `logprobs` field, not `top_logprobs`"
+        if not request_value_is_undefined(json_get(body, "n_probs")):
+            return "Text Completions do not support `n_probs`; use integer `logprobs`"
     ""
 
 # Truncates `text` at the earliest occurrence of any non-empty stop string.
-pub (string, bool) apply_stop(string text, [string] stops):
+pub (string, bool, string) apply_stop_with_word(string text, [string] stops):
     var string out = text
     var bool stopped = false
+    var string stopping_word = ""
     for s in stops:
-        if s != "" and out.contains(s):
-            out = out.split(s)[0]
-            stopped = true
+        if s != "" and text.contains(s):
+            let candidate = text.split(s)[0]
+            if not stopped or candidate.chars().length < out.chars().length:
+                out = candidate
+                stopped = true
+                stopping_word = s
+    (out, stopped, stopping_word)
+
+pub (string, bool) apply_stop(string text, [string] stops):
+    let (out, stopped, stopping_word) = apply_stop_with_word(text, stops)
     (out, stopped)
+
+pub string native_stopping_word(string stop_type, string stopping_word):
+    if stop_type == "word": stopping_word else: ""
+
+pub bool native_context_truncated(int prompt_tokens, int completion_tokens, int n_ctx, bool stopped_early):
+    not stopped_early and prompt_tokens + completion_tokens >= n_ctx
+
+pub string listen_address(string host, int port):
+    if host.contains(":") and not host.startsWith("["):
+        "[{host}]:{port}"
+    else:
+        "{host}:{port}"
+
+# HTTP header names and the Bearer scheme are case-insensitive; API keys are
+# not. Keeping this pure makes authentication testable without a socket.
+pub string http_header_value(string headers, string name):
+    let prefix = "{name.toLower()}:"
+    for line in headers.split("\r\n"):
+        if line.toLower().startsWith(prefix):
+            let chars = line.chars()
+            var string value = ""
+            var int i = prefix.chars().length
+            while i < chars.length:
+                value = "{value}{chars[i]}"
+                i += 1
+            return value.trim()
+    ""
+
+pub string cors_allow_origin(string configured, string origin, bool credentials):
+    if origin == "":
+        if configured == "*": return "*"
+        return ""
+    if configured == "*":
+        if credentials: return origin
+        return "*"
+    let lower = origin.toLower()
+    if configured == "localhost":
+        for base in ["http://localhost", "https://localhost", "http://127.0.0.1", "https://127.0.0.1", "http://[::1]", "https://[::1]"]:
+            if lower == base or lower.startsWith("{base}:"): return origin
+        return ""
+    for allowed in configured.split(","):
+        if allowed.trim() == origin: return origin
+    ""
+
+pub [string] api_keys_from_file_text(string text):
+    mut [string] keys = []
+    for line in text.split("\n"):
+        let key = line.trim()
+        if key != "" and not key.startsWith("#"):
+            keys.push(key)
+    keys
+
+pub bool api_key_authorized([string] configured_keys, string authorization):
+    if configured_keys.length == 0: return true
+    let scheme = "bearer "
+    guard authorization.toLower().startsWith(scheme) else return false
+    let chars = authorization.chars()
+    var string token = ""
+    var int i = scheme.chars().length
+    while i < chars.length:
+        token = "{token}{chars[i]}"
+        i += 1
+    for key in configured_keys:
+        if token == key: return true
+    false
+
+pub bool api_key_public_path(string path):
+    path == "/" or path == "/health" or path == "/v1/health" or path == "/models" or path == "/v1/models"
+
+pub string http_request_path(string target):
+    target.split("?")[0]
+
+pub string http_query_value(string target, string name):
+    let parts = target.split("?")
+    if parts.length < 2: return ""
+    let prefix = "{name}="
+    for field in parts[1].split("&"):
+        if field.startsWith(prefix):
+            let chars = field.chars()
+            var string value = ""
+            var int i = prefix.chars().length
+            while i < chars.length:
+                value = "{value}{chars[i]}"
+                i += 1
+            return value
+    ""
+
+# Returns the internal route path, or "" when the request is outside the
+# configured prefix. An exact prefix targets the server root.
+pub string strip_api_prefix(string path, string prefix):
+    if prefix == "": return path
+    if path == prefix: return "/"
+    let expected = "{prefix}/"
+    if not path.startsWith(expected): return ""
+    let chars = path.chars()
+    var string out = ""
+    var int i = prefix.chars().length
+    while i < chars.length:
+        out = "{out}{chars[i]}"
+        i += 1
+    out
+
+pub string api_prefix_validation_error(string prefix):
+    if prefix == "": return ""
+    if not prefix.startsWith("/"): return "--api-prefix must start with `/`"
+    if prefix.endsWith("/"): return "--api-prefix must not end with `/`"
+    if prefix.contains("?") or prefix.contains("#"): return "--api-prefix must be a URL path without query or fragment"
+    ""
+
+pub [string] model_alias_list(string configured, string fallback):
+    if configured == "": return [fallback]
+    mut [string] aliases = []
+    for alias in configured.split(","):
+        aliases.push(alias.trim())
+    aliases
+
+# RFC 3986 path-segment encoding used by `GET /v1/models/{model}`. Work on
+# UTF-8 bytes so non-ASCII ids round-trip through ordinary OpenAI SDKs too.
+pub string url_path_segment(string text):
+    let hex = "0123456789ABCDEF".chars()
+    var string out = ""
+    for ch in text.chars():
+        let cp = ord(ch)
+        let bytes = if cp <= 0x7F:
+            [cp]
+        elif cp <= 0x7FF:
+            [0xC0 | (cp >> 6), 0x80 | (cp & 0x3F)]
+        elif cp <= 0xFFFF:
+            [0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)]
+        else:
+            [0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)]
+        for b in bytes:
+            if (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or (b >= 48 and b <= 57) or b == 45 or b == 46 or b == 95 or b == 126:
+                out = "{out}{chr(b)}"
+            else:
+                out = "{out}%{hex[b / 16]}{hex[b % 16]}"
+    out
+
+pub bool model_alias_path_matches([string] aliases, string path):
+    for alias in aliases:
+        if path == "/v1/models/{url_path_segment(alias)}" or path == "/v1/models/{alias}": return true
+    false
+
+string model_aliases_json([string] aliases):
+    var string out = "["
+    var int i = 0
+    while i < aliases.length:
+        if i > 0: out = "{out}, "
+        out = "{out}\"{json_escape(aliases[i])}\""
+        i += 1
+    "{out}]"
+
+# The first generated line is unrestricted. After a newline, stop immediately
+# before the first non-whitespace character when its indentation is too small.
+pub (string, bool) apply_min_indent(string text, int minimum):
+    if minimum <= 0:
+        return (text, false)
+    let chars = text.chars()
+    var bool line_start = false
+    var int indentation = 0
+    var int i = 0
+    while i < chars.length:
+        let ch = chars[i]
+        if line_start:
+            if ch == " " or ch == "\t":
+                indentation += 1
+            else:
+                if indentation < minimum:
+                    var string out = ""
+                    var int j = 0
+                    while j < i:
+                        out = "{out}{chars[j]}"
+                        j += 1
+                    return (out, true)
+                line_start = false
+        elif ch == "\n":
+            line_start = true
+            indentation = 0
+        i += 1
+    (text, false)
+
+pub bool sse_ping_due(int interval_seconds, int last_activity_ms, int now_ms):
+    interval_seconds >= 0 and (interval_seconds == 0 or now_ms - last_activity_ms >= interval_seconds * 1000)
+
+pub string reasoning_format_for_request(JValue body, string server_default, bool is_chat):
+    if is_chat: json_get_str(body, "reasoning_format", server_default) else: "none"
 
 # ── Response bodies ──────────────────────────────────────────────────────
 
@@ -1278,8 +2283,8 @@ string tool_calls_json(string id, [ParsedToolCall] calls, bool with_index):
         i += 1
     "{out}]"
 
-string usage_json(int prompt_tokens, int completion_tokens):
-    "{{\"prompt_tokens\": {prompt_tokens}, \"completion_tokens\": {completion_tokens}, \"total_tokens\": {prompt_tokens + completion_tokens}}}"
+string usage_json(int prompt_tokens, int completion_tokens, int cached_tokens):
+    "{{\"prompt_tokens\": {prompt_tokens}, \"completion_tokens\": {completion_tokens}, \"total_tokens\": {prompt_tokens + completion_tokens}, \"prompt_tokens_details\": {{\"cached_tokens\": {cached_tokens}}}}}"
 
 pub string error_json(string message, string kind, string code):
     "{{\"error\": {{\"message\": \"{json_escape(message)}\", \"type\": \"{kind}\", \"code\": \"{code}\"}}}}"
@@ -1290,13 +2295,35 @@ pub string error_json(string message, string kind, string code):
 pub string endpoint_not_supported_json(string endpoint):
     "{{\"error\": {{\"code\": 501, \"message\": \"This server does not support {json_escape(endpoint)} endpoint.\", \"type\": \"not_supported_error\"}}}}"
 
+pub string feature_disabled_json():
+    "{{\"error\": {{\"message\": \"this feature is disabled\", \"type\": \"feature_disabled\"}}}}"
+
+pub string lora_adapters_json():
+    "[]"
+
+pub string slot_erased_json(int id_slot, int n_erased):
+    "{{\"id_slot\": {id_slot}, \"n_erased\": {n_erased}}}"
+
+pub string slot_filename_validation_error(string filename):
+    if filename == "": return "`filename` is required and must be a non-empty string"
+    if filename.contains("/") or filename.contains("\\") or filename == "." or filename == "..":
+        return "`filename` must be a plain file name without path components"
+    ""
+
+pub string slot_saved_json(int id_slot, string filename, int n_saved, int n_written, int elapsed_ms):
+    "{{\"id_slot\": {id_slot}, \"filename\": \"{json_escape(filename)}\", \"n_saved\": {n_saved}, \"n_written\": {n_written}, \"timings\": {{\"save_ms\": {elapsed_ms}}}}}"
+
+pub string slot_restored_json(int id_slot, string filename, int n_restored, int n_read, int elapsed_ms):
+    "{{\"id_slot\": {id_slot}, \"filename\": \"{json_escape(filename)}\", \"n_restored\": {n_restored}, \"n_read\": {n_read}, \"timings\": {{\"restore_ms\": {elapsed_ms}}}}}"
+
 pub string metrics_text(int prompt_tokens, int prompt_ms, int predicted_tokens,
-                         int predicted_ms, int n_tokens_max):
+                         int predicted_ms, int n_tokens_max, int n_decode):
     let prompt_seconds = prompt_ms as float / 1000.0
     let predicted_seconds = predicted_ms as float / 1000.0
     let prompt_rate = if prompt_ms > 0: prompt_tokens as float * 1000.0 / prompt_ms as float else: 0.0
     let predicted_rate = if predicted_ms > 0: predicted_tokens as float * 1000.0 / predicted_ms as float else: 0.0
-    "# TYPE llamacpp:prompt_tokens_total counter\nllamacpp:prompt_tokens_total {prompt_tokens}\n# TYPE llamacpp:prompt_seconds_total counter\nllamacpp:prompt_seconds_total {prompt_seconds}\n# TYPE llamacpp:prompt_tokens_seconds gauge\nllamacpp:prompt_tokens_seconds {prompt_rate}\n# TYPE llamacpp:tokens_predicted_total counter\nllamacpp:tokens_predicted_total {predicted_tokens}\n# TYPE llamacpp:tokens_predicted_seconds_total counter\nllamacpp:tokens_predicted_seconds_total {predicted_seconds}\n# TYPE llamacpp:predicted_tokens_seconds gauge\nllamacpp:predicted_tokens_seconds {predicted_rate}\n# TYPE llamacpp:requests_processing gauge\nllamacpp:requests_processing 0\n# TYPE llamacpp:requests_deferred gauge\nllamacpp:requests_deferred 0\n# TYPE llamacpp:n_tokens_max counter\nllamacpp:n_tokens_max {n_tokens_max}\n"
+    let busy_slots = if n_decode > 0: 1 else: 0
+    "# TYPE llamacpp:prompt_tokens_total counter\nllamacpp:prompt_tokens_total {prompt_tokens}\n# TYPE llamacpp:prompt_seconds_total counter\nllamacpp:prompt_seconds_total {prompt_seconds}\n# TYPE llamacpp:prompt_tokens_seconds gauge\nllamacpp:prompt_tokens_seconds {prompt_rate}\n# TYPE llamacpp:tokens_predicted_total counter\nllamacpp:tokens_predicted_total {predicted_tokens}\n# TYPE llamacpp:tokens_predicted_seconds_total counter\nllamacpp:tokens_predicted_seconds_total {predicted_seconds}\n# TYPE llamacpp:predicted_tokens_seconds gauge\nllamacpp:predicted_tokens_seconds {predicted_rate}\n# TYPE llamacpp:requests_processing gauge\nllamacpp:requests_processing 0\n# TYPE llamacpp:requests_deferred gauge\nllamacpp:requests_deferred 0\n# TYPE llamacpp:n_tokens_max counter\nllamacpp:n_tokens_max {n_tokens_max}\n# TYPE llamacpp:n_decode_total counter\nllamacpp:n_decode_total {n_decode}\n# TYPE llamacpp:n_busy_slots_per_decode gauge\nllamacpp:n_busy_slots_per_decode {busy_slots}\n# TYPE llamacpp:spec_decode_num_draft_tokens_total counter\nllamacpp:spec_decode_num_draft_tokens_total 0\n# TYPE llamacpp:spec_decode_num_accepted_tokens_total counter\nllamacpp:spec_decode_num_accepted_tokens_total 0\n# TYPE llamacpp:spec_decode_num_drafts_total counter\nllamacpp:spec_decode_num_drafts_total 0\n"
 
 # The 400 for a prompt that does not fit the context (`--ctx-size`). Clients
 # detect an overflow from the error code (OpenAI's `context_length_exceeded`)
@@ -1315,7 +2342,11 @@ pub string models_json(string model_id, uint64 created):
 
 pub string model_json_meta(string model_id, int vocab_type, int n_vocab, int n_ctx,
                            int n_ctx_train, int n_embd, int n_params, int size, uint64 created):
-    "{{\"id\": \"{json_escape(model_id)}\", \"aliases\": [\"{json_escape(model_id)}\"], \"tags\": [], \"object\": \"model\", \"created\": {created}, \"owned_by\": \"boring-llm\", \"meta\": {{\"vocab_type\": {vocab_type}, \"n_vocab\": {n_vocab}, \"n_ctx\": {n_ctx}, \"n_ctx_train\": {n_ctx_train}, \"n_embd\": {n_embd}, \"n_params\": {n_params}, \"size\": {size}}}}}"
+    model_json_meta_aliases(model_id, [model_id], [], vocab_type, n_vocab, n_ctx, n_ctx_train, n_embd, n_params, size, created)
+
+pub string model_json_meta_aliases(string model_id, [string] aliases, [string] tags, int vocab_type, int n_vocab, int n_ctx,
+                                   int n_ctx_train, int n_embd, int n_params, int size, uint64 created):
+    "{{\"id\": \"{json_escape(model_id)}\", \"aliases\": {model_aliases_json(aliases)}, \"tags\": {model_aliases_json(tags)}, \"object\": \"model\", \"created\": {created}, \"owned_by\": \"boring-llm\", \"architecture\": {{\"input_modalities\": [\"text\"], \"output_modalities\": [\"text\"]}}, \"meta\": {{\"vocab_type\": {vocab_type}, \"n_vocab\": {n_vocab}, \"n_ctx\": {n_ctx}, \"n_ctx_train\": {n_ctx_train}, \"n_embd\": {n_embd}, \"n_params\": {n_params}, \"size\": {size}}}}}"
 
 # llama-server exposes these GGUF/model facts in a non-standard `meta` object.
 # They are useful to clients which choose a context window or sanity-check the
@@ -1324,8 +2355,193 @@ pub string models_json_meta(string model_id, int vocab_type, int n_vocab, int n_
                             int n_ctx_train, int n_embd, int n_params, int size, uint64 created):
     "{{\"object\": \"list\", \"data\": [{model_json_meta(model_id, vocab_type, n_vocab, n_ctx, n_ctx_train, n_embd, n_params, size, created)}]}}"
 
+pub string models_json_meta_aliases(string model_id, [string] aliases, int vocab_type, int n_vocab, int n_ctx,
+                                    int n_ctx_train, int n_embd, int n_params, int size, uint64 created):
+    "{{\"object\": \"list\", \"data\": [{model_json_meta_aliases(model_id, aliases, [], vocab_type, n_vocab, n_ctx, n_ctx_train, n_embd, n_params, size, created)}]}}"
+
+pub string models_json_meta_aliases_tags(string model_id, [string] aliases, [string] tags, int vocab_type, int n_vocab, int n_ctx,
+                                         int n_ctx_train, int n_embd, int n_params, int size, uint64 created):
+    "{{\"object\": \"list\", \"data\": [{model_json_meta_aliases(model_id, aliases, tags, vocab_type, n_vocab, n_ctx, n_ctx_train, n_embd, n_params, size, created)}]}}"
+
 pub string input_tokens_json(int input_tokens):
     "{{\"object\": \"response.input_tokens\", \"input_tokens\": {input_tokens}}}"
+
+pub string anthropic_message_json(string id, string model, ParsedReply reply, string finish_reason,
+                                  string stop_sequence, int input_tokens, int output_tokens, int cached_tokens):
+    var string content = "["
+    var bool wrote = false
+    if reply.content != "" or reply.calls.length == 0:
+        content = "{content}{{\"type\":\"text\",\"text\":\"{json_escape(reply.content)}\"}}"
+        wrote = true
+    var int i = 0
+    while i < reply.calls.length:
+        if wrote: content = "{content},"
+        let parsed_input = try? json_parse(reply.calls[i].arguments)
+        var string input = "{{}}"
+        if let value = parsed_input: input = jv_to_json(value)
+        content = "{content}{{\"type\":\"tool_use\",\"id\":\"toolu_{id}_{i}\",\"name\":\"{json_escape(reply.calls[i].name)}\",\"input\":{input}}}"
+        wrote = true
+        i += 1
+    let stop_reason = if reply.calls.length > 0: "tool_use" elif finish_reason == "length": "max_tokens" elif stop_sequence != "": "stop_sequence" else: "end_turn"
+    let stop_sequence_json = if stop_sequence == "": "null" else: "\"{json_escape(stop_sequence)}\""
+    "{{\"id\":\"msg_{id}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":{content}],\"model\":\"{json_escape(model)}\",\"stop_reason\":\"{stop_reason}\",\"stop_sequence\":{stop_sequence_json},\"usage\":{{\"input_tokens\":{input_tokens},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":{cached_tokens},\"output_tokens\":{output_tokens}}}}}"
+
+string anthropic_sse(string event_type, string data):
+    "event: {event_type}\ndata: {data}\n\n"
+
+pub string anthropic_message_start_sse(string id, string model, int input_tokens, int cached_tokens):
+    anthropic_sse("message_start", "{{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_{id}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"{json_escape(model)}\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":{input_tokens},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":{cached_tokens},\"output_tokens\":0}}}}}}")
+
+pub string anthropic_text_start_sse(int index):
+    anthropic_sse("content_block_start", "{{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}")
+
+pub string anthropic_text_delta_sse(int index, string text):
+    anthropic_sse("content_block_delta", "{{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"text_delta\",\"text\":\"{json_escape(text)}\"}}}}")
+
+pub string anthropic_tool_start_sse(string id, int call_index, int content_index, ParsedToolCall call):
+    anthropic_sse("content_block_start", "{{\"type\":\"content_block_start\",\"index\":{content_index},\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_{id}_{call_index}\",\"name\":\"{json_escape(call.name)}\",\"input\":{{}}}}}}")
+
+pub string anthropic_tool_delta_sse(int index, string arguments):
+    anthropic_sse("content_block_delta", "{{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{json_escape(arguments)}\"}}}}")
+
+pub string anthropic_content_stop_sse(int index):
+    anthropic_sse("content_block_stop", "{{\"type\":\"content_block_stop\",\"index\":{index}}}")
+
+pub string anthropic_message_delta_sse(string finish_reason, string stop_sequence, int output_tokens):
+    let stop_reason = if finish_reason == "tool_calls": "tool_use" elif finish_reason == "length": "max_tokens" elif stop_sequence != "": "stop_sequence" else: "end_turn"
+    let stop_sequence_json = if stop_sequence == "": "null" else: "\"{json_escape(stop_sequence)}\""
+    anthropic_sse("message_delta", "{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop_reason}\",\"stop_sequence\":{stop_sequence_json}}},\"usage\":{{\"output_tokens\":{output_tokens}}}}}")
+
+pub string anthropic_message_stop_sse():
+    anthropic_sse("message_stop", "{{\"type\":\"message_stop\"}}")
+
+pub string anthropic_error_sse(string message):
+    anthropic_sse("error", "{{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":\"{json_escape(message)}\"}}}}")
+
+string responses_usage_json(int input_tokens, int output_tokens, int cached_tokens):
+    "{{\"input_tokens\": {input_tokens}, \"input_tokens_details\": {{\"cached_tokens\": {cached_tokens}}}, \"output_tokens\": {output_tokens}, \"output_tokens_details\": {{\"reasoning_tokens\": 0}}, \"total_tokens\": {input_tokens + output_tokens}}}"
+
+string responses_optional_json(JValue value):
+    if request_value_is_undefined(value): "null" else: jv_to_json(value)
+
+pub string responses_settings_json(JValue body, float temperature, float top_p):
+    let input_json = responses_optional_json(json_get(body, "input"))
+    let metadata = json_get(body, "metadata")
+    let metadata_json = if jv_is_dict(metadata): jv_to_json(metadata) else: "{}"
+    let reasoning = json_get(body, "reasoning")
+    let reasoning_json = if jv_is_dict(reasoning): jv_to_json(reasoning) else: "{{\"effort\": null, \"summary\": null}}"
+    let text = json_get(body, "text")
+    let text_json = if jv_is_dict(text): jv_to_json(text) else: "{{\"format\": {{\"type\": \"text\"}}}}"
+    let tools = json_get(body, "responses_tools")
+    let tools_json = if jv_is_list(tools): jv_to_json(tools) else: "[]"
+    let tool_choice = json_get(body, "responses_tool_choice")
+    let tool_choice_json = if request_value_is_undefined(tool_choice): "\"auto\"" else: jv_to_json(tool_choice)
+    let parallel_tool_calls = json_get_bool(body, "parallel_tool_calls", true)
+    "\"input\": {input_json}, \"instructions\": {responses_optional_json(json_get(body, "instructions"))}, \"max_output_tokens\": {responses_optional_json(json_get(body, "max_output_tokens"))}, \"parallel_tool_calls\": {parallel_tool_calls}, \"previous_response_id\": null, \"reasoning\": {reasoning_json}, \"store\": false, \"temperature\": {temperature}, \"text\": {text_json}, \"tool_choice\": {tool_choice_json}, \"tools\": {tools_json}, \"top_p\": {top_p}, \"truncation\": \"disabled\", \"metadata\": {metadata_json}"
+
+string responses_output_json_reasoning(string id, ParsedReply reply, string reasoning):
+    var string out = "["
+    var bool has_item = false
+    if reasoning != "":
+        out = "{out}{{\"id\": \"rs_{id}\", \"type\": \"reasoning\", \"status\": \"completed\", \"summary\": [{{\"type\": \"summary_text\", \"text\": \"{json_escape(reasoning)}\"}}], \"encrypted_content\": null}}"
+        has_item = true
+    if reply.content != "" or reply.calls.length == 0:
+        if has_item: out = "{out}, "
+        out = "{out}{{\"id\": \"msg_{id}\", \"type\": \"message\", \"status\": \"completed\", \"role\": \"assistant\", \"content\": [{{\"type\": \"output_text\", \"text\": \"{json_escape(reply.content)}\", \"annotations\": [], \"logprobs\": []}}]}}"
+        has_item = true
+    var int i = 0
+    while i < reply.calls.length:
+        if has_item: out = "{out}, "
+        let call = reply.calls[i]
+        out = "{out}{{\"id\": \"fc_{id}_{i}\", \"type\": \"function_call\", \"status\": \"completed\", \"call_id\": \"call_{id}_{i}\", \"name\": \"{json_escape(call.name)}\", \"arguments\": \"{json_escape(call.arguments)}\"}}"
+        has_item = true
+        i += 1
+    "{out}]"
+
+string responses_output_json(string id, ParsedReply reply):
+    responses_output_json_reasoning(id, reply, "")
+
+pub string responses_json_timed(string id, string model, ParsedReply reply, string finish_reason,
+                                 int input_tokens, int output_tokens, int cached_tokens, uint64 created,
+                                 uint64 completed, int prompt_ms, int predicted_ms, string settings):
+    let status = if finish_reason == "length": "incomplete" else: "completed"
+    let incomplete = if finish_reason == "length": "{{\"reason\": \"max_output_tokens\"}}" else: "null"
+    "{{\"id\": \"resp_{id}\", \"object\": \"response\", \"created_at\": {created}, \"completed_at\": {completed}, \"status\": \"{status}\", \"error\": null, \"incomplete_details\": {incomplete}, \"model\": \"{json_escape(model)}\", {settings}, \"output\": {responses_output_json(id, reply)}, \"usage\": {responses_usage_json(input_tokens, output_tokens, cached_tokens)}, \"timings\": {server_timings_json(cached_tokens, input_tokens - cached_tokens, prompt_ms, output_tokens, predicted_ms)}}}"
+
+pub string responses_json_reasoning_timed(string id, string model, ParsedReply reply, string reasoning,
+                                           string finish_reason, int input_tokens, int output_tokens,
+                                           int cached_tokens, uint64 created, uint64 completed, int prompt_ms,
+                                           int predicted_ms, string settings):
+    let status = if finish_reason == "length": "incomplete" else: "completed"
+    let incomplete = if finish_reason == "length": "{{\"reason\": \"max_output_tokens\"}}" else: "null"
+    "{{\"id\": \"resp_{id}\", \"object\": \"response\", \"created_at\": {created}, \"completed_at\": {completed}, \"status\": \"{status}\", \"error\": null, \"incomplete_details\": {incomplete}, \"model\": \"{json_escape(model)}\", {settings}, \"output\": {responses_output_json_reasoning(id, reply, reasoning)}, \"usage\": {responses_usage_json(input_tokens, output_tokens, cached_tokens)}, \"timings\": {server_timings_json(cached_tokens, input_tokens - cached_tokens, prompt_ms, output_tokens, predicted_ms)}}}"
+
+string responses_sse(string event_type, string data):
+    "event: {event_type}\ndata: {data}\n\n"
+
+pub string responses_created_sse(string id, string model, uint64 created, int sequence, string event_type,
+                                 string settings):
+    responses_sse(event_type, "{{\"type\": \"{event_type}\", \"response\": {{\"id\": \"resp_{id}\", \"object\": \"response\", \"created_at\": {created}, \"completed_at\": null, \"status\": \"in_progress\", \"error\": null, \"incomplete_details\": null, \"model\": \"{json_escape(model)}\", {settings}, \"output\": [], \"usage\": null}}, \"sequence_number\": {sequence}}}")
+
+pub string responses_message_added_sse(string id, int output_index, int sequence):
+    responses_sse("response.output_item.added", "{{\"type\": \"response.output_item.added\", \"output_index\": {output_index}, \"item\": {{\"id\": \"msg_{id}\", \"type\": \"message\", \"status\": \"in_progress\", \"role\": \"assistant\", \"content\": []}}, \"sequence_number\": {sequence}}}")
+
+pub string responses_content_added_sse(string id, int output_index, int sequence):
+    responses_sse("response.content_part.added", "{{\"type\": \"response.content_part.added\", \"item_id\": \"msg_{id}\", \"output_index\": {output_index}, \"content_index\": 0, \"part\": {{\"type\": \"output_text\", \"text\": \"\", \"annotations\": [], \"logprobs\": []}}, \"sequence_number\": {sequence}}}")
+
+pub string responses_reasoning_added_sse(string id, int sequence):
+    responses_sse("response.output_item.added", "{{\"type\": \"response.output_item.added\", \"output_index\": 0, \"item\": {{\"id\": \"rs_{id}\", \"type\": \"reasoning\", \"status\": \"in_progress\", \"summary\": [], \"encrypted_content\": null}}, \"sequence_number\": {sequence}}}")
+
+pub string responses_reasoning_part_sse(string id, string text, int sequence, bool done):
+    let event_type = if done: "response.reasoning_summary_part.done" else: "response.reasoning_summary_part.added"
+    responses_sse(event_type, "{{\"type\": \"{event_type}\", \"item_id\": \"rs_{id}\", \"output_index\": 0, \"summary_index\": 0, \"part\": {{\"type\": \"summary_text\", \"text\": \"{json_escape(text)}\"}}, \"sequence_number\": {sequence}}}")
+
+pub string responses_reasoning_delta_sse(string id, string delta, int sequence):
+    responses_sse("response.reasoning_summary_text.delta", "{{\"type\": \"response.reasoning_summary_text.delta\", \"item_id\": \"rs_{id}\", \"output_index\": 0, \"summary_index\": 0, \"delta\": \"{json_escape(delta)}\", \"sequence_number\": {sequence}}}")
+
+pub string responses_reasoning_text_done_sse(string id, string reasoning, int sequence):
+    responses_sse("response.reasoning_summary_text.done", "{{\"type\": \"response.reasoning_summary_text.done\", \"item_id\": \"rs_{id}\", \"output_index\": 0, \"summary_index\": 0, \"text\": \"{json_escape(reasoning)}\", \"sequence_number\": {sequence}}}")
+
+pub string responses_reasoning_done_sse(string id, string reasoning, int sequence):
+    responses_sse("response.output_item.done", "{{\"type\": \"response.output_item.done\", \"output_index\": 0, \"item\": {{\"id\": \"rs_{id}\", \"type\": \"reasoning\", \"status\": \"completed\", \"summary\": [{{\"type\": \"summary_text\", \"text\": \"{json_escape(reasoning)}\"}}], \"encrypted_content\": null}}, \"sequence_number\": {sequence}}}")
+
+pub string responses_text_delta_sse(string id, string delta, int output_index, int sequence):
+    responses_sse("response.output_text.delta", "{{\"type\": \"response.output_text.delta\", \"item_id\": \"msg_{id}\", \"output_index\": {output_index}, \"content_index\": 0, \"delta\": \"{json_escape(delta)}\", \"logprobs\": [], \"sequence_number\": {sequence}}}")
+
+pub string responses_text_done_sse(string id, string text, int output_index, int sequence):
+    responses_sse("response.output_text.done", "{{\"type\": \"response.output_text.done\", \"item_id\": \"msg_{id}\", \"output_index\": {output_index}, \"content_index\": 0, \"text\": \"{json_escape(text)}\", \"logprobs\": [], \"sequence_number\": {sequence}}}")
+
+pub string responses_content_done_sse(string id, string text, int output_index, int sequence):
+    responses_sse("response.content_part.done", "{{\"type\": \"response.content_part.done\", \"item_id\": \"msg_{id}\", \"output_index\": {output_index}, \"content_index\": 0, \"part\": {{\"type\": \"output_text\", \"text\": \"{json_escape(text)}\", \"annotations\": [], \"logprobs\": []}}, \"sequence_number\": {sequence}}}")
+
+pub string responses_message_done_sse(string id, string text, int output_index, int sequence):
+    responses_sse("response.output_item.done", "{{\"type\": \"response.output_item.done\", \"output_index\": {output_index}, \"item\": {{\"id\": \"msg_{id}\", \"type\": \"message\", \"status\": \"completed\", \"role\": \"assistant\", \"content\": [{{\"type\": \"output_text\", \"text\": \"{json_escape(text)}\", \"annotations\": [], \"logprobs\": []}}]}}, \"sequence_number\": {sequence}}}")
+
+pub string responses_function_sse(string id, ParsedToolCall call, int call_index, int output_index,
+                                   int sequence, bool done):
+    let event_type = if done: "response.output_item.done" else: "response.output_item.added"
+    let status = if done: "completed" else: "in_progress"
+    let arguments = if done: call.arguments else: ""
+    responses_sse(event_type, "{{\"type\": \"{event_type}\", \"output_index\": {output_index}, \"item\": {{\"id\": \"fc_{id}_{call_index}\", \"type\": \"function_call\", \"status\": \"{status}\", \"call_id\": \"call_{id}_{call_index}\", \"name\": \"{json_escape(call.name)}\", \"arguments\": \"{json_escape(arguments)}\"}}, \"sequence_number\": {sequence}}}")
+
+pub string responses_function_arguments_done_sse(string id, ParsedToolCall call, int call_index,
+                                                   int output_index, int sequence):
+    responses_sse("response.function_call_arguments.done", "{{\"type\": \"response.function_call_arguments.done\", \"item_id\": \"fc_{id}_{call_index}\", \"output_index\": {output_index}, \"arguments\": \"{json_escape(call.arguments)}\", \"sequence_number\": {sequence}}}")
+
+pub string responses_function_arguments_delta_sse(string id, string delta, int call_index,
+                                                    int output_index, int sequence):
+    responses_sse("response.function_call_arguments.delta", "{{\"type\": \"response.function_call_arguments.delta\", \"item_id\": \"fc_{id}_{call_index}\", \"output_index\": {output_index}, \"delta\": \"{json_escape(delta)}\", \"sequence_number\": {sequence}}}")
+
+pub string responses_terminal_sse(string response_json, int sequence, bool incomplete):
+    let event_type = if incomplete: "response.incomplete" else: "response.completed"
+    responses_sse(event_type, "{{\"type\": \"{event_type}\", \"response\": {response_json}, \"sequence_number\": {sequence}}}")
+
+pub string responses_error_sse(string message, int sequence):
+    responses_sse("error", "{{\"type\": \"error\", \"code\": \"internal_error\", \"message\": \"{json_escape(message)}\", \"param\": null, \"sequence_number\": {sequence}}}")
+
+pub string responses_failed_sse(string id, string model, string message, int sequence,
+                                uint64 created, uint64 completed, string settings):
+    responses_sse("response.failed", "{{\"type\": \"response.failed\", \"response\": {{\"id\": \"resp_{id}\", \"object\": \"response\", \"created_at\": {created}, \"completed_at\": {completed}, \"status\": \"failed\", \"error\": {{\"code\": \"internal_error\", \"message\": \"{json_escape(message)}\"}}, \"incomplete_details\": null, \"model\": \"{json_escape(model)}\", {settings}, \"output\": [], \"usage\": null}}, \"sequence_number\": {sequence}}}")
 
 pub string tokens_json([int] tokens):
     var string out = "["
@@ -1343,38 +2559,147 @@ pub string content_json(string content):
 pub string prompt_json(string prompt):
     "{{\"prompt\": \"{json_escape(prompt)}\"}}"
 
+pub string tokenize_request_validation_error(JValue body):
+    let content = json_get(body, "content")
+    if not jv_is_str(content):
+        return "`content` is required and must be a string"
+    for key in ["add_special", "parse_special", "with_pieces"]:
+        let value = json_get(body, key)
+        if not request_value_is_undefined(value) and not jv_is_bool(value):
+            return "`{key}` must be a boolean"
+    ""
+
+pub string apply_template_options_validation_error(JValue body):
+    let add_generation_prompt = json_get(body, "add_generation_prompt")
+    if not request_value_is_undefined(add_generation_prompt) and not jv_is_bool(add_generation_prompt):
+        return "`add_generation_prompt` must be a boolean"
+    let kwargs = json_get(body, "chat_template_kwargs")
+    if not request_value_is_undefined(kwargs):
+        match kwargs:
+            JDict(fields, keys): true
+            _: return "`chat_template_kwargs` must be an object"
+    ""
+
+# llama-server interprets a top-level array of strings, objects, or nested
+# token arrays as a batch of prompts. A flat int/string array is instead one
+# mixed token sequence.
+pub bool native_prompt_is_multiple(JValue prompt):
+    match prompt:
+        JList(items):
+            var int string_count = 0
+            for item in items:
+                match item:
+                    JStr(value): string_count += 1
+                    JList(nested): return true
+                    JDict(fields, keys): return true
+                    _: true
+            string_count > 1 and string_count == items.length
+        _: false
+
+string string_list_json([string] values):
+    var string out = "["
+    var int i = 0
+    while i < values.length:
+        if i > 0:
+            out = "{out}, "
+        out = "{out}\"{json_escape(values[i])}\""
+        i += 1
+    "{out}]"
+
+pub string llama_sampling_params_json(int max_tokens, float32 temperature, float32 dynatemp_range,
+                                      float32 dynatemp_exponent, float32 top_n_sigma,
+                                      int top_k, float32 typical_p,
+                                      float32 top_p, float32 min_p, float32 xtc_probability,
+                                      float32 xtc_threshold, int min_keep, int seed, float32 repeat_penalty,
+                                      int repeat_last_n, float32 dry_multiplier, float32 dry_base,
+                                      int dry_allowed_length, int dry_penalty_last_n,
+                                      [string] dry_sequence_breakers, int mirostat, float32 mirostat_tau,
+                                      float32 mirostat_eta, float32 adaptive_target, float32 adaptive_decay,
+                                      [string] samplers, float32 presence_penalty,
+                                      float32 frequency_penalty, [string] stops, bool ignore_eos,
+                                      bool streaming, int n_probs, bool timings_per_token, int n_indent,
+                                      int sse_ping_interval, bool post_sampling_probs,
+                                      string model, int n_ctx, bool cache_prompt,
+                                      bool return_tokens, bool return_progress, int t_max_predict_ms):
+    "{{\"n_predict\": {max_tokens}, \"n_ctx\": {n_ctx}, \"model\": \"{json_escape(model)}\", \"n_indent\": {n_indent}, \"sse_ping_interval\": {sse_ping_interval}, \"seed\": {seed}, \"temperature\": {temperature}, \"dynatemp_range\": {dynatemp_range}, \"dynatemp_exponent\": {dynatemp_exponent}, \"top_k\": {top_k}, \"top_p\": {top_p}, \"min_p\": {min_p}, \"top_n_sigma\": {top_n_sigma}, \"xtc_probability\": {xtc_probability}, \"xtc_threshold\": {xtc_threshold}, \"typical_p\": {typical_p}, \"repeat_last_n\": {repeat_last_n}, \"repeat_penalty\": {repeat_penalty}, \"presence_penalty\": {presence_penalty}, \"frequency_penalty\": {frequency_penalty}, \"dry_multiplier\": {dry_multiplier}, \"dry_base\": {dry_base}, \"dry_allowed_length\": {dry_allowed_length}, \"dry_penalty_last_n\": {dry_penalty_last_n}, \"dry_sequence_breakers\": {string_list_json(dry_sequence_breakers)}, \"mirostat\": {mirostat}, \"mirostat_tau\": {mirostat_tau}, \"mirostat_eta\": {mirostat_eta}, \"adaptive_target\": {adaptive_target}, \"adaptive_decay\": {adaptive_decay}, \"stop\": {string_list_json(stops)}, \"max_tokens\": {max_tokens}, \"n_keep\": 0, \"n_discard\": 0, \"ignore_eos\": {ignore_eos}, \"stream\": {streaming}, \"cache_prompt\": {cache_prompt}, \"return_tokens\": {return_tokens}, \"return_progress\": {return_progress}, \"t_max_predict_ms\": {t_max_predict_ms}, \"n_probs\": {n_probs}, \"post_sampling_probs\": {post_sampling_probs}, \"min_keep\": {min_keep}, \"grammar\": \"\", \"reasoning_format\": \"none\", \"reasoning_in_content\": false, \"generation_prompt\": \"\", \"samplers\": {string_list_json(samplers)}, \"speculative.n_max\": 0, \"speculative.n_min\": 0, \"speculative.p_min\": 0.0, \"timings_per_token\": {timings_per_token}, \"lora\": []}}"
+
+string llama_next_token_json(int remaining):
+    "{{\"has_next_token\": true, \"has_new_line\": false, \"n_remain\": {remaining}, \"n_decoded\": 0, \"stopping_word\": \"\"}}"
+
+# llama.cpp derives these capabilities from the parsed Jinja program.  The
+# Boring renderer does not retain an AST after startup, so report the template
+# variables it actually references and keep unsupported transformations false.
+string chat_template_caps_json(string chat_template):
+    let supports_tools = chat_template.contains("tools")
+    let supports_tool_calls = chat_template.contains("tool_calls")
+    let supports_system_role = chat_template.contains("system")
+    let supports_parallel_tool_calls = chat_template.contains("parallel_tool_calls")
+    let supports_preserve_reasoning = chat_template.contains("reasoning_content")
+    let supports_reasoning_effort = chat_template.contains("reasoning_effort")
+    "{{\"supports_tools\": {supports_tools}, \"supports_tool_calls\": {supports_tool_calls}, \"supports_system_role\": {supports_system_role}, \"supports_parallel_tool_calls\": {supports_parallel_tool_calls}, \"supports_preserve_reasoning\": {supports_preserve_reasoning}, \"supports_reasoning_effort\": {supports_reasoning_effort}, \"supports_string_content\": true, \"supports_typed_content\": false, \"supports_object_arguments\": {supports_tool_calls}}}"
+
 pub string props_json(string model_path, string chat_template, int n_ctx, int total_slots, int max_tokens,
-                         float32 temperature, int top_k, float32 top_p, float32 min_p, int seed,
-                         float32 repeat_penalty, int repeat_last_n):
-    "{{\"default_generation_settings\": {{\"n_ctx\": {n_ctx}, \"params\": {{\"n_predict\": {max_tokens}, \"seed\": {seed}, \"temperature\": {temperature}, \"top_k\": {top_k}, \"top_p\": {top_p}, \"min_p\": {min_p}, \"repeat_penalty\": {repeat_penalty}, \"repeat_last_n\": {repeat_last_n}}}}}, \"total_slots\": {total_slots}, \"model_path\": \"{json_escape(model_path)}\", \"chat_template\": \"{json_escape(chat_template)}\", \"chat_template_caps\": {{\"supports_tools\": true}}, \"modalities\": {{\"vision\": false}}, \"is_sleeping\": false}}"
+                         float32 temperature, float32 dynatemp_range, float32 dynatemp_exponent,
+                         float32 top_n_sigma, int top_k, float32 typical_p, float32 top_p, float32 min_p,
+                         float32 xtc_probability, float32 xtc_threshold, int min_keep, int seed,
+                         float32 repeat_penalty, int repeat_last_n, float32 dry_multiplier,
+                         float32 dry_base, int dry_allowed_length, int dry_penalty_last_n,
+                         int mirostat, float32 mirostat_tau, float32 mirostat_eta,
+                         float32 adaptive_target, float32 adaptive_decay,
+                         float32 presence_penalty, float32 frequency_penalty, [string] samplers,
+                         bool ignore_eos):
+    let params = llama_sampling_params_json(max_tokens, temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, ["\n", ":", "\"", "*"], mirostat, mirostat_tau, mirostat_eta, adaptive_target, adaptive_decay, samplers, presence_penalty, frequency_penalty, [], ignore_eos, true, 0, false, 0, 30, false, model_path, n_ctx, true, false, false, 0)
+    let next_token = llama_next_token_json(max_tokens)
+    let caps = chat_template_caps_json(chat_template)
+    "{{\"default_generation_settings\": {{\"id\": 0, \"id_task\": -1, \"n_ctx\": {n_ctx}, \"speculative\": false, \"is_processing\": false, \"params\": {params}, \"prompt\": \"\", \"next_token\": {next_token}}}, \"total_slots\": {total_slots}, \"model_path\": \"{json_escape(model_path)}\", \"chat_template\": \"{json_escape(chat_template)}\", \"chat_template_caps\": {caps}, \"modalities\": {{\"vision\": false}}, \"media_marker\": \"\", \"build_info\": \"boring-llm\", \"is_sleeping\": false}}"
 
 # llama-server's `/slots` monitor reports one item per configured KV-cache
 # slot. This server handles one request at a time, so a monitoring request can
 # only observe idle slots; there is no concurrent task id or timing metric to
 # expose truthfully.
-pub string slots_json(int n_slots, int n_ctx):
+pub string slots_json(int n_slots, [int] cached_tokens, string model, int n_ctx, int max_tokens, float32 temperature,
+                      float32 dynatemp_range, float32 dynatemp_exponent, float32 top_n_sigma,
+                      int top_k, float32 typical_p, float32 top_p, float32 min_p,
+                      float32 xtc_probability, float32 xtc_threshold, int min_keep, int seed,
+                      float32 repeat_penalty, int repeat_last_n, float32 dry_multiplier,
+                      float32 dry_base, int dry_allowed_length, int dry_penalty_last_n,
+                      int mirostat, float32 mirostat_tau, float32 mirostat_eta,
+                      float32 adaptive_target, float32 adaptive_decay,
+                      float32 presence_penalty, float32 frequency_penalty, [string] samplers,
+                      bool ignore_eos):
     var string out = "["
     var int slot = 0
     while slot < n_slots:
         if slot > 0:
             out = "{out}, "
-        out = "{out}{{\"id\": {slot}, \"n_ctx\": {n_ctx}, \"speculative\": false, \"is_processing\": false}}"
+        let n_past = if slot < cached_tokens.length: cached_tokens[slot] else: 0
+        let params = llama_sampling_params_json(max_tokens, temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, ["\n", ":", "\"", "*"], mirostat, mirostat_tau, mirostat_eta, adaptive_target, adaptive_decay, samplers, presence_penalty, frequency_penalty, [], ignore_eos, true, 0, false, 0, 30, false, model, n_ctx, true, false, false, 0)
+        let next_token = llama_next_token_json(max_tokens)
+        out = "{out}{{\"id\": {slot}, \"id_task\": -1, \"n_ctx\": {n_ctx}, \"speculative\": false, \"is_processing\": false, \"params\": {params}, \"prompt\": \"\", \"generated\": \"\", \"next_token\": {next_token}, \"n_past\": {n_past}, \"n_prompt_tokens\": 0, \"n_predicted\": 0, \"stopped_eos\": false, \"stopped_word\": false, \"stopped_limit\": false}}"
         slot += 1
     "{out}]"
 
 pub string completion_json(string id, string model, ParsedReply reply, string finish_reason,
-                            int prompt_tokens, int completion_tokens, uint64 created):
-    completion_json_r(id, model, reply, "", finish_reason, prompt_tokens, completion_tokens, created)
+                            int prompt_tokens, int completion_tokens, int cached_tokens, uint64 created):
+    completion_json_r(id, model, reply, "", finish_reason, prompt_tokens, completion_tokens, cached_tokens, created)
 
 # The same with `reasoning`, the model's `<think>` text (Qwen3 and other
 # reasoning models), returned as `message.reasoning_content` like llama.cpp and
 # DeepSeek's API do, when there is any.
 pub string completion_json_r(string id, string model, ParsedReply reply, string reasoning, string finish_reason,
-                              int prompt_tokens, int completion_tokens, uint64 created):
+                              int prompt_tokens, int completion_tokens, int cached_tokens, uint64 created):
     let content = if reply.content == "" and reply.calls.length > 0: "null" else: "\"{json_escape(reply.content)}\""
     let thinking = if reasoning != "": ", \"reasoning_content\": \"{json_escape(reasoning)}\"" else: ""
     let calls = if reply.calls.length > 0: ", \"tool_calls\": {tool_calls_json(id, reply.calls, false)}" else: ""
-    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{thinking}{calls}}}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}"
+    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{thinking}{calls}}}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}}}"
+
+pub string completion_json_r_timed(string id, string model, ParsedReply reply, string reasoning, string finish_reason,
+                                    int prompt_tokens, int completion_tokens, int cached_tokens, uint64 created,
+                                    int prompt_ms, int predicted_ms):
+    let content = if reply.content == "" and reply.calls.length > 0: "null" else: "\"{json_escape(reply.content)}\""
+    let thinking = if reasoning != "": ", \"reasoning_content\": \"{json_escape(reasoning)}\"" else: ""
+    let calls = if reply.calls.length > 0: ", \"tool_calls\": {tool_calls_json(id, reply.calls, false)}" else: ""
+    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{thinking}{calls}}}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}, \"timings\": {server_timings_json(cached_tokens, prompt_tokens - cached_tokens, prompt_ms, completion_tokens, predicted_ms)}}}"
 
 pub struct TokenLogprobAlternative:
     int id
@@ -1413,24 +2738,44 @@ pub string chat_logprobs_json([string] tokens, [[uint8]] token_bytes, [float32] 
 
 pub string completion_json_r_logprobs(string id, string model, ParsedReply reply, string reasoning,
                                        string finish_reason, int prompt_tokens, int completion_tokens,
-                                       uint64 created, [string] tokens, [[uint8]] token_bytes, [float32] values,
+                                       int cached_tokens, uint64 created, [string] tokens, [[uint8]] token_bytes, [float32] values,
                                        [[TokenLogprobAlternative]] alternatives):
     let content = if reply.content == "" and reply.calls.length > 0: "null" else: "\"{json_escape(reply.content)}\""
     let thinking = if reasoning != "": ", \"reasoning_content\": \"{json_escape(reasoning)}\"" else: ""
     let calls = if reply.calls.length > 0: ", \"tool_calls\": {tool_calls_json(id, reply.calls, false)}" else: ""
-    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{thinking}{calls}}}, \"logprobs\": {chat_logprobs_json(tokens, token_bytes, values, alternatives)}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}"
+    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{thinking}{calls}}}, \"logprobs\": {chat_logprobs_json(tokens, token_bytes, values, alternatives)}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}}}"
+
+pub string completion_json_r_logprobs_timed(string id, string model, ParsedReply reply, string reasoning,
+                                             string finish_reason, int prompt_tokens, int completion_tokens,
+                                             int cached_tokens, uint64 created, [string] tokens, [[uint8]] token_bytes,
+                                             [float32] values, [[TokenLogprobAlternative]] alternatives,
+                                             int prompt_ms, int predicted_ms):
+    let content = if reply.content == "" and reply.calls.length > 0: "null" else: "\"{json_escape(reply.content)}\""
+    let thinking = if reasoning != "": ", \"reasoning_content\": \"{json_escape(reasoning)}\"" else: ""
+    let calls = if reply.calls.length > 0: ", \"tool_calls\": {tool_calls_json(id, reply.calls, false)}" else: ""
+    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{thinking}{calls}}}, \"logprobs\": {chat_logprobs_json(tokens, token_bytes, values, alternatives)}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}, \"timings\": {server_timings_json(cached_tokens, prompt_tokens - cached_tokens, prompt_ms, completion_tokens, predicted_ms)}}}"
 
 pub string text_completion_json(string id, string model, string content, string finish_reason,
-                                int prompt_tokens, int completion_tokens, uint64 created):
-    "{{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(content)}\", \"index\": 0, \"logprobs\": null, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}"
+                                int prompt_tokens, int completion_tokens, int cached_tokens, uint64 created):
+    "{{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(content)}\", \"index\": 0, \"logprobs\": null, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}}}"
+
+pub string text_completion_json_timed(string id, string model, string content, string finish_reason,
+                                      int prompt_tokens, int completion_tokens, int cached_tokens, uint64 created,
+                                      int prompt_ms, int predicted_ms):
+    "{{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(content)}\", \"index\": 0, \"logprobs\": null, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}, \"timings\": {server_timings_json(cached_tokens, prompt_tokens - cached_tokens, prompt_ms, completion_tokens, predicted_ms)}}}"
 
 pub string completion_logprobs_json([string] tokens, [float32] values,
                                      [[TokenLogprobAlternative]] alternatives):
+    completion_logprobs_json_at(tokens, values, alternatives, 0)
+
+pub string completion_logprobs_json_at([string] tokens, [float32] values,
+                                        [[TokenLogprobAlternative]] alternatives,
+                                        int starting_offset):
     var string token_json = "["
     var string value_json = "["
     var string top_json = "["
     var string offset_json = "["
-    var int offset = 0
+    var int offset = starting_offset
     var int i = 0
     while i < tokens.length:
         if i > 0:
@@ -1455,10 +2800,18 @@ pub string completion_logprobs_json([string] tokens, [float32] values,
     "{{\"tokens\": {token_json}], \"token_logprobs\": {value_json}], \"top_logprobs\": {top_json}], \"text_offset\": {offset_json}]}}"
 
 pub string text_completion_json_logprobs(string id, string model, string content, string finish_reason,
-                                          int prompt_tokens, int completion_tokens, uint64 created,
+                                          int prompt_tokens, int completion_tokens, int cached_tokens,
+                                          uint64 created,
                                           [string] tokens, [float32] values,
                                           [[TokenLogprobAlternative]] alternatives):
-    "{{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(content)}\", \"index\": 0, \"logprobs\": {completion_logprobs_json(tokens, values, alternatives)}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}"
+    "{{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(content)}\", \"index\": 0, \"logprobs\": {completion_logprobs_json(tokens, values, alternatives)}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}}}"
+
+pub string text_completion_json_logprobs_timed(string id, string model, string content, string finish_reason,
+                                                int prompt_tokens, int completion_tokens, int cached_tokens,
+                                                uint64 created, [string] tokens, [float32] values,
+                                                [[TokenLogprobAlternative]] alternatives,
+                                                int prompt_ms, int predicted_ms):
+    "{{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(content)}\", \"index\": 0, \"logprobs\": {completion_logprobs_json(tokens, values, alternatives)}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}, \"timings\": {server_timings_json(cached_tokens, prompt_tokens - cached_tokens, prompt_ms, completion_tokens, predicted_ms)}}}"
 
 string sse_chunk(string id, string model, string delta, string finish_reason, uint64 created):
     let fr = if finish_reason == "": "null" else: "\"{finish_reason}\""
@@ -1474,6 +2827,11 @@ pub string sse_role_event(string id, string model, uint64 created):
 pub string sse_content_event(string id, string model, string text, uint64 created):
     sse_chunk(id, model, "{{\"content\": \"{json_escape(text)}\"}}", "", created)
 
+pub string sse_content_event_logprobs(string id, string model, string text, uint64 created,
+                                       [string] tokens, [[uint8]] token_bytes, [float32] values,
+                                       [[TokenLogprobAlternative]] alternatives):
+    "data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"delta\": {{\"content\": \"{json_escape(text)}\"}}, \"logprobs\": {chat_logprobs_json(tokens, token_bytes, values, alternatives)}, \"finish_reason\": null}}]}}\n\n"
+
 pub string sse_reasoning_event(string id, string model, string text, uint64 created):
     sse_chunk(id, model, "{{\"reasoning_content\": \"{json_escape(text)}\"}}", "", created)
 
@@ -1483,8 +2841,12 @@ pub string sse_tool_calls_event(string id, string model, [ParsedToolCall] calls,
 pub string sse_finish_event(string id, string model, string finish_reason, uint64 created):
     sse_chunk(id, model, "{{}}", finish_reason, created)
 
-pub string sse_usage_event(string id, string model, int prompt_tokens, int completion_tokens, uint64 created):
-    "data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}\n\n"
+pub string sse_usage_event(string id, string model, int prompt_tokens, int completion_tokens, int cached_tokens, uint64 created):
+    "data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}}}\n\n"
+
+pub string sse_usage_event_timed(string id, string model, int prompt_tokens, int completion_tokens,
+                                  int cached_tokens, uint64 created, int prompt_ms, int predicted_ms):
+    "data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}, \"timings\": {server_timings_json(cached_tokens, prompt_tokens - cached_tokens, prompt_ms, completion_tokens, predicted_ms)}}}\n\n"
 
 pub string sse_done_event():
     "data: [DONE]\n\n"
@@ -1493,8 +2855,20 @@ pub string text_completion_sse_event(string id, string model, string text, strin
     let fr = if finish_reason == "": "null" else: "\"{finish_reason}\""
     "data: {{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(text)}\", \"index\": 0, \"logprobs\": null, \"finish_reason\": {fr}}}]}}\n\n"
 
-pub string text_completion_usage_sse_event(string id, string model, int prompt_tokens, int completion_tokens, uint64 created):
-    "data: {{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [], \"usage\": {usage_json(prompt_tokens, completion_tokens)}}}\n\n"
+pub string text_completion_sse_event_logprobs(string id, string model, string text,
+                                               string finish_reason, uint64 created, int text_offset,
+                                               [string] tokens, [float32] values,
+                                               [[TokenLogprobAlternative]] alternatives):
+    let fr = if finish_reason == "": "null" else: "\"{finish_reason}\""
+    "data: {{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(text)}\", \"index\": 0, \"logprobs\": {completion_logprobs_json_at(tokens, values, alternatives, text_offset)}, \"finish_reason\": {fr}}}]}}\n\n"
+
+pub string text_completion_usage_sse_event(string id, string model, int prompt_tokens, int completion_tokens, int cached_tokens, uint64 created):
+    "data: {{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}}}\n\n"
+
+pub string text_completion_usage_sse_event_timed(string id, string model, int prompt_tokens,
+                                                   int completion_tokens, int cached_tokens, uint64 created,
+                                                   int prompt_ms, int predicted_ms):
+    "data: {{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}, \"timings\": {server_timings_json(cached_tokens, prompt_tokens - cached_tokens, prompt_ms, completion_tokens, predicted_ms)}}}\n\n"
 
 string token_ids_json([int] tokens):
     var string out = "["
@@ -1505,13 +2879,32 @@ string token_ids_json([int] tokens):
         i += 1
     "{out}]"
 
-pub string native_completion_json(string model, string content, [int] tokens, bool stopped,
-                                  string stop_type, int prompt_tokens, int completion_tokens, int cached_tokens):
+pub string server_timings_json(int cached_tokens, int prompt_tokens, int prompt_ms,
+                               int predicted_tokens, int predicted_ms):
+    let prompt_per_token = if prompt_tokens > 0: prompt_ms as float / prompt_tokens as float else: 0.0
+    let prompt_per_second = if prompt_ms > 0: prompt_tokens as float * 1000.0 / prompt_ms as float else: 0.0
+    let predicted_per_token = if predicted_tokens > 0: predicted_ms as float / predicted_tokens as float else: 0.0
+    let predicted_per_second = if predicted_ms > 0: predicted_tokens as float * 1000.0 / predicted_ms as float else: 0.0
+    "{{\"cache_n\": {cached_tokens}, \"prompt_n\": {prompt_tokens}, \"prompt_ms\": {prompt_ms}, \"prompt_per_token_ms\": {prompt_per_token}, \"prompt_per_second\": {prompt_per_second}, \"predicted_n\": {predicted_tokens}, \"predicted_ms\": {predicted_ms}, \"predicted_per_token_ms\": {predicted_per_token}, \"predicted_per_second\": {predicted_per_second}}}"
+
+pub string native_timings_json(int prompt_tokens, int prompt_ms,
+                                int predicted_tokens, int predicted_ms):
+    server_timings_json(0, prompt_tokens, prompt_ms, predicted_tokens, predicted_ms)
+
+pub string native_completion_json(string model, string content, [int] tokens, bool return_tokens, int id_slot, bool stopped,
+                                  string stop_type, string stopping_word, bool truncated, int prompt_tokens, int completion_tokens, int cached_tokens,
+                                  int prompt_ms, int predicted_ms, string generation_settings, string prompt):
     let stop_value = if stopped: "true" else: "false"
-    "{{\"index\": 0, \"content\": \"{json_escape(content)}\", \"tokens\": {token_ids_json(tokens)}, \"id_slot\": 0, \"stop\": {stop_value}, \"model\": \"{json_escape(model)}\", \"tokens_predicted\": {completion_tokens}, \"tokens_evaluated\": {prompt_tokens}, \"truncated\": false, \"stop_type\": \"{stop_type}\", \"stopping_word\": \"\", \"tokens_cached\": {cached_tokens}}}"
+    let evaluated_tokens = prompt_tokens - cached_tokens
+    let returned_tokens = if return_tokens: token_ids_json(tokens) else: "[]"
+    let has_new_line = content.contains("\n")
+    "{{\"index\": 0, \"content\": \"{json_escape(content)}\", \"tokens\": {returned_tokens}, \"id_slot\": {id_slot}, \"stop\": {stop_value}, \"model\": \"{json_escape(model)}\", \"tokens_predicted\": {completion_tokens}, \"tokens_evaluated\": {prompt_tokens}, \"generation_settings\": {generation_settings}, \"prompt\": \"{json_escape(prompt)}\", \"has_new_line\": {has_new_line}, \"truncated\": {truncated}, \"stop_type\": \"{stop_type}\", \"stopping_word\": \"{json_escape(stopping_word)}\", \"tokens_cached\": {cached_tokens}, \"timings\": {server_timings_json(cached_tokens, evaluated_tokens, prompt_ms, completion_tokens, predicted_ms)}}}"
 
 string native_logprobs_json([int] ids, [string] tokens, [float32] values,
-                            [[uint8]] token_bytes, [[TokenLogprobAlternative]] alternatives):
+                            [[uint8]] token_bytes, [[TokenLogprobAlternative]] alternatives,
+                            bool post_sampling_probs):
+    let value_key = if post_sampling_probs: "prob" else: "logprob"
+    let top_key = if post_sampling_probs: "top_probs" else: "top_logprobs"
     var string out = "["
     var int i = 0
     while i < tokens.length:
@@ -1523,22 +2916,61 @@ string native_logprobs_json([int] ids, [string] tokens, [float32] values,
             if j > 0:
                 tops = "{tops}, "
             let alternative = alternatives[i][j]
-            tops = "{tops}{{\"id\": {alternative.id}, \"token\": \"{json_escape(alternative.token)}\", \"bytes\": {logprob_bytes_json(alternative.bytes)}, \"logprob\": {alternative.logprob}}}"
+            tops = "{tops}{{\"id\": {alternative.id}, \"token\": \"{json_escape(alternative.token)}\", \"bytes\": {logprob_bytes_json(alternative.bytes)}, \"{value_key}\": {alternative.logprob}}}"
             j += 1
-        out = "{out}{{\"id\": {ids[i]}, \"token\": \"{json_escape(tokens[i])}\", \"bytes\": {logprob_bytes_json(token_bytes[i])}, \"logprob\": {values[i]}, \"top_logprobs\": {tops}]}}"
+        out = "{out}{{\"id\": {ids[i]}, \"token\": \"{json_escape(tokens[i])}\", \"bytes\": {logprob_bytes_json(token_bytes[i])}, \"{value_key}\": {values[i]}, \"{top_key}\": {tops}]}}"
         i += 1
     "{out}]"
 
-pub string native_completion_json_logprobs(string model, string content, [int] tokens, bool stopped,
-                                             string stop_type, int prompt_tokens, int completion_tokens,
-                                             int cached_tokens, [string] prob_tokens, [float32] values,
-                                             [[uint8]] token_bytes, [[TokenLogprobAlternative]] alternatives):
+pub string native_completion_json_logprobs(string model, string content, [int] tokens, bool return_tokens, int id_slot, bool stopped,
+                                             string stop_type, string stopping_word, bool truncated, int prompt_tokens, int completion_tokens,
+                                             int cached_tokens, int prompt_ms, int predicted_ms,
+                                             [string] prob_tokens, [float32] values,
+                                             [[uint8]] token_bytes, [[TokenLogprobAlternative]] alternatives,
+                                             string generation_settings, string prompt,
+                                             bool post_sampling_probs):
     let stop_value = if stopped: "true" else: "false"
-    "{{\"index\": 0, \"content\": \"{json_escape(content)}\", \"tokens\": {token_ids_json(tokens)}, \"id_slot\": 0, \"stop\": {stop_value}, \"model\": \"{json_escape(model)}\", \"tokens_predicted\": {completion_tokens}, \"tokens_evaluated\": {prompt_tokens}, \"truncated\": false, \"stop_type\": \"{stop_type}\", \"stopping_word\": \"\", \"tokens_cached\": {cached_tokens}, \"completion_probabilities\": {native_logprobs_json(tokens, prob_tokens, values, token_bytes, alternatives)}}}"
+    let evaluated_tokens = prompt_tokens - cached_tokens
+    let returned_tokens = if return_tokens: token_ids_json(tokens) else: "[]"
+    let has_new_line = content.contains("\n")
+    "{{\"index\": 0, \"content\": \"{json_escape(content)}\", \"tokens\": {returned_tokens}, \"id_slot\": {id_slot}, \"stop\": {stop_value}, \"model\": \"{json_escape(model)}\", \"tokens_predicted\": {completion_tokens}, \"tokens_evaluated\": {prompt_tokens}, \"generation_settings\": {generation_settings}, \"prompt\": \"{json_escape(prompt)}\", \"has_new_line\": {has_new_line}, \"truncated\": {truncated}, \"stop_type\": \"{stop_type}\", \"stopping_word\": \"{json_escape(stopping_word)}\", \"tokens_cached\": {cached_tokens}, \"timings\": {server_timings_json(cached_tokens, evaluated_tokens, prompt_ms, completion_tokens, predicted_ms)}, \"completion_probabilities\": {native_logprobs_json(tokens, prob_tokens, values, token_bytes, alternatives, post_sampling_probs)}}}"
 
-pub string native_completion_sse_event(string content, [int] tokens, bool stopped):
+pub string native_stream_timings_suffix(bool enabled, int cached_tokens, int evaluated_tokens,
+                                         int prompt_ms, int predicted_tokens, int predicted_ms):
+    if enabled:
+        ", \"timings\": {server_timings_json(cached_tokens, evaluated_tokens, prompt_ms, predicted_tokens, predicted_ms)}"
+    else:
+        ""
+
+pub string native_completion_sse_event(string content, [int] tokens, bool stopped,
+                                         string timings_suffix):
     let stop_value = if stopped: "true" else: "false"
-    "data: {{\"index\": 0, \"content\": \"{json_escape(content)}\", \"tokens\": {token_ids_json(tokens)}, \"stop\": {stop_value}}}\n\n"
+    "data: {{\"index\": 0, \"content\": \"{json_escape(content)}\", \"tokens\": {token_ids_json(tokens)}, \"stop\": {stop_value}{timings_suffix}}}\n\n"
+
+pub string prompt_progress_sse_event(int total, int cached, int processed, int elapsed_ms):
+    "data: {{\"prompt_progress\": {{\"total\": {total}, \"cache\": {cached}, \"processed\": {processed}, \"time_ms\": {elapsed_ms}}}}}\n\n"
+
+pub string native_completion_sse_event_logprobs(string content, [int] tokens, bool stopped,
+                                                  string timings_suffix,
+                                                  [string] prob_tokens, [float32] values,
+                                                  [[uint8]] token_bytes,
+                                                  [[TokenLogprobAlternative]] alternatives,
+                                                  bool post_sampling_probs):
+    let stop_value = if stopped: "true" else: "false"
+    "data: {{\"index\": 0, \"content\": \"{json_escape(content)}\", \"tokens\": {token_ids_json(tokens)}, \"stop\": {stop_value}, \"completion_probabilities\": {native_logprobs_json(tokens, prob_tokens, values, token_bytes, alternatives, post_sampling_probs)}{timings_suffix}}}\n\n"
+
+pub string native_completion_final_json(string model, int id_slot, string stop_type, string stopping_word, bool truncated,
+                                         int prompt_tokens, int completion_tokens,
+                                         int cached_tokens, int prompt_ms, int predicted_ms,
+                                         string generation_settings, string prompt, bool has_new_line):
+    let evaluated_tokens = prompt_tokens - cached_tokens
+    "{{\"index\": 0, \"content\": \"\", \"tokens\": [], \"id_slot\": {id_slot}, \"stop\": true, \"model\": \"{json_escape(model)}\", \"tokens_predicted\": {completion_tokens}, \"tokens_evaluated\": {prompt_tokens}, \"generation_settings\": {generation_settings}, \"prompt\": \"{json_escape(prompt)}\", \"has_new_line\": {has_new_line}, \"truncated\": {truncated}, \"stop_type\": \"{stop_type}\", \"stopping_word\": \"{json_escape(stopping_word)}\", \"tokens_cached\": {cached_tokens}, \"timings\": {server_timings_json(cached_tokens, evaluated_tokens, prompt_ms, completion_tokens, predicted_ms)}}}"
+
+pub string native_completion_final_sse_event(string model, int id_slot, string stop_type, string stopping_word, bool truncated,
+                                               int prompt_tokens, int completion_tokens,
+                                               int cached_tokens, int prompt_ms, int predicted_ms,
+                                               string generation_settings, string prompt, bool has_new_line):
+    "data: {native_completion_final_json(model, id_slot, stop_type, stopping_word, truncated, prompt_tokens, completion_tokens, cached_tokens, prompt_ms, predicted_ms, generation_settings, prompt, has_new_line)}\n\n"
 
 pub string sse_error_event(string message):
     "data: {{\"error\": {{\"message\": \"{json_escape(message)}\", \"type\": \"server_error\", \"code\": \"internal_error\"}}}}\n\n"
@@ -1548,7 +2980,7 @@ pub string sse_error_event(string message):
 # role chunk, one content chunk, optional tool-call chunk, a finish chunk and
 # (when asked via `stream_options.include_usage`) a usage chunk.
 pub string completion_sse(string id, string model, ParsedReply reply, string finish_reason,
-                           int prompt_tokens, int completion_tokens, bool include_usage, uint64 created):
+                           int prompt_tokens, int completion_tokens, int cached_tokens, bool include_usage, uint64 created):
     var string out = sse_role_event(id, model, created)
     if reply.content != "":
         out = "{out}{sse_content_event(id, model, reply.content, created)}"
@@ -1556,7 +2988,7 @@ pub string completion_sse(string id, string model, ParsedReply reply, string fin
         out = "{out}{sse_tool_calls_event(id, model, reply.calls, created)}"
     out = "{out}{sse_finish_event(id, model, finish_reason, created)}"
     if include_usage:
-        out = "{out}{sse_usage_event(id, model, prompt_tokens, completion_tokens, created)}"
+        out = "{out}{sse_usage_event(id, model, prompt_tokens, completion_tokens, cached_tokens, created)}"
     "{out}{sse_done_event()}"
 
 # ── Incremental streaming of the reply text ──────────────────────────────
@@ -1702,6 +3134,16 @@ pub (string, string) split_reasoning(string text):
         (trim_nl(r, true, true), trim_nl(c, true, false))
     else:
         (trim_nl(r, true, true), "")
+
+# Applies llama-server's response-format policy after the model-specific
+# `<think>` parser has separated reasoning from the answer.
+pub (string, string) reasoning_response_parts(string text, string format):
+    let (reasoning, content) = split_reasoning(text)
+    if format == "none":
+        return ("", text)
+    if format == "deepseek-legacy":
+        return (reasoning, text)
+    (reasoning, content)
 
 # `r` without a trailing piece that could still grow into `</think>`.
 string without_partial_close(string r):

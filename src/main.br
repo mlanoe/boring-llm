@@ -7,6 +7,7 @@
 
 use gguf
 use gguf_file
+use io
 use cache_policy
 use prompt_cache
 use math_gpu
@@ -56,6 +57,21 @@ int parse_int_arg(string name, string s) throws:
     guard let n = (s as int) else throw "invalid {name} value: '{s}'"
     n
 
+bool parse_bool_arg(string name, string s) throws:
+    let value = s.trim().lower()
+    if value == "1" or value == "true" or value == "on" or value == "enabled": return true
+    if value == "0" or value == "false" or value == "off" or value == "disabled": return false
+    throw "invalid {name} boolean value: '{s}'"
+
+bool has_cli_arg([string] argv, [string] names):
+    for arg in argv:
+        if names.contains(arg): return true
+    false
+
+string environment_default([string] argv, [string] cli_names, string env_name, string fallback):
+    if has_cli_arg(argv, cli_names): return fallback
+    environment(env_name) else fallback
+
 float32 parse_float_arg(string name, string s) throws:
     # NOTE: `(s as float32)` directly (not going through `float`/f64 first)
     # mis-transpiles under --target metal — the parsed value comes out
@@ -64,6 +80,33 @@ float32 parse_float_arg(string name, string s) throws:
     # float64 under a GPU target" theme as elsewhere in this project).
     guard let f = (s as float) else throw "invalid {name} value: '{s}'"
     f as float32
+
+[string] parse_sampler_names(string value) throws:
+    mut [string] names = []
+    for raw in value.split(";"):
+        let name = raw.trim()
+        guard name != "" else throw "--samplers must not contain an empty entry"
+        names.push(name)
+    let validation_error = sampler_list_validation_error(names)
+    guard validation_error == "" else throw "--samplers: {validation_error}"
+    names
+
+[string] parse_sampler_sequence(string value) throws:
+    mut [string] names = []
+    for ch in value.chars():
+        if ch == "e": names.push("penalties")
+        elif ch == "d": names.push("dry")
+        elif ch == "s": names.push("top_n_sigma")
+        elif ch == "k": names.push("top_k")
+        elif ch == "y": names.push("typ_p")
+        elif ch == "p": names.push("top_p")
+        elif ch == "m": names.push("min_p")
+        elif ch == "x": names.push("xtc")
+        elif ch == "t": names.push("temperature")
+        else: throw "--sampler-seq contains unsupported sampler code `{ch}`"
+    let validation_error = sampler_list_validation_error(names)
+    guard validation_error == "" else throw "--sampler-seq: {validation_error}"
+    names
 
 [int] parse_token_ids(string csv) throws:
     mut [int] result = []
@@ -359,9 +402,11 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
 # tokenizer and a GgufFile that holds the metadata (chat template, vocabulary)
 # and the file's path — tensor data is read from disk tensor by tensor, so the
 # file is never held in memory.
-(GgufFile, QuantModel, Tokenizer) load_for_serving(string path) throws:
+(GgufFile, QuantModel, Tokenizer) load_for_serving(string path, string chat_template_override) throws:
     print "[diag] parsing {path}..."
-    let file = parse_gguf_path(path)
+    var GgufFile file = parse_gguf_path(path)
+    if chat_template_override != "":
+        file.metadata["tokenizer.chat_template"] = GgufValue.Str(chat_template_override)
     print "[diag] parsed ({file.file_size} bytes, {file.tensors.length} tensors, {file.metadata.length} metadata keys)"
     print "[diag] loading model weights (packed bytes, quantized tensor kernels)..."
     let m = load_model_quantized(file)
@@ -369,27 +414,40 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
     let tok = load_tokenizer(file)
     (file, m, tok)
 
-def run_serve(string path, string model_name, int ctx_size, int max_tokens, int cache_slots, string prompt_cache_dir, int prompt_cache_files, int prompt_cache_max_mb, int port, bool metrics_enabled, SamplingParams params) throws:
+def run_serve(string path, string model_name, [string] model_tags, string chat_template_override, int ctx_size, int max_tokens, int cache_slots, string prompt_cache_dir, string slot_save_dir, int prompt_cache_files, int prompt_cache_max_mb, string host, int port, [string] api_keys, string api_prefix, string cors_origins, string cors_methods, string cors_headers, bool cors_credentials, bool metrics_enabled, bool slots_enabled, bool cache_prompt_default, int sse_ping_interval_default, string reasoning_format_default, string reasoning_effort_default, JValue chat_template_kwargs_default, ServerSamplingDefaults extra_defaults, SamplingParams params) throws:
+    guard host != "" else throw "--host must not be empty"
+    guard port >= 1 and port <= 65535 else throw "--port must be between 1 and 65535"
+    guard ctx_size >= 2 else throw "--ctx-size must be at least 2"
+    guard max_tokens >= -1 else throw "--max-tokens must be -1 or greater"
     guard cache_slots >= 1 else throw "--cache-slots must be at least 1"
     guard prompt_cache_files >= 1 else throw "--prompt-cache-files must be at least 1"
     guard prompt_cache_max_mb >= 0 else throw "--prompt-cache-max-mb must not be negative"
-    let (file, m, tok) = load_for_serving(path)
-    let name = if model_name != "": model_name else: (gguf_get_string(file.metadata, "general.name") else "boring-llm")
+    guard sse_ping_interval_default >= -1 else throw "--sse-ping-interval must be -1 or a non-negative integer"
+    let prefix_error = api_prefix_validation_error(api_prefix)
+    guard prefix_error == "" else throw prefix_error
+    let (file, m, tok) = load_for_serving(path, chat_template_override)
+    let fallback_name = gguf_get_string(file.metadata, "general.name") else "boring-llm"
+    let aliases = model_alias_list(model_name, fallback_name)
+    let name = aliases[0]
     var int fp = 0
     var int bpt = 0
     var [DiskSnap] disk = []
-    if prompt_cache_dir != "":
-        ensure_dir(prompt_cache_dir)
-        let kv_dim = kv_dim_of(m)
+    let kv_dim = kv_dim_of(m)
+    if prompt_cache_dir != "" or slot_save_dir != "":
         fp = model_fingerprint(file, m.config.n_layer, kv_dim)
         bpt = snapshot_bytes_per_token(m.config.n_layer, kv_dim)
+    if prompt_cache_dir != "":
+        ensure_dir(prompt_cache_dir)
         disk = scan_snapshots(prompt_cache_dir, fp, m.config.n_layer, kv_dim, prompt_cache_files)
         for d in disk:
             print "[serve] prompt cache: file {d.slot} holds {d.tokens.length} tokens"
         let cap = if prompt_cache_max_mb > 0: "{prompt_cache_max_mb} MB" else: "no size cap"
         print "[serve] prompt cache: {prompt_cache_dir} ({disk.length} snapshot(s), keeping up to {prompt_cache_files} files, {cap})"
-    let ctx = ServerCtx(file, tok, m, path, name, ctx_size, max_tokens, cache_slots, params, prompt_cache_dir, fp, prompt_cache_files, prompt_cache_max_mb * 1048576, bpt, metrics_enabled)
-    serve(ctx, port, disk)
+    if slot_save_dir != "":
+        ensure_dir(slot_save_dir)
+        print "[serve] named slot snapshots: {slot_save_dir}"
+    let ctx = ServerCtx(file, tok, m, path, name, aliases, model_tags, ctx_size, max_tokens, cache_slots, params, extra_defaults, prompt_cache_dir, fp, prompt_cache_files, prompt_cache_max_mb * 1048576, bpt, metrics_enabled, slot_save_dir, api_keys, api_prefix, slots_enabled, cache_prompt_default, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, cors_origins, cors_methods, cors_headers, cors_credentials)
+    serve(ctx, host, port, disk)
 
 def run_render_request(GgufFile file, string path) throws:
     let tok = load_tokenizer(file)
@@ -426,10 +484,18 @@ def run_encode_file(GgufFile file, string path) throws:
         _:
             throw "--encode-file: expected a JSON array of strings"
 
+string usage_text():
+    "boring-llm — local GGUF inference and OpenAI-compatible server\n\nUsage:\n  main -m MODEL [options]\n\nModel:\n  -m, --model, --gguf PATH        GGUF model file (required)\n  -a, --alias, --model-name NAME  model id reported by the API\n  --tags TAGS                     informational comma-separated model tags\n  -c, --ctx-size N                context size (default: 4096)\n\nServer:\n  --serve                         run the HTTP server\n  --host HOST                     listening host (default: 127.0.0.1)\n  --port N                        listening port (default: 8080)\n  --api-prefix PATH               serve every route below a path prefix\n  --api-key KEY                   require a Bearer key; comma separates keys\n  --api-key-file FILE             read one Bearer key per line\n  --cache-slots N                 in-memory prompt-cache slots (default: 4)\n  --cache-prompt, --no-cache-prompt  default prompt-prefix reuse policy\n  --slots, --no-slots             enable or disable the /slots endpoint\n  --prompt-cache DIR              persistent prompt-cache directory\n  --metrics                       enable GET /metrics\n  --sse-ping-interval N           SSE keep-alive seconds; -1 disables\n  --reasoning-format FORMAT       default reasoning extraction mode\n  -rea, --reasoning [MODE]        thinking default: on, off, or auto\n  --reasoning-preserve, --no-reasoning-preserve\n                                  preserve earlier assistant reasoning\n  --reasoning-effort LEVEL        default effort passed to chat templates\n  --chat-template-kwargs JSON     default chat-template variables\n  --chat-template TEMPLATE       override the embedded Jinja template\n  --chat-template-file FILE      read the Jinja template from a file\n\nGeneration:\n  --prompt TEXT                   generate one chat reply\n  --chat                          interactive terminal chat\n  -n, --predict, --n-predict N    reply-token limit (default: 40)\n  --max-tokens N                  same reply-token limit\n  --temp, --temperature T --top-k K --top-p P --min-p P\n  --typical-p P --top-n-sigma N --dynatemp-range N\n  --dynatemp-exp N --xtc-probability P --xtc-threshold P\n  --min-keep N\n  -s, --seed S --repeat-penalty R --repeat-last-n N\n\nDiagnostics:\n  --dump-metadata                 print GGUF metadata\n  --tokens IDS                    print logits for comma-separated token ids\n  --generate-tokens IDS           generate from comma-separated token ids\n  -h, --help, --usage             print this help and exit\n  --version                       print build identity and exit"
+
+string full_usage_text():
+    let cors = usage_text().replace("  --api-key KEY", "  --cors-origins ORIGINS          allowed browser origins (default: *)\n  --cors-methods METHODS          allowed CORS methods\n  --cors-headers HEADERS          allowed CORS headers\n  --cors-credentials, --no-cors-credentials\n                                  allow or deny browser credentials\n  --api-key KEY")
+    let parallel = cors.replace("  --cache-prompt, --no-cache-prompt", "  -np, --parallel N               concurrent request slots (only 1 supported)\n  --threads-http N                HTTP worker count (only 1 supported)\n  --jinja                         Jinja chat templates (always enabled)\n  --no-warmup                    skip startup warmup (current behavior)\n  -nocb, --no-cont-batching      serialized serving (current behavior)\n  --no-context-shift             stop when the context is full\n  --no-webui, --no-ui            API-only server (current behavior)\n  --no-mmproj                    text-only mode (current behavior)\n  --cache-prompt, --no-cache-prompt")
+    parallel.replace("  -s, --seed S", "  --dry-multiplier N --dry-base N --dry-allowed-length N\n  --dry-penalty-last-n N\n  --presence-penalty N --frequency-penalty N\n  --mirostat N --mirostat-ent N --mirostat-lr N (server)\n  --adaptive-target N --adaptive-decay N (server)\n  --samplers LIST --sampler-seq SEQUENCE\n  --ignore-eos                    suppress the EOS token (server)\n  -s, --seed S")
+
 def main() throws:
     let [string] argv = args()
 
-    var string gguf_path = ""
+    var string gguf_path = environment_default(argv, ["--gguf", "--model", "-m"], "LLAMA_ARG_MODEL", "")
     var bool dump_metadata = false
     var string tokens_csv = ""
     var string generate_tokens_csv = ""
@@ -437,33 +503,143 @@ def main() throws:
     var bool quantized = false
     var string prompt = ""
     var string system_msg = "You are a helpful assistant."
-    var int max_tokens = 40
+    let max_tokens_env = environment_default(argv, ["--max-tokens", "--predict", "--n-predict", "-n"], "LLAMA_ARG_N_PREDICT", "40")
+    var int max_tokens = parse_max_tokens(max_tokens_env)
     var bool kv_cache = false
     var bool chat_mode = false
-    var float32 temperature = 0.0 as float32
-    var int top_k = 0
-    var float32 top_p = 1.0 as float32
-    var float32 min_p = 0.0 as float32
+    let temperature_env = environment_default(argv, ["--temperature", "--temp"], "LLAMA_ARG_TEMPERATURE", "0.0")
+    var float32 temperature = parse_float_arg("LLAMA_ARG_TEMPERATURE", temperature_env)
+    var float32 dynatemp_range = 0.0 as float32
+    var float32 dynatemp_exponent = 1.0 as float32
+    var float32 top_n_sigma = -1.0 as float32
+    let top_k_env = environment_default(argv, ["--top-k"], "LLAMA_ARG_TOP_K", "0")
+    var int top_k = parse_int_arg("LLAMA_ARG_TOP_K", top_k_env)
+    var float32 typical_p = 1.0 as float32
+    let top_p_env = environment_default(argv, ["--top-p"], "LLAMA_ARG_TOP_P", "1.0")
+    var float32 top_p = parse_float_arg("LLAMA_ARG_TOP_P", top_p_env)
+    let min_p_env = environment_default(argv, ["--min-p"], "LLAMA_ARG_MIN_P", "0.0")
+    var float32 min_p = parse_float_arg("LLAMA_ARG_MIN_P", min_p_env)
+    var float32 xtc_probability = 0.0 as float32
+    var float32 xtc_threshold = 0.1 as float32
+    var int min_keep = 0
     var int seed = 0
-    var float32 repeat_penalty = 1.0 as float32
+    let repeat_penalty_env = environment_default(argv, ["--repeat-penalty"], "LLAMA_ARG_REPEAT_PENALTY", "1.0")
+    var float32 repeat_penalty = parse_float_arg("LLAMA_ARG_REPEAT_PENALTY", repeat_penalty_env)
     var int repeat_last_n = 64
+    var float32 dry_multiplier = 0.0 as float32
+    var float32 dry_base = 1.75 as float32
+    var int dry_allowed_length = 2
+    var int dry_penalty_last_n = 64
+    let presence_penalty_env = environment_default(argv, ["--presence-penalty"], "LLAMA_ARG_PRESENCE_PENALTY", "0.0")
+    var float32 presence_penalty = parse_float_arg("LLAMA_ARG_PRESENCE_PENALTY", presence_penalty_env)
+    guard presence_penalty >= -2.0 as float32 and presence_penalty <= 2.0 as float32 else throw "LLAMA_ARG_PRESENCE_PENALTY must be between -2 and 2"
+    let frequency_penalty_env = environment_default(argv, ["--frequency-penalty"], "LLAMA_ARG_FREQUENCY_PENALTY", "0.0")
+    var float32 frequency_penalty = parse_float_arg("LLAMA_ARG_FREQUENCY_PENALTY", frequency_penalty_env)
+    guard frequency_penalty >= -2.0 as float32 and frequency_penalty <= 2.0 as float32 else throw "LLAMA_ARG_FREQUENCY_PENALTY must be between -2 and 2"
+    var int mirostat = 0
+    var float32 mirostat_tau = 5.0 as float32
+    var float32 mirostat_eta = 0.1 as float32
+    var float32 adaptive_target = -1.0 as float32
+    var float32 adaptive_decay = 0.9 as float32
+    var [string] samplers = ["penalties", "dry", "top_n_sigma", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"]
+    var bool ignore_eos = false
     var bool serve_mode = false
     var string render_request_path = ""
     var string encode_file_path = ""
-    var int port = 8080
-    var string model_name = ""
-    var int ctx_size = 4096
+    var string host = environment_default(argv, ["--host"], "LLAMA_ARG_HOST", "127.0.0.1")
+    let port_env = environment_default(argv, ["--port"], "LLAMA_ARG_PORT", "8080")
+    var int port = parse_int_arg("LLAMA_ARG_PORT", port_env)
+    var mut [string] api_keys = []
+    let api_key_env = environment_default(argv, ["--api-key", "--api-key-file"], "LLAMA_API_KEY", "")
+    if api_key_env != "":
+        for key in api_key_env.split(","):
+            guard key.trim() != "" else throw "LLAMA_API_KEY must not contain an empty comma-separated key"
+            api_keys.push(key.trim())
+    let api_key_file_env = environment_default(argv, ["--api-key", "--api-key-file"], "LLAMA_ARG_API_KEY_FILE", "")
+    if api_key_file_env != "":
+        let key_bytes = fs.readBytes(api_key_file_env)
+        guard is_valid_utf8(key_bytes) else throw "LLAMA_ARG_API_KEY_FILE must name a UTF-8 file"
+        let file_keys = api_keys_from_file_text(bytes_to_str(key_bytes))
+        guard file_keys.length > 0 else throw "LLAMA_ARG_API_KEY_FILE contains no keys"
+        for key in file_keys: api_keys.push(key)
+    var bool api_keys_from_cli = false
+    var string api_prefix = ""
+    var string cors_origins = environment_default(argv, ["--cors-origins"], "LLAMA_ARG_CORS_ORIGINS", "*")
+    var string cors_methods = environment_default(argv, ["--cors-methods"], "LLAMA_ARG_CORS_METHODS", "GET, POST, DELETE, OPTIONS")
+    var string cors_headers = environment_default(argv, ["--cors-headers"], "LLAMA_ARG_CORS_HEADERS", "*")
+    var bool cors_credentials = true
+    var string model_name = environment_default(argv, ["--model-name", "--alias", "-a"], "LLAMA_ARG_ALIAS", "")
+    var mut [string] model_tags = []
+    let tags_env = environment_default(argv, ["--tags"], "LLAMA_ARG_TAGS", "")
+    if tags_env != "":
+        for tag in tags_env.split(","):
+            guard tag.trim() != "" else throw "LLAMA_ARG_TAGS must not contain an empty comma-separated tag"
+            model_tags.push(tag.trim())
+    var bool tags_from_cli = false
+    var string chat_template_override = ""
+    let ctx_size_env = environment_default(argv, ["--ctx-size", "-c"], "LLAMA_ARG_CTX_SIZE", "4096")
+    var int ctx_size = parse_int_arg("LLAMA_ARG_CTX_SIZE", ctx_size_env)
     var int cache_slots = 4
     var string prompt_cache_dir = ""
+    var string slot_save_dir = environment_default(argv, ["--slot-save-path"], "LLAMA_ARG_SLOT_SAVE_PATH", "")
     var int prompt_cache_files = 2
     var int prompt_cache_max_mb = 4096
     var int requested_profile_stage = 0
-    var bool metrics_enabled = false
+    let metrics_env = environment_default(argv, ["--metrics"], "LLAMA_ARG_ENDPOINT_METRICS", "false")
+    var bool metrics_enabled = parse_bool_arg("LLAMA_ARG_ENDPOINT_METRICS", metrics_env)
+    let slots_env = environment_default(argv, ["--slots", "--no-slots"], "LLAMA_ARG_ENDPOINT_SLOTS", "true")
+    var bool slots_enabled = parse_bool_arg("LLAMA_ARG_ENDPOINT_SLOTS", slots_env)
+    let cache_prompt_env = environment_default(argv, ["--cache-prompt", "--no-cache-prompt"], "LLAMA_ARG_CACHE_PROMPT", "true")
+    var bool cache_prompt_default = parse_bool_arg("LLAMA_ARG_CACHE_PROMPT", cache_prompt_env)
+    let sse_ping_env = environment_default(argv, ["--sse-ping-interval"], "LLAMA_ARG_SSE_PING_INTERVAL", "30")
+    var int sse_ping_interval_default = parse_int_arg("LLAMA_ARG_SSE_PING_INTERVAL", sse_ping_env)
+    let parallel_env = environment_default(argv, ["--parallel", "-np"], "LLAMA_ARG_N_PARALLEL", "1")
+    let parallel_default = parse_int_arg("LLAMA_ARG_N_PARALLEL", parallel_env)
+    guard parallel_default == 1 else throw "LLAMA_ARG_N_PARALLEL currently supports only 1 because requests are serialized"
+    let threads_http_env = environment_default(argv, ["--threads-http"], "LLAMA_ARG_THREADS_HTTP", "1")
+    let threads_http_default = parse_int_arg("LLAMA_ARG_THREADS_HTTP", threads_http_env)
+    guard threads_http_default == 1 else throw "LLAMA_ARG_THREADS_HTTP currently supports only 1 because requests are serialized"
+    let ui_env = environment_default(argv, ["--ui", "--webui", "--no-ui", "--no-webui"], "LLAMA_ARG_UI", "false")
+    guard !parse_bool_arg("LLAMA_ARG_UI", ui_env) else throw "LLAMA_ARG_UI cannot enable the unsupported Web UI"
+    let jinja_env = environment_default(argv, ["--jinja", "--no-jinja"], "LLAMA_ARG_JINJA", "true")
+    guard parse_bool_arg("LLAMA_ARG_JINJA", jinja_env) else throw "LLAMA_ARG_JINJA cannot disable the chat-template engine"
+    let embeddings_env = environment_default(argv, ["--embedding", "--embeddings"], "LLAMA_ARG_EMBEDDINGS", "false")
+    guard !parse_bool_arg("LLAMA_ARG_EMBEDDINGS", embeddings_env) else throw "LLAMA_ARG_EMBEDDINGS is not supported; boring-llm serves causal text generation only"
+    let reranking_env = environment_default(argv, ["--rerank", "--reranking"], "LLAMA_ARG_RERANKING", "false")
+    guard !parse_bool_arg("LLAMA_ARG_RERANKING", reranking_env) else throw "LLAMA_ARG_RERANKING is not supported; boring-llm does not load ranking models"
+    let cont_batching_env = environment_default(argv, ["--cont-batching", "-cb", "--no-cont-batching", "-nocb"], "LLAMA_ARG_CONT_BATCHING", "false")
+    guard !parse_bool_arg("LLAMA_ARG_CONT_BATCHING", cont_batching_env) else throw "LLAMA_ARG_CONT_BATCHING is not supported because requests are serialized"
+    let context_shift_env = environment_default(argv, ["--context-shift", "--no-context-shift"], "LLAMA_ARG_CONTEXT_SHIFT", "false")
+    guard !parse_bool_arg("LLAMA_ARG_CONTEXT_SHIFT", context_shift_env) else throw "LLAMA_ARG_CONTEXT_SHIFT is not supported; generation stops at the context limit"
+    let mmproj_env = environment_default(argv, ["--mmproj", "-mm", "--mmproj-url", "-mmu", "--mmproj-auto", "--no-mmproj", "--no-mmproj-auto"], "LLAMA_ARG_MMPROJ", "")
+    guard mmproj_env == "" else throw "LLAMA_ARG_MMPROJ is not supported because boring-llm is text-only"
+    let mmproj_url_env = environment_default(argv, ["--mmproj", "-mm", "--mmproj-url", "-mmu", "--mmproj-auto", "--no-mmproj", "--no-mmproj-auto"], "LLAMA_ARG_MMPROJ_URL", "")
+    guard mmproj_url_env == "" else throw "LLAMA_ARG_MMPROJ_URL is not supported because boring-llm is text-only"
+    let mmproj_auto_env = environment_default(argv, ["--mmproj", "-mm", "--mmproj-url", "-mmu", "--mmproj-auto", "--no-mmproj", "--no-mmproj-auto"], "LLAMA_ARG_MMPROJ_AUTO", "false")
+    guard !parse_bool_arg("LLAMA_ARG_MMPROJ_AUTO", mmproj_auto_env) else throw "LLAMA_ARG_MMPROJ_AUTO cannot enable multimodal projector discovery in text-only mode"
+    var string reasoning_format_default = environment_default(argv, ["--reasoning-format"], "LLAMA_ARG_REASONING_FORMAT", "auto")
+    guard reasoning_format_default == "auto" or reasoning_format_default == "none" or reasoning_format_default == "deepseek" or reasoning_format_default == "deepseek-legacy" else throw "LLAMA_ARG_REASONING_FORMAT expects auto, none, deepseek, or deepseek-legacy"
+    var string reasoning_effort_default = ""
+    var string reasoning_default = "auto"
+    var string reasoning_preserve_default = "default"
+    var JValue chat_template_kwargs_default = JValue.JDict({=}, [])
+    let template_kwargs_env = environment_default(argv, ["--chat-template-kwargs"], "LLAMA_ARG_CHAT_TEMPLATE_KWARGS", "")
+    if template_kwargs_env != "":
+        let parsed_kwargs = json_parse(template_kwargs_env)
+        match parsed_kwargs:
+            JDict(fields, keys): chat_template_kwargs_default = parsed_kwargs
+            _: throw "LLAMA_ARG_CHAT_TEMPLATE_KWARGS expects a JSON object"
 
     var int i = 1
     while i < argv.length:
         let a = argv[i]
-        if a == "--gguf" and i + 1 < argv.length:
+        if a == "-h" or a == "--help" or a == "--usage":
+            print full_usage_text()
+            return
+        elif a == "--version":
+            print "boring-llm"
+            return
+        elif (a == "--gguf" or a == "--model" or a == "-m") and i + 1 < argv.length:
             gguf_path = argv[i + 1]
             i += 2
         elif a == "--dump-metadata":
@@ -487,7 +663,7 @@ def main() throws:
         elif a == "--system" and i + 1 < argv.length:
             system_msg = argv[i + 1]
             i += 2
-        elif a == "--max-tokens" and i + 1 < argv.length:
+        elif (a == "--max-tokens" or a == "--predict" or a == "--n-predict" or a == "-n") and i + 1 < argv.length:
             max_tokens = parse_max_tokens(argv[i + 1])
             i += 2
         elif a == "--kv-cache":
@@ -496,11 +672,26 @@ def main() throws:
         elif a == "--chat":
             chat_mode = true
             i += 1
-        elif a == "--temperature" and i + 1 < argv.length:
+        elif (a == "--temperature" or a == "--temp") and i + 1 < argv.length:
             temperature = parse_float_arg("--temperature", argv[i + 1])
+            i += 2
+        elif a == "--dynatemp-range" and i + 1 < argv.length:
+            dynatemp_range = parse_float_arg("--dynatemp-range", argv[i + 1])
+            guard dynatemp_range >= 0.0 as float32 else throw "--dynatemp-range must be non-negative"
+            i += 2
+        elif (a == "--dynatemp-exp" or a == "--dynatemp-exponent") and i + 1 < argv.length:
+            dynatemp_exponent = parse_float_arg("--dynatemp-exp", argv[i + 1])
+            guard dynatemp_exponent > 0.0 as float32 else throw "--dynatemp-exp must be positive"
+            i += 2
+        elif (a == "--top-nsigma" or a == "--top-n-sigma") and i + 1 < argv.length:
+            top_n_sigma = parse_float_arg("--top-n-sigma", argv[i + 1])
             i += 2
         elif a == "--top-k" and i + 1 < argv.length:
             top_k = parse_int_arg("--top-k", argv[i + 1])
+            i += 2
+        elif (a == "--typical" or a == "--typical-p") and i + 1 < argv.length:
+            typical_p = parse_float_arg("--typical-p", argv[i + 1])
+            guard typical_p > 0.0 as float32 and typical_p <= 1.0 as float32 else throw "--typical-p must be greater than 0 and at most 1"
             i += 2
         elif a == "--top-p" and i + 1 < argv.length:
             top_p = parse_float_arg("--top-p", argv[i + 1])
@@ -508,7 +699,19 @@ def main() throws:
         elif a == "--min-p" and i + 1 < argv.length:
             min_p = parse_float_arg("--min-p", argv[i + 1])
             i += 2
-        elif a == "--seed" and i + 1 < argv.length:
+        elif a == "--xtc-probability" and i + 1 < argv.length:
+            xtc_probability = parse_float_arg("--xtc-probability", argv[i + 1])
+            guard xtc_probability >= 0.0 as float32 and xtc_probability <= 1.0 as float32 else throw "--xtc-probability must be between 0 and 1"
+            i += 2
+        elif a == "--xtc-threshold" and i + 1 < argv.length:
+            xtc_threshold = parse_float_arg("--xtc-threshold", argv[i + 1])
+            guard xtc_threshold >= 0.0 as float32 and xtc_threshold <= 1.0 as float32 else throw "--xtc-threshold must be between 0 and 1"
+            i += 2
+        elif a == "--min-keep" and i + 1 < argv.length:
+            min_keep = parse_int_arg("--min-keep", argv[i + 1])
+            guard min_keep >= 0 else throw "--min-keep must be non-negative"
+            i += 2
+        elif (a == "--seed" or a == "-s") and i + 1 < argv.length:
             seed = parse_int_arg("--seed", argv[i + 1])
             i += 2
         elif a == "--repeat-penalty" and i + 1 < argv.length:
@@ -517,6 +720,99 @@ def main() throws:
         elif a == "--repeat-last-n" and i + 1 < argv.length:
             repeat_last_n = parse_int_arg("--repeat-last-n", argv[i + 1])
             i += 2
+        elif a == "--dry-multiplier" and i + 1 < argv.length:
+            dry_multiplier = parse_float_arg("--dry-multiplier", argv[i + 1])
+            guard dry_multiplier >= 0.0 as float32 else throw "--dry-multiplier must be non-negative"
+            i += 2
+        elif a == "--dry-base" and i + 1 < argv.length:
+            dry_base = parse_float_arg("--dry-base", argv[i + 1])
+            guard dry_base >= 1.0 as float32 else throw "--dry-base must be at least 1"
+            i += 2
+        elif a == "--dry-allowed-length" and i + 1 < argv.length:
+            dry_allowed_length = parse_int_arg("--dry-allowed-length", argv[i + 1])
+            guard dry_allowed_length >= 0 else throw "--dry-allowed-length must be non-negative"
+            i += 2
+        elif a == "--dry-penalty-last-n" and i + 1 < argv.length:
+            dry_penalty_last_n = parse_int_arg("--dry-penalty-last-n", argv[i + 1])
+            guard dry_penalty_last_n >= 0 else throw "--dry-penalty-last-n must be non-negative"
+            i += 2
+        elif a == "--presence-penalty" and i + 1 < argv.length:
+            presence_penalty = parse_float_arg("--presence-penalty", argv[i + 1])
+            guard presence_penalty >= -2.0 as float32 and presence_penalty <= 2.0 as float32 else throw "--presence-penalty must be between -2 and 2"
+            i += 2
+        elif a == "--frequency-penalty" and i + 1 < argv.length:
+            frequency_penalty = parse_float_arg("--frequency-penalty", argv[i + 1])
+            guard frequency_penalty >= -2.0 as float32 and frequency_penalty <= 2.0 as float32 else throw "--frequency-penalty must be between -2 and 2"
+            i += 2
+        elif a == "--mirostat" and i + 1 < argv.length:
+            mirostat = parse_int_arg("--mirostat", argv[i + 1])
+            guard mirostat >= 0 and mirostat <= 2 else throw "--mirostat must be 0, 1, or 2"
+            i += 2
+        elif (a == "--mirostat-ent" or a == "--mirostat-tau") and i + 1 < argv.length:
+            mirostat_tau = parse_float_arg("--mirostat-ent", argv[i + 1])
+            guard mirostat_tau > 0.0 as float32 else throw "--mirostat-ent must be positive"
+            i += 2
+        elif (a == "--mirostat-lr" or a == "--mirostat-eta") and i + 1 < argv.length:
+            mirostat_eta = parse_float_arg("--mirostat-lr", argv[i + 1])
+            guard mirostat_eta > 0.0 as float32 else throw "--mirostat-lr must be positive"
+            i += 2
+        elif a == "--adaptive-target" and i + 1 < argv.length:
+            adaptive_target = parse_float_arg("--adaptive-target", argv[i + 1])
+            guard adaptive_target <= 1.0 as float32 else throw "--adaptive-target must be at most 1"
+            i += 2
+        elif a == "--adaptive-decay" and i + 1 < argv.length:
+            adaptive_decay = parse_float_arg("--adaptive-decay", argv[i + 1])
+            guard adaptive_decay >= 0.0 as float32 and adaptive_decay <= 0.99 as float32 else throw "--adaptive-decay must be between 0 and 0.99"
+            i += 2
+        elif a == "--samplers" and i + 1 < argv.length:
+            samplers = parse_sampler_names(argv[i + 1])
+            i += 2
+        elif (a == "--sampler-seq" or a == "--sampling-seq") and i + 1 < argv.length:
+            samplers = parse_sampler_sequence(argv[i + 1])
+            i += 2
+        elif a == "--ignore-eos":
+            ignore_eos = true
+            i += 1
+        elif a == "--jinja":
+            # Chat templates always use boring-llm's Jinja interpreter.
+            i += 1
+        elif a == "--no-jinja":
+            throw "--no-jinja is not supported because chat templates require Jinja evaluation"
+        elif a == "--no-warmup":
+            # boring-llm does not run a startup inference warmup.
+            i += 1
+        elif a == "--warmup":
+            throw "--warmup is not supported; boring-llm starts without an inference warmup"
+        elif a == "--no-cont-batching" or a == "-nocb":
+            # Requests are serialized, so continuous batching is already off.
+            i += 1
+        elif a == "--cont-batching" or a == "-cb":
+            throw "--cont-batching is not supported because requests are serialized"
+        elif a == "--no-context-shift":
+            # Generation already stops when the configured context is full.
+            i += 1
+        elif a == "--context-shift":
+            throw "--context-shift is not supported; generation stops at the context limit"
+        elif a == "--threads-http" and i + 1 < argv.length:
+            let threads_http = parse_int_arg("--threads-http", argv[i + 1])
+            guard threads_http == 1 else throw "--threads-http currently supports only 1 because requests are serialized"
+            i += 2
+        elif a == "--no-webui" or a == "--no-ui":
+            # boring-llm exposes API routes only and has no embedded Web UI.
+            i += 1
+        elif a == "--webui" or a == "--ui":
+            throw "--webui is not supported; boring-llm serves API routes only"
+        elif a == "--no-mmproj" or a == "--no-mmproj-auto":
+            # No multimodal projector is loaded by boring-llm.
+            i += 1
+        elif a == "--mmproj-auto":
+            throw "--mmproj-auto is not supported because boring-llm is text-only"
+        elif (a == "--mmproj" or a == "-mm" or a == "--mmproj-url" or a == "-mmu") and i + 1 < argv.length:
+            throw "{a} is not supported because boring-llm is text-only"
+        elif a == "--embedding" or a == "--embeddings":
+            throw "{a} is not supported; boring-llm currently serves causal text generation only"
+        elif a == "--rerank" or a == "--reranking":
+            throw "{a} is not supported; boring-llm does not load ranking models"
         elif a == "--serve":
             serve_mode = true
             i += 1
@@ -529,10 +825,77 @@ def main() throws:
         elif a == "--port" and i + 1 < argv.length:
             port = parse_int_arg("--port", argv[i + 1])
             i += 2
-        elif a == "--model-name" and i + 1 < argv.length:
-            model_name = argv[i + 1]
+        elif a == "--host" and i + 1 < argv.length:
+            host = argv[i + 1]
             i += 2
-        elif a == "--ctx-size" and i + 1 < argv.length:
+        elif a == "--api-key" and i + 1 < argv.length:
+            if !api_keys_from_cli:
+                api_keys = []
+                api_keys_from_cli = true
+            let supplied_keys = argv[i + 1]
+            guard supplied_keys.trim() != "" else throw "--api-key expects a non-empty key"
+            for key in supplied_keys.split(","):
+                guard key.trim() != "" else throw "--api-key must not contain an empty comma-separated key"
+                api_keys.push(key.trim())
+            i += 2
+        elif a == "--api-key-file" and i + 1 < argv.length:
+            if !api_keys_from_cli:
+                api_keys = []
+                api_keys_from_cli = true
+            let key_bytes = fs.readBytes(argv[i + 1])
+            guard is_valid_utf8(key_bytes) else throw "--api-key-file must be UTF-8"
+            let file_keys = api_keys_from_file_text(bytes_to_str(key_bytes))
+            guard file_keys.length > 0 else throw "--api-key-file contains no keys"
+            for key in file_keys:
+                api_keys.push(key)
+            i += 2
+        elif a == "--api-prefix" and i + 1 < argv.length:
+            api_prefix = argv[i + 1]
+            i += 2
+        elif a == "--cors-origins" and i + 1 < argv.length:
+            cors_origins = argv[i + 1]
+            guard cors_origins.trim() != "" else throw "--cors-origins expects a non-empty value"
+            i += 2
+        elif a == "--cors-methods" and i + 1 < argv.length:
+            cors_methods = argv[i + 1]
+            guard cors_methods.trim() != "" else throw "--cors-methods expects a non-empty value"
+            i += 2
+        elif a == "--cors-headers" and i + 1 < argv.length:
+            cors_headers = argv[i + 1]
+            guard cors_headers.trim() != "" else throw "--cors-headers expects a non-empty value"
+            i += 2
+        elif a == "--cors-credentials":
+            cors_credentials = true
+            i += 1
+        elif a == "--no-cors-credentials":
+            cors_credentials = false
+            i += 1
+        elif (a == "--model-name" or a == "--alias" or a == "-a") and i + 1 < argv.length:
+            let supplied_aliases = argv[i + 1]
+            guard supplied_aliases.trim() != "" else throw "--alias expects a non-empty name"
+            for alias in supplied_aliases.split(","):
+                guard alias.trim() != "" else throw "--alias must not contain an empty comma-separated name"
+            model_name = supplied_aliases
+            i += 2
+        elif a == "--tags" and i + 1 < argv.length:
+            if !tags_from_cli:
+                model_tags = []
+                tags_from_cli = true
+            for tag in argv[i + 1].split(","):
+                guard tag.trim() != "" else throw "--tags must not contain an empty comma-separated tag"
+                model_tags.push(tag.trim())
+            i += 2
+        elif a == "--chat-template" and i + 1 < argv.length:
+            chat_template_override = argv[i + 1]
+            guard chat_template_override != "" else throw "--chat-template expects a non-empty template"
+            i += 2
+        elif a == "--chat-template-file" and i + 1 < argv.length:
+            let template_bytes = fs.readBytes(argv[i + 1])
+            guard is_valid_utf8(template_bytes) else throw "--chat-template-file must be UTF-8"
+            chat_template_override = bytes_to_str(template_bytes)
+            guard chat_template_override != "" else throw "--chat-template-file must not be empty"
+            i += 2
+        elif (a == "--ctx-size" or a == "-c") and i + 1 < argv.length:
             ctx_size = parse_int_arg("--ctx-size", argv[i + 1])
             i += 2
         elif a == "--kquant-prefill" and i + 1 < argv.length:
@@ -545,15 +908,67 @@ def main() throws:
         elif a == "--prompt-cache-files" and i + 1 < argv.length:
             prompt_cache_files = parse_int_arg("--prompt-cache-files", argv[i + 1])
             i += 2
+        elif a == "--slot-save-path" and i + 1 < argv.length:
+            slot_save_dir = argv[i + 1]
+            i += 2
         elif a == "--prompt-cache-max-mb" and i + 1 < argv.length:
             prompt_cache_max_mb = parse_int_arg("--prompt-cache-max-mb", argv[i + 1])
             i += 2
         elif a == "--cache-slots" and i + 1 < argv.length:
             cache_slots = parse_int_arg("--cache-slots", argv[i + 1])
             i += 2
+        elif (a == "--parallel" or a == "-np") and i + 1 < argv.length:
+            let parallel = parse_int_arg("--parallel", argv[i + 1])
+            guard parallel == 1 else throw "--parallel currently supports only 1 because requests are serialized"
+            i += 2
         elif a == "--metrics":
             metrics_enabled = true
             i += 1
+        elif a == "--slots":
+            slots_enabled = true
+            i += 1
+        elif a == "--no-slots":
+            slots_enabled = false
+            i += 1
+        elif a == "--cache-prompt":
+            cache_prompt_default = true
+            i += 1
+        elif a == "--no-cache-prompt":
+            cache_prompt_default = false
+            i += 1
+        elif a == "--sse-ping-interval" and i + 1 < argv.length:
+            sse_ping_interval_default = parse_int_arg("--sse-ping-interval", argv[i + 1])
+            guard sse_ping_interval_default >= -1 else throw "--sse-ping-interval must be -1 or a non-negative integer"
+            i += 2
+        elif a == "--reasoning-format" and i + 1 < argv.length:
+            reasoning_format_default = argv[i + 1]
+            guard reasoning_format_default == "auto" or reasoning_format_default == "none" or reasoning_format_default == "deepseek" or reasoning_format_default == "deepseek-legacy" else throw "--reasoning-format expects auto, none, deepseek, or deepseek-legacy"
+            i += 2
+        elif a == "--reasoning-effort" and i + 1 < argv.length:
+            reasoning_effort_default = argv[i + 1]
+            guard reasoning_effort_default == "default" or reasoning_effort_default == "none" or reasoning_effort_default == "minimal" or reasoning_effort_default == "low" or reasoning_effort_default == "medium" or reasoning_effort_default == "high" or reasoning_effort_default == "xhigh" or reasoning_effort_default == "max" else throw "--reasoning-effort expects default, none, minimal, low, medium, high, xhigh, or max"
+            i += 2
+        elif a == "--reasoning" or a == "-rea":
+            if i + 1 < argv.length and (argv[i + 1] == "on" or argv[i + 1] == "off" or argv[i + 1] == "auto"):
+                reasoning_default = argv[i + 1]
+                i += 2
+            elif i + 1 < argv.length and not argv[i + 1].startsWith("-"):
+                throw "--reasoning expects on, off, or auto"
+            else:
+                reasoning_default = "on"
+                i += 1
+        elif a == "--reasoning-preserve":
+            reasoning_preserve_default = "on"
+            i += 1
+        elif a == "--no-reasoning-preserve":
+            reasoning_preserve_default = "off"
+            i += 1
+        elif a == "--chat-template-kwargs" and i + 1 < argv.length:
+            let parsed_kwargs = json_parse(argv[i + 1])
+            match parsed_kwargs:
+                JDict(fields, keys): chat_template_kwargs_default = parsed_kwargs
+                _: throw "--chat-template-kwargs expects a JSON object"
+            i += 2
         elif a == "--decode-profile-stage" and i + 1 < argv.length:
             let stage = argv[i + 1]
             if stage == "qkv": requested_profile_stage = 1
@@ -569,9 +984,16 @@ def main() throws:
             else: throw "--decode-profile-stage expects qkv, attention, attn-proj, residual-norm, ffn, output-head, ffn-gate, ffn-up, swiglu, or ffn-down"
             i += 2
         else:
-            i += 1
+            throw "unknown or incomplete argument `{a}`"
 
-    guard gguf_path != "" else throw "usage: --gguf <path.gguf> [--dump-metadata] [--tokens 1,2,3 [--gpu|--quantized]] [--generate-tokens 1,2,3 --max-tokens N] [--prompt \"...\"|--chat [--system \"...\"] [--max-tokens N] [--kv-cache] [--temperature T --top-k K --top-p P --min-p P --seed S --repeat-penalty R --repeat-last-n N]|--serve [--port N] [--ctx-size N] [--cache-slots N] [--metrics] [--prompt-cache DIR [--prompt-cache-files N] [--prompt-cache-max-mb N]] [--kquant-prefill tensor|handwritten] [--decode-profile-stage STAGE] [--model-name NAME] [--max-tokens N default per request]]"
+    guard gguf_path != "" else throw full_usage_text()
+    guard repeat_last_n >= -1 else throw "--repeat-last-n must be -1 or greater"
+    guard mirostat == 0 or adaptive_target < 0.0 as float32 else throw "--mirostat and --adaptive-target cannot be enabled together"
+    guard serve_mode or (presence_penalty == 0.0 as float32 and frequency_penalty == 0.0 as float32 and mirostat == 0 and adaptive_target < 0.0 as float32 and not ignore_eos) else throw "presence/frequency penalties, stateful sampling, and --ignore-eos currently require --serve"
+    if reasoning_default == "on" or reasoning_default == "off":
+        chat_template_kwargs_default = jv_set(chat_template_kwargs_default, "enable_thinking", JValue.JBool(reasoning_default == "on"))
+    if reasoning_preserve_default == "on" or reasoning_preserve_default == "off":
+        chat_template_kwargs_default = jv_set(chat_template_kwargs_default, "preserve_reasoning", JValue.JBool(reasoning_preserve_default == "on"))
 
     set_decode_profile_stage(requested_profile_stage)
 
@@ -580,7 +1002,8 @@ def main() throws:
         # weight quantized GPU path, with the model loaded once up front and
         # kept resident for every request. Handled before the generic parse
         # below (which would also be fine now: no mode holds the file in memory).
-        run_serve(gguf_path, model_name, ctx_size, max_tokens, cache_slots, prompt_cache_dir, prompt_cache_files, prompt_cache_max_mb, port, metrics_enabled, SamplingParams(temperature, top_k, top_p, min_p, seed, repeat_penalty, repeat_last_n))
+        let extra_defaults = ServerSamplingDefaults(presence_penalty, frequency_penalty, mirostat, mirostat_tau, mirostat_eta, adaptive_target, adaptive_decay, samplers, ignore_eos)
+        run_serve(gguf_path, model_name, model_tags, chat_template_override, ctx_size, max_tokens, cache_slots, prompt_cache_dir, slot_save_dir, prompt_cache_files, prompt_cache_max_mb, host, port, api_keys, api_prefix, cors_origins, cors_methods, cors_headers, cors_credentials, metrics_enabled, slots_enabled, cache_prompt_default, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, extra_defaults, SamplingParams(temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, []))
         return
 
     print "[diag] parsing {gguf_path}..."
@@ -597,15 +1020,15 @@ def main() throws:
             run_forward_debug(file, parse_token_ids(tokens_csv), use_gpu)
 
     if generate_tokens_csv != "":
-        run_generate_tokens(file, parse_token_ids(generate_tokens_csv), max_tokens, SamplingParams(temperature, top_k, top_p, min_p, seed, repeat_penalty, repeat_last_n))
+        run_generate_tokens(file, parse_token_ids(generate_tokens_csv), max_tokens, SamplingParams(temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, []))
 
     if encode_file_path != "":
         run_encode_file(file, encode_file_path)
     if render_request_path != "":
         run_render_request(file, render_request_path)
     if chat_mode:
-        let params = SamplingParams(temperature, top_k, top_p, min_p, seed, repeat_penalty, repeat_last_n)
+        let params = SamplingParams(temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, [])
         run_chat(file, system_msg, max_tokens, kv_cache, quantized, params)
     elif prompt != "":
-        let params = SamplingParams(temperature, top_k, top_p, min_p, seed, repeat_penalty, repeat_last_n)
+        let params = SamplingParams(temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, [])
         run_generate(file, system_msg, prompt, max_tokens, kv_cache, quantized, params)

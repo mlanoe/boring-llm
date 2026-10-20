@@ -12,14 +12,14 @@ Full documentation: [the book](docs/book.md) ([HTML](docs/book.html)): command l
 
 - **Runs real models.** Qwen2.5 (0.5B, 3B, 7B tested), Qwen3 (4B tested) and Llama-architecture models (TinyLlama 1.1B tested), in F32, F16, Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q6_K and IQ4_NL, including the mixed-format files llama.cpp produces (`*-Q4_K_M.gguf`). Weights stay quantized on the GPU; there is no dequantized copy.
 - **Needs little memory.** Tensors are read from disk one at a time, then live on the GPU: a 3B Q4_K_M server starts in ~5 s and holds ~3.1 GB.
-- **Serves the OpenAI and llama-server APIs.** `GET /v1/models`, `POST /v1/chat/completions`, OpenAI `POST /v1/completions`, native `POST /completion`, chat input-token counting, and llama-server-compatible `/health`, `/props`, `/slots`, `/tokenize`, `/detokenize` and `/apply-template` routes. Completions are JSON or streamed (SSE, token by token, with `stream_options.include_usage` on OpenAI streams), with `stop` strings, reply-length controls, sampling parameters, OpenAI penalties and `logit_bias`; non-streaming responses support OpenAI `logprobs` and native `n_probs`. **Tool calling** uses the model's own chat template, parses Hermes-style `<tool_call>` output back into `tool_calls`, omits tools for `tool_choice: "none"`, and grammar-enforces `"required"` or a named function against its JSON Schema. Reasoning models (Qwen3) have their `<think>` text returned as `reasoning_content`, streamed too, and `chat_template_kwargs` (e.g. `{"enable_thinking": false}`) reaches the chat template.
+- **Serves the OpenAI, Anthropic and llama-server APIs.** `GET`/`HEAD /v1/models`, `POST /v1/chat/completions`, Anthropic `POST /v1/messages`, OpenAI `POST /v1/completions`, native `POST /completion`, OpenAI and Anthropic input-token counting, and llama-server-compatible `/health`, `/props`, `/slots`, `/tokenize`, `/detokenize` and `/apply-template` routes. Monitoring and model-metadata routes accept bodyless `HEAD` probes. Completions are JSON or streamed (SSE, token by token, with `stream_options.include_usage` on OpenAI streams), with `stop` strings, reply-length controls, sampling parameters, OpenAI penalties and `logit_bias`; buffered and streamed responses support OpenAI `logprobs` and native `n_probs` where token-to-text mapping is exact. **Tool calling** uses the model's own chat template, parses Hermes-style `<tool_call>` output back into `tool_calls`, omits tools for `tool_choice: "none"`, and grammar-enforces `"required"` or a named function against its JSON Schema. Reasoning models (Qwen3) have their `<think>` text returned as `reasoning_content`, streamed too, and `chat_template_kwargs` (e.g. `{"enable_thinking": false}`) reaches the chat template.
 - **Is fast enough for agents.** An agent resends its whole history every turn, so the server keeps the KV caches of its recent requests in memory (`--cache-slots`) and, with `--prompt-cache DIR`, on disk across restarts: only the tokens after the shared prefix are processed.
 - **Has two GPU backends**, Metal and wgpu (Vulkan, DirectX 12, Metal), producing the same output. CUDA and ROCm share the source but have never been run (no hardware).
 - **Is checked against llama.cpp.** Tokenization and chat-template rendering are compared token for token with `llama-cpp-python`/`jinja2`, and greedy generation matches llama.cpp's on real weights (identical text on Qwen2.5 0.5B Q8_0 and Q4_K_M and on 7B Q4_K_M for the prompts checked; the 3B was checked for consistency across backends and compilers, not against llama.cpp).
 
 ## Quick start
 
-Requirements: the [Rust toolchain](https://rustup.rs/), [Boring](https://github.com/mlanoe/boring) (`cargo install --git https://github.com/mlanoe/boring`), and a GPU supported by Metal or wgpu. Use a `boring` built from `51d7260e` or later. Earlier builds cannot select launch batching only during decode (before `51d7260e`), leave about 1.8 ms/token on the table for the large Q8_0 decode projections (before `a08df631`), decode Q8_0 weights ~2x slower on Metal (before `1faf71e2`), do not compile the disk prompt cache or the native Metal K-quant kernels on macOS 27 (before `a057dd8c`), decode Q4_K weights ~2x slower (before `6fb92947`), prefill ~3x slower on Metal, stage the prefill tiles in half precision (`6acc7d44` to `316c7695`: logits of the 7B drift) or, between `316c7695` and `ff79f091`, return wrong values for the biased Q8_0 projections of small Qwen models, or, between `8bdac11d` and `d38813c8`, return wrong values for every odd output column of Q6_K matrices (Q4_K_M models then produce garbage), or, before `46c2473f`, fail to transpile a `.split()` used as a call argument.
+Requirements: the [Rust toolchain](https://rustup.rs/), [Boring](https://github.com/mlanoe/boring) (`cargo install --git https://github.com/mlanoe/boring`), and a GPU supported by Metal or wgpu. Use a `boring` built from `9b6ac41c` or later; this version adds the process-environment primitive used for `LLAMA_ARG_*` compatibility. Earlier builds cannot select launch batching only during decode (before `51d7260e`), leave about 1.8 ms/token on the table for the large Q8_0 decode projections (before `a08df631`), decode Q8_0 weights ~2x slower on Metal (before `1faf71e2`), do not compile the disk prompt cache or the native Metal K-quant kernels on macOS 27 (before `a057dd8c`), decode Q4_K weights ~2x slower (before `6fb92947`), prefill ~3x slower on Metal, stage the prefill tiles in half precision (`6acc7d44` to `316c7695`: logits of the 7B drift) or, between `316c7695` and `ff79f091`, return wrong values for the biased Q8_0 projections of small Qwen models, or, between `8bdac11d` and `d38813c8`, return wrong values for every odd output column of Q6_K matrices (Q4_K_M models then produce garbage), or, before `46c2473f`, fail to transpile a `.split()` used as a call argument.
 
 ```sh
 # 1. build (Metal; use --target wgpu on other platforms)
@@ -82,20 +82,60 @@ The first request of a session is the slow one, because the ~7.5k-token prompt h
 
 | Option | Default | |
 |---|---|---|
-| `--gguf PATH` | | model file (required) |
-| `--serve`, `--port N` | `8080` | HTTP server on `127.0.0.1` |
-| `--ctx-size N` | `4096` | prompt + reply tokens a request may use; a longer prompt gets `context_length_exceeded` |
-| `--max-tokens N` | `40` | reply length when a request sets none |
-| `--model-name NAME` | GGUF `general.name` | id returned by `/v1/models` |
+| `-h`, `--help`, `--usage` | | print command-line help and exit |
+| `--version` | | print the build identity and exit |
+| `-m`, `--model`, `--gguf PATH` | | model file (required) |
+| `--serve`, `--host HOST`, `--port N` | `127.0.0.1:8080` | HTTP listening address; IPv6 literals are bracketed automatically |
+| `--api-prefix PATH` | disabled | serve every route below a prefix such as `/llm`, without a trailing slash |
+| `--cors-origins`, `--cors-methods`, `--cors-headers` | llama-server defaults | configure browser CORS allowlists; origin `localhost` accepts loopback origins only |
+| `--cors-credentials`, `--no-cors-credentials` | enabled | allow browser credentials; wildcard origins are reflected when enabled |
+| `--api-key KEY` | disabled | require `Authorization: Bearer KEY`; comma-separated keys are accepted |
+| `--api-key-file FILE` | disabled | read accepted Bearer keys one per line; blank lines and `#` comments are ignored |
+| `-c`, `--ctx-size N` | `4096` | prompt + reply tokens a request may use; a longer prompt gets `context_length_exceeded` |
+| `--max-tokens N`, `-n`, `--predict`, `--n-predict` | `40` | reply length when a request sets none |
+| `-a`, `--alias`, `--model-name NAME` | GGUF `general.name` | comma-separated API aliases; the first is the primary model id |
+| `--tags TAGS` | none | comma-separated informational tags reported by the model API; they do not affect routing |
 | `--cache-slots N` | `4` | KV caches kept in memory (LRU) |
+| `-np`, `--parallel N` | `1` | compatibility option; only `1` is accepted because requests are serialized |
+| `--jinja`, `--no-warmup`, `-nocb`/`--no-cont-batching`, `--no-context-shift` | current behavior | accepted llama-server compatibility switches; opposite switches are rejected when their feature is unavailable |
+| `--threads-http N`, `--no-webui`/`--no-ui` | `1`, UI disabled | compatibility settings matching the serialized API-only server; other thread counts and UI activation are rejected |
+| `--no-mmproj`, `--no-mmproj-auto` | current behavior | accepted text-only settings; projector, embeddings and reranking modes are rejected before model loading |
+| `LLAMA_ARG_MODEL`, `LLAMA_ARG_ALIAS`, `LLAMA_ARG_TAGS`, `LLAMA_ARG_HOST`, `LLAMA_ARG_PORT`, `LLAMA_ARG_CTX_SIZE`, `LLAMA_ARG_N_PREDICT`, `LLAMA_API_KEY` | unset | core llama-server environment defaults; an explicit command-line option takes precedence |
+| `LLAMA_ARG_CORS_ORIGINS`, `LLAMA_ARG_CORS_METHODS`, `LLAMA_ARG_CORS_HEADERS`, `LLAMA_ARG_ENDPOINT_METRICS`, `LLAMA_ARG_ENDPOINT_SLOTS`, `LLAMA_ARG_CACHE_PROMPT`, `LLAMA_ARG_SSE_PING_INTERVAL` | matching CLI defaults | server environment defaults, including llama.cpp boolean spellings (`1`/`0`, `true`/`false`, `on`/`off`, `enabled`/`disabled`) |
+| `LLAMA_ARG_API_KEY_FILE`, `LLAMA_ARG_SLOT_SAVE_PATH`, `LLAMA_ARG_CHAT_TEMPLATE_KWARGS`, `LLAMA_ARG_REASONING_FORMAT`, `LLAMA_ARG_N_PARALLEL`, `LLAMA_ARG_THREADS_HTTP` | matching CLI defaults | additional llama-server settings; parallel and HTTP worker counts currently accept only `1` |
+| `LLAMA_ARG_UI`, `LLAMA_ARG_JINJA`, `LLAMA_ARG_EMBEDDINGS`, `LLAMA_ARG_RERANKING` | API-only Jinja text generation | accepted when matching the current mode; requests to enable unsupported modes are rejected explicitly |
+| `LLAMA_ARG_TEMPERATURE`, `LLAMA_ARG_TOP_K`, `LLAMA_ARG_TOP_P`, `LLAMA_ARG_MIN_P`, `LLAMA_ARG_REPEAT_PENALTY`, `LLAMA_ARG_PRESENCE_PENALTY`, `LLAMA_ARG_FREQUENCY_PENALTY` | matching sampling defaults | official llama.cpp environment names for supported generation defaults |
+| `LLAMA_ARG_CONT_BATCHING`, `LLAMA_ARG_CONTEXT_SHIFT`, `LLAMA_ARG_MMPROJ`, `LLAMA_ARG_MMPROJ_URL`, `LLAMA_ARG_MMPROJ_AUTO` | disabled | serialized text-only settings are accepted; unsupported activation is rejected explicitly |
+| `--cache-prompt`, `--no-cache-prompt` | enabled | default prompt-prefix reuse policy; a request may override it with `cache_prompt` |
+| `--slots`, `--no-slots` | enabled | expose or disable the `/slots` monitoring and snapshot endpoints |
 | `--metrics` | off | expose llama-server-compatible Prometheus counters at `GET /metrics` |
+| `--sse-ping-interval N` | `30` | seconds between keep-alive comments during silent prefill; `-1` disables them |
+| `--reasoning-format FORMAT` | `auto` | default reasoning extraction: `auto`, `none`, `deepseek`, or `deepseek-legacy` |
+| `-rea, --reasoning [MODE]` | `auto` | set the chat template's thinking default to `on`, `off`, or automatic detection; omitting MODE means `on`, and request kwargs may override it |
+| `--reasoning-preserve`, `--no-reasoning-preserve` | template default | preserve or discard earlier assistant reasoning in supported chat templates |
+| `--reasoning-effort LEVEL` | template default | default effort exposed to the chat template; requests may override it |
+| `--chat-template-kwargs JSON` | `{}` | default JSON object exposed to the chat template; request kwargs take priority |
+| `--chat-template TEMPLATE`, `--chat-template-file FILE` | GGUF metadata | override the model's embedded Jinja chat template inline or from a UTF-8 file |
 | `--prompt-cache DIR` | off | also keep KV caches on disk, reused after a restart |
 | `--prompt-cache-files N` | `2` | snapshots kept on disk |
 | `--prompt-cache-max-mb N` | `4096` | cap on all snapshots together (`0` = none) |
+| `--slot-save-path DIR` | disabled | directory for named `/slots/{id}?action=save|restore` snapshots |
 | `--kquant-prefill handwritten` | `tensor` | wgpu/CUDA/ROCm: keep the hand-written Q4_K/Q6_K prefill kernels (faster there today) |
-| `--temperature`, `--top-k`, `--top-p`, `--min-p`, `--seed`, `--repeat-penalty`, `--repeat-last-n` | greedy | sampling defaults; a request can override temperature, top_p, min_p, top_k, seed and repeat_penalty, and add frequency_penalty and presence_penalty |
+| `--temperature`/`--temp`, `--top-k`, `--top-p`, `--min-p`, `--seed`/`-s`, `--repeat-penalty`, `--repeat-last-n` | greedy | core sampling defaults; a request can override each of them |
+| `--typical-p`, `--top-n-sigma`, `--dynatemp-range`, `--dynatemp-exp`, `--xtc-probability`, `--xtc-threshold`, `--min-keep` | disabled/neutral | additional llama.cpp sampling defaults; requests may override them |
+| `--dry-multiplier`, `--dry-base`, `--dry-allowed-length`, `--dry-penalty-last-n` | DRY disabled | repetition-control defaults compatible with llama.cpp; requests may override them |
+| `--presence-penalty`, `--frequency-penalty`, `--mirostat`, `--mirostat-ent`, `--mirostat-lr` | disabled | server-only OpenAI/llama.cpp sampling defaults; requests may override them |
+| `--adaptive-target`, `--adaptive-decay` | disabled, `0.9` | server-only adaptive-p defaults; adaptive-p and Mirostat are mutually exclusive |
+| `--ignore-eos` | off | server default that suppresses the model's EOS token until another stop condition |
+| `--samplers LIST`, `--sampler-seq SEQUENCE`, `--sampling-seq SEQUENCE` | llama.cpp order | enable a canonical ordered subset using semicolon-separated names or compact codes such as `edskypmxt` |
 
 One request is served at a time (one GPU). Every response is `Connection: close`.
+
+boring-llm is a single-model server. Modern llama-server router routes such as `/models/load`, `/models/unload`, `/models/sse`, and model-cache deletion are recognized but return `501` rather than pretending dynamic model management is available.
+
+Embedding (`/embedding`, `/embeddings`, `/v1/embeddings`) and reranking (`/rerank`, `/v1/rerank`, `/v1/reranking`) routes are likewise recognized and return `501`: boring-llm currently loads causal text-generation models only.
+
+Unsupported modern API families—Realtime and in-flight chat-completion control—also return a structured `501` instead of looking like misspelled paths.
 
 **Prompt cache on disk.** After a request, the cache it left is written to `DIR/prompt-cache-<n>.bin` when it adds at least 1024 tokens to what the disk already holds; the write happens after the response has been sent. A later request whose prompt starts like a snapshot reads those positions back (`N reused from disk` in the log) instead of recomputing them. A snapshot replaces the one it extends, else takes a free file, else the oldest; the oldest are also dropped to stay under `--prompt-cache-max-mb`. A snapshot is used only by the exact model that wrote it, a truncated or half-written file is ignored, and floats are stored as the GPU holds them, so a restored cache gives the same answers as a cold one. The files contain the prompts' token ids and activations: keep the directory private. On the 0.5B model a 6.4k-token prompt takes ~13 s cold and 0.5-1.5 s restored. On the 7B model, OpenCode's first request (7.6k tokens) spent 321 s in prefill cold and 1.9 s restored from an ~890 MB snapshot (7,636 tokens read back), after a server restart.
 

@@ -18,6 +18,20 @@
 pub struct Rng:
     uint64 state
 
+pub int resolve_seed(int requested, uint64 entropy, int request_counter):
+    if requested >= 0:
+        requested
+    else:
+        # llama-server's negative seed means "choose one for this request".
+        # Mix wall-clock time with the monotonic request counter so two requests
+        # accepted in the same clock tick still get different streams.
+        var uint64 mixed = entropy ^ ((request_counter as uint64) << 32) ^ (request_counter as uint64)
+        mixed = mixed ^ (mixed << 13)
+        mixed = mixed ^ (mixed >> 7)
+        mixed = mixed ^ (mixed << 17)
+        let chosen = (mixed & (2147483647 as uint64)) as int
+        if chosen == 0: 1 else: chosen
+
 pub Rng seed_rng(int seed):
     # xorshift's only fixed point is state == 0 (every subsequent call
     # would then keep returning 0 forever) — guard against a caller
@@ -40,7 +54,8 @@ pub (float32, Rng) rng_next_f32(Rng rng):
     (f, new_rng)
 
 # Penalizes logits for tokens already seen in `history` (the last
-# `repeat_last_n` tokens, or the whole history when `repeat_last_n <= 0`),
+# `repeat_last_n` tokens, or the whole history when `repeat_last_n < 0`;
+# zero disables the sampler, matching llama.cpp),
 # matching llama.cpp's own repeat-penalty convention: a positive logit is
 # divided by `penalty`, a non-positive one is multiplied by it — either way
 # this pushes an already-used token's logit down. Applied once per unique
@@ -48,7 +63,7 @@ pub (float32, Rng) rng_next_f32(Rng rng):
 # the window is still only penalized once, same as llama.cpp).
 # `penalty == 1.0` is a no-op — returns `logits` unchanged, no history scan.
 pub [float32] apply_repeat_penalty([float32] logits, [int] history, float32 penalty, int repeat_last_n):
-    if penalty == 1.0 as float32 or history.length == 0:
+    if penalty == 1.0 as float32 or repeat_last_n == 0 or history.length == 0:
         logits
     else:
         mut [float32] out = [0.0 for i in 0..<logits.length]
@@ -91,6 +106,70 @@ pub [float32] apply_presence_frequency_penalty([float32] logits, [int] generated
             out[tok] = out[tok] - (c as float32) * frequency - presence
         out
 
+# DRY (Don't Repeat Yourself) penalizes the token which would extend a suffix
+# already seen in the recent context. llama.cpp uses a linear Z-algorithm;
+# this direct scan has the same semantics and is simpler for the small default
+# window (64 tokens). Sequence breakers limit how far the current suffix may
+# reach backwards; a one-token breaker is itself exempt from the penalty.
+pub [float32] apply_dry_penalty([float32] logits, [int] history, float32 multiplier,
+                                float32 base, int allowed_length, int penalty_last_n,
+                                [[int]] breakers):
+    if multiplier == 0.0 as float32 or base < 1.0 as float32 or penalty_last_n == 0:
+        return logits
+    let window = if history.length > penalty_last_n: penalty_last_n else: history.length
+    if window <= allowed_length:
+        return logits
+    var int start = history.length - window
+    # Only repetitions after the latest complete breaker can be extended.
+    for breaker in breakers:
+        if breaker.length > 0 and breaker.length <= history.length - start:
+            var int at = history.length - breaker.length
+            while at >= start:
+                var bool matches = true
+                var int b = 0
+                while b < breaker.length and matches:
+                    if history[at + b] != breaker[b]: matches = false
+                    b += 1
+                if matches and at + breaker.length > start:
+                    start = at + breaker.length
+                    at = start - 1
+                else:
+                    at -= 1
+    let suffix_len = history.length - start
+    if suffix_len < allowed_length:
+        return logits
+    mut [float32] out = [0.0 for i in 0..<logits.length]
+    var int v = 0
+    while v < logits.length:
+        out[v] = logits[v]
+        v += 1
+    mut {int=int} maximum_repeat = {=}
+    # `candidate_at` is the token which would continue an earlier occurrence
+    # of the current suffix. Compare backwards from the context tail.
+    var int candidate_at = start + 1
+    while candidate_at < history.length:
+        var int repeated = 0
+        while repeated < suffix_len and candidate_at - repeated - 1 >= start and history[candidate_at - repeated - 1] == history[history.length - repeated - 1]:
+            repeated += 1
+        if repeated >= allowed_length:
+            let token = history[candidate_at]
+            let previous = maximum_repeat[token] else -1
+            if repeated > previous: maximum_repeat[token] = repeated
+        candidate_at += 1
+    for token in maximum_repeat.keys():
+        var bool exempt = false
+        for breaker in breakers:
+            if breaker.length == 1 and breaker[0] == token: exempt = true
+        if not exempt:
+            let repeated = maximum_repeat[token] else allowed_length
+            var int exponent = repeated - allowed_length
+            # Match llama.cpp's overflow guard for float32 pow().
+            if base > 1.000001 as float32:
+                let maximum_exponent = (88.7228391 as float32 / base.ln()) as int
+                if exponent > maximum_exponent: exponent = maximum_exponent
+            out[token] = out[token] - multiplier * base.pow(exponent as float32)
+    out
+
 # OpenAI logit_bias: additive per-token offsets, applied before the normal
 # repeat/frequency/presence penalties and samplers. An empty map is a no-op.
 pub [float32] apply_logit_bias([float32] logits, {int=float32} biases):
@@ -107,6 +186,20 @@ pub [float32] apply_logit_bias([float32] logits, {int=float32} biases):
             let bias = biases[tok] else 0.0 as float32
             out[tok] = out[tok] + bias
         out
+
+# llama.cpp implements `ignore_eos` as an EOS logit bias of negative
+# infinity. A large finite sentinel is sufficient for the float32 ranking and
+# avoids backend-specific infinity literals.
+pub [float32] suppress_token([float32] logits, int token):
+    if token < 0 or token >= logits.length:
+        return logits
+    mut [float32] out = [0.0 for i in 0..<logits.length]
+    var int i = 0
+    while i < logits.length:
+        out[i] = logits[i]
+        i += 1
+    out[token] = -1000000000.0 as float32
+    out
 
 pub int sample_greedy([float32] logits, int vocab):
     var int best = 0
@@ -167,45 +260,219 @@ pub ([float32], [int]) top_k_select([float32] logits, int vocab, int k):
         v += 1
     (top_val, top_idx)
 
-# Temperature + top-k + top-p (nucleus) + min-p sampling, plus llama.cpp-style
+# Full-vocabulary descending rank for llama.cpp's `top_k <= 0` convention.
+# A max heap keeps this O(vocab log vocab), avoiding the O(vocab²) insertion
+# path that `top_k_select(..., vocab)` would otherwise take.
+pub ([float32], [int]) all_candidates_sorted([float32] logits, int vocab):
+    mut [float32] heap_values = [0.0 for i in 0..<vocab]
+    mut [int] heap_ids = [0 for i in 0..<vocab]
+    var int i = 0
+    while i < vocab:
+        heap_values[i] = logits[i]
+        heap_ids[i] = i
+        i += 1
+    # Bottom-up max-heap construction.
+    var int parent = vocab / 2 - 1
+    while parent >= 0:
+        var int root = parent
+        var bool placed = false
+        while not placed:
+            let left = root * 2 + 1
+            if left >= vocab:
+                placed = true
+            else:
+                var int child = left
+                let right = left + 1
+                if right < vocab and heap_values[right] > heap_values[left]: child = right
+                if heap_values[child] <= heap_values[root]:
+                    placed = true
+                else:
+                    let old_value = heap_values[root]
+                    let old_id = heap_ids[root]
+                    heap_values[root] = heap_values[child]
+                    heap_ids[root] = heap_ids[child]
+                    heap_values[child] = old_value
+                    heap_ids[child] = old_id
+                    root = child
+        parent -= 1
+    mut [float32] sorted_values = [0.0 for i in 0..<vocab]
+    mut [int] sorted_ids = [0 for i in 0..<vocab]
+    var int heap_size = vocab
+    i = 0
+    while heap_size > 0:
+        sorted_values[i] = heap_values[0]
+        sorted_ids[i] = heap_ids[0]
+        heap_size -= 1
+        if heap_size > 0:
+            heap_values[0] = heap_values[heap_size]
+            heap_ids[0] = heap_ids[heap_size]
+            var int root = 0
+            var bool placed = false
+            while not placed:
+                let left = root * 2 + 1
+                if left >= heap_size:
+                    placed = true
+                else:
+                    var int child = left
+                    let right = left + 1
+                    if right < heap_size and heap_values[right] > heap_values[left]: child = right
+                    if heap_values[child] <= heap_values[root]:
+                        placed = true
+                    else:
+                        let old_value = heap_values[root]
+                        let old_id = heap_ids[root]
+                        heap_values[root] = heap_values[child]
+                        heap_ids[root] = heap_ids[child]
+                        heap_values[child] = old_value
+                        heap_ids[child] = old_id
+                        root = child
+        i += 1
+    (sorted_values, sorted_ids)
+
+pub ([float32], [int]) rank_candidates([float32] logits, int vocab, int top_k):
+    if top_k > 0 and top_k < vocab:
+        top_k_select(logits, vocab, top_k)
+    else:
+        all_candidates_sorted(logits, vocab)
+
+# Top-n-sigma keeps logits no farther than `n` population standard deviations
+# below the maximum. Values at the suppression sentinel are excluded from the
+# statistics so grammar/EOS masking cannot inflate sigma.
+pub [float32] top_n_sigma_logits([float32] logits, int vocab, float32 n):
+    if n <= 0.0 as float32 or vocab <= 1:
+        return logits
+    var float32 maximum = -1.0e30 as float32
+    var float64 sum = 0.0
+    var float64 sum_sq = 0.0
+    var int count = 0
+    var int i = 0
+    while i < vocab:
+        let value = logits[i]
+        if value > -1.0e29 as float32:
+            if value > maximum:
+                maximum = value
+            sum += value as float64
+            sum_sq += value as float64 * value as float64
+            count += 1
+        i += 1
+    if count <= 1:
+        return logits
+    let mean = sum / count as float64
+    let variance = sum_sq / count as float64 - mean * mean
+    if variance <= 0.0:
+        return logits
+    let sigma = variance.sqrt() as float32
+    let threshold = maximum - n * sigma
+    mut [float32] filtered = [-1.0e30 as float32 for i in 0..<vocab]
+    i = 0
+    while i < vocab:
+        if logits[i] >= threshold:
+            filtered[i] = logits[i]
+        i += 1
+    filtered
+
+# Temperature + top-n-sigma + top-k + locally typical + top-p (nucleus) + min-p + XTC sampling, plus llama.cpp-style
 # repeat penalty applied first (against `history` — the tokens generated so
 # far in this call, i.e. prompt + already-generated). `temperature <= 0`
-# behaves as plain greedy argmax (ignores top_k/top_p entirely, matching
+# behaves as plain greedy argmax (ignores top_k/typical_p/top_p/min_p, matching
 # llama.cpp's own `--temp 0` convention) — repeat penalty still applies in
 # that case too, same as llama.cpp (it's independent of the temperature
-# sampler). `top_k <= 0` defaults to 50 — top-p alone, over the full
-# untruncated vocab, would need a full sort of 150k+ logits every step;
-# every real sampling setup bounds it with a top-k pre-filter anyway, so
-# this project does too rather than special-casing an "unbounded top-p"
-# path nothing exercises. `top_p >= 1.0` disables nucleus filtering (keeps
+# sampler). `top_k <= 0` leaves the vocabulary unbounded, matching llama.cpp;
+# that path uses an O(vocab log vocab) heap rank. `top_p >= 1.0` disables
+# nucleus filtering (keeps
 # the whole top-k set). `repeat_penalty == 1.0` disables the penalty
 # entirely (this project's own default — see main.br's CLI help for why it
 # doesn't default to llama.cpp's own 1.1).
 # Samples from an already-ranked candidate list. Keeping this phase separate
 # lets grammar constraints remove invalid token pieces after top-k selection
 # but before top-p/min-p and the random draw.
-pub (int, Rng) sample_candidates(Rng rng, [float32] top_val, [int] top_idx,
-                                 float32 temperature, float32 top_p, float32 min_p) throws:
+([float32], [float32], [int]) typical_filter([float32] probs, [float32] logits,
+                                             [int] ids, float32 typical_p, int min_keep):
+    if typical_p >= 1.0 as float32 or probs.length <= 1:
+        return (probs, logits, ids)
+    var float32 entropy = 0.0
+    var int i = 0
+    while i < probs.length:
+        if probs[i] > 0.0 as float32:
+            entropy -= probs[i] * probs[i].ln()
+        i += 1
+    mut [bool] selected = [false for i in 0..<probs.length]
+    let required = if min_keep > 1: min_keep else: 1
+    var float32 cumulative = 0.0
+    var int count = 0
+    while count < probs.length and (cumulative < typical_p or count < required):
+        var int best = -1
+        var float32 best_distance = 3.4028235e38 as float32
+        i = 0
+        while i < probs.length:
+            if not selected[i] and probs[i] > 0.0 as float32:
+                let distance = (-probs[i].ln() - entropy).abs()
+                if best < 0 or distance < best_distance:
+                    best = i
+                    best_distance = distance
+            i += 1
+        if best < 0:
+            count = probs.length
+        else:
+            selected[best] = true
+            cumulative += probs[best]
+            count += 1
+    mut [float32] kept_probs = []
+    mut [float32] kept_logits = []
+    mut [int] kept_ids = []
+    i = 0
+    while i < probs.length:
+        if selected[i]:
+            kept_probs.push(probs[i])
+            kept_logits.push(logits[i])
+            kept_ids.push(ids[i])
+        i += 1
+    (kept_probs, kept_logits, kept_ids)
+
+pub float32 dynamic_temperature([float32] probs, int first, int cutoff,
+                                float32 temperature, float32 range, float32 exponent):
+    if range <= 0.0 as float32 or cutoff - first <= 1:
+        return temperature
+    var float32 surviving_sum = 0.0
+    var int i = first
+    while i < cutoff:
+        surviving_sum += probs[i]
+        i += 1
+    var float32 entropy = 0.0
+    i = first
+    while i < cutoff:
+        let probability = probs[i] / surviving_sum
+        if probability > 0.0 as float32:
+            entropy -= probability * probability.ln()
+        i += 1
+    let candidate_count = cutoff - first
+    let max_entropy = (candidate_count as float32).ln()
+    let normalized_entropy = entropy / max_entropy
+    let min_temperature = if temperature > range: temperature - range else: 0.0 as float32
+    let max_temperature = temperature + range
+    min_temperature + (max_temperature - min_temperature) * normalized_entropy.powf(exponent)
+
+pub (int, Rng, [float32], [int]) sample_candidates_with_probs(Rng rng, [float32] top_val, [int] top_idx,
+                                                               float32 temperature, float32 dynatemp_range,
+                                                               float32 dynatemp_exponent, float32 typical_p, float32 top_p,
+                                                               float32 min_p, float32 xtc_probability,
+                                                               float32 xtc_threshold, int min_keep) throws:
     guard top_val.length > 0 and top_val.length == top_idx.length else throw "sample_candidates: empty or mismatched candidates"
     if temperature <= 0.0 as float32:
-        (top_idx[0], rng)
+        (top_idx[0], rng, [1.0 as float32], [top_idx[0]])
     else:
         let n = top_val.length
+        var int keep = if min_keep > 1: min_keep else: 1
+        if keep > n:
+            keep = n
 
-        mut [float32] scaled = [0.0 for i in 0..<n]
-        var int i = 0
-        while i < n:
-            scaled[i] = top_val[i] / temperature
-            i += 1
-
-        # softmax over the top-k candidates (top_val/scaled are already
-        # sorted descending, so scaled[0] is the max — no separate max-scan
-        # needed).
+        # llama.cpp applies temperature last. Build the untempered softmax for
+        # typical-p/top-p/min-p/XTC, then rescale only the surviving logits.
         mut [float32] probs = [0.0 for i in 0..<n]
         var float32 sum_exp = 0.0
-        i = 0
+        var int i = 0
         while i < n:
-            let e = (scaled[i] - scaled[0]).exp()
+            let e = (top_val[i] - top_val[0]).exp()
             probs[i] = e
             sum_exp += e
             i += 1
@@ -214,18 +481,26 @@ pub (int, Rng) sample_candidates(Rng rng, [float32] top_val, [int] top_idx,
             probs[i] = probs[i] / sum_exp
             i += 1
 
-        # top-p (nucleus): probs is already sorted descending, so the
+        let (typical_probs, typical_values, typical_idx) = typical_filter(probs, top_val, top_idx, typical_p, keep)
+        probs = typical_probs
+        let candidate_values = typical_values
+        let candidate_idx = typical_idx
+        let filtered_n = probs.length
+        if keep > filtered_n:
+            keep = filtered_n
+
+        # top-p (nucleus): probs remains in descending probability order, so the
         # smallest prefix whose cumulative sum reaches top_p is exactly
         # the first `cutoff` entries.
-        var int cutoff = n
+        var int cutoff = filtered_n
         if top_p < 1.0 as float32:
             var float32 cum = 0.0
             var int j = 0
             var bool cut_found = false
-            while j < n and not cut_found:
+            while j < filtered_n and not cut_found:
                 cum += probs[j]
                 j += 1
-                if cum >= top_p:
+                if cum >= top_p and j >= keep:
                     cutoff = j
                     cut_found = true
 
@@ -234,23 +509,51 @@ pub (int, Rng) sample_candidates(Rng rng, [float32] top_val, [int] top_idx,
         # so this is another prefix cutoff and composes naturally with top-p.
         if min_p > 0.0 as float32:
             let threshold = probs[0] * min_p
-            var int min_cutoff = 1
+            var int min_cutoff = keep
             while min_cutoff < cutoff and probs[min_cutoff] >= threshold:
                 min_cutoff += 1
             cutoff = min_cutoff
 
+        # XTC probabilistically removes the head of the distribution when at
+        # least two candidates meet the threshold. Keep the last qualifying
+        # token, matching llama.cpp's `pos_last` behavior.
+        var int first = 0
+        var sample_rng = rng
+        if xtc_probability > 0.0 as float32 and xtc_threshold <= 0.5 as float32 and cutoff >= 2:
+            let (chance, after_chance) = rng_next_f32(sample_rng)
+            sample_rng = after_chance
+            if chance <= xtc_probability:
+                var float32 xtc_sum = 0.0
+                i = 0
+                while i < cutoff:
+                    xtc_sum += probs[i]
+                    i += 1
+                var int pos_last = 0
+                i = 0
+                while i < cutoff and probs[i] / xtc_sum >= xtc_threshold:
+                    pos_last = i
+                    i += 1
+                if pos_last > 0 and cutoff - pos_last >= keep:
+                    first = pos_last
+
+        let effective_temperature = dynamic_temperature(probs, first, cutoff, temperature,
+            dynatemp_range, dynatemp_exponent)
+        if effective_temperature <= 0.0 as float32:
+            return (candidate_idx[first], sample_rng, [1.0 as float32], [candidate_idx[first]])
+
         var float32 renorm_sum = 0.0
-        i = 0
+        i = first
         while i < cutoff:
+            probs[i] = ((candidate_values[i] - candidate_values[first]) / effective_temperature).exp()
             renorm_sum += probs[i]
             i += 1
 
-        let (r01, new_rng) = rng_next_f32(rng)
+        let (r01, new_rng) = rng_next_f32(sample_rng)
         let target = r01 * renorm_sum
 
         var int chosen_slot = cutoff - 1
         var float32 running = 0.0
-        var int s = 0
+        var int s = first
         var bool slot_found = false
         while s < cutoff and not slot_found:
             running += probs[s]
@@ -259,18 +562,180 @@ pub (int, Rng) sample_candidates(Rng rng, [float32] top_val, [int] top_idx,
                 slot_found = true
             s += 1
 
-        (top_idx[chosen_slot], new_rng)
+        mut [float32] final_probs = []
+        mut [int] final_ids = []
+        i = first
+        while i < cutoff:
+            final_probs.push(probs[i] / renorm_sum)
+            final_ids.push(candidate_idx[i])
+            i += 1
+        (candidate_idx[chosen_slot], new_rng, final_probs, final_ids)
+
+pub (int, Rng) sample_candidates(Rng rng, [float32] top_val, [int] top_idx,
+                                 float32 temperature, float32 dynatemp_range,
+                                 float32 dynatemp_exponent, float32 typical_p, float32 top_p,
+                                 float32 min_p, float32 xtc_probability,
+                                 float32 xtc_threshold, int min_keep) throws:
+    let (token, next_rng, probs, ids) = sample_candidates_with_probs(rng, top_val, top_idx,
+        temperature, dynatemp_range, dynatemp_exponent, typical_p, top_p, min_p,
+        xtc_probability, xtc_threshold, min_keep)
+    (token, next_rng)
+
+([float32], [int]) temperature_ranked([float32] logits, int vocab, float32 temperature):
+    let (values, ids) = all_candidates_sorted(logits, vocab)
+    let divisor = if temperature > 0.0 as float32: temperature else: 1.0 as float32
+    mut [float32] scaled = [0.0 for i in 0..<values.length]
+    var int i = 0
+    while i < values.length:
+        scaled[i] = if temperature <= 0.0 as float32 and i > 0: -1.0e30 as float32 else: values[i] / divisor
+        i += 1
+    (scaled, ids)
+
+([float32], float32) softmax_prefix([float32] values, int count):
+    mut [float32] probs = [0.0 for i in 0..<count]
+    var float32 total = 0.0
+    var int i = 0
+    while i < count:
+        probs[i] = (values[i] - values[0]).exp()
+        total += probs[i]
+        i += 1
+    i = 0
+    while i < count:
+        probs[i] = probs[i] / total
+        i += 1
+    (probs, total)
+
+(int, Rng, float32) draw_mirostat_prefix(Rng rng, [float32] values, [int] ids,
+                                         int count, float32 tau, float32 eta,
+                                         float32 mu) throws:
+    let (probs, _) = softmax_prefix(values, count)
+    let (draw, new_rng) = rng_next_f32(rng)
+    var float32 cumulative = 0.0
+    var int selected = count - 1
+    var int i = 0
+    var bool found = false
+    while i < count and not found:
+        cumulative += probs[i]
+        if cumulative >= draw:
+            selected = i
+            found = true
+        i += 1
+    let surprise = -probs[selected].ln() / (2.0 as float32).ln()
+    (ids[selected], new_rng, mu - eta * (surprise - tau))
+
+# Stateful Mirostat samplers. `mu` starts at 2*tau and the returned value must
+# be fed into the next token step of the same generation.
+pub (int, Rng, float32) sample_mirostat_v2(Rng rng, [float32] logits, int vocab,
+                                           float32 temperature, float32 tau,
+                                           float32 eta, float32 mu) throws:
+    if temperature <= 0.0 as float32:
+        return (sample_greedy(logits, vocab), rng, mu)
+    let (values, ids) = temperature_ranked(logits, vocab, temperature)
+    let (probs, _) = softmax_prefix(values, vocab)
+    var int cutoff = 0
+    while cutoff < vocab and (-probs[cutoff].ln() / (2.0 as float32).ln()) <= mu:
+        cutoff += 1
+    if cutoff == 0: cutoff = 1
+    draw_mirostat_prefix(rng, values, ids, cutoff, tau, eta, mu)
+
+pub (int, Rng, float32) sample_mirostat_v1(Rng rng, [float32] logits, int vocab,
+                                           float32 temperature, float32 tau,
+                                           float32 eta, float32 mu) throws:
+    if temperature <= 0.0 as float32:
+        return (sample_greedy(logits, vocab), rng, mu)
+    let (values, ids) = temperature_ranked(logits, vocab, temperature)
+    let (probs, _) = softmax_prefix(values, vocab)
+    let m = if vocab < 100: vocab else: 100
+    var float32 sum_ti_bi = 0.0
+    var float32 sum_ti_sq = 0.0
+    var int i = 0
+    while i < m - 1:
+        let t_i = ((i + 2) as float32 / (i + 1) as float32).ln()
+        let b_i = (probs[i] / probs[i + 1]).ln()
+        sum_ti_bi += t_i * b_i
+        sum_ti_sq += t_i * t_i
+        i += 1
+    let s_hat = sum_ti_bi / sum_ti_sq
+    let epsilon_hat = s_hat - 1.0 as float32
+    let numerator = epsilon_hat * (2.0 as float32).pow(mu)
+    let denominator = 1.0 as float32 - (vocab as float32).pow(-epsilon_hat)
+    let estimate = (numerator / denominator).pow(1.0 as float32 / s_hat) as int
+    var int cutoff = if estimate > 1: estimate else: 1
+    if cutoff > vocab: cutoff = vocab
+    draw_mirostat_prefix(rng, values, ids, cutoff, tau, eta, mu)
+
+# llama.cpp adaptive-p: favor tokens whose original probability is near a
+# stateful target, then update the EMA with the chosen token's pre-transform
+# probability. The two returned floats are the next weighted_sum/total_weight.
+pub (int, Rng, float32, float32) sample_adaptive_p(Rng rng, [float32] logits, int vocab,
+                                                   float32 target, float32 decay,
+                                                   float32 weighted_sum,
+                                                   float32 total_weight) throws:
+    let (maximum, log_sum_exp) = logprob_normalizer(logits, vocab)
+    mut [float32] original_probs = [0.0 as float32 for i in 0..<vocab]
+    mut [float32] transformed = [0.0 as float32 for i in 0..<vocab]
+    let average = if total_weight == 0.0 as float32: target else: weighted_sum / total_weight
+    var float32 adapted_target = 2.0 as float32 * target - average
+    if adapted_target < 0.0 as float32: adapted_target = 0.0 as float32
+    if adapted_target > 1.0 as float32: adapted_target = 1.0 as float32
+    var int i = 0
+    while i < vocab:
+        let probability = (logits[i] - maximum - log_sum_exp).exp()
+        original_probs[i] = probability
+        if logits[i] <= -1.0e29 as float32:
+            transformed[i] = logits[i]
+        else:
+            let distance = (probability - adapted_target).abs() / (0.3 as float32)
+            transformed[i] = 5.0 as float32 - 10.0 as float32 * distance * distance / (1.0 as float32 + distance)
+        i += 1
+    let (transformed_max, transformed_sum) = logprob_normalizer(transformed, vocab)
+    let (draw, new_rng) = rng_next_f32(rng)
+    var float32 cumulative = 0.0 as float32
+    var int selected = vocab - 1
+    i = 0
+    var bool found = false
+    while i < vocab and not found:
+        cumulative += (transformed[i] - transformed_max - transformed_sum).exp()
+        if cumulative >= draw:
+            selected = i
+            found = true
+        i += 1
+    (selected, new_rng,
+     original_probs[selected] + decay * weighted_sum,
+     1.0 as float32 + decay * total_weight)
+
+pub (int, Rng, [float32], [int]) sample_with_probs(Rng rng, [float32] logits, int vocab, float32 temperature,
+                                                    float32 dynatemp_range, float32 dynatemp_exponent,
+                                                    float32 top_n_sigma, int top_k, float32 typical_p, float32 top_p,
+                                                    float32 min_p, float32 xtc_probability, float32 xtc_threshold,
+                                                    int min_keep, [int] history, float32 repeat_penalty,
+                                                    int repeat_last_n, float32 dry_multiplier, float32 dry_base,
+                                                    int dry_allowed_length, int dry_penalty_last_n, [[int]] dry_breakers) throws:
+    let repeated = sampling_logits(logits, history, repeat_penalty, repeat_last_n)
+    let penalized = apply_dry_penalty(repeated, history, dry_multiplier, dry_base,
+        dry_allowed_length, dry_penalty_last_n, dry_breakers)
+    if temperature <= 0.0 as float32:
+        let token = sample_greedy(penalized, vocab)
+        (token, rng, [1.0 as float32], [token])
+    else:
+        let sigma_filtered = top_n_sigma_logits(penalized, vocab, top_n_sigma)
+        let (top_val, top_idx) = rank_candidates(sigma_filtered, vocab, top_k)
+        sample_candidates_with_probs(rng, top_val, top_idx, temperature, dynatemp_range, dynatemp_exponent,
+                                     typical_p, top_p, min_p,
+                                     xtc_probability, xtc_threshold, min_keep)
 
 pub (int, Rng) sample(Rng rng, [float32] logits, int vocab, float32 temperature,
-                       int top_k, float32 top_p, float32 min_p, [int] history, float32 repeat_penalty,
-                       int repeat_last_n) throws:
-    let penalized = sampling_logits(logits, history, repeat_penalty, repeat_last_n)
-    if temperature <= 0.0 as float32:
-        (sample_greedy(penalized, vocab), rng)
-    else:
-        let k = if top_k > 0: top_k else: 50
-        let (top_val, top_idx) = top_k_select(penalized, vocab, k)
-        sample_candidates(rng, top_val, top_idx, temperature, top_p, min_p)
+                       float32 dynatemp_range, float32 dynatemp_exponent,
+                       float32 top_n_sigma, int top_k, float32 typical_p, float32 top_p,
+                       float32 min_p, float32 xtc_probability, float32 xtc_threshold,
+                       int min_keep, [int] history, float32 repeat_penalty,
+                       int repeat_last_n, float32 dry_multiplier, float32 dry_base,
+                       int dry_allowed_length, int dry_penalty_last_n, [[int]] dry_breakers) throws:
+    let (token, next_rng, probs, ids) = sample_with_probs(rng, logits, vocab, temperature,
+        dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p,
+        xtc_probability, xtc_threshold, min_keep, history, repeat_penalty, repeat_last_n,
+        dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, dry_breakers)
+    (token, next_rng)
 
 # The exact logits consumed by `sample`. Kept public so optional API
 # instrumentation (notably OpenAI logprobs) can describe the same distribution

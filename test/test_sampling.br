@@ -4,6 +4,14 @@
 use sampling
 
 def main() throws:
+    assert_eq(resolve_seed(42, 1000 as uint64, 1), 42 as int)
+    let random_seed_a = resolve_seed(-1, 1000 as uint64, 1)
+    let random_seed_b = resolve_seed(-1, 1000 as uint64, 2)
+    let random_seed_c = resolve_seed(-1, 1001 as uint64, 1)
+    assert(random_seed_a > 0, "random seed is positive")
+    assert(random_seed_a != random_seed_b, "request counter changes random seed")
+    assert(random_seed_a != random_seed_c, "clock entropy changes random seed")
+
     # --- sample_greedy: plain argmax ---
     assert_eq(sample_greedy([1.0, 5.0, 3.0, -2.0], 4), 1)
 
@@ -40,22 +48,127 @@ def main() throws:
     assert_eq(vals[1], 5.0 as float32)
     assert_eq(vals[2], 3.0 as float32)
 
+    # --- full-vocabulary heap rank: descending with value/id pairing intact ---
+    let (all_vals, all_ids) = all_candidates_sorted([1.0, 5.0, 3.0, -2.0, 9.0, 0.5], 6)
+    assert_eq(all_vals[0], 9.0 as float32)
+    assert_eq(all_ids[0], 4)
+    assert_eq(all_vals[1], 5.0 as float32)
+    assert_eq(all_ids[1], 1)
+    assert_eq(all_vals[5], -2.0 as float32)
+    assert_eq(all_ids[5], 3)
+    let (unbounded_vals, unbounded_ids) = rank_candidates([1.0, 5.0, 3.0], 3, 0)
+    assert_eq(unbounded_vals.length, 3)
+    assert_eq(unbounded_ids[0], 1)
+
+    let sigma_filtered = top_n_sigma_logits([10.0 as float32, 8.0 as float32, 0.0 as float32], 3, 0.2 as float32)
+    assert_eq(sigma_filtered[0], 10.0 as float32)
+    assert(sigma_filtered[1] < -1.0e29 as float32, "top-n-sigma removes logits below max - n*sigma")
+    let sigma_disabled = top_n_sigma_logits([10.0 as float32, 8.0 as float32, 0.0 as float32], 3, -1.0 as float32)
+    assert_eq(sigma_disabled[2], 0.0 as float32)
+    let sigma_zero = top_n_sigma_logits([10.0 as float32, 8.0 as float32, 0.0 as float32], 3, 0.0 as float32)
+    assert_eq(sigma_zero[2], 0.0 as float32)
+    let sigma_masked = top_n_sigma_logits([10.0 as float32, 9.0 as float32, -1.0e30 as float32], 3, 3.0 as float32)
+    assert_eq(sigma_masked[1], 9.0 as float32)
+
     # Ranked candidates can be filtered by a grammar before sampling without
     # changing the probability phase. Greedy picks the first remaining token.
-    let (filtered_greedy, filtered_rng) = sample_candidates(seed_rng(9), [5.0 as float32, 3.0 as float32], [7, 2], 0.0 as float32, 1.0 as float32, 0.0 as float32)
+    let (filtered_greedy, filtered_rng) = sample_candidates(seed_rng(9), [5.0 as float32, 3.0 as float32], [7, 2], 0.0 as float32, 0.0 as float32, 1.0 as float32, 1.0 as float32, 1.0 as float32, 0.0 as float32, 0.0 as float32, 0.1 as float32, 0)
     assert_eq(filtered_greedy, 7)
     let (filtered_before, _) = rng_next_u64(seed_rng(9))
     let (filtered_after, _) = rng_next_u64(filtered_rng)
     assert_eq(filtered_before, filtered_after)
+    let (prob_token, prob_rng, post_probs, post_ids) = sample_candidates_with_probs(seed_rng(9),
+        [2.0 as float32, 1.0 as float32], [7, 2], 1.0 as float32, 0.0 as float32,
+        1.0 as float32, 1.0 as float32, 1.0 as float32, 0.0 as float32,
+        0.0 as float32, 0.1 as float32, 0)
+    assert(prob_token == 7 or prob_token == 2, "sampled candidate is returned")
+    assert_eq(post_ids.length, 2 as int)
+    assert_eq(post_ids[0], 7 as int)
+    assert(post_probs[0] > post_probs[1], "post-sampling probabilities preserve rank")
+    assert((post_probs[0] + post_probs[1] - 1.0 as float32).abs() < 0.00001 as float32, "post-sampling probabilities normalize")
     var int filtered_seed = 1
     while filtered_seed <= 10:
-        let (filtered_sample, _) = sample_candidates(seed_rng(filtered_seed), [30.0 as float32, 0.0 as float32], [4, 8], 1.0 as float32, 1.0 as float32, 0.0 as float32)
+        let (filtered_sample, _) = sample_candidates(seed_rng(filtered_seed), [30.0 as float32, 0.0 as float32], [4, 8], 1.0 as float32, 0.0 as float32, 1.0 as float32, 1.0 as float32, 1.0 as float32, 0.0 as float32, 0.0 as float32, 0.1 as float32, 0)
         assert_eq(filtered_sample, 4)
         filtered_seed += 1
 
+    # A tiny nucleus would normally keep only the first of two tied tokens;
+    # min_keep=2 preserves both and lets different seeds reach both.
+    var bool min_keep_saw_second = false
+    var min_keep_rng = seed_rng(1)
+    var int min_keep_draw = 0
+    while min_keep_draw < 100:
+        let (kept, next_min_keep_rng) = sample_candidates(min_keep_rng, [1.0 as float32, 1.0 as float32], [4, 8],
+                                                          1.0 as float32, 0.0 as float32, 1.0 as float32, 1.0 as float32, 0.1 as float32, 0.0 as float32, 0.0 as float32, 0.1 as float32, 2)
+        min_keep_rng = next_min_keep_rng
+        if kept == 8:
+            min_keep_saw_second = true
+        min_keep_draw += 1
+    assert(min_keep_saw_second, "min_keep preserves candidates beyond top-p cutoff")
+
+    # Locally typical sampling ranks by distance from the distribution's
+    # entropy, not by raw probability. With this distribution the middle
+    # candidate is the most typical and a small mass keeps it alone.
+    let (typical_token, _) = sample_candidates(seed_rng(1),
+        [0.916 as float32, 0.405 as float32, 0.0 as float32], [4, 8, 9],
+        1.0 as float32, 0.0 as float32, 1.0 as float32, 0.1 as float32, 1.0 as float32, 0.0 as float32, 0.0 as float32, 0.1 as float32, 1)
+    assert_eq(typical_token, 8)
+    let (typical_probs_only, typical_logits_only, typical_ids_only) = typical_filter(
+        [0.5 as float32, 0.3 as float32, 0.2 as float32],
+        [9.0 as float32, 4.0 as float32, 1.0 as float32], [10, 20, 30],
+        0.1 as float32, 1)
+    assert_eq(typical_probs_only.length, 1)
+    assert_eq(typical_logits_only[0], 4.0 as float32)
+    assert_eq(typical_ids_only[0], 20)
+
+    let (mirostat_token, _, mirostat_mu) = sample_mirostat_v2(seed_rng(1),
+        [4.0 as float32, 2.0 as float32, 0.0 as float32], 3,
+        1.0 as float32, 5.0 as float32, 0.1 as float32, 1.0 as float32)
+    assert_eq(mirostat_token, 0)
+    assert(mirostat_mu > 1.0 as float32, "surprise below tau raises mirostat mu")
+    let (mirostat1_token, _, _) = sample_mirostat_v1(seed_rng(2),
+        [4.0 as float32, 2.0 as float32, 0.0 as float32], 3,
+        1.0 as float32, 5.0 as float32, 0.1 as float32, 10.0 as float32)
+    assert(mirostat1_token >= 0 and mirostat1_token < 3, "mirostat v1 returns a vocabulary token")
+    let greedy_mirostat_rng = seed_rng(2)
+    let (mirostat1_greedy, mirostat1_greedy_rng, mirostat1_greedy_mu) = sample_mirostat_v1(greedy_mirostat_rng,
+        [4.0 as float32, 2.0 as float32, 0.0 as float32], 3,
+        0.0 as float32, 5.0 as float32, 0.1 as float32, 10.0 as float32)
+    assert_eq(mirostat1_greedy, 0 as int)
+    assert_eq(mirostat1_greedy_rng.state, greedy_mirostat_rng.state)
+    assert_eq(mirostat1_greedy_mu, 10.0 as float32)
+
+    let adaptive_target = 0.3 as float32
+    let adaptive_decay = 0.9 as float32
+    let adaptive_weight = adaptive_target / (1.0 as float32 - adaptive_decay)
+    let adaptive_total = 1.0 as float32 / (1.0 as float32 - adaptive_decay)
+    let (adaptive_token, _, next_adaptive_weight, next_adaptive_total) = sample_adaptive_p(
+        seed_rng(3), [3.0 as float32, 1.0 as float32, 0.0 as float32], 3,
+        adaptive_target, adaptive_decay, adaptive_weight, adaptive_total)
+    assert(adaptive_token >= 0 and adaptive_token < 3, "adaptive-p returns a vocabulary token")
+    assert(next_adaptive_weight > adaptive_decay * adaptive_weight, "adaptive-p records original probability")
+    assert_eq(next_adaptive_total, 1.0 as float32 + adaptive_decay * adaptive_total)
+
+    let uniform_temp = dynamic_temperature([0.5 as float32, 0.5 as float32], 0, 2,
+        0.8 as float32, 0.4 as float32, 1.0 as float32)
+    assert(uniform_temp > 1.199 as float32 and uniform_temp < 1.201 as float32,
+           "maximum entropy reaches dynatemp upper bound")
+    let peaked_temp = dynamic_temperature([0.999 as float32, 0.001 as float32], 0, 2,
+        0.8 as float32, 0.4 as float32, 1.0 as float32)
+    assert(peaked_temp > 0.4 as float32 and peaked_temp < 0.5 as float32,
+           "low entropy approaches dynatemp lower bound")
+    assert_eq(dynamic_temperature([1.0 as float32, 0.0 as float32], 0, 2,
+        0.5 as float32, 1.0 as float32, 1.0 as float32), 0.0 as float32)
+
+    let (xtc_token, _) = sample_candidates(seed_rng(1),
+        [0.47 as float32, 0.336 as float32, 0.0 as float32], [4, 8, 9],
+        1.0 as float32, 0.0 as float32, 1.0 as float32, 1.0 as float32, 1.0 as float32, 0.0 as float32,
+        1.0 as float32, 0.2 as float32, 1)
+    assert_eq(xtc_token, 9)
+
     # --- sample: temperature <= 0 behaves as greedy, RNG untouched ---
     let rng0 = seed_rng(1)
-    let (tok0, rng0b) = sample(rng0, [1.0, 5.0, 3.0, -2.0], 4, 0.0 as float32, 0, 1.0 as float32, 0.0 as float32, [], 1.0 as float32, 64)
+    let (tok0, rng0b) = sample(rng0, [1.0, 5.0, 3.0, -2.0], 4, 0.0 as float32, 0.0 as float32, 1.0 as float32, -1.0 as float32, 0, 1.0 as float32, 1.0 as float32, 0.0 as float32, 0.0 as float32, 0.1 as float32, 0, [], 1.0 as float32, 64, 0.0 as float32, 1.75 as float32, 2, 64, [])
     assert_eq(tok0, 1)
     let (u0_before, _) = rng_next_u64(rng0)
     let (u0_after, _) = rng_next_u64(rng0b)
@@ -67,7 +180,7 @@ def main() throws:
     var seed = 1
     while seed <= 10:
         let rng_s = seed_rng(seed)
-        let (tok, _new_rng) = sample(rng_s, peaked, 5, 1.0 as float32, 3, 1.0 as float32, 0.0 as float32, [], 1.0 as float32, 64)
+        let (tok, _new_rng) = sample(rng_s, peaked, 5, 1.0 as float32, 0.0 as float32, 1.0 as float32, -1.0 as float32, 3, 1.0 as float32, 1.0 as float32, 0.0 as float32, 0.0 as float32, 0.1 as float32, 0, [], 1.0 as float32, 64, 0.0 as float32, 1.75 as float32, 2, 64, [])
         assert_eq(tok, 2)
         seed += 1
 
@@ -90,11 +203,30 @@ def main() throws:
     let windowed = apply_repeat_penalty([4.0, 4.0], [0, 1], 2.0 as float32, 1)
     assert_eq(windowed[0], 4.0 as float32)     # token 0 is outside the last-1 window
     assert_eq(windowed[1], 2.0 as float32)     # token 1 is the last entry, penalized
+    let disabled_repeat = apply_repeat_penalty([4.0, 4.0], [0, 1], 2.0 as float32, 0)
+    assert_eq(disabled_repeat[0], 4.0 as float32)
+    assert_eq(disabled_repeat[1], 4.0 as float32)
+    let full_repeat = apply_repeat_penalty([4.0, 4.0], [0, 1], 2.0 as float32, -1)
+    assert_eq(full_repeat[0], 2.0 as float32)
+    assert_eq(full_repeat[1], 2.0 as float32)
+
+    # --- DRY: extending a three-token repeated suffix receives an exponential
+    #     penalty; a later breaker prevents matching across it ---
+    let dry = apply_dry_penalty([10.0, 10.0, 10.0, 10.0], [0, 1, 2, 2, 1, 2, 3, 0, 1, 2],
+        2.0 as float32, 2.0 as float32, 2, 64, [])
+    assert_eq(dry[2], 6.0 as float32)  # repeated length 3: 10 - 2 * 2^(3-2)
+    assert_eq(dry[3], 8.0 as float32)  # repeated length 2: 10 - 2 * 2^0
+    let dry_broken = apply_dry_penalty([10.0, 10.0, 10.0, 10.0], [0, 1, 2, 2, 1, 2, 3, 0, 1, 2],
+        2.0 as float32, 2.0 as float32, 2, 64, [[3]])
+    assert_eq(dry_broken[2], 10.0 as float32)
+    let dry_exempt = apply_dry_penalty([10.0, 10.0], [0, 1, 0],
+        2.0 as float32, 2.0 as float32, 1, 64, [[1]])
+    assert_eq(dry_exempt[1], 10.0 as float32)
 
     # --- sample: with greedy argmax, a repeat penalty can flip the winner
     #     away from an already-generated token ---
     let rng_p = seed_rng(1)
-    let (tok_p, _) = sample(rng_p, [10.0, 9.0], 2, 0.0 as float32, 0, 1.0 as float32, 0.0 as float32, [0], 2.0 as float32, 64)
+    let (tok_p, _) = sample(rng_p, [10.0, 9.0], 2, 0.0 as float32, 0.0 as float32, 1.0 as float32, -1.0 as float32, 0, 1.0 as float32, 1.0 as float32, 0.0 as float32, 0.0 as float32, 0.1 as float32, 0, [0], 2.0 as float32, 64, 0.0 as float32, 1.75 as float32, 2, 64, [])
     assert_eq(tok_p, 1)   # token 0's logit (10.0) halved to 5.0, now below token 1's 9.0
 
     # --- apply_presence_frequency_penalty: both 0 is a no-op ---
@@ -111,9 +243,13 @@ def main() throws:
     assert_eq(pf[2], 10.0 as float32)   # never generated
     let pf_neg = apply_presence_frequency_penalty([1.0, 2.0], [0], 0.0 as float32, -1.5 as float32)
     assert_eq(pf_neg[0], 2.5 as float32)  # a negative presence penalty encourages the token
+    let without_eos = suppress_token([1.0, 9.0, 3.0], 1)
+    assert_eq(without_eos[0], 1.0 as float32)
+    assert(without_eos[1] < -1000000.0 as float32, "suppressed token is never ranked normally")
+    assert_eq(without_eos[2], 3.0 as float32)
 
     # --- it can flip the greedy winner, and an empty history changes nothing ---
-    let (tok_pf, _) = sample(seed_rng(1), apply_presence_frequency_penalty([10.0, 9.0], [0], 0.0 as float32, 2.0 as float32), 2, 0.0 as float32, 0, 1.0 as float32, 0.0 as float32, [], 1.0 as float32, 64)
+    let (tok_pf, _) = sample(seed_rng(1), apply_presence_frequency_penalty([10.0, 9.0], [0], 0.0 as float32, 2.0 as float32), 2, 0.0 as float32, 0.0 as float32, 1.0 as float32, -1.0 as float32, 0, 1.0 as float32, 1.0 as float32, 0.0 as float32, 0.0 as float32, 0.1 as float32, 0, [], 1.0 as float32, 64, 0.0 as float32, 1.75 as float32, 2, 64, [])
     assert_eq(tok_pf, 1)
     let pf_empty = apply_presence_frequency_penalty([10.0, 9.0], [], 1.0 as float32, 1.0 as float32)
     assert_eq(pf_empty[0], 10.0 as float32)
@@ -131,7 +267,7 @@ def main() throws:
     # unique winner is deterministic regardless of the random draw.
     seed = 1
     while seed <= 10:
-        let (tok_min_p, _) = sample(seed_rng(seed), [4.0, 3.0, 2.0], 3, 1.0 as float32, 3, 1.0 as float32, 1.0 as float32, [], 1.0 as float32, 64)
+        let (tok_min_p, _) = sample(seed_rng(seed), [4.0, 3.0, 2.0], 3, 1.0 as float32, 0.0 as float32, 1.0 as float32, -1.0 as float32, 3, 1.0 as float32, 1.0 as float32, 1.0 as float32, 0.0 as float32, 0.1 as float32, 0, [], 1.0 as float32, 64, 0.0 as float32, 1.75 as float32, 2, 64, [])
         assert_eq(tok_min_p, 0)
         seed += 1
 

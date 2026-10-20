@@ -122,7 +122,7 @@ This runs the GGUF parser in the interpreter on a tiny synthetic file. It is the
 
 ## 3. Command-Line Reference
 
-The executable has one required flag, `--gguf`, and several modes selected by the other flags. Unknown flags are ignored.
+The executable has one required model flag, `-m` / `--model` / `--gguf`, and several modes selected by the other flags. Unknown flags and options missing their value are rejected explicitly.
 
 ### Modes
 
@@ -143,11 +143,13 @@ The executable has one required flag, `--gguf`, and several modes selected by th
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--gguf PATH` | | model file (required) |
+| `-h`, `--help`, `--usage` | | print command-line help and exit without loading a model |
+| `--version` | | print the same `boring-llm` build identity exposed by `/props` and exit |
+| `-m`, `--model`, `--gguf PATH` | | model file (required) |
 | `--quantized` | off | keep weights quantized on the GPU (always on for `--serve`) |
 | `--kv-cache` | off | incremental decode with a KV cache (`--chat`, `--prompt`) |
 | `--system TEXT` | `You are a helpful assistant.` | system message for `--chat` and `--prompt` |
-| `--max-tokens N` | `40` | reply length; for `--serve` the default when a request sets none |
+| `--max-tokens N`, `-n`, `--predict`, `--n-predict` | `40` | reply length; for `--serve` the default when a request sets none |
 
 Without `--quantized`, `--chat` and `--prompt` dequantize every tensor to float32 at load time, which needs several times the file size in memory and is only sensible for small models.
 
@@ -155,28 +157,60 @@ Without `--quantized`, `--chat` and `--prompt` dequantize every tensor to float3
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--temperature T` | `0` (greedy) | softmax temperature; 0 or less means greedy argmax |
+| `--temperature T`, `--temp T` | `0` (greedy) | softmax temperature; 0 or less means greedy argmax |
 | `--top-k K` | `0` (off) | keep the K most likely tokens |
 | `--top-p P` | `1.0` | nucleus sampling threshold |
 | `--min-p P` | `0` (off) | keep tokens whose probability is at least this fraction of the most likely token's probability |
-| `--seed S` | `0` | PRNG seed (0 is replaced by a fixed constant) |
+| `--seed S`, `-s S` | `0` | PRNG seed (0 is replaced by a fixed constant) |
 | `--repeat-penalty R` | `1.0` (off) | llama.cpp-style repeat penalty |
-| `--repeat-last-n N` | `64` | window for the penalty; 0 or less means the whole history |
+| `--repeat-last-n N` | `64` | window for the penalty; `0` disables it and `-1` uses the whole history, as in llama.cpp |
 
-For `--serve`, these set the server defaults; a request may override `temperature`, `top_p`, `min_p`, `top_k`, `seed` and `repeat_penalty`, and add `frequency_penalty` and `presence_penalty` (see [chapter 4](#4-the-http-server)).
+For `--serve`, the sampling flags set server defaults. Alongside `temperature`, `top_p`, `min_p`, `top_k`, `seed`, `repeat_penalty` and `repeat_last_n`, the command line accepts llama.cpp's `--typical`/`--typical-p`, `--top-nsigma`/`--top-n-sigma`, `--dynatemp-range`, `--dynatemp-exp`/`--dynatemp-exponent`, `--xtc-probability`, `--xtc-threshold`, `--min-keep`, `--dry-multiplier`, `--dry-base`, `--dry-allowed-length`, `--dry-penalty-last-n`, `--mirostat`, `--mirostat-ent`/`--mirostat-tau`, `--mirostat-lr`/`--mirostat-eta`, `--adaptive-target`, and `--adaptive-decay`. Adaptive-p and Mirostat cannot both be enabled. `--presence-penalty` and `--frequency-penalty` set the corresponding OpenAI-style defaults, while `--ignore-eos` suppresses the EOS token until another stop condition is met. `--samplers` selects a semicolon-separated canonical subset; `--sampler-seq` and `--sampling-seq` accept llama.cpp's compact `edskypmxt` notation. Reordered, duplicated, empty, or unknown samplers are rejected. A request may override each value (see [chapter 4](#4-the-http-server)). Stateful samplers, the OpenAI penalties, and `--ignore-eos` are server-only because the direct CLI generation path does not yet carry their state; using them there produces an explicit error. The effective defaults are also reported by `/props` and `/slots`.
 
 ### Server flags
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--port N` | `8080` | listening port |
-| `--ctx-size N` | `4096` | prompt plus reply tokens one request may use |
-| `--model-name NAME` | GGUF `general.name` | id returned by `/v1/models` |
-| `--cache-slots N` | `4` | KV caches kept in memory (least recently used evicted) |
+| `--host HOST` | `127.0.0.1` | listening host or IP address; IPv6 literals such as `::1` are bracketed automatically |
+| `--port N` | `8080` | listening port, from 1 through 65535 |
+| `--api-prefix PATH` | disabled | serve every route below a prefix such as `/llm`; it must start with `/` and have no trailing slash |
+| `--cors-origins ORIGINS` | `*` | comma-separated allowed browser origins; `localhost` accepts HTTP(S) loopback origins only |
+| `--cors-methods METHODS`, `--cors-headers HEADERS` | `GET, POST, DELETE, OPTIONS`; `*` | values returned in CORS preflight and normal response headers |
+| `--cors-credentials`, `--no-cors-credentials` | enabled | emit `Access-Control-Allow-Credentials`; with wildcard origins enabled, reflect the request origin as required by browsers |
+| `--api-key KEY` | disabled | require `Authorization: Bearer KEY`; comma-separated keys are accepted; health and model-list routes remain public like llama-server |
+| `--api-key-file FILE` | disabled | read accepted Bearer keys one per UTF-8 line; blank lines and `#` comments are ignored |
+| `-c`, `--ctx-size N` | `4096` | prompt plus reply tokens one request may use; must be at least 2 |
+| `-a`, `--alias`, `--model-name NAME` | GGUF `general.name` | comma-separated API aliases; the first is the primary model id and all are reported by `/v1/models` |
+| `--tags TAGS` | none | comma-separated informational tags reported by `/v1/models` and the model detail route; they do not affect routing |
+| `--cache-slots N` | `4` | KV caches kept in memory (least recently used evicted); must be at least 1 |
+| `-np`, `--parallel N` | `1` | llama-server compatibility option; only `1` is accepted because boring-llm does not yet process concurrent requests |
+| `--jinja` | enabled | accepted compatibility flag; boring-llm always renders chat templates through its Jinja subset, so `--no-jinja` is rejected |
+| `--no-warmup` | current behavior | accepted because boring-llm performs no startup inference warmup; `--warmup` is rejected |
+| `-nocb`, `--no-cont-batching` | current behavior | accepted because requests are serialized; `-cb`/`--cont-batching` is rejected |
+| `--no-context-shift` | current behavior | accepted because generation stops at the context limit; `--context-shift` is rejected |
+| `--threads-http N` | `1` | compatibility option; only one HTTP worker is accepted because requests are serialized |
+| `--no-webui`, `--no-ui` | current behavior | accepted because boring-llm is API-only; `--webui`/`--ui` is rejected |
+| `--no-mmproj`, `--no-mmproj-auto` | current behavior | accepted because boring-llm is text-only; `--mmproj`, `--mmproj-url`, embeddings and reranking modes are rejected before model loading |
+| `LLAMA_ARG_MODEL`, `LLAMA_ARG_ALIAS`, `LLAMA_ARG_TAGS`, `LLAMA_ARG_HOST`, `LLAMA_ARG_PORT`, `LLAMA_ARG_CTX_SIZE`, `LLAMA_ARG_N_PREDICT`, `LLAMA_API_KEY` | unset | core llama-server environment defaults; an explicit command-line option takes precedence |
+| `LLAMA_ARG_CORS_ORIGINS`, `LLAMA_ARG_CORS_METHODS`, `LLAMA_ARG_CORS_HEADERS`, `LLAMA_ARG_ENDPOINT_METRICS`, `LLAMA_ARG_ENDPOINT_SLOTS`, `LLAMA_ARG_CACHE_PROMPT`, `LLAMA_ARG_SSE_PING_INTERVAL` | matching CLI defaults | server environment defaults, including llama.cpp boolean spellings (`1`/`0`, `true`/`false`, `on`/`off`, `enabled`/`disabled`) |
+| `LLAMA_ARG_API_KEY_FILE`, `LLAMA_ARG_SLOT_SAVE_PATH`, `LLAMA_ARG_CHAT_TEMPLATE_KWARGS`, `LLAMA_ARG_REASONING_FORMAT`, `LLAMA_ARG_N_PARALLEL`, `LLAMA_ARG_THREADS_HTTP` | matching CLI defaults | additional llama-server settings; parallel and HTTP worker counts currently accept only `1` |
+| `LLAMA_ARG_UI`, `LLAMA_ARG_JINJA`, `LLAMA_ARG_EMBEDDINGS`, `LLAMA_ARG_RERANKING` | API-only Jinja text generation | accepted when matching the current mode; requests to enable unsupported modes are rejected explicitly |
+| `LLAMA_ARG_TEMPERATURE`, `LLAMA_ARG_TOP_K`, `LLAMA_ARG_TOP_P`, `LLAMA_ARG_MIN_P`, `LLAMA_ARG_REPEAT_PENALTY`, `LLAMA_ARG_PRESENCE_PENALTY`, `LLAMA_ARG_FREQUENCY_PENALTY` | matching sampling defaults | official llama.cpp environment names for supported generation defaults |
+| `LLAMA_ARG_CONT_BATCHING`, `LLAMA_ARG_CONTEXT_SHIFT`, `LLAMA_ARG_MMPROJ`, `LLAMA_ARG_MMPROJ_URL`, `LLAMA_ARG_MMPROJ_AUTO` | disabled | serialized text-only settings are accepted; unsupported activation is rejected explicitly |
+| `--cache-prompt`, `--no-cache-prompt` | enabled | default prompt-prefix reuse policy; a request-level `cache_prompt` value takes priority |
+| `--slots`, `--no-slots` | enabled | expose or disable the `/slots` monitoring and snapshot endpoints; prompt caching itself remains active |
 | `--metrics` | off | expose llama-server-compatible Prometheus counters at `GET /metrics` |
+| `--sse-ping-interval N` | `30` | default seconds between SSE keep-alive comments during silent prefill; `0` checks every chunk and `-1` disables them |
+| `--reasoning-format FORMAT` | `auto` | default reasoning extraction: `auto`, `none`, `deepseek`, or `deepseek-legacy`; a request value takes priority |
+| `-rea, --reasoning [MODE]` | `auto` | set `enable_thinking` to `true` (`on` or omitted MODE), `false` (`off`), or leave it to the template (`auto`); request kwargs take priority |
+| `--reasoning-preserve`, `--no-reasoning-preserve` | template default | set `preserve_reasoning` for templates that support retaining earlier assistant reasoning; request kwargs take priority |
+| `--reasoning-effort LEVEL` | template default | expose `default`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` to the chat template; a request value takes priority |
+| `--chat-template-kwargs JSON` | `{}` | default JSON object exposed to the chat template; keys supplied by a request take priority |
+| `--chat-template TEMPLATE`, `--chat-template-file FILE` | GGUF metadata | override the embedded Jinja chat template inline or from a non-empty UTF-8 file; the last option wins |
 | `--prompt-cache DIR` | off | also keep KV caches on disk, reused after a restart |
-| `--prompt-cache-files N` | `2` | snapshot files kept on disk |
-| `--prompt-cache-max-mb N` | `4096` | size cap on all snapshots together; 0 means none |
+| `--prompt-cache-files N` | `2` | snapshot files kept on disk; must be at least 1 |
+| `--prompt-cache-max-mb N` | `4096` | non-negative size cap on all snapshots together; 0 means none |
+| `--slot-save-path DIR` | disabled | directory for explicit llama-server-compatible named slot snapshots |
 | `--kquant-prefill MODE` | `tensor` | `tensor` or `handwritten`; wgpu, CUDA and ROCm only (see [chapter 10](#10-gpu-backends-and-kernel-scheduling)) |
 
 ### Examples
@@ -210,19 +244,33 @@ The server listens on `127.0.0.1` only and has no authentication. To reach it fr
 
 | Method and path | Purpose |
 |---|---|
-| `GET /v1/models` (also `/models`) | one model, its id is the GGUF `general.name` or `--model-name`; its llama-server-style `meta` reports vocabulary, context, embedding, parameter and file sizes |
-| `GET /v1/models/{model}` | retrieve that model by its URL-encoded id, in the standard OpenAI single-model shape |
+| `GET`/`HEAD /v1/models` (also `/models`) | one text-in/text-out model, its id is the GGUF `general.name` or `--model-name`; its llama-server-style `architecture` reports those modalities and `meta` reports vocabulary, context, embedding, parameter and file sizes |
+| `GET`/`HEAD /v1/models/{model}` | retrieve that model by its URL-encoded id, in the standard OpenAI single-model shape |
+| `POST /models/load`, `POST /models/unload`, `GET`/`HEAD /models/sse`, `DELETE /models` | recognized router-server routes returning 501; boring-llm keeps one startup-selected model resident and has no dynamic model cache |
 | `POST /v1/chat/completions` (also `/chat/completions`) | chat completion, JSON or SSE |
+| `POST /v1/responses` (also `/responses`) | buffered or SSE text Responses API generation, including native reasoning summaries, function tools, structured output, cache usage and timings |
 | `POST /v1/completions` | OpenAI-compatible text completion from a raw string or token-ID array `prompt`, JSON or SSE; string prompts honor the GGUF tokenizer's automatic BOS setting |
-| `POST /completion` (also `/completions`) | llama-server native completion format, including `n_predict` (`-1` uses all context room and `0` only evaluates/caches the prompt), mixed token-ID/text sequences or `prompt_string` objects, generated token IDs, non-streaming `n_probs` token probabilities, and native SSE stop events; multimodal prompt data is rejected explicitly |
+| `POST /completion` (also `/completions`) | llama-server native completion format, including `n_predict` (`-1` uses all context room and `0` only evaluates/caches the prompt), mixed token-ID/text sequences or `prompt_string` objects, generated token IDs, effective `generation_settings` with `model` and `n_ctx`, decoded `prompt`, `has_new_line`, context-exhaustion `truncated`, prompt/decode `timings` (also on the final SSE event), buffered or streamed `n_probs` token probabilities, and native SSE stop events; multimodal data and multiple-prompt batches are rejected explicitly |
 | `POST /v1/chat/completions/input_tokens` (also `/chat/completions/input_tokens`) | render a chat request and count its input tokens without running the model |
-| `POST /tokenize`, `POST /detokenize` | llama-server-compatible text/token conversion, including `/tokenize`'s optional `with_pieces` output |
-| `POST /apply-template` | render messages with the model's embedded chat template without tokenizing or generating |
-| `GET /props` | llama-server-style model path, chat template and default generation settings |
-| `GET /slots` | llama-server-style status for each configured KV-cache slot; because requests are serialized, reported slots are idle |
-| `GET /metrics` | Prometheus counters when the server starts with `--metrics`; otherwise 501, as with llama-server's disabled endpoint |
+| `POST /v1/responses/input_tokens` (also `/responses/input_tokens`) | convert a text-only Responses request (`instructions`, string or message `input`, function tools, and `function_call` / `function_call_output` history) through the same chat template and count it; media and other specialized items are rejected explicitly |
+| `POST /tokenize`, `POST /detokenize` | llama-server-compatible text/token conversion, including `/tokenize`'s boolean `add_special`, `parse_special`, and `with_pieces` options and byte-array pieces for partial UTF-8 tokens. `add_special` follows the GGUF tokenizer's `add_bos_token` and `add_eos_token` policies, so it does not invent boundary tokens disabled by the model. |
+| `POST /apply-template` | render messages with the model's embedded chat template without tokenizing or generating; accepts boolean `add_generation_prompt` and object-valued `chat_template_kwargs` |
+| `GET`/`HEAD /props` | llama-server-style model path, build identity, chat template with conservatively detected capabilities, text-only modalities and an empty media marker, plus idle slot-shaped default generation settings including the sampler pipeline, neutral values for disabled samplers, reasoning and speculative decoding, and next-token state |
+| `GET`/`HEAD /slots` | llama-server-style status, next-token budget and default sampling parameters for each configured KV-cache slot; because requests are serialized, reported slots are idle, but `n_past` exposes each cached prefix length |
+| `POST /slots/{id}?action=erase` | erase one in-memory KV-cache slot and report `n_erased`; with persistent `--prompt-cache` it returns 501 so a disk snapshot cannot silently restore erased state |
+| `POST /slots/{id}?action=save|restore` | with `--slot-save-path`, save or restore the slot KV cache using the plain `filename` supplied in the JSON body; responses report token/byte counts and timings like llama-server |
+| `GET /lora-adapters` | empty llama-server-compatible adapter list; boring-llm does not load LoRA adapters |
+| `POST /lora-adapters` | recognized and returns 501 because runtime LoRA loading is not supported |
+| `GET /tools`, `POST /tools` | return llama-server's 403 `feature_disabled`; server-executed tools are disabled and are distinct from OpenAI request tool calling |
+| `POST /embedding`, `/embeddings`, `/v1/embeddings` | recognized and return 501; the loaded causal text model does not expose a pooled embedding output |
+| `POST /rerank`, `/v1/rerank`, `/v1/reranking` | recognized and return 501; dedicated ranking models are not supported |
+| `POST /v1/chat/completions/control` | recognized and returns 501; serialized requests cannot be controlled through a concurrent side channel |
+| `POST /v1/messages/count_tokens` | Anthropic text messages, system text blocks, tool definitions and `tool_use`/`tool_result` history are adapted to the model chat template and counted without inference; media blocks are rejected explicitly |
+| `POST /v1/messages` | Anthropic Messages generation with text and tool-use blocks, buffered or streamed with native Anthropic SSE events; matched `stop_sequences` are reported with `stop_reason: "stop_sequence"`, and `disable_parallel_tool_use` reaches compatible chat templates |
+| `GET`/`POST /v1/realtime` | recognized and returns 501; WebSocket realtime sessions are not implemented |
+| `GET`/`HEAD /metrics` | Prometheus counters when the server starts with `--metrics`; otherwise 501, as with llama-server's disabled endpoint |
 | `POST /props` | recognized as an optional llama-server endpoint and returns 501; mutable global properties are not enabled |
-| `GET /health` (also `/v1/health` and `/`) | `{"status": "ok"}` |
+| `GET`/`HEAD /health` (also `/v1/health` and `/`) | `{"status": "ok"}`; `HEAD` returns the matching headers and no body |
 | `OPTIONS` anything | `204`, for browser preflight |
 
 Any other route returns `404` with an OpenAI-shaped error body.
@@ -236,35 +284,61 @@ Any other route returns `404` with an OpenAI-shaped error body.
 | `tools` | handed to the model's own chat template as its `tools` variable; function names must be unique |
 | `chat_template_kwargs` | an object whose keys become extra variables of the chat template; Qwen3's template reads `enable_thinking` (`false` starts the reply with an empty thinking block, so the model answers directly) |
 | `reasoning_effort` | exposed to the chat template like llama-server; `"none"` also supplies `enable_thinking: false` for Qwen3 unless explicitly overridden in `chat_template_kwargs` |
+| `reasoning_format` | llama-server-compatible `auto` / `deepseek` extraction into `reasoning_content`, `none` to leave `<think>` markup in content, or `deepseek-legacy` to provide both forms |
 | `max_tokens`, `max_completion_tokens` | reply length; the smaller of this and the room left in the context |
-| `temperature`, `top_p`, `min_p`, `top_k`, `seed` | override the server defaults |
-| `repeat_penalty` | llama.cpp-style repeat penalty over the prompt and the reply so far (an extension of the OpenAI API) |
+| `temperature`, `dynatemp_range`, `dynatemp_exponent`, `top_n_sigma`, `typical_p`, `top_p`, `min_p`, `xtc_probability`, `xtc_threshold`, `top_k`, `min_keep`, `seed` | override the server defaults; a negative request seed selects a fresh per-request seed like llama-server; `top_k <= 0` uses the full vocabulary like llama.cpp; dynamic temperature maps normalized candidate entropy into `temperature ± dynatemp_range`; positive `top_n_sigma` keeps logits within that many standard deviations of the maximum; `typical_p` applies locally typical sampling; XTC probabilistically excludes the highest-probability choices above its threshold; and `min_keep` protects a minimum candidate count through typical-p/top-p/min-p/XTC |
+| `repeat_penalty`, `repeat_last_n` | llama.cpp-style repeat penalty over the prompt and reply so far; `repeat_last_n` selects the recent window, `0` disables it and `-1` uses the full history (extensions of the OpenAI API) |
+| `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_penalty_last_n`, `dry_sequence_breakers` | llama.cpp-style DRY sequence-repetition penalty; `dry_multiplier: 0` or `dry_penalty_last_n: 0` disables it, and breakers reset the repetition scan |
+| `samplers` | optional llama.cpp sampler pipeline; a canonical-order subset of `penalties`, `dry`, `top_n_sigma`, `top_k`, `typ_p`, `top_p`, `min_p`, `xtc`, `temperature` disables omitted stages. Reordered pipelines are rejected until arbitrary-order execution is available |
+| `mirostat`, `mirostat_tau`, `mirostat_eta` | llama.cpp-compatible stateful Mirostat sampling (`1` for v1, `2` for v2, `0` disabled); constrained JSON/tool decoding rejects Mirostat because its adaptive truncation cannot preserve the grammar distribution |
+| `adaptive_target`, `adaptive_decay` | llama.cpp adaptive-p sampling; a non-negative target enables probability-targeted sampling with a stateful exponential moving average (`adaptive_decay` 0–0.99). It is mutually exclusive with Mirostat and constrained decoding |
 | `frequency_penalty`, `presence_penalty` | OpenAI-style penalties over the reply so far: the logit of a token drops by its count times the frequency penalty plus the presence penalty (default 0, may be negative) |
-| `logit_bias` | OpenAI token-ID-to-bias object; values from -100 to 100 are added to logits before penalties and sampling |
+| `logit_bias` | OpenAI token-ID-to-bias object or native llama-server object/array with token IDs or text; values from -100 to 100 are added before penalties and sampling, native `false` suppresses a token, text applies its bias to every token in its tokenization, and native out-of-vocabulary IDs are ignored |
+| `response_fields` | Native `/completion` only: select final response fields; slash-separated nested paths such as `generation_settings/n_predict` are flattened to `n_predict` at the response root, and missing fields are omitted |
+| `n_indent` | Minimum spaces or tabs required before the first non-whitespace character after each generated newline; a dedented line stops before that character with a length/limit finish, matching llama-server code-completion behavior |
 | `tool_choice` | `"none"` leaves tools out; `"auto"` exposes all tools; `"required"` grammar-enforces a valid `{name, arguments}` call; a named function becomes the only exposed tool and grammar-enforces an arguments object matching its schema |
 | `parallel_tool_calls` | boolean exposed to the chat template like llama-server, allowing templates which support it to enable or suppress multiple calls |
-| `stop` | a string or an array of strings; the reply is cut at the earliest match |
+| `stop` | a string or an array of strings; the reply is cut at the earliest match, reported as `stopping_word` by the native API |
+| `ignore_eos` | llama-server extension; suppress the EOS token and continue until another stop condition or the token/context limit |
+| `id_slot` | Native `/completion` extension; `-1` automatically chooses a cache slot, while a non-negative id pins both cache reuse and the resulting sequence to that slot. The actual slot id is returned in buffered responses and the terminal SSE event. |
+| `cache_prompt` | llama-server extension, enabled by default. Set it to `false` to evaluate the complete prompt without reusing an in-memory or persistent cached prefix. This and the other native response controls are reflected in effective `generation_settings`. |
+| `n_keep`, `n_discard`, `n_cache_reuse` | Native context-shift controls. Their neutral value `0` is accepted; non-zero values are rejected explicitly because boring-llm does not shift its exact-prefix KV caches. |
+| `return_tokens` | Native `/completion` extension. Buffered responses return generated token ids in `tokens` only when this is `true`; native streaming events always include their token ids, matching llama-server. |
+| `t_max_predict_ms` | llama-server extension. A positive value limits the prediction phase after the first generated token; as in llama-server, generation stops only once the limit is exceeded and a newline has already been produced. `0` and `-1` disable it. |
+| `return_progress` | Native `/completion` only. With streaming enabled, emits llama-server-compatible `prompt_progress` SSE objects after each prefill chunk, reporting total, cached and processed token counts plus elapsed milliseconds. |
+| `sse_ping_interval` | Seconds between SSE `: ping` comments during silent prompt processing (default 30); `0` checks after every prefill chunk and `-1` disables pings. `return_progress` events take their place when enabled. |
+| `timings_per_token` | Native streaming extension. When true, each generated-content event includes cumulative prompt and prediction timings; the terminal event always includes final timings. |
 | `stream` | `true` for server-sent events |
 | `stream_options.include_usage` | adds a final usage chunk to a stream |
-| `response_format` | `{"type":"text"}`, `{"type":"json_object"}`, and OpenAI's `{"type":"json_schema", "json_schema":{"name", "schema", "strict"}}` form are accepted. JSON responses use token-level constrained decoding; a completed object and EOS are allowed only when the schema matches. |
-| `logprobs`, `top_logprobs` | non-streaming Chat requests support `logprobs: true` and return each generated token's full-vocabulary log-probability; `top_logprobs` may request 0–20 alternatives. Non-streaming text Completions support the legacy integer `logprobs` count from 0 to 5. Disabled Chat forms are accepted; streaming logprobs still return 400. |
-
+| Chat-only controls | `tools`, `tool_choice`, `parallel_tool_calls`, `chat_template_kwargs`, `reasoning_effort`, and `reasoning_format` are rejected by raw Text and native Completions rather than silently ignored. Native `/completion` likewise rejects the OpenAI-only `n`, `max_completion_tokens`, and `stream_options` aliases. |
+| `response_format` | `{"type":"text"}`, `{"type":"json_object"}`, OpenAI's `{"type":"json_schema", "json_schema":{"name", "schema", "strict"}}` form, and llama-server's direct `{"type":"json_object|json_schema", "schema":...}` form are accepted. JSON responses use token-level constrained decoding; a schema-less `json_object` requires an object, while an explicit schema permits any matching root value. A completed value and EOS are allowed only when the schema matches. |
+| `json_schema` | llama-server's top-level JSON Schema constraint. It uses the same token-level constrained decoder as `response_format`, takes priority over both `response_format` and `grammar`, and treats an empty schema as an object constraint. Boolean schemas are accepted. |
+| `grammar` | The default empty string is accepted for request compatibility. A non-empty BNF grammar without `json_schema` is rejected explicitly; use `json_schema` or `response_format` for constrained output. |
+| `logprobs`, `top_logprobs` | Chat requests support `logprobs: true` and 0–20 `top_logprobs`. Streaming Chat logprobs require `reasoning_format: "none"` and no active tools so response transformations cannot detach probabilities from their tokens. Text Completions support the legacy integer `logprobs` count from 0 to 5 in buffered and streamed responses. |
+| `n_probs`, `post_sampling_probs` | Native `/completion` only: a positive `n_probs` returns token alternatives in `completion_probabilities`. By default values are pre-sampling log-probabilities; with `post_sampling_probs: true`, `prob` and `top_probs` contain normalized probabilities after the standard sampler chain. The flag has no sampling cost when `n_probs` is zero. Stateful adaptive and constrained decoding modes reject active post-sampling probabilities because they use separate sampling paths. |
+| `n_cmpl`, `lora` | Native `/completion` accepts the neutral `n_cmpl: 1`; every generation route accepts `lora: []`, and native effective `generation_settings` expose that empty adapter list. Multiple native completions and non-empty per-request LoRA lists return 400 instead of being silently ignored; this server currently loads no adapters and generates one sequence per request. |
 Other unknown fields are ignored for forward compatibility. A `null` or missing `content` (an assistant message that only carries tool calls) is read as an empty string, because templates do string operations on it. Only assistant messages may carry a non-empty `tool_calls` array; every call needs an id unique within that message, and every `tool` result needs the corresponding non-empty `tool_call_id`. An assistant message's `tool_calls[i].function.arguments` may be a JSON string (as OpenAI sends it) or an object; it is normalized for the template.
 
-### Responses
+### Chat completion responses
 
-A non-streaming reply is a normal `chat.completion` object with `usage` filled in and `created` set to the request's Unix timestamp. Every chunk of one streamed reply carries that same timestamp. When the model reasons (`<think>...</think>`, Qwen3's default), the reasoning is returned apart as `message.reasoning_content` (as llama.cpp and DeepSeek's API do) and `content` holds only the answer; the markers never appear in either. `finish_reason` is `tool_calls` when the reply contains tool calls, `stop` when the model ended or a stop string matched, and `length` when `max_tokens` or the context ran out.
+A non-streaming reply is a normal `chat.completion` object with `usage` filled in, including the reused prefix in `prompt_tokens_details.cached_tokens`, and `created` set to the request's Unix timestamp. It also carries llama-server's `timings` object: `cache_n`, the newly evaluated `prompt_n`, prompt and prediction milliseconds, and their per-token rates. The optional final usage chunk of a stream exposes both the same cache detail and the same timings; every chunk of one streamed reply carries the request's timestamp. When the model reasons (`<think>...</think>`, Qwen3's default), the reasoning is returned apart as `message.reasoning_content` (as llama.cpp and DeepSeek's API do) and `content` holds only the answer; the markers never appear in either. `finish_reason` is `tool_calls` when the reply contains tool calls, `stop` when the model ended or a stop string matched, and `length` when `max_tokens` or the context ran out.
+
+### Responses API
+
+The Responses routes accept `instructions`, string or message-list `input`, function tools and tool history. `max_output_tokens`, reasoning effort, text format and tool choice are translated to the same generation path as Chat Completions. OpenCode's default `store: false` is supported; stored/background responses, `previous_response_id` and stored conversations are rejected explicitly because this single-process server does not keep response objects. Request `metadata` follows OpenAI's limit of 16 string pairs (64-character keys and 512-character values) and is echoed in buffered responses and streaming lifecycle events. Those response objects also report the effective instructions, output limit, reasoning and text configuration, tools and tool choice, temperature, `top_p`, storage and truncation settings consistently through the created, completed, incomplete and failed states. The original Responses tool definitions remain visible even with `tool_choice: "none"`; only their internal prompt representation is removed. Other recognized Responses options are type-checked rather than silently ignored.
+
+Buffered replies use the native `response` object with the original `input`, separate reasoning, message and function-call output items, cache-aware usage, timings, and distinct creation/completion Unix timestamps. Streaming lifecycle response objects preserve that same input from `response.created` and `response.in_progress` through `response.completed`, `response.incomplete` or `response.failed`; intervening events carry reasoning or text deltas and completed output items. Media and provider-hosted tools remain unsupported.
 
 ### Context overflow
 
-The server never drops part of a conversation to make it fit. A prompt that fills the whole context (`--ctx-size`) is refused with the 400 `context_length_exceeded` error below, and a reply that reaches the end of the context stops there with `finish_reason` `length`. llama.cpp behaves the same way when its context shift is off. Shifting the context would mean discarding old positions and re-rotating the cached keys (or recomputing the cache), and the in-memory and on-disk caches rely on exact token prefixes. Agent clients such as OpenCode shorten the history themselves when they see this error.
+The server never drops part of a conversation to make it fit. Responses requests may state `truncation: "disabled"`; `truncation: "auto"` is rejected explicitly instead of being accepted without effect. A prompt that fills the whole context (`--ctx-size`) is refused with the 400 `context_length_exceeded` error below, and a reply that reaches the end of the context stops there with `finish_reason` `length`. llama.cpp behaves the same way when its context shift is off. Shifting the context would mean discarding old positions and re-rotating the cached keys (or recomputing the cache), and the in-memory and on-disk caches rely on exact token prefixes. Agent clients such as OpenCode shorten the history themselves when they see this error.
 
 ### Streaming
 
 With `"stream": true` the reply is sent as server-sent events, token by token as the model produces them:
 
 1. the head and a role chunk are sent **immediately**, before the prompt is processed;
-2. while a long prompt is processed, an SSE comment line `: prefill N/M` follows every 512 prompt tokens, so the connection is never silent;
+2. while a long prompt is processed, an SSE comment line `: ping` is emitted at the requested `sse_ping_interval` after a prefill chunk completes (30 seconds by default, `-1` disables it), so the connection remains observable;
 3. deltas, one per decoded piece of text (a character spanning several byte-level tokens is held back until it is complete): `reasoning_content` deltas while the model is inside `<think>`, then `content` deltas;
 4. tool calls, if any, as one chunk;
 5. the finish chunk, an optional usage chunk, and `data: [DONE]`.
@@ -299,7 +373,7 @@ Errors use the OpenAI shape `{"error": {"message", "type", "code"}}`.
 | 404 | `not_found` | unknown route |
 | 500 | `internal_error` | a failure inside the request (also logged as `request N failed`) |
 
-A failure after a stream has opened cannot change the status; an SSE `error` event followed by `[DONE]` ends the stream instead. In both cases the server keeps running.
+A failure after a stream has opened cannot change the HTTP status. Chat and completion streams receive an SSE error followed by `[DONE]`; Responses streams receive terminal `response.failed`. In both cases the server keeps running.
 
 ### Log lines
 
@@ -315,7 +389,7 @@ The server writes to standard output:
 
 ### Checking a server
 
-`tools/smoke_server.py` checks the wire format against a running server: models, a plain completion, an SSE stream that really arrives token by token, the error shapes, and the JSON shape of a tool-calling round trip.
+`tools/smoke_server.py` checks the wire format against a running server: models, buffered and streamed Chat Completions and Responses, an SSE stream that really arrives token by token, error shapes, and the JSON shape of a tool-calling round trip.
 
 ```sh
 tools/smoke_server.py http://127.0.0.1:8080

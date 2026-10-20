@@ -112,8 +112,10 @@ pub int model_fingerprint(GgufFile file, int n_layer, int kv_dim) throws:
 # The snapshot in file `slot` if it is complete and was made by this model;
 # slot = -1 otherwise.
 DiskSnap read_snapshot_header(string dir, int slot, int fp, int n_layer, int kv_dim):
+    read_snapshot_file_header(snapshot_path(dir, slot), slot, fp, n_layer, kv_dim)
+
+pub DiskSnap read_snapshot_file_header(string path, int slot, int fp, int n_layer, int kv_dim):
     let none = DiskSnap(-1, 0, [])
-    let path = snapshot_path(dir, slot)
     let head = try? read_at(path, 0, PC_HEADER)
     guard let head else return none
     if read_u32_le(head, 0) != PC_MAGIC or read_u32_le(head, 4) != PC_VERSION:
@@ -146,11 +148,13 @@ pub [DiskSnap] scan_snapshots(string dir, int fp, int n_layer, int kv_dim, int m
 
 # Writes the first `tokens.length` positions of `cache` to file `slot`.
 pub def save_snapshot(string dir, int fp, int slot, int seq, QuantModel model, GenCache cache, [int] tokens) throws:
+    save_snapshot_file(snapshot_path(dir, slot), fp, seq, model, cache, tokens)
+
+pub def save_snapshot_file(string path, int fp, int seq, QuantModel model, GenCache cache, [int] tokens) throws:
     let n = tokens.length
     guard n > 0 and cache.pos >= n else throw "prompt cache: nothing to save"
     let kv_dim = kv_dim_of(model)
     let n_layer = model.config.n_layer
-    let path = snapshot_path(dir, slot)
     let folded = fold_cache(model, cache)
     let created = try? File.create(path)
     guard let created else throw "cannot create {path}"
@@ -183,10 +187,12 @@ pub def save_snapshot(string dir, int fp, int slot, int seq, QuantModel model, G
 # The first `common` positions of snapshot `snap`, uploaded to the GPU as a
 # cache ready to resume from.
 pub GenCache load_snapshot(string dir, DiskSnap snap, QuantModel model, int common) throws:
+    load_snapshot_file(snapshot_path(dir, snap.slot), snap, model, common)
+
+pub GenCache load_snapshot_file(string path, DiskSnap snap, QuantModel model, int common) throws:
     let n_total = snap.tokens.length
     guard common > 0 and common <= n_total else throw "prompt cache: cannot restore {common} of {n_total} positions"
     let kv_dim = kv_dim_of(model)
-    let path = snapshot_path(dir, snap.slot)
     let opened = try? File.open(path)
     guard let opened else throw "cannot open {path}"
     var f = opened
