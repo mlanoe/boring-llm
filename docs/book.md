@@ -849,7 +849,7 @@ This writes `docs/book.html`, `README.html` at the repository root, and one HTML
 - **Context** is limited by `--ctx-size` and memory. The KV cache is float32, twice the size llama.cpp's float16 cache needs.
 - **Architectures**: Llama-style GGUF layouts only (`qwen2` and `llama` are the tested ones); no mixture-of-experts, no vision.
 - **Chat templates** use a Jinja2 subset; an unsupported construct is reported.
-- **Single-file GGUF only.** Split models are not supported.
+- **Standard split GGUF naming required.** Multi-file models are discovered from any `model-00001-of-000NN.gguf` shard using their `split.no`, `split.count`, and `split.tensors.count` metadata. Arbitrary shard filenames are not guessed.
 - **Unix only for the disk features**: the streaming loader and snapshots use Unix file APIs.
 - **wgpu, CUDA, ROCm**: K-quant prefill through the portable schedule is about three times slower than the hand-written kernels; CUDA and ROCm have never been run.
 - **Speed** is about half to two thirds of llama.cpp's on the 7B model (see [chapter 8](#8-performance)); the remaining gap is in the Metal kernels and the float32 KV cache.

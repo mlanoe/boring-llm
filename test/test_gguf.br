@@ -8,6 +8,24 @@ use io
 use gguf
 
 def main() throws:
+    assert_eq(split_shard_path("models/model-00001-of-00003.gguf", 0), "models/model-00001-of-00003.gguf")
+    assert_eq(split_shard_path("models/model-00001-of-00003.gguf", 1), "models/model-00002-of-00003.gguf")
+    assert_eq(split_shard_path("models/model.gguf", 0), "")
+    assert_eq(split_shard_path("models/model-abcde-of-00003.gguf", 0), "")
+    assert_eq(split_shard_path("models/model-00001-of-00003.bin", 0), "")
+    let split_meta0 = {"split.no"=GgufValue.U16(0), "split.count"=GgufValue.U16(2), "split.tensors.count"=GgufValue.I32(2)}
+    let split_meta1 = {"split.no"=GgufValue.U16(1), "split.count"=GgufValue.U16(2), "split.tensors.count"=GgufValue.I32(2)}
+    let shard0 = GgufFile(3, split_meta0, [GgufTensorInfo("a", [2], 0, 32)], 100, [], "a", 1000, [], [])
+    let shard1 = GgufFile(3, split_meta1, [GgufTensorInfo("b", [2], 0, 64)], 200, [], "b", 2000, [], [])
+    let merged = merge_gguf_shards([shard0, shard1], ["a", "b"])
+    assert_eq(merged.file_size, 3000)
+    assert_eq(merged.shard_starts, [0, 1000])
+    assert_eq(merged.tensors[0].offset, 132)
+    assert_eq(merged.tensors[1].offset, 1264)
+    assert_eq(virtual_shard_index(merged.shard_starts, 0), 0)
+    assert_eq(virtual_shard_index(merged.shard_starts, 999), 0)
+    assert_eq(virtual_shard_index(merged.shard_starts, 1000), 1)
+    assert_eq(virtual_shard_index(merged.shard_starts, 2999), 1)
     let [uint8] bytes = fs.readBytes("test/fixtures/tiny.gguf")
     let file = parse_gguf(bytes)
 

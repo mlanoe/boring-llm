@@ -36,7 +36,7 @@ pub int file_len(string path) throws:
 
 # Parses the header of the GGUF at `path`. The header is read as a prefix of the
 # file, doubled (x4) until parse_gguf stops reporting a truncation.
-pub GgufFile parse_gguf_path(string path) throws:
+GgufFile parse_gguf_single_path(string path) throws:
     let size = file_len(path)
     var int prefix = 16777216
     while true:
@@ -44,16 +44,56 @@ pub GgufFile parse_gguf_path(string path) throws:
         let head = read_at(path, 0, n)
         let parsed = try? parse_gguf(head)
         if let g = parsed:
-            return GgufFile(g.version, g.metadata, g.tensors, g.data_offset, [], path, size)
+            return GgufFile(g.version, g.metadata, g.tensors, g.data_offset, [], path, size, [], [])
         if n >= size:
             parse_gguf(head)    # the whole file and still not parseable: surface the real error
         prefix = prefix * 4
     throw "unreachable"
 
+pub GgufFile parse_gguf_path(string path) throws:
+    let first = parse_gguf_single_path(path)
+    let split_count = gguf_get_int(first.metadata, "split.count") else 1
+    if split_count <= 1:
+        return first
+    guard let supplied_no = gguf_get_int(first.metadata, "split.no") else throw "GGUF split: missing split.no"
+    guard supplied_no >= 0 and supplied_no < split_count else throw "GGUF split: invalid split.no {supplied_no} for {split_count} files"
+    let first_path = split_shard_path(path, 0)
+    guard first_path != "" else throw "GGUF split: expected a name like model-00001-of-00002.gguf"
+    mut [string] paths = []
+    mut [GgufFile] parts = []
+    var int shard = 0
+    while shard < split_count:
+        let shard_path = split_shard_path(path, shard)
+        let part = if shard == supplied_no: first else: parse_gguf_single_path(shard_path)
+        guard let part_no = gguf_get_int(part.metadata, "split.no") else throw "GGUF split: {shard_path} has no split.no"
+        guard let part_count = gguf_get_int(part.metadata, "split.count") else throw "GGUF split: {shard_path} has no split.count"
+        guard part_no == shard and part_count == split_count else throw "GGUF split: inconsistent metadata in {shard_path}"
+        paths.push(shard_path)
+        parts.push(part)
+        shard += 1
+    merge_gguf_shards(parts, paths)
+
 # `n` bytes of tensor data at absolute file offset `start`: from disk when the
 # file was opened by path, from the in-memory copy otherwise.
 pub [uint8] file_bytes(GgufFile file, int start, int n) throws:
-    if file.path != "":
+    if file.shard_paths.length > 0:
+        guard n >= 0 and start >= 0 and start + n <= file.file_size else throw "GGUF split: read outside virtual file"
+        mut [uint8] out = []
+        var int position = start
+        var int remaining = n
+        while remaining > 0:
+            let shard = virtual_shard_index(file.shard_starts, position)
+            guard shard >= 0 else throw "GGUF split: read starts before the first shard"
+            let shard_end = if shard + 1 < file.shard_paths.length: file.shard_starts[shard + 1] else: file.file_size
+            let available = shard_end - position
+            let take = if remaining < available: remaining else: available
+            let chunk = read_at(file.shard_paths[shard], position - file.shard_starts[shard], take)
+            for byte in chunk:
+                out.push(byte)
+            position += take
+            remaining -= take
+        out
+    elif file.path != "":
         read_at(file.path, start, n)
     else:
         read_bytes(file.bytes, start, n)

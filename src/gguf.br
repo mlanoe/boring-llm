@@ -62,6 +62,8 @@ pub struct GgufFile:
     [uint8] bytes        # the whole file when parsed from memory (tests, small files); EMPTY when `path` is set
     string path          # non-empty: tensor data is read from this file on demand and never held in memory
     int file_size        # size of the file in bytes
+    [string] shard_paths # split GGUF files, empty for memory/single-file inputs
+    [int] shard_starts   # virtual byte offset of each split file
 
 # --- low-level readers -----------------------------------------------------
 
@@ -247,7 +249,94 @@ pub GgufFile parse_gguf([uint8] bytes) throws:
     let alignment = alignment_from_metadata(metadata)
     let data_offset = align_up(offset, alignment)
 
-    GgufFile(version, metadata, tensors, data_offset, bytes, "", bytes.length)
+    GgufFile(version, metadata, tensors, data_offset, bytes, "", bytes.length, [], [])
+
+# Standard gguf-split filenames use one-based five-digit shard numbers. Return
+# an empty string when the supplied path is not in that form.
+pub string split_shard_path(string path, int shard_index):
+    let cs = path.chars()
+    let n = cs.length
+    if n < 20 or shard_index < 0 or shard_index >= 99999:
+        return ""
+    let marker = ["-", "o", "f", "-"]
+    let marker_at = n - 14
+    if cs[n - 20] != "-":
+        return ""
+    let decimal = "0123456789"
+    var int d = n - 19
+    while d < n - 14:
+        if not decimal.contains(cs[d]):
+            return ""
+        d += 1
+    var int m = 0
+    while m < marker.length:
+        if cs[marker_at + m] != marker[m]:
+            return ""
+        m += 1
+    d = n - 10
+    while d < n - 5:
+        if not decimal.contains(cs[d]):
+            return ""
+        d += 1
+    let suffix = [".", "g", "g", "u", "f"]
+    var int s = 0
+    while s < suffix.length:
+        if cs[n - 5 + s] != suffix[s]:
+            return ""
+        s += 1
+    mut string digits = "{shard_index + 1}"
+    while digits.chars().length < 5:
+        digits = "0{digits}"
+    if digits.chars().length != 5:
+        return ""
+    var string out = ""
+    var int i = 0
+    while i < n:
+        if i == n - 19:
+            out = "{out}{digits}"
+            i += 5
+        else:
+            out = "{out}{cs[i]}"
+            i += 1
+    out
+
+# Merge already-parsed shard headers into one virtual file. Tensor offsets
+# become absolute positions in the concatenation of the physical files; the
+# disk reader maps those positions back to the owning shard.
+pub GgufFile merge_gguf_shards([GgufFile] parts, [string] paths) throws:
+    guard parts.length > 0 and parts.length == paths.length else throw "GGUF split: shard/path count mismatch"
+    guard let split_count = gguf_get_int(parts[0].metadata, "split.count") else throw "GGUF split: missing split.count"
+    guard split_count == parts.length else throw "GGUF split: expected {split_count} files, found {parts.length}"
+    guard let expected_tensors = gguf_get_int(parts[0].metadata, "split.tensors.count") else throw "GGUF split: missing split.tensors.count"
+    mut [int] starts = []
+    mut [GgufTensorInfo] tensors = []
+    mut {string=bool} seen = {=}
+    var int total_size = 0
+    var int shard = 0
+    while shard < parts.length:
+        let part = parts[shard]
+        guard let part_no = gguf_get_int(part.metadata, "split.no") else throw "GGUF split: shard {shard} has no split.no"
+        guard let part_count = gguf_get_int(part.metadata, "split.count") else throw "GGUF split: shard {shard} has no split.count"
+        guard let part_tensors = gguf_get_int(part.metadata, "split.tensors.count") else throw "GGUF split: shard {shard} has no split.tensors.count"
+        guard part.version == parts[0].version and part_no == shard and part_count == split_count and part_tensors == expected_tensors else throw "GGUF split: inconsistent metadata in shard {shard}"
+        starts.push(total_size)
+        for tensor in part.tensors:
+            guard not seen.contains(tensor.name) else throw "GGUF split: duplicate tensor '{tensor.name}'"
+            seen[tensor.name] = true
+            tensors.push(GgufTensorInfo(tensor.name, tensor.dims, tensor.ggml_type,
+                         total_size + part.data_offset + tensor.offset))
+        total_size += part.file_size
+        shard += 1
+    guard tensors.length == expected_tensors else throw "GGUF split: expected {expected_tensors} tensors, found {tensors.length}"
+    GgufFile(parts[0].version, parts[0].metadata, tensors, 0, [], paths[0], total_size, paths, starts)
+
+pub int virtual_shard_index([int] starts, int offset):
+    if starts.length == 0 or offset < starts[0]:
+        return -1
+    var int shard = starts.length - 1
+    while shard > 0 and offset < starts[shard]:
+        shard -= 1
+    shard
 
 # --- typed metadata accessors (used by main.br and later phases) -----------
 

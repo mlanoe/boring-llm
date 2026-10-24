@@ -207,7 +207,7 @@ boring.toml               kernel scheduling policy (native Metal paths for Q8_0,
 - Context is limited by `--ctx-size` and by memory (the KV cache is float32: ~115 KB per token for the 7B model).
 - Only Llama-style GGUF layouts are supported (Qwen2 and Llama are the ones tested); no MoE, no vision.
 - Chat templates use a Jinja2 subset (enough for Qwen2.5 and TinyLlama); an unsupported construct is reported, not ignored.
-- Snapshots on disk and the disk-streaming loader use Unix file APIs; GGUF files split in several parts are not supported.
+- Snapshots on disk and the disk-streaming loader use Unix file APIs. Standard `model-00001-of-000NN.gguf` split models are discovered from any shard and read lazily without concatenating their weights in memory.
 - CUDA and ROCm have not been run.
 
 ## Boring

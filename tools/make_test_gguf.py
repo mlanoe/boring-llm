@@ -10,6 +10,7 @@ import numpy as np
 import gguf
 
 OUT = "test/fixtures/tiny.gguf"
+SPLIT_OUT = "test/fixtures/tiny-split.gguf"
 
 w = gguf.GGUFWriter(OUT, arch="tinytest")
 
@@ -31,3 +32,16 @@ w.write_tensors_to_file()
 w.close()
 
 print(f"wrote {OUT}")
+
+# Force one tensor per shard so the compiled split-loader test exercises a
+# physical read from both files. GGUFWriter applies llama.cpp's standard
+# `-00001-of-00002.gguf` naming and split metadata.
+sw = gguf.GGUFWriter(SPLIT_OUT, arch="tinytest", split_max_tensors=1)
+sw.add_uint32("tinytest.block_count", 1)
+sw.add_tensor("weight.0", tensor)
+sw.add_tensor("weight.1", tensor + 10.0)
+sw.write_header_to_file()
+sw.write_kv_data_to_file()
+sw.write_tensors_to_file()
+sw.close()
+print(f"wrote split fixture from {SPLIT_OUT}")
