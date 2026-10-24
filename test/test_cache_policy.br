@@ -33,6 +33,22 @@ def main():
     assert(restore_from_disk(5000, 1, 5256), "a gain of 256 tokens is")
     assert(not restore_from_disk(0, -1, 0), "no snapshot, nothing to restore")
 
+    assert(resolve_context_keep(-1, 5) == 5, "n_keep -1 retains the complete initial prompt")
+    assert(resolve_context_keep(2, 5) == 2, "an explicit n_keep is unchanged")
+
+    let no_shift = plan_context_shift(7, 8, 0, 0)
+    assert(no_shift.keep == 0 and no_shift.discard == 0, "a context with free space is not shifted")
+    let half = plan_context_shift(8, 8, 2, 0)
+    assert(half.keep == 2 and half.discard == 3, "default shift drops half the movable context")
+    let explicit = plan_context_shift(12, 8, 2, 2)
+    assert(explicit.keep == 2 and explicit.discard == 5, "explicit discard grows enough to leave one free position")
+    let capped_keep = plan_context_shift(8, 8, 99, 0)
+    assert(capped_keep.keep == 7 and capped_keep.discard == 1, "keep leaves one position for generation")
+    let discard_all_movable = plan_context_shift(8, 8, 6, 99)
+    assert(discard_all_movable.keep == 6 and discard_all_movable.discard == 2, "discard is capped to the movable suffix")
+    let shifted = apply_context_shift([0, 1, 2, 3, 4, 5, 6, 7], ContextShiftPlan(2, 3))
+    assert(shifted == [0, 1, 5, 6, 7], "shift retains the requested prefix and newest suffix")
+
     let a = toks(1, 3000)
     let none = plan_save([], toks(1, 1000), 2, 100, 0)
     assert(not none.save, "under 1024 tokens is never written")

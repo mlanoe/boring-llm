@@ -57,10 +57,11 @@ pub struct ServerCtx:
     int cache_bpt           # bytes one token adds to a snapshot
     bool metrics_enabled    # expose Prometheus counters at GET /metrics
     string slot_save_dir    # named llama-server slot snapshots; "" disables them
-    [string] api_keys       # accepted Bearer keys; empty disables authentication
+    [string] api_keys       # accepted Bearer/x-api-key values; empty disables authentication
     string api_prefix       # route prefix, without a trailing slash; "" disables it
     bool slots_enabled      # expose GET/POST /slots; caches remain active either way
     bool cache_prompt_default # default prefix reuse; requests may override cache_prompt
+    bool context_shift      # rebuild a retained context when generation fills the KV cache
     int sse_ping_interval_default # seconds; -1 disables, requests may override
     string reasoning_format_default # auto/none/deepseek/deepseek-legacy
     string reasoning_effort_default # empty keeps template default; requests may override
@@ -79,38 +80,49 @@ pub struct CacheSlot:
     [int] tokens
     int used        # request counter when last touched; smallest = least recently used
 
-# 0 = nothing written for the current request yet, 1 = an SSE stream is open
-# (a failure then must not write a second HTTP response into it), 2 = a complete
-# response was written.
-static var int response_state = 0
-static var bool response_head_only = false
-# Streaming errors are written outside the request dispatcher. Keep just enough
-# protocol state for that fallback to use the route's native terminal event.
-static var bool response_stream_is_responses = false
-static var bool response_stream_is_anthropic = false
-static var int response_stream_sequence = 0
-static var uint64 response_stream_created = 0
-static var string response_stream_settings = ""
-static var string response_cors_origins = "*"
-static var string response_cors_methods = "GET, POST, DELETE, OPTIONS"
-static var string response_cors_headers = "*"
-static var bool response_cors_credentials = true
-static var string response_request_origin = ""
+# Every connection owns its response bookkeeping. Keeping this out of global
+# state prevents one request from changing another request's protocol, CORS,
+# HEAD, or streaming-error behavior when concurrent serving is introduced.
+pub struct ResponseState:
+    var int state # 0 = unwritten, 1 = SSE stream open, 2 = response complete
+    var bool head_only
+    var bool stream_is_responses
+    var bool stream_is_anthropic
+    var bool request_is_anthropic
+    var int stream_sequence
+    var uint64 stream_created
+    var string stream_settings
+    string cors_origins
+    string cors_methods
+    string cors_headers
+    bool cors_credentials
+    var string request_origin
 
-# Process-wide counters are sufficient because the server deliberately owns
-# one model and handles one connection at a time.
-static var int metric_prompt_tokens = 0
-static var int metric_prompt_ms = 0
-static var int metric_predicted_tokens = 0
-static var int metric_predicted_ms = 0
-static var int metric_n_tokens_max = 0
-static var int metric_n_decode = 0
+# Server-wide counters remain shared across requests, but their ownership is
+# explicit so a future scheduler can synchronize updates without hidden state.
+pub struct ServerMetrics:
+    var int prompt_tokens
+    var int prompt_ms
+    var int predicted_tokens
+    var int predicted_ms
+    var int n_tokens_max
+    var int n_decode
+
+# Mutable scheduler-owned data. The current accept loop owns this directly;
+# a concurrent implementation can put this single value behind one actor/lock
+# without separately coordinating counters, metrics, and cache indexes.
+pub struct ServerState:
+    var int counter
+    var ServerMetrics metrics
+    var [CacheSlot] slots
+    var [DiskSnap] disk
 
 pub struct HttpRequest:
     string method
     string path
     string body
     string authorization
+    string api_key
     string origin
 
 # llama_model_n_params() is the sum of the element counts of the tensors
@@ -333,30 +345,30 @@ def write_text(var TcpStream sock, string text) throws:
     let w = try? sock.writeAll(text.asBytes())
     guard let w else throw "socket write failed"
 
-def respond(var TcpStream sock, int status, string reason, string content_type, string body) throws:
+def respond(mut ResponseState& response, var TcpStream sock, int status, string reason, string content_type, string body) throws:
     let body_len = body.asBytes().length
-    let allow_origin = cors_allow_origin(response_cors_origins, response_request_origin, response_cors_credentials)
+    let allow_origin = cors_allow_origin(response.cors_origins, response.request_origin, response.cors_credentials)
     let origin_head = if allow_origin != "": "Access-Control-Allow-Origin: {allow_origin}\r\n" else: ""
     let vary_head = if allow_origin != "" and allow_origin != "*": "Vary: Origin\r\n" else: ""
-    let credentials_head = if response_cors_credentials and allow_origin != "": "Access-Control-Allow-Credentials: true\r\n" else: ""
-    let head = "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {body_len}\r\nConnection: close\r\nCache-Control: no-cache\r\n{origin_head}{vary_head}Access-Control-Allow-Headers: {response_cors_headers}\r\nAccess-Control-Allow-Methods: {response_cors_methods}\r\n{credentials_head}\r\n"
+    let credentials_head = if response.cors_credentials and allow_origin != "": "Access-Control-Allow-Credentials: true\r\n" else: ""
+    let head = "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {body_len}\r\nConnection: close\r\nCache-Control: no-cache\r\n{origin_head}{vary_head}Access-Control-Allow-Headers: {response.cors_headers}\r\nAccess-Control-Allow-Methods: {response.cors_methods}\r\n{credentials_head}\r\n"
     write_text(sock, head)
-    if not response_head_only:
+    if not response.head_only:
         write_text(sock, body)
-    response_state = 2
+    response.state = 2
 
 # Headers of a streamed reply: no Content-Length, the body ends when the
 # connection closes. Events follow as the model produces them.
-def respond_stream_head(var TcpStream sock) throws:
-    response_state = 1
-    let allow_origin = cors_allow_origin(response_cors_origins, response_request_origin, response_cors_credentials)
+def respond_stream_head(mut ResponseState& response, var TcpStream sock) throws:
+    response.state = 1
+    let allow_origin = cors_allow_origin(response.cors_origins, response.request_origin, response.cors_credentials)
     let origin_head = if allow_origin != "": "Access-Control-Allow-Origin: {allow_origin}\r\n" else: ""
     let vary_head = if allow_origin != "" and allow_origin != "*": "Vary: Origin\r\n" else: ""
-    let credentials_head = if response_cors_credentials and allow_origin != "": "Access-Control-Allow-Credentials: true\r\n" else: ""
-    write_text(sock, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nX-Accel-Buffering: no\r\n{origin_head}{vary_head}Access-Control-Allow-Headers: {response_cors_headers}\r\nAccess-Control-Allow-Methods: {response_cors_methods}\r\n{credentials_head}\r\n")
+    let credentials_head = if response.cors_credentials and allow_origin != "": "Access-Control-Allow-Credentials: true\r\n" else: ""
+    write_text(sock, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nX-Accel-Buffering: no\r\n{origin_head}{vary_head}Access-Control-Allow-Headers: {response.cors_headers}\r\nAccess-Control-Allow-Methods: {response.cors_methods}\r\n{credentials_head}\r\n")
 
-def respond_json(var TcpStream sock, int status, string reason, string body) throws:
-    respond(sock, status, reason, "application/json", body)
+def respond_json(mut ResponseState& response, var TcpStream sock, int status, string reason, string body) throws:
+    respond(response, sock, status, reason, "application/json", body)
 
 int parse_content_length(string head) throws:
     var int found = 0
@@ -433,7 +445,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     if not is_valid_utf8(body_bytes):
         throw "http_400:request body is not valid UTF-8"
     let body = bytes_to_str(body_bytes)
-    HttpRequest(request_line[0], request_line[1], body, http_header_value(head, "authorization"), http_header_value(head, "origin"))
+    HttpRequest(request_line[0], request_line[1], body, http_header_value(head, "authorization"), http_header_value(head, "x-api-key"), http_header_value(head, "origin"))
 
 # ── Chat completions ─────────────────────────────────────────────────────
 
@@ -452,33 +464,33 @@ HttpRequest read_http_request(var TcpStream sock) throws:
 # `slots` are the KV caches left by earlier requests; the returned list
 # replaces them. A new prompt only pays for the tokens after its longest common
 # prefix with the best slot.
-[CacheSlot] handle_completion(ServerCtx& ctx, var TcpStream sock, string body_text, int counter,
+[CacheSlot] handle_completion(ServerCtx& ctx, mut ServerMetrics& metrics, mut ResponseState& response, var TcpStream sock, string body_text, int counter,
                               [CacheSlot] slots, [DiskSnap] disk, bool is_chat, bool is_native,
                               bool is_responses, bool is_anthropic) throws:
     let parsed = try? json_parse(body_text)
     guard let raw_body = parsed else:
-        respond_json(sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
+        respond_json(response, sock, 400, "Bad Request", provider_error_json(is_anthropic, "{counter}", "request body is not valid JSON", "invalid_request_error", "invalid_json"))
         return slots
     if is_anthropic:
         let anthropic_invalid = anthropic_input_validation_error(raw_body)
         if anthropic_invalid != "":
-            respond_json(sock, 400, "Bad Request", error_json(anthropic_invalid, "invalid_request_error", "invalid_request"))
+            respond_json(response, sock, 400, "Bad Request", anthropic_error_json("{counter}", anthropic_invalid, "invalid_request_error"))
             return slots
     if is_responses:
         let responses_invalid = responses_input_validation_error(raw_body)
         if responses_invalid != "":
-            respond_json(sock, 400, "Bad Request", error_json(responses_invalid, "invalid_request_error", "invalid_request"))
+            respond_json(response, sock, 400, "Bad Request", error_json(responses_invalid, "invalid_request_error", "invalid_request"))
             return slots
-    var JValue body = if is_responses: responses_chat_body(raw_body) elif is_anthropic: anthropic_chat_body(raw_body) else: raw_body
+    var JValue body = if is_responses: responses_chat_body(raw_body) elif is_anthropic: anthropic_chat_body(raw_body) else: raw_body.clone()
     if is_anthropic:
         body = jv_set(body, "stop", json_get(raw_body, "stop_sequences"))
     let invalid = endpoint_request_validation_error(body, is_chat, is_native)
     if invalid != "":
-        respond_json(sock, 400, "Bad Request", error_json(invalid, "invalid_request_error", "invalid_parameter"))
+        respond_json(response, sock, 400, "Bad Request", provider_error_json(is_anthropic, "{counter}", invalid, "invalid_request_error", "invalid_parameter"))
         return slots
     let requested_slot = if is_native: json_get_int(body, "id_slot", -1) else: -1
     if requested_slot >= ctx.cache_slots:
-        respond_json(sock, 400, "Bad Request", error_json("slot id {requested_slot} is out of range", "invalid_request_error", "invalid_slot_id"))
+        respond_json(response, sock, 400, "Bad Request", error_json("slot id {requested_slot} is out of range", "invalid_request_error", "invalid_slot_id"))
         return slots
     mut [JValue] messages = []
     mut [JValue] tools = []
@@ -487,12 +499,12 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         let invalid_shape = request_shape_error(body)
         if invalid_shape != "":
             let code = if invalid_shape.startsWith("`messages` is required"): "missing_messages" else: "invalid_request"
-            respond_json(sock, 400, "Bad Request", error_json(invalid_shape, "invalid_request_error", code))
+            respond_json(response, sock, 400, "Bad Request", provider_error_json(is_anthropic, "{counter}", invalid_shape, "invalid_request_error", code))
             return slots
         let raw_tools = json_get_list(body, "tools")
         let invalid_choice = tool_choice_validation_error(body, raw_tools)
         if invalid_choice != "":
-            respond_json(sock, 400, "Bad Request", error_json(invalid_choice, "invalid_request_error", "invalid_tool_choice"))
+            respond_json(response, sock, 400, "Bad Request", provider_error_json(is_anthropic, "{counter}", invalid_choice, "invalid_request_error", "invalid_tool_choice"))
             return slots
         messages = normalize_messages(json_get_list(body, "messages"))
         tools = tools_for_request(body, raw_tools)
@@ -505,65 +517,74 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                     prompt_tokens = ctx.tok.encode_completion_prompt(prompt)
             JList(items):
                 if is_native and native_prompt_is_multiple(prompt_value):
-                    respond_json(sock, 400, "Bad Request", error_json("multiple native prompts are not supported", "invalid_request_error", "unsupported_multiple_prompts"))
+                    respond_json(response, sock, 400, "Bad Request", error_json("multiple native prompts are not supported", "invalid_request_error", "unsupported_multiple_prompts"))
                     return slots
                 var bool first_item = true
                 for item in items:
                     match item:
                         JInt(id):
                             if id < 0 or id >= ctx.model.config.vocab_size:
-                                respond_json(sock, 400, "Bad Request", error_json("prompt token id {id} is outside the vocabulary", "invalid_request_error", "invalid_prompt_token"))
+                                respond_json(response, sock, 400, "Bad Request", error_json("prompt token id {id} is outside the vocabulary", "invalid_request_error", "invalid_prompt_token"))
                                 return slots
                             prompt_tokens.push(id)
                         JStr(fragment):
                             if not is_native:
-                                respond_json(sock, 400, "Bad Request", error_json("OpenAI `prompt` token arrays must contain only integer token ids", "invalid_request_error", "invalid_prompt"))
+                                respond_json(response, sock, 400, "Bad Request", error_json("OpenAI `prompt` token arrays must contain only integer token ids", "invalid_request_error", "invalid_prompt"))
                                 return slots
                             let fragment_tokens = if first_item: ctx.tok.encode_completion_prompt(fragment) else: ctx.tok.encode_with_specials(fragment)
                             for id in fragment_tokens:
                                 prompt_tokens.push(id)
                         _:
                             let expected = if is_native: "integer token ids or string fragments" else: "integer token ids"
-                            respond_json(sock, 400, "Bad Request", error_json("`prompt` arrays must contain only {expected}", "invalid_request_error", "invalid_prompt"))
+                            respond_json(response, sock, 400, "Bad Request", error_json("`prompt` arrays must contain only {expected}", "invalid_request_error", "invalid_prompt"))
                             return slots
                     first_item = false
             JDict(fields, keys):
                 if not is_native:
-                    respond_json(sock, 400, "Bad Request", error_json("OpenAI `prompt` must be a string or an array of token ids", "invalid_request_error", "invalid_prompt"))
+                    respond_json(response, sock, 400, "Bad Request", error_json("OpenAI `prompt` must be a string or an array of token ids", "invalid_request_error", "invalid_prompt"))
                     return slots
                 let media = json_get(prompt_value, "multimodal_data")
                 if not request_value_is_undefined(media):
                     match media:
                         JList(items):
                             if items.length > 0:
-                                respond_json(sock, 400, "Bad Request", error_json("multimodal completion prompts are not supported", "invalid_request_error", "unsupported_multimodal_prompt"))
+                                respond_json(response, sock, 400, "Bad Request", error_json("multimodal completion prompts are not supported", "invalid_request_error", "unsupported_multimodal_prompt"))
                                 return slots
                         _:
-                            respond_json(sock, 400, "Bad Request", error_json("`prompt.multimodal_data` must be an array", "invalid_request_error", "invalid_prompt"))
+                            respond_json(response, sock, 400, "Bad Request", error_json("`prompt.multimodal_data` must be an array", "invalid_request_error", "invalid_prompt"))
                             return slots
                 let prompt_string = json_get(prompt_value, "prompt_string")
                 if not jv_is_str(prompt_string):
-                    respond_json(sock, 400, "Bad Request", error_json("native prompt objects require a string `prompt_string`", "invalid_request_error", "invalid_prompt"))
+                    respond_json(response, sock, 400, "Bad Request", error_json("native prompt objects require a string `prompt_string`", "invalid_request_error", "invalid_prompt"))
                     return slots
                 let text = json_get_str(prompt_value, "prompt_string", "")
                 if text.chars().length > 0:
                     prompt_tokens = ctx.tok.encode_completion_prompt(text)
             _:
-                respond_json(sock, 400, "Bad Request", error_json("`prompt` is required and must be a string, token array, or native prompt object", "invalid_request_error", "missing_prompt"))
+                respond_json(response, sock, 400, "Bad Request", error_json("`prompt` is required and must be a string, token array, or native prompt object", "invalid_request_error", "missing_prompt"))
                 return slots
         if prompt_tokens.length == 0:
-            respond_json(sock, 400, "Bad Request", error_json("`prompt` must not be empty", "invalid_request_error", "missing_prompt"))
+            respond_json(response, sock, 400, "Bad Request", error_json("`prompt` must not be empty", "invalid_request_error", "missing_prompt"))
             return slots
 
     let room = ctx.max_ctx - prompt_tokens.length
     if room <= 0:
-        respond_json(sock, 400, "Bad Request", context_exceeded_json(prompt_tokens.length, ctx.max_ctx))
+        respond_json(response, sock, 400, "Bad Request", provider_context_exceeded_json(is_anthropic, "{counter}", prompt_tokens.length, ctx.max_ctx))
         return slots
     let default_asked = if is_native: json_get_int(body, "n_predict", ctx.default_max_tokens) else: json_get_int(body, "max_completion_tokens", ctx.default_max_tokens)
     let asked = json_get_int(body, "max_tokens", default_asked)
-    # llama-server uses -1 for unbounded native completion. With context shift
-    # disabled, "unbounded" means all positions still available in this context.
-    let max_new = if asked < 0 or asked > room: room else: asked
+    let context_shift = ctx.context_shift
+    let n_keep = if is_native: json_get_int(body, "n_keep", 0) else: 0
+    let n_discard = if is_native: json_get_int(body, "n_discard", 0) else: 0
+    if not context_shift and (n_keep != 0 or n_discard != 0):
+        respond_json(response, sock, 400, "Bad Request", error_json("native `n_keep` and `n_discard` require context shifting", "invalid_request_error", "context_shift_disabled"))
+        return slots
+    # llama-server uses -1 for unbounded native completion. Without shifting,
+    # generation remains bounded by the positions currently available.
+    let max_new = if context_shift:
+        if asked < 0: 2147483647 else: asked
+    else:
+        if asked < 0 or asked > room: room else: asked
 
     let temperature = json_get_float(body, "temperature", ctx.defaults.temperature as float)
     let dynatemp_range = json_get_float(body, "dynatemp_range", ctx.defaults.dynatemp_range as float)
@@ -615,7 +636,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     let sampling_presence_penalty = if use_penalties: presence_penalty else: 0.0 as float32
     let (logit_bias, invalid_bias_token) = request_logit_bias(ctx.tok, body, ctx.model.config.vocab_size, not is_native)
     if invalid_bias_token >= 0:
-        respond_json(sock, 400, "Bad Request", error_json("logit_bias token id {invalid_bias_token} is outside the vocabulary", "invalid_request_error", "invalid_logit_bias"))
+        respond_json(response, sock, 400, "Bad Request", error_json("logit_bias token id {invalid_bias_token} is outside the vocabulary", "invalid_request_error", "invalid_logit_bias"))
         return slots
 
     let started = Instant.now()
@@ -634,10 +655,10 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     let requested_post_sampling_probs = is_native and json_get_bool(body, "post_sampling_probs", false)
     let post_sampling_probs = requested_post_sampling_probs and requested_native_logprobs > 0
     if (mirostat != 0 or adaptive_target >= 0.0 as float32) and (json_mode or constrained_tool_choice):
-        respond_json(sock, 400, "Bad Request", error_json("stateful adaptive sampling cannot be combined with constrained decoding", "invalid_request_error", "unsupported_sampler_combination"))
+        respond_json(response, sock, 400, "Bad Request", error_json("stateful adaptive sampling cannot be combined with constrained decoding", "invalid_request_error", "unsupported_sampler_combination"))
         return slots
     if post_sampling_probs and (mirostat != 0 or adaptive_target >= 0.0 as float32 or json_mode or constrained_tool_choice):
-        respond_json(sock, 400, "Bad Request", error_json("post_sampling_probs require the standard unconstrained sampling chain", "invalid_request_error", "unsupported_sampler_combination"))
+        respond_json(response, sock, 400, "Bad Request", error_json("post_sampling_probs require the standard unconstrained sampling chain", "invalid_request_error", "unsupported_sampler_combination"))
         return slots
     let wants_chat_logprobs = is_chat and json_get_bool(body, "logprobs", false)
     var bool wants_completion_logprobs = false
@@ -666,7 +687,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     let n_indent = json_get_int(body, "n_indent", 0)
     let sse_ping_interval = json_get_int(body, "sse_ping_interval", ctx.sse_ping_interval_default)
     let response_fields = json_get(body, "response_fields")
-    let native_generation_settings = llama_sampling_params_json(max_new, temperature as float32,
+    let base_generation_settings = llama_sampling_params_json(max_new, temperature as float32,
         dynatemp_range as float32, dynatemp_exponent as float32, top_n_sigma as float32, top_k,
         typical_p as float32, top_p as float32, min_p as float32, xtc_probability as float32,
         xtc_threshold as float32, min_keep, seed, repeat_penalty as float32,
@@ -677,11 +698,14 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         stops, ignore_eos, streaming,
         requested_native_logprobs, timings_per_token, n_indent, sse_ping_interval, requested_post_sampling_probs,
         ctx.model_name, ctx.max_ctx, cache_prompt, return_tokens, return_progress, t_max_predict_ms)
+    let keep_generation_settings = base_generation_settings.replace("\"n_keep\": 0", "\"n_keep\": {n_keep}")
+    let native_generation_settings = keep_generation_settings.replace("\"n_discard\": 0", "\"n_discard\": {n_discard}")
     let processed_prompt = if is_native: ctx.tok.decode(prompt_tokens) else: ""
     let id = "{counter}"
     var bool responses_text_started = false
     var bool responses_reasoning_started = false
     var bool anthropic_text_started = false
+    var bool anthropic_thinking_started = false
     # The last prompt token always goes through the model (its logits pick the
     # first reply token), so at most `length - 1` cached positions are reusable.
     mut [[int]] slot_tokens = []
@@ -710,18 +734,18 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     # ignore it, but the connection is not idle. A client that has gone away is
     # noticed by the failing write, so its prefill stops early.
     if streaming:
-        respond_stream_head(sock)
+        respond_stream_head(response, sock)
         if is_responses:
-            response_stream_is_responses = true
+            response.stream_is_responses = true
             let response_settings = responses_settings_json(body, temperature as float, top_p as float)
-            response_stream_created = created
-            response_stream_settings = response_settings
-            write_text(sock, responses_created_sse(id, ctx.model_name, created, response_stream_sequence, "response.created", response_settings))
-            response_stream_sequence += 1
-            write_text(sock, responses_created_sse(id, ctx.model_name, created, response_stream_sequence, "response.in_progress", response_settings))
-            response_stream_sequence += 1
+            response.stream_created = created
+            response.stream_settings = response_settings
+            write_text(sock, responses_created_sse(id, ctx.model_name, created, response.stream_sequence, "response.created", response_settings))
+            response.stream_sequence += 1
+            write_text(sock, responses_created_sse(id, ctx.model_name, created, response.stream_sequence, "response.in_progress", response_settings))
+            response.stream_sequence += 1
         elif is_anthropic:
-            response_stream_is_anthropic = true
+            response.stream_is_anthropic = true
             write_text(sock, anthropic_message_start_sse(id, ctx.model_name, prompt_tokens.length, reuse))
         elif is_chat:
             write_text(sock, sse_role_event(id, ctx.model_name, created))
@@ -748,7 +772,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         let upto = if done + chunk_len < pending.length: done + chunk_len else: pending.length
         let (lg, c) = prefill_step_gpu_quantized(ctx.model, cache_p, pending[done..<upto])
         if ctx.metrics_enabled:
-            metric_n_decode += 1
+            metrics.n_decode += 1
         first_logits = lg
         cache_p = c
         done = upto
@@ -759,7 +783,10 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                            elapsed_prefill_ms))
                 last_sse_activity_ms = elapsed_prefill_ms
             elif done < pending.length and sse_ping_due(sse_ping_interval, last_sse_activity_ms, elapsed_prefill_ms):
-                write_text(sock, ": ping\n\n")
+                if is_anthropic:
+                    write_text(sock, anthropic_ping_sse())
+                else:
+                    write_text(sock, ": ping\n\n")
                 last_sse_activity_ms = elapsed_prefill_ms
     let cache0 = cache_p
     let prefill_ms = started.elapsed().asMillis() as int
@@ -791,6 +818,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     var string stopping_word = ""
     var bool indentation_stopped = false
     var bool prediction_timed_out = false
+    var bool context_was_shifted = false
     var int generated = 0
     var int first_token_ms = -1
     var float32 mirostat_mu = 2.0 as float32 * mirostat_tau
@@ -927,14 +955,19 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                     let reasoning_delta = chars_from(reasoning_now, emitted_r)
                     if is_responses:
                         if not responses_reasoning_started:
-                            write_text(sock, responses_reasoning_added_sse(id, response_stream_sequence))
-                            response_stream_sequence += 1
-                            write_text(sock, responses_reasoning_part_sse(id, "", response_stream_sequence, false))
-                            response_stream_sequence += 1
+                            write_text(sock, responses_reasoning_added_sse(id, response.stream_sequence))
+                            response.stream_sequence += 1
+                            write_text(sock, responses_reasoning_part_sse(id, "", response.stream_sequence, false))
+                            response.stream_sequence += 1
                             responses_reasoning_started = true
-                        write_text(sock, responses_reasoning_delta_sse(id, reasoning_delta, response_stream_sequence))
-                        response_stream_sequence += 1
-                    elif not is_anthropic:
+                        write_text(sock, responses_reasoning_delta_sse(id, reasoning_delta, response.stream_sequence))
+                        response.stream_sequence += 1
+                    elif is_anthropic:
+                        if not anthropic_thinking_started:
+                            write_text(sock, anthropic_thinking_start_sse(0))
+                            anthropic_thinking_started = true
+                        write_text(sock, anthropic_thinking_delta_sse(0, reasoning_delta))
+                    else:
                         write_text(sock, sse_reasoning_event(id, ctx.model_name, reasoning_delta, created))
                     emitted_r = n_reasoning
                 let (chat_vs, chat_vl) = stream_bounds(content_now, stops)
@@ -950,18 +983,19 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                     if is_responses:
                         let response_text_index = if responses_reasoning_started: 1 else: 0
                         if not responses_text_started:
-                            write_text(sock, responses_message_added_sse(id, response_text_index, response_stream_sequence))
-                            response_stream_sequence += 1
-                            write_text(sock, responses_content_added_sse(id, response_text_index, response_stream_sequence))
-                            response_stream_sequence += 1
+                            write_text(sock, responses_message_added_sse(id, response_text_index, response.stream_sequence))
+                            response.stream_sequence += 1
+                            write_text(sock, responses_content_added_sse(id, response_text_index, response.stream_sequence))
+                            response.stream_sequence += 1
                             responses_text_started = true
-                        write_text(sock, responses_text_delta_sse(id, delta, response_text_index, response_stream_sequence))
-                        response_stream_sequence += 1
+                        write_text(sock, responses_text_delta_sse(id, delta, response_text_index, response.stream_sequence))
+                        response.stream_sequence += 1
                     elif is_anthropic:
+                        let content_index = if anthropic_thinking_started: 1 else: 0
                         if not anthropic_text_started:
-                            write_text(sock, anthropic_text_start_sse(0))
+                            write_text(sock, anthropic_text_start_sse(content_index))
                             anthropic_text_started = true
-                        write_text(sock, anthropic_text_delta_sse(0, delta))
+                        write_text(sock, anthropic_text_delta_sse(content_index, delta))
                     elif is_chat:
                         if wants_chat_logprobs:
                             write_text(sock, sse_content_event_logprobs(id, ctx.model_name, delta, created,
@@ -997,10 +1031,34 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                         else:
                             write_text(sock, text_completion_sse_event(id, ctx.model_name, delta, "", created))
                     emitted = vl - vs
-            if not stopped:
+            # A sampled EOS terminates the reply and is deliberately not fed
+            # back into the reusable KV cache.
+            if not stopped and not hit_eos:
+                if context_shift and cur.pos >= ctx.max_ctx:
+                    let effective_keep = resolve_context_keep(n_keep, prompt_tokens.length)
+                    let shift = plan_context_shift(cur.pos, ctx.max_ctx, effective_keep, n_discard)
+                    guard shift.discard > 0 else throw "context shift could not free a KV-cache position"
+                    let retained = apply_context_shift(tokens[0..<cur.pos], shift)
+                    var rebuilt = empty_cache(ctx.model.config.n_layer)
+                    var int rebuilt_count = 0
+                    while rebuilt_count < retained.length:
+                        let rebuilt_upto = if rebuilt_count + chunk_len < retained.length: rebuilt_count + chunk_len else: retained.length
+                        let (rebuilt_logits, rebuilt_cache) = prefill_step_gpu_quantized(ctx.model, rebuilt, retained[rebuilt_count..<rebuilt_upto])
+                        rebuilt = rebuilt_cache
+                        rebuilt_count = rebuilt_upto
+                        if ctx.metrics_enabled:
+                            metrics.n_decode += 1
+                    cur = rebuilt
+                    context_was_shifted = true
+                    mut [int] shifted_tokens = []
+                    for retained_token in retained:
+                        shifted_tokens.push(retained_token)
+                    shifted_tokens.push(next_tok)
+                    tokens = shifted_tokens
+                    print "[serve] context shift: kept {shift.keep}, discarded {shift.discard}, retained {retained.length} tokens"
                 let (step_logits, step_cache) = forward_step(ctx.model, cur, next_tok)
                 if ctx.metrics_enabled:
-                    metric_n_decode += 1
+                    metrics.n_decode += 1
                 logits = step_logits
                 cur = step_cache
             if t_max_predict_ms > 0 and first_token_ms >= 0 and text.contains("\n"):
@@ -1026,18 +1084,18 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     let anthropic_stop_sequence = if is_anthropic and (stopped or stopped_full): stopping_word else: ""
     let completion_tokens = generated
     let decode_ms = if gen_ms > prefill_ms: gen_ms - prefill_ms else: 0
-    let native_truncated = native_context_truncated(prompt_tokens.length, completion_tokens, ctx.max_ctx,
-        hit_eos or stopped or prediction_timed_out)
+    let native_truncated = native_truncated_status(prompt_tokens.length, completion_tokens, ctx.max_ctx,
+        hit_eos or stopped or prediction_timed_out, context_shift, context_was_shifted)
 
     if ctx.metrics_enabled:
-        metric_prompt_tokens += pending.length
-        metric_prompt_ms += prefill_ms
-        metric_predicted_tokens += completion_tokens
+        metrics.prompt_tokens += pending.length
+        metrics.prompt_ms += prefill_ms
+        metrics.predicted_tokens += completion_tokens
         if decode_ms > 0:
-            metric_predicted_ms += decode_ms
+            metrics.predicted_ms += decode_ms
         let occupied = prompt_tokens.length + completion_tokens
-        if occupied > metric_n_tokens_max:
-            metric_n_tokens_max = occupied
+        if occupied > metrics.n_tokens_max:
+            metrics.n_tokens_max = occupied
 
     let mode = if streaming: "streamed" else: "buffered"
     let reuse_src = if restored: "disk" else: "cache"
@@ -1069,22 +1127,27 @@ HttpRequest read_http_request(var TcpStream sock) throws:
             let reasoning_tail = chars_from(final_reasoning, emitted_r)
             if is_responses:
                 if not responses_reasoning_started:
-                    write_text(sock, responses_reasoning_added_sse(id, response_stream_sequence))
-                    response_stream_sequence += 1
-                    write_text(sock, responses_reasoning_part_sse(id, "", response_stream_sequence, false))
-                    response_stream_sequence += 1
+                    write_text(sock, responses_reasoning_added_sse(id, response.stream_sequence))
+                    response.stream_sequence += 1
+                    write_text(sock, responses_reasoning_part_sse(id, "", response.stream_sequence, false))
+                    response.stream_sequence += 1
                     responses_reasoning_started = true
-                write_text(sock, responses_reasoning_delta_sse(id, reasoning_tail, response_stream_sequence))
-                response_stream_sequence += 1
-            elif not is_anthropic:
+                write_text(sock, responses_reasoning_delta_sse(id, reasoning_tail, response.stream_sequence))
+                response.stream_sequence += 1
+            elif is_anthropic:
+                if not anthropic_thinking_started:
+                    write_text(sock, anthropic_thinking_start_sse(0))
+                    anthropic_thinking_started = true
+                write_text(sock, anthropic_thinking_delta_sse(0, reasoning_tail))
+            else:
                 write_text(sock, sse_reasoning_event(id, ctx.model_name, reasoning_tail, created))
         if is_responses and responses_reasoning_started:
-            write_text(sock, responses_reasoning_text_done_sse(id, final_reasoning, response_stream_sequence))
-            response_stream_sequence += 1
-            write_text(sock, responses_reasoning_part_sse(id, final_reasoning, response_stream_sequence, true))
-            response_stream_sequence += 1
-            write_text(sock, responses_reasoning_done_sse(id, final_reasoning, response_stream_sequence))
-            response_stream_sequence += 1
+            write_text(sock, responses_reasoning_text_done_sse(id, final_reasoning, response.stream_sequence))
+            response.stream_sequence += 1
+            write_text(sock, responses_reasoning_part_sse(id, final_reasoning, response.stream_sequence, true))
+            response.stream_sequence += 1
+            write_text(sock, responses_reasoning_done_sse(id, final_reasoning, response.stream_sequence))
+            response.stream_sequence += 1
         let content_chars = reply.content.chars()
         var string tail = ""
         var int q3 = emitted
@@ -1095,18 +1158,19 @@ HttpRequest read_http_request(var TcpStream sock) throws:
             if is_responses:
                 let response_text_index = if responses_reasoning_started: 1 else: 0
                 if not responses_text_started:
-                    write_text(sock, responses_message_added_sse(id, response_text_index, response_stream_sequence))
-                    response_stream_sequence += 1
-                    write_text(sock, responses_content_added_sse(id, response_text_index, response_stream_sequence))
-                    response_stream_sequence += 1
+                    write_text(sock, responses_message_added_sse(id, response_text_index, response.stream_sequence))
+                    response.stream_sequence += 1
+                    write_text(sock, responses_content_added_sse(id, response_text_index, response.stream_sequence))
+                    response.stream_sequence += 1
                     responses_text_started = true
-                write_text(sock, responses_text_delta_sse(id, tail, response_text_index, response_stream_sequence))
-                response_stream_sequence += 1
+                write_text(sock, responses_text_delta_sse(id, tail, response_text_index, response.stream_sequence))
+                response.stream_sequence += 1
             elif is_anthropic:
+                let content_index = if anthropic_thinking_started: 1 else: 0
                 if not anthropic_text_started:
-                    write_text(sock, anthropic_text_start_sse(0))
+                    write_text(sock, anthropic_text_start_sse(content_index))
                     anthropic_text_started = true
-                write_text(sock, anthropic_text_delta_sse(0, tail))
+                write_text(sock, anthropic_text_delta_sse(content_index, tail))
             elif is_chat:
                 if wants_chat_logprobs:
                     write_text(sock, sse_content_event_logprobs(id, ctx.model_name, tail, created,
@@ -1146,39 +1210,43 @@ HttpRequest read_http_request(var TcpStream sock) throws:
             let response_text_index = if responses_reasoning_started: 1 else: 0
             if has_message:
                 if not responses_text_started:
-                    write_text(sock, responses_message_added_sse(id, response_text_index, response_stream_sequence))
-                    response_stream_sequence += 1
-                    write_text(sock, responses_content_added_sse(id, response_text_index, response_stream_sequence))
-                    response_stream_sequence += 1
-                write_text(sock, responses_text_done_sse(id, reply.content, response_text_index, response_stream_sequence))
-                response_stream_sequence += 1
-                write_text(sock, responses_content_done_sse(id, reply.content, response_text_index, response_stream_sequence))
-                response_stream_sequence += 1
-                write_text(sock, responses_message_done_sse(id, reply.content, response_text_index, response_stream_sequence))
-                response_stream_sequence += 1
+                    write_text(sock, responses_message_added_sse(id, response_text_index, response.stream_sequence))
+                    response.stream_sequence += 1
+                    write_text(sock, responses_content_added_sse(id, response_text_index, response.stream_sequence))
+                    response.stream_sequence += 1
+                write_text(sock, responses_text_done_sse(id, reply.content, response_text_index, response.stream_sequence))
+                response.stream_sequence += 1
+                write_text(sock, responses_content_done_sse(id, reply.content, response_text_index, response.stream_sequence))
+                response.stream_sequence += 1
+                write_text(sock, responses_message_done_sse(id, reply.content, response_text_index, response.stream_sequence))
+                response.stream_sequence += 1
             var int call_index = 0
             while call_index < reply.calls.length:
                 let output_index = call_index + (if has_message: 1 else: 0) + (if responses_reasoning_started: 1 else: 0)
-                write_text(sock, responses_function_sse(id, reply.calls[call_index], call_index, output_index, response_stream_sequence, false))
-                response_stream_sequence += 1
-                write_text(sock, responses_function_arguments_delta_sse(id, reply.calls[call_index].arguments, call_index, output_index, response_stream_sequence))
-                response_stream_sequence += 1
-                write_text(sock, responses_function_arguments_done_sse(id, reply.calls[call_index], call_index, output_index, response_stream_sequence))
-                response_stream_sequence += 1
-                write_text(sock, responses_function_sse(id, reply.calls[call_index], call_index, output_index, response_stream_sequence, true))
-                response_stream_sequence += 1
+                write_text(sock, responses_function_sse(id, reply.calls[call_index], call_index, output_index, response.stream_sequence, false))
+                response.stream_sequence += 1
+                write_text(sock, responses_function_arguments_delta_sse(id, reply.calls[call_index].arguments, call_index, output_index, response.stream_sequence))
+                response.stream_sequence += 1
+                write_text(sock, responses_function_arguments_done_sse(id, reply.calls[call_index], call_index, output_index, response.stream_sequence))
+                response.stream_sequence += 1
+                write_text(sock, responses_function_sse(id, reply.calls[call_index], call_index, output_index, response.stream_sequence, true))
+                response.stream_sequence += 1
                 call_index += 1
             let completed_response = responses_json_reasoning_timed(id, ctx.model_name, reply, final_reasoning, finish, prompt_tokens.length, completion_tokens, reuse, created, completed, prefill_ms, decode_ms, responses_settings_json(body, temperature as float, top_p as float))
-            write_text(sock, responses_terminal_sse(completed_response, response_stream_sequence, finish == "length"))
+            write_text(sock, responses_terminal_sse(completed_response, response.stream_sequence, finish == "length"))
         elif is_anthropic:
+            if anthropic_thinking_started:
+                write_text(sock, anthropic_signature_delta_sse(0, anthropic_thinking_signature(id)))
+                write_text(sock, anthropic_content_stop_sse(0))
+            let anthropic_text_index = if anthropic_thinking_started: 1 else: 0
             if not anthropic_text_started and reply.calls.length == 0:
-                write_text(sock, anthropic_text_start_sse(0))
+                write_text(sock, anthropic_text_start_sse(anthropic_text_index))
                 anthropic_text_started = true
             if anthropic_text_started:
-                write_text(sock, anthropic_content_stop_sse(0))
+                write_text(sock, anthropic_content_stop_sse(anthropic_text_index))
             var int anthropic_call_index = 0
             while anthropic_call_index < reply.calls.length:
-                let content_index = anthropic_call_index + (if anthropic_text_started: 1 else: 0)
+                let content_index = anthropic_call_index + (if anthropic_thinking_started: 1 else: 0) + (if anthropic_text_started: 1 else: 0)
                 write_text(sock, anthropic_tool_start_sse(id, anthropic_call_index, content_index, reply.calls[anthropic_call_index]))
                 write_text(sock, anthropic_tool_delta_sse(content_index, reply.calls[anthropic_call_index].arguments))
                 write_text(sock, anthropic_content_stop_sse(content_index))
@@ -1205,17 +1273,17 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                     write_text(sock, text_completion_usage_sse_event_timed(id, ctx.model_name, prompt_tokens.length, completion_tokens, reuse, created, prefill_ms, decode_ms))
             if not is_native:
                 write_text(sock, sse_done_event())
-        response_state = 2
+        response.state = 2
     else:
         if is_chat:
             if is_responses:
-                respond_json(sock, 200, "OK", responses_json_reasoning_timed(id, ctx.model_name, reply, final_reasoning, finish, prompt_tokens.length, completion_tokens, reuse, created, completed, prefill_ms, decode_ms, responses_settings_json(body, temperature as float, top_p as float)))
+                respond_json(response, sock, 200, "OK", responses_json_reasoning_timed(id, ctx.model_name, reply, final_reasoning, finish, prompt_tokens.length, completion_tokens, reuse, created, completed, prefill_ms, decode_ms, responses_settings_json(body, temperature as float, top_p as float)))
             elif is_anthropic:
-                respond_json(sock, 200, "OK", anthropic_message_json(id, ctx.model_name, reply, finish, anthropic_stop_sequence, prompt_tokens.length, completion_tokens, reuse))
+                respond_json(response, sock, 200, "OK", anthropic_message_json(id, ctx.model_name, reply, final_reasoning, finish, anthropic_stop_sequence, prompt_tokens.length, completion_tokens, reuse))
             elif wants_chat_logprobs:
-                respond_json(sock, 200, "OK", completion_json_r_logprobs_timed(id, ctx.model_name, reply, final_reasoning, finish, prompt_tokens.length, completion_tokens, reuse, created, reply_logprob_tokens, reply_logprob_bytes, reply_logprobs, reply_top_logprobs, prefill_ms, decode_ms))
+                respond_json(response, sock, 200, "OK", completion_json_r_logprobs_timed(id, ctx.model_name, reply, final_reasoning, finish, prompt_tokens.length, completion_tokens, reuse, created, reply_logprob_tokens, reply_logprob_bytes, reply_logprobs, reply_top_logprobs, prefill_ms, decode_ms))
             else:
-                respond_json(sock, 200, "OK", completion_json_r_timed(id, ctx.model_name, reply, final_reasoning, finish, prompt_tokens.length, completion_tokens, reuse, created, prefill_ms, decode_ms))
+                respond_json(response, sock, 200, "OK", completion_json_r_timed(id, ctx.model_name, reply, final_reasoning, finish, prompt_tokens.length, completion_tokens, reuse, created, prefill_ms, decode_ms))
         elif is_native:
             let native_stop_type = if hit_eos: "eos" elif indentation_stopped: "limit" elif stopped or stopped_full: "word" else: "limit"
             let native_stop_word = native_stopping_word(native_stop_type, stopping_word)
@@ -1223,12 +1291,12 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                 native_completion_json_logprobs(ctx.model_name, reply.content, reply_tokens, return_tokens, assigned_slot, true, native_stop_type, native_stop_word, native_truncated, prompt_tokens.length, completion_tokens, reuse, prefill_ms, decode_ms, reply_logprob_tokens, reply_logprobs, reply_logprob_bytes, reply_top_logprobs, native_generation_settings, processed_prompt, post_sampling_probs)
             else:
                 native_completion_json(ctx.model_name, reply.content, reply_tokens, return_tokens, assigned_slot, true, native_stop_type, native_stop_word, native_truncated, prompt_tokens.length, completion_tokens, reuse, prefill_ms, decode_ms, native_generation_settings, processed_prompt)
-            respond_json(sock, 200, "OK", native_response_fields_json(native_json, response_fields))
+            respond_json(response, sock, 200, "OK", native_response_fields_json(native_json, response_fields))
         else:
             if wants_completion_logprobs:
-                respond_json(sock, 200, "OK", text_completion_json_logprobs_timed(id, ctx.model_name, reply.content, finish, prompt_tokens.length, completion_tokens, reuse, created, reply_logprob_tokens, reply_logprobs, reply_top_logprobs, prefill_ms, decode_ms))
+                respond_json(response, sock, 200, "OK", text_completion_json_logprobs_timed(id, ctx.model_name, reply.content, finish, prompt_tokens.length, completion_tokens, reuse, created, reply_logprob_tokens, reply_logprobs, reply_top_logprobs, prefill_ms, decode_ms))
             else:
-                respond_json(sock, 200, "OK", text_completion_json_timed(id, ctx.model_name, reply.content, finish, prompt_tokens.length, completion_tokens, reuse, created, prefill_ms, decode_ms))
+                respond_json(response, sock, 200, "OK", text_completion_json_timed(id, ctx.model_name, reply.content, finish, prompt_tokens.length, completion_tokens, reuse, created, prefill_ms, decode_ms))
     # `cur` covers cur.pos tokens: every token that was fed through the model
     # (the final EOS, or the token that completed a stop string, is sampled but
     # never fed back).
@@ -1268,83 +1336,83 @@ HttpRequest read_http_request(var TcpStream sock) throws:
 # llama-server exposes this lightweight companion to chat completions.  It
 # runs the exact same normalization and embedded chat template as generation,
 # but never touches the GPU or the prompt cache.
-[CacheSlot] handle_input_tokens(ServerCtx& ctx, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
+[CacheSlot] handle_input_tokens(ServerCtx& ctx, mut ResponseState& response, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
     let parsed = try? json_parse(body_text)
     guard let body = parsed else:
-        respond_json(sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
+        respond_json(response, sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
         return slots
     let invalid_shape = request_shape_error(body)
     if invalid_shape != "":
         let code = if invalid_shape.startsWith("`messages` is required"): "missing_messages" else: "invalid_request"
-        respond_json(sock, 400, "Bad Request", error_json(invalid_shape, "invalid_request_error", code))
+        respond_json(response, sock, 400, "Bad Request", error_json(invalid_shape, "invalid_request_error", code))
         return slots
     let invalid_options = apply_template_options_validation_error(body)
     if invalid_options != "":
-        respond_json(sock, 400, "Bad Request", error_json(invalid_options, "invalid_request_error", "invalid_request"))
+        respond_json(response, sock, 400, "Bad Request", error_json(invalid_options, "invalid_request_error", "invalid_request"))
         return slots
     let raw_tools = json_get_list(body, "tools")
     let invalid_choice = tool_choice_validation_error(body, raw_tools)
     if invalid_choice != "":
-        respond_json(sock, 400, "Bad Request", error_json(invalid_choice, "invalid_request_error", "invalid_tool_choice"))
+        respond_json(response, sock, 400, "Bad Request", error_json(invalid_choice, "invalid_request_error", "invalid_tool_choice"))
         return slots
     let messages = normalize_messages(json_get_list(body, "messages"))
     if messages.length == 0:
-        respond_json(sock, 400, "Bad Request", error_json("`messages` is required and must be a non-empty array", "invalid_request_error", "missing_messages"))
+        respond_json(response, sock, 400, "Bad Request", error_json("`messages` is required and must be a non-empty array", "invalid_request_error", "missing_messages"))
         return slots
     let tools = tools_for_request(body, raw_tools)
     let prompt_tokens = render_chat_prompt_messages_kw(ctx.file, ctx.tok, messages, tools, true, chat_template_variables_server_default(body, ctx.chat_template_kwargs_default, ctx.reasoning_effort_default))
-    respond_json(sock, 200, "OK", input_tokens_json(prompt_tokens.length))
+    respond_json(response, sock, 200, "OK", input_tokens_json(prompt_tokens.length))
     slots
 
-[CacheSlot] handle_responses_input_tokens(ServerCtx& ctx, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
+[CacheSlot] handle_responses_input_tokens(ServerCtx& ctx, mut ResponseState& response, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
     let parsed = try? json_parse(body_text)
     guard let body = parsed else:
-        respond_json(sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
+        respond_json(response, sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
         return slots
     let invalid = responses_input_validation_error(body)
     if invalid != "":
-        respond_json(sock, 400, "Bad Request", error_json(invalid, "invalid_request_error", "invalid_request"))
+        respond_json(response, sock, 400, "Bad Request", error_json(invalid, "invalid_request_error", "invalid_request"))
         return slots
     let messages = normalize_messages(responses_input_messages(body))
     let tools = responses_input_tools(body)
     let prompt_tokens = render_chat_prompt_messages_kw(ctx.file, ctx.tok, messages, tools, true, chat_template_variables_server_default(body, ctx.chat_template_kwargs_default, ctx.reasoning_effort_default))
-    respond_json(sock, 200, "OK", input_tokens_json(prompt_tokens.length))
+    respond_json(response, sock, 200, "OK", input_tokens_json(prompt_tokens.length))
     slots
 
-[CacheSlot] handle_anthropic_input_tokens(ServerCtx& ctx, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
+[CacheSlot] handle_anthropic_input_tokens(ServerCtx& ctx, mut ResponseState& response, var TcpStream sock, string body_text, int counter, [CacheSlot] slots) throws:
     let parsed = try? json_parse(body_text)
     guard let raw_body = parsed else:
-        respond_json(sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
+        respond_json(response, sock, 400, "Bad Request", anthropic_error_json("{counter}", "request body is not valid JSON", "invalid_request_error"))
         return slots
     let invalid = anthropic_input_validation_error(raw_body)
     if invalid != "":
-        respond_json(sock, 400, "Bad Request", error_json(invalid, "invalid_request_error", "invalid_request"))
+        respond_json(response, sock, 400, "Bad Request", anthropic_error_json("{counter}", invalid, "invalid_request_error"))
         return slots
     let body = anthropic_chat_body(raw_body)
     let invalid_shape = request_shape_error(body)
     if invalid_shape != "":
-        respond_json(sock, 400, "Bad Request", error_json(invalid_shape, "invalid_request_error", "invalid_request"))
+        respond_json(response, sock, 400, "Bad Request", anthropic_error_json("{counter}", invalid_shape, "invalid_request_error"))
         return slots
     let raw_tools = json_get_list(body, "tools")
     let invalid_choice = tool_choice_validation_error(body, raw_tools)
     if invalid_choice != "":
-        respond_json(sock, 400, "Bad Request", error_json(invalid_choice, "invalid_request_error", "invalid_tool_choice"))
+        respond_json(response, sock, 400, "Bad Request", anthropic_error_json("{counter}", invalid_choice, "invalid_request_error"))
         return slots
     let messages = normalize_messages(json_get_list(body, "messages"))
     let tools = tools_for_request(body, raw_tools)
     let prompt_tokens = render_chat_prompt_messages_kw(ctx.file, ctx.tok, messages, tools, true, chat_template_variables_server_default(body, ctx.chat_template_kwargs_default, ctx.reasoning_effort_default))
-    respond_json(sock, 200, "OK", input_tokens_json(prompt_tokens.length))
+    respond_json(response, sock, 200, "OK", anthropic_input_tokens_json(prompt_tokens.length))
     slots
 
-[CacheSlot] handle_tokenize(ServerCtx& ctx, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
+[CacheSlot] handle_tokenize(ServerCtx& ctx, mut ResponseState& response, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
     let parsed = try? json_parse(body_text)
     guard let body = parsed else:
-        respond_json(sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
+        respond_json(response, sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
         return slots
     let invalid = tokenize_request_validation_error(body)
     if invalid != "":
         let code = if invalid.startsWith("`content`"): "missing_content" else: "invalid_request"
-        respond_json(sock, 400, "Bad Request", error_json(invalid, "invalid_request_error", code))
+        respond_json(response, sock, 400, "Bad Request", error_json(invalid, "invalid_request_error", code))
         return slots
     let content = json_get_str(body, "content", "")
     let parse_special = json_get_bool(body, "parse_special", true)
@@ -1352,15 +1420,15 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     let ids = add_configured_special_tokens(encoded, ctx.tok.bos_token_id, ctx.tok.eos_token_id,
         ctx.tok.add_bos_token, ctx.tok.add_eos_token, json_get_bool(body, "add_special", false))
     if json_get_bool(body, "with_pieces", false):
-        respond_json(sock, 200, "OK", tokens_with_pieces_json(ctx.tok, ids))
+        respond_json(response, sock, 200, "OK", tokens_with_pieces_json(ctx.tok, ids))
     else:
-        respond_json(sock, 200, "OK", tokens_json(ids))
+        respond_json(response, sock, 200, "OK", tokens_json(ids))
     slots
 
-[CacheSlot] handle_detokenize(ServerCtx& ctx, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
+[CacheSlot] handle_detokenize(ServerCtx& ctx, mut ResponseState& response, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
     let parsed = try? json_parse(body_text)
     guard let body = parsed else:
-        respond_json(sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
+        respond_json(response, sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
         return slots
     mut [int] ids = []
     let raw = json_get(body, "tokens")
@@ -1370,79 +1438,82 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                 match item:
                     JInt(id):
                         if id < 0 or id >= ctx.model.config.vocab_size:
-                            respond_json(sock, 400, "Bad Request", error_json("token id {id} is outside the vocabulary", "invalid_request_error", "invalid_token"))
+                            respond_json(response, sock, 400, "Bad Request", error_json("token id {id} is outside the vocabulary", "invalid_request_error", "invalid_token"))
                             return slots
                         ids.push(id)
                     _:
-                        respond_json(sock, 400, "Bad Request", error_json("`tokens` must contain only integer token ids", "invalid_request_error", "invalid_tokens"))
+                        respond_json(response, sock, 400, "Bad Request", error_json("`tokens` must contain only integer token ids", "invalid_request_error", "invalid_tokens"))
                         return slots
         _:
-            respond_json(sock, 400, "Bad Request", error_json("`tokens` is required and must be an array", "invalid_request_error", "missing_tokens"))
+            respond_json(response, sock, 400, "Bad Request", error_json("`tokens` is required and must be an array", "invalid_request_error", "missing_tokens"))
             return slots
-    respond_json(sock, 200, "OK", content_json(ctx.tok.decode(ids)))
+    respond_json(response, sock, 200, "OK", content_json(ctx.tok.decode(ids)))
     slots
 
-[CacheSlot] handle_apply_template(ServerCtx& ctx, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
+[CacheSlot] handle_apply_template(ServerCtx& ctx, mut ResponseState& response, var TcpStream sock, string body_text, [CacheSlot] slots) throws:
     let parsed = try? json_parse(body_text)
     guard let body = parsed else:
-        respond_json(sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
+        respond_json(response, sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
         return slots
     let invalid_shape = request_shape_error(body)
     if invalid_shape != "":
         let code = if invalid_shape.startsWith("`messages` is required"): "missing_messages" else: "invalid_request"
-        respond_json(sock, 400, "Bad Request", error_json(invalid_shape, "invalid_request_error", code))
+        respond_json(response, sock, 400, "Bad Request", error_json(invalid_shape, "invalid_request_error", code))
         return slots
     let raw_tools = json_get_list(body, "tools")
     let invalid_choice = tool_choice_validation_error(body, raw_tools)
     if invalid_choice != "":
-        respond_json(sock, 400, "Bad Request", error_json(invalid_choice, "invalid_request_error", "invalid_tool_choice"))
+        respond_json(response, sock, 400, "Bad Request", error_json(invalid_choice, "invalid_request_error", "invalid_tool_choice"))
         return slots
     let messages = normalize_messages(json_get_list(body, "messages"))
     if messages.length == 0:
-        respond_json(sock, 400, "Bad Request", error_json("`messages` is required and must be a non-empty array", "invalid_request_error", "missing_messages"))
+        respond_json(response, sock, 400, "Bad Request", error_json("`messages` is required and must be a non-empty array", "invalid_request_error", "missing_messages"))
         return slots
     let tools = tools_for_request(body, raw_tools)
     let add_generation_prompt = json_get_bool(body, "add_generation_prompt", true)
     let prompt = render_chat_prompt_text_messages_kw(ctx.file, ctx.tok, messages, tools, add_generation_prompt, chat_template_variables_server_default(body, ctx.chat_template_kwargs_default, ctx.reasoning_effort_default))
-    respond_json(sock, 200, "OK", prompt_json(prompt))
+    respond_json(response, sock, 200, "OK", prompt_json(prompt))
     slots
 
-[CacheSlot] handle_request(ServerCtx& ctx, var TcpStream sock, int counter, [CacheSlot] slots, [DiskSnap] disk) throws:
-    let r = read_http_request(sock)
-    response_head_only = r.method == "HEAD"
-    response_request_origin = r.origin
+[CacheSlot] dispatch_request(ServerCtx& ctx, mut ServerMetrics& metrics, mut ResponseState& response,
+                             var TcpStream sock, int counter, HttpRequest& r,
+                             [CacheSlot] slots, [DiskSnap] disk) throws:
+    response.head_only = r.method == "HEAD"
+    response.request_origin = r.origin
     print "[serve] {r.method} {r.path}"
     let path = strip_api_prefix(http_request_path(r.path), ctx.api_prefix)
+    let generation_kind = generation_route_kind(r.method, path)
+    response.request_is_anthropic = anthropic_api_path(path)
     let action = http_query_value(r.path, "action")
     if r.method == "OPTIONS":
-        respond(sock, 204, "No Content", "text/plain", "")
-    elif not api_key_public_path(path) and not api_key_authorized(ctx.api_keys, r.authorization):
-        respond_json(sock, 401, "Unauthorized", error_json("Invalid API Key", "authentication_error", "invalid_api_key"))
+        respond(response, sock, 204, "No Content", "text/plain", "")
+    elif not api_key_public_path(path) and not api_key_authorized(ctx.api_keys, r.authorization, r.api_key):
+        respond_json(response, sock, 401, "Unauthorized", provider_error_json(response.request_is_anthropic, "{counter}", "Invalid API Key", "authentication_error", "invalid_api_key"))
     elif (r.method == "GET" or r.method == "HEAD") and (path == "/v1/models" or path == "/models"):
         let arch = gguf_get_string(ctx.file.metadata, "general.architecture") else ""
         let n_ctx_train = gguf_get_int(ctx.file.metadata, "{arch}.context_length") else 0
         let vocab_type = if ctx.tok.is_spm: 1 else: 2
-        respond_json(sock, 200, "OK", models_json_meta_aliases_tags(ctx.model_name, ctx.model_aliases, ctx.model_tags, vocab_type,
+        respond_json(response, sock, 200, "OK", models_json_meta_aliases_tags(ctx.model_name, ctx.model_aliases, ctx.model_tags, vocab_type,
                      ctx.model.config.vocab_size, ctx.max_ctx, n_ctx_train,
                      ctx.model.config.d_model, gguf_parameter_count(ctx.file), ctx.file.file_size, unix_timestamp()))
     elif (r.method == "GET" or r.method == "HEAD") and model_alias_path_matches(ctx.model_aliases, path):
         let arch = gguf_get_string(ctx.file.metadata, "general.architecture") else ""
         let n_ctx_train = gguf_get_int(ctx.file.metadata, "{arch}.context_length") else 0
         let vocab_type = if ctx.tok.is_spm: 1 else: 2
-        respond_json(sock, 200, "OK", model_json_meta_aliases(ctx.model_name, ctx.model_aliases, ctx.model_tags, vocab_type,
+        respond_json(response, sock, 200, "OK", model_json_meta_aliases(ctx.model_name, ctx.model_aliases, ctx.model_tags, vocab_type,
                      ctx.model.config.vocab_size, ctx.max_ctx, n_ctx_train,
                      ctx.model.config.d_model, gguf_parameter_count(ctx.file), ctx.file.file_size, unix_timestamp()))
     elif r.method == "POST" and (path == "/models/load" or path == "/models/unload"):
-        respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("dynamic model routing"))
+        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("dynamic model routing"))
     elif (r.method == "GET" or r.method == "HEAD") and path == "/models/sse":
-        respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("model router events"))
+        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("model router events"))
     elif r.method == "DELETE" and path == "/models":
-        respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("model cache deletion"))
+        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("model cache deletion"))
     elif (r.method == "GET" or r.method == "HEAD") and (path == "/health" or path == "/v1/health" or path == "/"):
-        respond_json(sock, 200, "OK", "{{\"status\": \"ok\"}}")
+        respond_json(response, sock, 200, "OK", "{{\"status\": \"ok\"}}")
     elif (r.method == "GET" or r.method == "HEAD") and path == "/props":
         let template = gguf_get_string(ctx.file.metadata, "tokenizer.chat_template") else ""
-        respond_json(sock, 200, "OK", props_json(ctx.model_path, template, ctx.max_ctx, ctx.cache_slots, ctx.default_max_tokens,
+        respond_json(response, sock, 200, "OK", props_json(ctx.model_path, template, ctx.max_ctx, ctx.cache_slots, ctx.default_max_tokens,
                      ctx.defaults.temperature, ctx.defaults.dynatemp_range, ctx.defaults.dynatemp_exponent,
                      ctx.defaults.top_n_sigma, ctx.defaults.top_k, ctx.defaults.typical_p,
                      ctx.defaults.top_p, ctx.defaults.min_p, ctx.defaults.xtc_probability,
@@ -1454,20 +1525,20 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                      ctx.extra_defaults.presence_penalty, ctx.extra_defaults.frequency_penalty,
                      ctx.extra_defaults.samplers, ctx.extra_defaults.ignore_eos))
     elif r.method == "POST" and path == "/props":
-        respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("props"))
+        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("props"))
     elif (r.method == "GET" or r.method == "HEAD") and path == "/metrics":
         if ctx.metrics_enabled:
-            respond(sock, 200, "OK", "text/plain; version=0.0.4", metrics_text(metric_prompt_tokens, metric_prompt_ms,
-                    metric_predicted_tokens, metric_predicted_ms, metric_n_tokens_max, metric_n_decode))
+            respond(response, sock, 200, "OK", "text/plain; version=0.0.4", metrics_text(metrics.prompt_tokens, metrics.prompt_ms,
+                    metrics.predicted_tokens, metrics.predicted_ms, metrics.n_tokens_max, metrics.n_decode))
         else:
-            respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("metrics"))
+            respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("metrics"))
     elif not ctx.slots_enabled and (((r.method == "GET" or r.method == "HEAD") and path == "/slots") or (r.method == "POST" and path.startsWith("/slots/"))):
-        respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("slots"))
+        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("slots"))
     elif (r.method == "GET" or r.method == "HEAD") and path == "/slots":
         mut [int] cached_tokens = []
         for slot in slots:
             cached_tokens.push(slot.tokens.length)
-        respond_json(sock, 200, "OK", slots_json(ctx.cache_slots, cached_tokens, ctx.model_name, ctx.max_ctx, ctx.default_max_tokens,
+        respond_json(response, sock, 200, "OK", slots_json(ctx.cache_slots, cached_tokens, ctx.model_name, ctx.max_ctx, ctx.default_max_tokens,
                      ctx.defaults.temperature, ctx.defaults.dynatemp_range, ctx.defaults.dynatemp_exponent,
                      ctx.defaults.top_n_sigma, ctx.defaults.top_k, ctx.defaults.typical_p,
                      ctx.defaults.top_p, ctx.defaults.min_p, ctx.defaults.xtc_probability,
@@ -1483,10 +1554,10 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         let id_text = path.replace("/slots/", "")
         if let id_slot = (id_text as int):
             if id_slot < 0 or id_slot >= ctx.cache_slots:
-                respond_json(sock, 400, "Bad Request", error_json("slot id {id_slot} is out of range", "invalid_request_error", "invalid_slot_id"))
+                respond_json(response, sock, 400, "Bad Request", error_json("slot id {id_slot} is out of range", "invalid_request_error", "invalid_slot_id"))
             elif action == "erase":
                 if ctx.cache_dir != "":
-                    respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("slots erase with persistent prompt cache"))
+                    respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("slots erase with persistent prompt cache"))
                 else:
                     var int n_erased = 0
                     mut [CacheSlot] erased = []
@@ -1498,42 +1569,42 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                         else:
                             erased.push(slot)
                         slot_idx += 1
-                    respond_json(sock, 200, "OK", slot_erased_json(id_slot, n_erased))
+                    respond_json(response, sock, 200, "OK", slot_erased_json(id_slot, n_erased))
                     return erased
             elif action == "save":
                 if ctx.slot_save_dir == "":
-                    respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("slots save"))
+                    respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("slots save"))
                 else:
                     let action_body = json_parse(r.body)
                     let filename = json_get_str(action_body, "filename", "")
                     let filename_error = slot_filename_validation_error(filename)
                     if filename_error != "":
-                        respond_json(sock, 400, "Bad Request", error_json(filename_error, "invalid_request_error", "invalid_filename"))
+                        respond_json(response, sock, 400, "Bad Request", error_json(filename_error, "invalid_request_error", "invalid_filename"))
                     elif slots[id_slot].tokens.length == 0:
-                        respond_json(sock, 400, "Bad Request", error_json("slot {id_slot} has no prompt cache to save", "invalid_request_error", "empty_slot"))
+                        respond_json(response, sock, 400, "Bad Request", error_json("slot {id_slot} has no prompt cache to save", "invalid_request_error", "empty_slot"))
                     else:
                         let operation_started = Instant.now()
                         let path_name = "{ctx.slot_save_dir}/{filename}"
                         save_snapshot_file(path_name, ctx.cache_fp, counter, ctx.model, slots[id_slot].cache, slots[id_slot].tokens)
                         let n_saved = slots[id_slot].tokens.length
-                        respond_json(sock, 200, "OK", slot_saved_json(id_slot, filename, n_saved,
+                        respond_json(response, sock, 200, "OK", slot_saved_json(id_slot, filename, n_saved,
                             32 + n_saved * ctx.cache_bpt, operation_started.elapsed().asMillis() as int))
             elif action == "restore":
                 if ctx.slot_save_dir == "":
-                    respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("slots restore"))
+                    respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("slots restore"))
                 else:
                     let action_body = json_parse(r.body)
                     let filename = json_get_str(action_body, "filename", "")
                     let filename_error = slot_filename_validation_error(filename)
                     if filename_error != "":
-                        respond_json(sock, 400, "Bad Request", error_json(filename_error, "invalid_request_error", "invalid_filename"))
+                        respond_json(response, sock, 400, "Bad Request", error_json(filename_error, "invalid_request_error", "invalid_filename"))
                     else:
                         let operation_started = Instant.now()
                         let path_name = "{ctx.slot_save_dir}/{filename}"
                         let snap = read_snapshot_file_header(path_name, id_slot, ctx.cache_fp,
                             ctx.model.config.n_layer, kv_dim_of(ctx.model))
                         if snap.slot < 0:
-                            respond_json(sock, 400, "Bad Request", error_json("slot snapshot `{filename}` is missing, incomplete, or belongs to another model", "invalid_request_error", "invalid_slot_snapshot"))
+                            respond_json(response, sock, 400, "Bad Request", error_json("slot snapshot `{filename}` is missing, incomplete, or belongs to another model", "invalid_request_error", "invalid_slot_snapshot"))
                         else:
                             let restored_cache = load_snapshot_file(path_name, snap, ctx.model, snap.tokens.length)
                             mut [CacheSlot] restored = []
@@ -1545,51 +1616,48 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                                     restored.push(slot)
                                 slot_idx += 1
                             let n_restored = snap.tokens.length
-                            respond_json(sock, 200, "OK", slot_restored_json(id_slot, filename, n_restored,
+                            respond_json(response, sock, 200, "OK", slot_restored_json(id_slot, filename, n_restored,
                                 32 + n_restored * ctx.cache_bpt, operation_started.elapsed().asMillis() as int))
                             return restored
             else:
-                respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("slots action"))
+                respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("slots action"))
         else:
-            respond_json(sock, 400, "Bad Request", error_json("slot id must be an integer", "invalid_request_error", "invalid_slot_id"))
+            respond_json(response, sock, 400, "Bad Request", error_json("slot id must be an integer", "invalid_request_error", "invalid_slot_id"))
     elif r.method == "GET" and path == "/lora-adapters":
-        respond_json(sock, 200, "OK", lora_adapters_json())
+        respond_json(response, sock, 200, "OK", lora_adapters_json())
     elif r.method == "POST" and path == "/lora-adapters":
-        respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("lora-adapters"))
+        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("lora-adapters"))
     elif (r.method == "GET" or r.method == "POST") and path == "/tools":
-        respond_json(sock, 403, "Forbidden", feature_disabled_json())
+        respond_json(response, sock, 403, "Forbidden", feature_disabled_json())
     elif r.method == "POST" and (path == "/embedding" or path == "/embeddings" or path == "/v1/embeddings"):
-        respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("embeddings"))
+        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("embeddings"))
     elif r.method == "POST" and (path == "/rerank" or path == "/v1/rerank" or path == "/v1/reranking"):
-        respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("reranking"))
+        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("reranking"))
     elif r.method == "POST" and path == "/v1/chat/completions/control":
-        respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("in-flight completion control"))
-    elif r.method == "POST" and path == "/v1/messages":
-        return handle_completion(ctx, sock, r.body, counter, slots, disk, true, false, false, true)
+        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("in-flight completion control"))
     elif r.method == "POST" and path == "/v1/messages/count_tokens":
-        return handle_anthropic_input_tokens(ctx, sock, r.body, slots)
+        return handle_anthropic_input_tokens(ctx, response, sock, r.body, counter, slots)
     elif (r.method == "GET" or r.method == "POST") and path == "/v1/realtime":
-        respond_json(sock, 501, "Not Implemented", endpoint_not_supported_json("Realtime API"))
-    elif r.method == "POST" and (path == "/v1/chat/completions" or path == "/chat/completions"):
-        return handle_completion(ctx, sock, r.body, counter, slots, disk, true, false, false, false)
-    elif r.method == "POST" and path == "/v1/completions":
-        return handle_completion(ctx, sock, r.body, counter, slots, disk, false, false, false, false)
-    elif r.method == "POST" and (path == "/completion" or path == "/completions"):
-        return handle_completion(ctx, sock, r.body, counter, slots, disk, false, true, false, false)
-    elif r.method == "POST" and (path == "/v1/responses" or path == "/responses"):
-        return handle_completion(ctx, sock, r.body, counter, slots, disk, true, false, true, false)
+        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("Realtime API"))
+    elif generation_kind > 0:
+        let is_anthropic = generation_kind == 1
+        let is_chat = generation_kind == 1 or generation_kind == 2 or generation_kind == 5
+        let is_native = generation_kind == 4
+        let is_responses = generation_kind == 5
+        return handle_completion(ctx, metrics, response, sock, r.body, counter, slots, disk,
+                                 is_chat, is_native, is_responses, is_anthropic)
     elif r.method == "POST" and (path == "/v1/chat/completions/input_tokens" or path == "/chat/completions/input_tokens"):
-        return handle_input_tokens(ctx, sock, r.body, slots)
+        return handle_input_tokens(ctx, response, sock, r.body, slots)
     elif r.method == "POST" and (path == "/v1/responses/input_tokens" or path == "/responses/input_tokens"):
-        return handle_responses_input_tokens(ctx, sock, r.body, slots)
+        return handle_responses_input_tokens(ctx, response, sock, r.body, slots)
     elif r.method == "POST" and path == "/tokenize":
-        return handle_tokenize(ctx, sock, r.body, slots)
+        return handle_tokenize(ctx, response, sock, r.body, slots)
     elif r.method == "POST" and path == "/detokenize":
-        return handle_detokenize(ctx, sock, r.body, slots)
+        return handle_detokenize(ctx, response, sock, r.body, slots)
     elif r.method == "POST" and path == "/apply-template":
-        return handle_apply_template(ctx, sock, r.body, slots)
+        return handle_apply_template(ctx, response, sock, r.body, slots)
     else:
-        respond_json(sock, 404, "Not Found", error_json("no route for {r.method} {r.path}", "invalid_request_error", "not_found"))
+        respond_json(response, sock, 404, "Not Found", error_json("no route for {r.method} {r.path}", "invalid_request_error", "not_found"))
     slots
 
 # After a request: write the cache it left to disk when cache_policy.br says so
@@ -1631,79 +1699,65 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         delete_snapshot(ctx.cache_dir, plan.slot)
     kept
 
-# One connection, start to finish. The socket belongs to this function, so it
-# is closed when it returns — before the caller spends time writing a snapshot.
-[CacheSlot] serve_conn(ServerCtx& ctx, var TcpStream sock, int counter, [CacheSlot] slots, [DiskSnap] disk) throws:
-    var [CacheSlot] out = slots
+# One connection, start to finish. Only this function updates the scheduler's
+# in-memory slots and metrics for the request.
+def serve_conn(ServerCtx& ctx, mut ServerState& server, var TcpStream sock) throws:
+    let counter = server.counter
+    var response = ResponseState(0, false, false, false, false, 0, 0 as uint64, "",
+        ctx.cors_origins, ctx.cors_methods, ctx.cors_headers, ctx.cors_credentials, "")
+    var [CacheSlot] out = server.slots
     try:
-        out = handle_request(ctx, sock, counter, slots, disk)
+        let request = read_http_request(sock)
+        out = dispatch_request(ctx, server.metrics, response, sock, counter, request, server.slots, server.disk)
     catch:
         print "[serve] request {counter} failed: {error}"
-        if response_state == 0:
+        if response.state == 0:
             let error_text = "{error}"
             if error_text.startsWith("http_400:"):
                 let message = error_text.replace("http_400:", "")
-                let sent = try? respond_json(sock, 400, "Bad Request", error_json(message, "invalid_request_error", "malformed_http_request"))
+                let sent = try? respond_json(response, sock, 400, "Bad Request", provider_error_json(response.request_is_anthropic, "{counter}", message, "invalid_request_error", "malformed_http_request"))
             elif error_text.startsWith("http_413:"):
                 let message = error_text.replace("http_413:", "")
-                let sent = try? respond_json(sock, 413, "Content Too Large", error_json(message, "invalid_request_error", "request_too_large"))
+                let kind = if response.request_is_anthropic: "request_too_large" else: "invalid_request_error"
+                let sent = try? respond_json(response, sock, 413, "Content Too Large", provider_error_json(response.request_is_anthropic, "{counter}", message, kind, "request_too_large"))
             elif error_text.startsWith("http_431:"):
                 let message = error_text.replace("http_431:", "")
-                let sent = try? respond_json(sock, 431, "Request Header Fields Too Large", error_json(message, "invalid_request_error", "headers_too_large"))
+                let sent = try? respond_json(response, sock, 431, "Request Header Fields Too Large", provider_error_json(response.request_is_anthropic, "{counter}", message, "invalid_request_error", "headers_too_large"))
             else:
-                let sent = try? respond_json(sock, 500, "Internal Server Error", error_json(error_text, "server_error", "internal_error"))
-        elif response_state == 1:
+                let kind = if response.request_is_anthropic: "api_error" else: "server_error"
+                let sent = try? respond_json(response, sock, 500, "Internal Server Error", provider_error_json(response.request_is_anthropic, "{counter}", error_text, kind, "internal_error"))
+        elif response.state == 1:
             # a stream is open (or the client left): end it with an error event
-            if response_stream_is_responses:
+            if response.stream_is_responses:
                 let failed_at_value = try? unix_timestamp()
-                var uint64 failed_at = response_stream_created
+                var uint64 failed_at = response.stream_created
                 if let timestamp = failed_at_value:
                     failed_at = timestamp
                 let sent = try? write_text(sock, responses_failed_sse("{counter}", ctx.model_name, "{error}",
-                    response_stream_sequence, response_stream_created, failed_at, response_stream_settings))
-            elif response_stream_is_anthropic:
-                let sent = try? write_text(sock, "{anthropic_error_sse("{error}")}{anthropic_message_stop_sse()}")
+                    response.stream_sequence, response.stream_created, failed_at, response.stream_settings))
+            elif response.stream_is_anthropic:
+                let sent = try? write_text(sock, anthropic_stream_failure_sse("{error}"))
             else:
                 let sent = try? write_text(sock, "{sse_error_event(error)}{sse_done_event()}")
-    out
+    server.slots = out
 
 # One request at a time, forever. A failure inside a request (bad socket,
 # generation error) is reported to the client when possible and logged, but
 # never takes the server down. `disk0` is what the prompt cache directory held
 # at startup.
 pub def serve(ServerCtx& ctx, string host, int port, [DiskSnap] disk0) throws:
-    response_cors_origins = ctx.cors_origins
-    response_cors_methods = ctx.cors_methods
-    response_cors_headers = ctx.cors_headers
-    response_cors_credentials = ctx.cors_credentials
     let address = listen_address(host, port)
     let listener = try? TcpListener.bind(address)
     guard let listener else throw "could not bind {address} (address unavailable or port already in use?)"
     print "[serve] model '{ctx.model_name}' ready — listening on http://{address}{ctx.api_prefix}/v1 (context {ctx.max_ctx} tokens, {ctx.cache_slots} prompt-cache slots)"
-    var int counter = 0
-    var [CacheSlot] slots = []
-    var [DiskSnap] disk = disk0
-    metric_prompt_tokens = 0
-    metric_prompt_ms = 0
-    metric_predicted_tokens = 0
-    metric_predicted_ms = 0
-    metric_n_tokens_max = 0
-    metric_n_decode = 0
+    var mut ServerState server = ServerState(0, ServerMetrics(0, 0, 0, 0, 0, 0), [], disk0)
     for conn in listener.incoming():
         let c = try? conn
         guard let c else:
             print "[serve] accept failed"
             continue
         var sock = c
-        counter += 1
-        response_state = 0
-        response_head_only = false
-        response_stream_is_responses = false
-        response_stream_is_anthropic = false
-        response_stream_sequence = 0
-        response_stream_created = 0
-        response_stream_settings = ""
-        response_request_origin = ""
-        slots = serve_conn(ctx, sock, counter, slots, disk)
+        server.counter += 1
+        serve_conn(ctx, server, sock)
         if ctx.cache_dir != "":
-            disk = maybe_save(ctx, slots, counter, disk)
+            server.disk = maybe_save(ctx, server.slots, server.counter, server.disk)

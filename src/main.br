@@ -414,7 +414,7 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
     let tok = load_tokenizer(file)
     (file, m, tok)
 
-def run_serve(string path, string model_name, [string] model_tags, string chat_template_override, int ctx_size, int max_tokens, int cache_slots, string prompt_cache_dir, string slot_save_dir, int prompt_cache_files, int prompt_cache_max_mb, string host, int port, [string] api_keys, string api_prefix, string cors_origins, string cors_methods, string cors_headers, bool cors_credentials, bool metrics_enabled, bool slots_enabled, bool cache_prompt_default, int sse_ping_interval_default, string reasoning_format_default, string reasoning_effort_default, JValue chat_template_kwargs_default, ServerSamplingDefaults extra_defaults, SamplingParams params) throws:
+def run_serve(string path, string model_name, [string] model_tags, string chat_template_override, int ctx_size, int max_tokens, int cache_slots, string prompt_cache_dir, string slot_save_dir, int prompt_cache_files, int prompt_cache_max_mb, string host, int port, [string] api_keys, string api_prefix, string cors_origins, string cors_methods, string cors_headers, bool cors_credentials, bool metrics_enabled, bool slots_enabled, bool cache_prompt_default, bool context_shift, int sse_ping_interval_default, string reasoning_format_default, string reasoning_effort_default, JValue chat_template_kwargs_default, ServerSamplingDefaults extra_defaults, SamplingParams params) throws:
     guard host != "" else throw "--host must not be empty"
     guard port >= 1 and port <= 65535 else throw "--port must be between 1 and 65535"
     guard ctx_size >= 2 else throw "--ctx-size must be at least 2"
@@ -446,7 +446,7 @@ def run_serve(string path, string model_name, [string] model_tags, string chat_t
     if slot_save_dir != "":
         ensure_dir(slot_save_dir)
         print "[serve] named slot snapshots: {slot_save_dir}"
-    let ctx = ServerCtx(file, tok, m, path, name, aliases, model_tags, ctx_size, max_tokens, cache_slots, params, extra_defaults, prompt_cache_dir, fp, prompt_cache_files, prompt_cache_max_mb * 1048576, bpt, metrics_enabled, slot_save_dir, api_keys, api_prefix, slots_enabled, cache_prompt_default, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, cors_origins, cors_methods, cors_headers, cors_credentials)
+    let ctx = ServerCtx(file, tok, m, path, name, aliases, model_tags, ctx_size, max_tokens, cache_slots, params, extra_defaults, prompt_cache_dir, fp, prompt_cache_files, prompt_cache_max_mb * 1048576, bpt, metrics_enabled, slot_save_dir, api_keys, api_prefix, slots_enabled, cache_prompt_default, context_shift, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, cors_origins, cors_methods, cors_headers, cors_credentials)
     serve(ctx, host, port, disk)
 
 def run_render_request(GgufFile file, string path) throws:
@@ -488,8 +488,9 @@ string usage_text():
     "boring-llm — local GGUF inference and OpenAI-compatible server\n\nUsage:\n  main -m MODEL [options]\n\nModel:\n  -m, --model, --gguf PATH        GGUF model file (required)\n  -a, --alias, --model-name NAME  model id reported by the API\n  --tags TAGS                     informational comma-separated model tags\n  -c, --ctx-size N                context size (default: 4096)\n\nServer:\n  --serve                         run the HTTP server\n  --host HOST                     listening host (default: 127.0.0.1)\n  --port N                        listening port (default: 8080)\n  --api-prefix PATH               serve every route below a path prefix\n  --api-key KEY                   require a Bearer key; comma separates keys\n  --api-key-file FILE             read one Bearer key per line\n  --cache-slots N                 in-memory prompt-cache slots (default: 4)\n  --cache-prompt, --no-cache-prompt  default prompt-prefix reuse policy\n  --slots, --no-slots             enable or disable the /slots endpoint\n  --prompt-cache DIR              persistent prompt-cache directory\n  --metrics                       enable GET /metrics\n  --sse-ping-interval N           SSE keep-alive seconds; -1 disables\n  --reasoning-format FORMAT       default reasoning extraction mode\n  -rea, --reasoning [MODE]        thinking default: on, off, or auto\n  --reasoning-preserve, --no-reasoning-preserve\n                                  preserve earlier assistant reasoning\n  --reasoning-effort LEVEL        default effort passed to chat templates\n  --chat-template-kwargs JSON     default chat-template variables\n  --chat-template TEMPLATE       override the embedded Jinja template\n  --chat-template-file FILE      read the Jinja template from a file\n\nGeneration:\n  --prompt TEXT                   generate one chat reply\n  --chat                          interactive terminal chat\n  -n, --predict, --n-predict N    reply-token limit (default: 40)\n  --max-tokens N                  same reply-token limit\n  --temp, --temperature T --top-k K --top-p P --min-p P\n  --typical-p P --top-n-sigma N --dynatemp-range N\n  --dynatemp-exp N --xtc-probability P --xtc-threshold P\n  --min-keep N\n  -s, --seed S --repeat-penalty R --repeat-last-n N\n\nDiagnostics:\n  --dump-metadata                 print GGUF metadata\n  --tokens IDS                    print logits for comma-separated token ids\n  --generate-tokens IDS           generate from comma-separated token ids\n  -h, --help, --usage             print this help and exit\n  --version                       print build identity and exit"
 
 string full_usage_text():
-    let cors = usage_text().replace("  --api-key KEY", "  --cors-origins ORIGINS          allowed browser origins (default: *)\n  --cors-methods METHODS          allowed CORS methods\n  --cors-headers HEADERS          allowed CORS headers\n  --cors-credentials, --no-cors-credentials\n                                  allow or deny browser credentials\n  --api-key KEY")
-    let parallel = cors.replace("  --cache-prompt, --no-cache-prompt", "  -np, --parallel N               concurrent request slots (only 1 supported)\n  --threads-http N                HTTP worker count (only 1 supported)\n  --jinja                         Jinja chat templates (always enabled)\n  --no-warmup                    skip startup warmup (current behavior)\n  -nocb, --no-cont-batching      serialized serving (current behavior)\n  --no-context-shift             stop when the context is full\n  --no-webui, --no-ui            API-only server (current behavior)\n  --no-mmproj                    text-only mode (current behavior)\n  --cache-prompt, --no-cache-prompt")
+    let auth = usage_text().replace("require a Bearer key; comma separates keys", "require Bearer or x-api-key; comma separates keys").replace("read one Bearer key per line", "read one accepted key per line")
+    let cors = auth.replace("  --api-key KEY", "  --cors-origins ORIGINS          allowed browser origins (default: *)\n  --cors-methods METHODS          allowed CORS methods\n  --cors-headers HEADERS          allowed CORS headers\n  --cors-credentials, --no-cors-credentials\n                                  allow or deny browser credentials\n  --api-key KEY")
+    let parallel = cors.replace("  --cache-prompt, --no-cache-prompt", "  -np, --parallel N               concurrent request slots (only 1 supported)\n  --threads-http N                HTTP worker count (only 1 supported)\n  --jinja                         Jinja chat templates (always enabled)\n  --no-warmup                    skip startup warmup (current behavior)\n  -nocb, --no-cont-batching      serialized serving (current behavior)\n  --context-shift, --no-context-shift\n                                  rebuild a retained context, or stop when full\n  --no-webui, --no-ui            API-only server (current behavior)\n  --no-mmproj                    text-only mode (current behavior)\n  --cache-prompt, --no-cache-prompt")
     parallel.replace("  -s, --seed S", "  --dry-multiplier N --dry-base N --dry-allowed-length N\n  --dry-penalty-last-n N\n  --presence-penalty N --frequency-penalty N\n  --mirostat N --mirostat-ent N --mirostat-lr N (server)\n  --adaptive-target N --adaptive-decay N (server)\n  --samplers LIST --sampler-seq SEQUENCE\n  --ignore-eos                    suppress the EOS token (server)\n  -s, --seed S")
 
 def main() throws:
@@ -610,7 +611,7 @@ def main() throws:
     let cont_batching_env = environment_default(argv, ["--cont-batching", "-cb", "--no-cont-batching", "-nocb"], "LLAMA_ARG_CONT_BATCHING", "false")
     guard !parse_bool_arg("LLAMA_ARG_CONT_BATCHING", cont_batching_env) else throw "LLAMA_ARG_CONT_BATCHING is not supported because requests are serialized"
     let context_shift_env = environment_default(argv, ["--context-shift", "--no-context-shift"], "LLAMA_ARG_CONTEXT_SHIFT", "false")
-    guard !parse_bool_arg("LLAMA_ARG_CONTEXT_SHIFT", context_shift_env) else throw "LLAMA_ARG_CONTEXT_SHIFT is not supported; generation stops at the context limit"
+    var bool context_shift = parse_bool_arg("LLAMA_ARG_CONTEXT_SHIFT", context_shift_env)
     let mmproj_env = environment_default(argv, ["--mmproj", "-mm", "--mmproj-url", "-mmu", "--mmproj-auto", "--no-mmproj", "--no-mmproj-auto"], "LLAMA_ARG_MMPROJ", "")
     guard mmproj_env == "" else throw "LLAMA_ARG_MMPROJ is not supported because boring-llm is text-only"
     let mmproj_url_env = environment_default(argv, ["--mmproj", "-mm", "--mmproj-url", "-mmu", "--mmproj-auto", "--no-mmproj", "--no-mmproj-auto"], "LLAMA_ARG_MMPROJ_URL", "")
@@ -789,10 +790,11 @@ def main() throws:
         elif a == "--cont-batching" or a == "-cb":
             throw "--cont-batching is not supported because requests are serialized"
         elif a == "--no-context-shift":
-            # Generation already stops when the configured context is full.
+            context_shift = false
             i += 1
         elif a == "--context-shift":
-            throw "--context-shift is not supported; generation stops at the context limit"
+            context_shift = true
+            i += 1
         elif a == "--threads-http" and i + 1 < argv.length:
             let threads_http = parse_int_arg("--threads-http", argv[i + 1])
             guard threads_http == 1 else throw "--threads-http currently supports only 1 because requests are serialized"
@@ -1003,7 +1005,7 @@ def main() throws:
         # kept resident for every request. Handled before the generic parse
         # below (which would also be fine now: no mode holds the file in memory).
         let extra_defaults = ServerSamplingDefaults(presence_penalty, frequency_penalty, mirostat, mirostat_tau, mirostat_eta, adaptive_target, adaptive_decay, samplers, ignore_eos)
-        run_serve(gguf_path, model_name, model_tags, chat_template_override, ctx_size, max_tokens, cache_slots, prompt_cache_dir, slot_save_dir, prompt_cache_files, prompt_cache_max_mb, host, port, api_keys, api_prefix, cors_origins, cors_methods, cors_headers, cors_credentials, metrics_enabled, slots_enabled, cache_prompt_default, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, extra_defaults, SamplingParams(temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, []))
+        run_serve(gguf_path, model_name, model_tags, chat_template_override, ctx_size, max_tokens, cache_slots, prompt_cache_dir, slot_save_dir, prompt_cache_files, prompt_cache_max_mb, host, port, api_keys, api_prefix, cors_origins, cors_methods, cors_headers, cors_credentials, metrics_enabled, slots_enabled, cache_prompt_default, context_shift, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, extra_defaults, SamplingParams(temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, []))
         return
 
     print "[diag] parsing {gguf_path}..."

@@ -177,8 +177,8 @@ For `--serve`, the sampling flags set server defaults. Alongside `temperature`, 
 | `--cors-origins ORIGINS` | `*` | comma-separated allowed browser origins; `localhost` accepts HTTP(S) loopback origins only |
 | `--cors-methods METHODS`, `--cors-headers HEADERS` | `GET, POST, DELETE, OPTIONS`; `*` | values returned in CORS preflight and normal response headers |
 | `--cors-credentials`, `--no-cors-credentials` | enabled | emit `Access-Control-Allow-Credentials`; with wildcard origins enabled, reflect the request origin as required by browsers |
-| `--api-key KEY` | disabled | require `Authorization: Bearer KEY`; comma-separated keys are accepted; health and model-list routes remain public like llama-server |
-| `--api-key-file FILE` | disabled | read accepted Bearer keys one per UTF-8 line; blank lines and `#` comments are ignored |
+| `--api-key KEY` | disabled | require `Authorization: Bearer KEY` or Anthropic's `x-api-key: KEY`; comma-separated keys are accepted; health and model-list routes remain public like llama-server |
+| `--api-key-file FILE` | disabled | read accepted API keys one per UTF-8 line; blank lines and `#` comments are ignored |
 | `-c`, `--ctx-size N` | `4096` | prompt plus reply tokens one request may use; must be at least 2 |
 | `-a`, `--alias`, `--model-name NAME` | GGUF `general.name` | comma-separated API aliases; the first is the primary model id and all are reported by `/v1/models` |
 | `--tags TAGS` | none | comma-separated informational tags reported by `/v1/models` and the model detail route; they do not affect routing |
@@ -187,7 +187,7 @@ For `--serve`, the sampling flags set server defaults. Alongside `temperature`, 
 | `--jinja` | enabled | accepted compatibility flag; boring-llm always renders chat templates through its Jinja subset, so `--no-jinja` is rejected |
 | `--no-warmup` | current behavior | accepted because boring-llm performs no startup inference warmup; `--warmup` is rejected |
 | `-nocb`, `--no-cont-batching` | current behavior | accepted because requests are serialized; `-cb`/`--cont-batching` is rejected |
-| `--no-context-shift` | current behavior | accepted because generation stops at the context limit; `--context-shift` is rejected |
+| `--context-shift`, `--no-context-shift` | disabled | continue long replies by retaining a prefix and recent suffix, or stop when the context is full |
 | `--threads-http N` | `1` | compatibility option; only one HTTP worker is accepted because requests are serialized |
 | `--no-webui`, `--no-ui` | current behavior | accepted because boring-llm is API-only; `--webui`/`--ui` is rejected |
 | `--no-mmproj`, `--no-mmproj-auto` | current behavior | accepted because boring-llm is text-only; `--mmproj`, `--mmproj-url`, embeddings and reranking modes are rejected before model loading |
@@ -196,7 +196,8 @@ For `--serve`, the sampling flags set server defaults. Alongside `temperature`, 
 | `LLAMA_ARG_API_KEY_FILE`, `LLAMA_ARG_SLOT_SAVE_PATH`, `LLAMA_ARG_CHAT_TEMPLATE_KWARGS`, `LLAMA_ARG_REASONING_FORMAT`, `LLAMA_ARG_N_PARALLEL`, `LLAMA_ARG_THREADS_HTTP` | matching CLI defaults | additional llama-server settings; parallel and HTTP worker counts currently accept only `1` |
 | `LLAMA_ARG_UI`, `LLAMA_ARG_JINJA`, `LLAMA_ARG_EMBEDDINGS`, `LLAMA_ARG_RERANKING` | API-only Jinja text generation | accepted when matching the current mode; requests to enable unsupported modes are rejected explicitly |
 | `LLAMA_ARG_TEMPERATURE`, `LLAMA_ARG_TOP_K`, `LLAMA_ARG_TOP_P`, `LLAMA_ARG_MIN_P`, `LLAMA_ARG_REPEAT_PENALTY`, `LLAMA_ARG_PRESENCE_PENALTY`, `LLAMA_ARG_FREQUENCY_PENALTY` | matching sampling defaults | official llama.cpp environment names for supported generation defaults |
-| `LLAMA_ARG_CONT_BATCHING`, `LLAMA_ARG_CONTEXT_SHIFT`, `LLAMA_ARG_MMPROJ`, `LLAMA_ARG_MMPROJ_URL`, `LLAMA_ARG_MMPROJ_AUTO` | disabled | serialized text-only settings are accepted; unsupported activation is rejected explicitly |
+| `LLAMA_ARG_CONTEXT_SHIFT` | disabled | environment equivalent of `--context-shift` |
+| `LLAMA_ARG_CONT_BATCHING`, `LLAMA_ARG_MMPROJ`, `LLAMA_ARG_MMPROJ_URL`, `LLAMA_ARG_MMPROJ_AUTO` | disabled | serialized text-only settings are accepted; unsupported activation is rejected explicitly |
 | `--cache-prompt`, `--no-cache-prompt` | enabled | default prompt-prefix reuse policy; a request-level `cache_prompt` value takes priority |
 | `--slots`, `--no-slots` | enabled | expose or disable the `/slots` monitoring and snapshot endpoints; prompt caching itself remains active |
 | `--metrics` | off | expose llama-server-compatible Prometheus counters at `GET /metrics` |
@@ -265,8 +266,8 @@ The server listens on `127.0.0.1` only and has no authentication. To reach it fr
 | `POST /embedding`, `/embeddings`, `/v1/embeddings` | recognized and return 501; the loaded causal text model does not expose a pooled embedding output |
 | `POST /rerank`, `/v1/rerank`, `/v1/reranking` | recognized and return 501; dedicated ranking models are not supported |
 | `POST /v1/chat/completions/control` | recognized and returns 501; serialized requests cannot be controlled through a concurrent side channel |
-| `POST /v1/messages/count_tokens` | Anthropic text messages, system text blocks, tool definitions and `tool_use`/`tool_result` history are adapted to the model chat template and counted without inference; media blocks are rejected explicitly |
-| `POST /v1/messages` | Anthropic Messages generation with text and tool-use blocks, buffered or streamed with native Anthropic SSE events; matched `stop_sequences` are reported with `stop_reason: "stop_sequence"`, and `disable_parallel_tool_use` reaches compatible chat templates |
+| `POST /v1/messages/count_tokens` | Anthropic text messages, system text blocks, tool definitions and `thinking`/`tool_use`/`tool_result` history (including tool error state) are adapted to the model chat template and counted without inference; the response uses Anthropic's native `{input_tokens}` shape, and media blocks are rejected explicitly |
+| `POST /v1/messages` | Anthropic Messages generation with text, signed thinking and tool-use blocks, buffered or streamed with native Anthropic SSE events (including `signature_delta` and terminal `error` events), non-overlapping cached/non-cached usage, and Anthropic-shaped validation, authentication and server errors carrying `request_id`; `thinking: {type: "enabled", budget_tokens: N}` enables model reasoning, assistant thinking history is preserved, matched `stop_sequences` are reported with `stop_reason: "stop_sequence"`, and `disable_parallel_tool_use` reaches compatible chat templates |
 | `GET`/`POST /v1/realtime` | recognized and returns 501; WebSocket realtime sessions are not implemented |
 | `GET`/`HEAD /metrics` | Prometheus counters when the server starts with `--metrics`; otherwise 501, as with llama-server's disabled endpoint |
 | `POST /props` | recognized as an optional llama-server endpoint and returns 501; mutable global properties are not enabled |
@@ -302,11 +303,11 @@ Any other route returns `404` with an OpenAI-shaped error body.
 | `ignore_eos` | llama-server extension; suppress the EOS token and continue until another stop condition or the token/context limit |
 | `id_slot` | Native `/completion` extension; `-1` automatically chooses a cache slot, while a non-negative id pins both cache reuse and the resulting sequence to that slot. The actual slot id is returned in buffered responses and the terminal SSE event. |
 | `cache_prompt` | llama-server extension, enabled by default. Set it to `false` to evaluate the complete prompt without reusing an in-memory or persistent cached prefix. This and the other native response controls are reflected in effective `generation_settings`. |
-| `n_keep`, `n_discard`, `n_cache_reuse` | Native context-shift controls. Their neutral value `0` is accepted; non-zero values are rejected explicitly because boring-llm does not shift its exact-prefix KV caches. |
+| `n_keep`, `n_discard`, `n_cache_reuse` | Native context-shift controls. With server context shifting enabled, `n_keep` retains the prompt prefix (`-1` means the complete initial prompt) and positive `n_discard` selects how many middle tokens to drop; zero discards roughly half of the movable context. `n_cache_reuse` currently accepts only `0`. |
 | `return_tokens` | Native `/completion` extension. Buffered responses return generated token ids in `tokens` only when this is `true`; native streaming events always include their token ids, matching llama-server. |
 | `t_max_predict_ms` | llama-server extension. A positive value limits the prediction phase after the first generated token; as in llama-server, generation stops only once the limit is exceeded and a newline has already been produced. `0` and `-1` disable it. |
 | `return_progress` | Native `/completion` only. With streaming enabled, emits llama-server-compatible `prompt_progress` SSE objects after each prefill chunk, reporting total, cached and processed token counts plus elapsed milliseconds. |
-| `sse_ping_interval` | Seconds between SSE `: ping` comments during silent prompt processing (default 30); `0` checks after every prefill chunk and `-1` disables pings. `return_progress` events take their place when enabled. |
+| `sse_ping_interval` | Seconds between keep-alives during silent prompt processing (default 30): SSE `: ping` comments for OpenAI/llama-server, native `ping` events for Anthropic; `0` checks after every prefill chunk and `-1` disables pings. `return_progress` events take their place when enabled. |
 | `timings_per_token` | Native streaming extension. When true, each generated-content event includes cumulative prompt and prediction timings; the terminal event always includes final timings. |
 | `stream` | `true` for server-sent events |
 | `stream_options.include_usage` | adds a final usage chunk to a stream |
@@ -331,14 +332,16 @@ Buffered replies use the native `response` object with the original `input`, sep
 
 ### Context overflow
 
-The server never drops part of a conversation to make it fit. Responses requests may state `truncation: "disabled"`; `truncation: "auto"` is rejected explicitly instead of being accepted without effect. A prompt that fills the whole context (`--ctx-size`) is refused with the 400 `context_length_exceeded` error below, and a reply that reaches the end of the context stops there with `finish_reason` `length`. llama.cpp behaves the same way when its context shift is off. Shifting the context would mean discarding old positions and re-rotating the cached keys (or recomputing the cache), and the in-memory and on-disk caches rely on exact token prefixes. Agent clients such as OpenCode shorten the history themselves when they see this error.
+By default the server never drops part of a conversation to make it fit. Responses requests may state `truncation: "disabled"`; `truncation: "auto"` is rejected explicitly instead of being accepted without effect. A prompt that fills the whole context (`--ctx-size`) is refused with the 400 `context_length_exceeded` error below, and a reply that reaches the end of the context stops there with `finish_reason` `length`.
+
+With `--context-shift`, generation may continue past that boundary. boring-llm retains the requested `n_keep` prefix and newest suffix, drops a middle span, and exactly rebuilds the KV cache at the new positions. This matches llama-server's externally visible bounded-context behavior, including `truncated: true` in the native result after a shift, although rebuilding is more expensive than llama.cpp's in-place cache operations. The original prompt itself must still fit in one context.
 
 ### Streaming
 
 With `"stream": true` the reply is sent as server-sent events, token by token as the model produces them:
 
 1. the head and a role chunk are sent **immediately**, before the prompt is processed;
-2. while a long prompt is processed, an SSE comment line `: ping` is emitted at the requested `sse_ping_interval` after a prefill chunk completes (30 seconds by default, `-1` disables it), so the connection remains observable;
+2. while a long prompt is processed, an SSE keep-alive is emitted at the requested `sse_ping_interval` after a prefill chunk completes (an OpenAI/llama-server `: ping` comment or an Anthropic `ping` event; 30 seconds by default, `-1` disables it), so the connection remains observable;
 3. deltas, one per decoded piece of text (a character spanning several byte-level tokens is held back until it is complete): `reasoning_content` deltas while the model is inside `<think>`, then `content` deltas;
 4. tool calls, if any, as one chunk;
 5. the finish chunk, an optional usage chunk, and `data: [DONE]`.

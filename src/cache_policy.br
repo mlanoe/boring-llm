@@ -22,6 +22,18 @@ pub struct SavePlan:
     int seq
     [int] drop
 
+# A context shift retains the first `keep` tokens and the newest suffix after
+# dropping `discard` tokens from the middle. The retained sequence is then
+# re-prefilled so its RoPE positions and KV cache remain exact.
+pub struct ContextShiftPlan:
+    int keep
+    int discard
+
+# llama-server uses -1 as the request spelling for retaining the complete
+# initial prompt. Other values are explicit prefix lengths.
+pub int resolve_context_keep(int requested_keep, int prompt_tokens):
+    if requested_keep == -1: prompt_tokens else: requested_keep
+
 # A snapshot only replaces the in-memory slot when it covers at least this many
 # more tokens of the prompt (reading and uploading it is not free).
 let int DISK_MIN_GAIN = 256
@@ -34,6 +46,38 @@ let int SAVE_MIN_GAIN = 1024
 # (covering `mem_reuse`).
 pub bool restore_from_disk(int mem_reuse, int disk_best, int disk_reuse):
     disk_best >= 0 and disk_reuse >= mem_reuse + DISK_MIN_GAIN
+
+# llama.cpp-style bounded shift policy, kept pure for testing. A zero
+# `requested_discard` drops roughly half of the movable context. The result
+# always leaves at least one free position when a shift is needed.
+pub ContextShiftPlan plan_context_shift(int n_tokens, int n_ctx, int requested_keep, int requested_discard):
+    if n_ctx < 2 or n_tokens < n_ctx:
+        return ContextShiftPlan(0, 0)
+    var int keep = requested_keep
+    if keep < 0: keep = 0
+    if keep > n_ctx - 1: keep = n_ctx - 1
+    if keep > n_tokens: keep = n_tokens
+    let movable = n_tokens - keep
+    var int discard = if requested_discard > 0: requested_discard else: movable / 2
+    if discard < 1: discard = 1
+    let minimum = n_tokens - (n_ctx - 1)
+    if discard < minimum: discard = minimum
+    if discard > movable: discard = movable
+    ContextShiftPlan(keep, discard)
+
+# Applies a validated shift plan to the logical token sequence. Keeping this
+# separate from KV rebuilding makes the exact prefix/suffix splice testable.
+pub [int] apply_context_shift([int] tokens, ContextShiftPlan plan):
+    mut [int] retained = []
+    var int i = 0
+    while i < plan.keep and i < tokens.length:
+        retained.push(tokens[i])
+        i += 1
+    i = plan.keep + plan.discard
+    while i < tokens.length:
+        retained.push(tokens[i])
+        i += 1
+    retained
 
 # Decides whether the cache a request left (`tokens`) should be written, and
 # where. `bytes_per_token` is a snapshot's size per token (token id plus K and V

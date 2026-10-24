@@ -89,15 +89,16 @@ The first request of a session is the slow one, because the ~7.5k-token prompt h
 | `--api-prefix PATH` | disabled | serve every route below a prefix such as `/llm`, without a trailing slash |
 | `--cors-origins`, `--cors-methods`, `--cors-headers` | llama-server defaults | configure browser CORS allowlists; origin `localhost` accepts loopback origins only |
 | `--cors-credentials`, `--no-cors-credentials` | enabled | allow browser credentials; wildcard origins are reflected when enabled |
-| `--api-key KEY` | disabled | require `Authorization: Bearer KEY`; comma-separated keys are accepted |
-| `--api-key-file FILE` | disabled | read accepted Bearer keys one per line; blank lines and `#` comments are ignored |
+| `--api-key KEY` | disabled | require `Authorization: Bearer KEY` or Anthropic's `x-api-key: KEY`; comma-separated keys are accepted |
+| `--api-key-file FILE` | disabled | read accepted API keys one per line; blank lines and `#` comments are ignored |
 | `-c`, `--ctx-size N` | `4096` | prompt + reply tokens a request may use; a longer prompt gets `context_length_exceeded` |
 | `--max-tokens N`, `-n`, `--predict`, `--n-predict` | `40` | reply length when a request sets none |
 | `-a`, `--alias`, `--model-name NAME` | GGUF `general.name` | comma-separated API aliases; the first is the primary model id |
 | `--tags TAGS` | none | comma-separated informational tags reported by the model API; they do not affect routing |
 | `--cache-slots N` | `4` | KV caches kept in memory (LRU) |
 | `-np`, `--parallel N` | `1` | compatibility option; only `1` is accepted because requests are serialized |
-| `--jinja`, `--no-warmup`, `-nocb`/`--no-cont-batching`, `--no-context-shift` | current behavior | accepted llama-server compatibility switches; opposite switches are rejected when their feature is unavailable |
+| `--jinja`, `--no-warmup`, `-nocb`/`--no-cont-batching` | current behavior | accepted llama-server compatibility switches; opposite switches are rejected when their feature is unavailable |
+| `--context-shift`, `--no-context-shift` | disabled | continue long replies by retaining a prefix and recent suffix, or stop when the context is full |
 | `--threads-http N`, `--no-webui`/`--no-ui` | `1`, UI disabled | compatibility settings matching the serialized API-only server; other thread counts and UI activation are rejected |
 | `--no-mmproj`, `--no-mmproj-auto` | current behavior | accepted text-only settings; projector, embeddings and reranking modes are rejected before model loading |
 | `LLAMA_ARG_MODEL`, `LLAMA_ARG_ALIAS`, `LLAMA_ARG_TAGS`, `LLAMA_ARG_HOST`, `LLAMA_ARG_PORT`, `LLAMA_ARG_CTX_SIZE`, `LLAMA_ARG_N_PREDICT`, `LLAMA_API_KEY` | unset | core llama-server environment defaults; an explicit command-line option takes precedence |
@@ -105,7 +106,8 @@ The first request of a session is the slow one, because the ~7.5k-token prompt h
 | `LLAMA_ARG_API_KEY_FILE`, `LLAMA_ARG_SLOT_SAVE_PATH`, `LLAMA_ARG_CHAT_TEMPLATE_KWARGS`, `LLAMA_ARG_REASONING_FORMAT`, `LLAMA_ARG_N_PARALLEL`, `LLAMA_ARG_THREADS_HTTP` | matching CLI defaults | additional llama-server settings; parallel and HTTP worker counts currently accept only `1` |
 | `LLAMA_ARG_UI`, `LLAMA_ARG_JINJA`, `LLAMA_ARG_EMBEDDINGS`, `LLAMA_ARG_RERANKING` | API-only Jinja text generation | accepted when matching the current mode; requests to enable unsupported modes are rejected explicitly |
 | `LLAMA_ARG_TEMPERATURE`, `LLAMA_ARG_TOP_K`, `LLAMA_ARG_TOP_P`, `LLAMA_ARG_MIN_P`, `LLAMA_ARG_REPEAT_PENALTY`, `LLAMA_ARG_PRESENCE_PENALTY`, `LLAMA_ARG_FREQUENCY_PENALTY` | matching sampling defaults | official llama.cpp environment names for supported generation defaults |
-| `LLAMA_ARG_CONT_BATCHING`, `LLAMA_ARG_CONTEXT_SHIFT`, `LLAMA_ARG_MMPROJ`, `LLAMA_ARG_MMPROJ_URL`, `LLAMA_ARG_MMPROJ_AUTO` | disabled | serialized text-only settings are accepted; unsupported activation is rejected explicitly |
+| `LLAMA_ARG_CONTEXT_SHIFT` | disabled | environment equivalent of `--context-shift` |
+| `LLAMA_ARG_CONT_BATCHING`, `LLAMA_ARG_MMPROJ`, `LLAMA_ARG_MMPROJ_URL`, `LLAMA_ARG_MMPROJ_AUTO` | disabled | serialized text-only settings are accepted; unsupported activation is rejected explicitly |
 | `--cache-prompt`, `--no-cache-prompt` | enabled | default prompt-prefix reuse policy; a request may override it with `cache_prompt` |
 | `--slots`, `--no-slots` | enabled | expose or disable the `/slots` monitoring and snapshot endpoints |
 | `--metrics` | off | expose llama-server-compatible Prometheus counters at `GET /metrics` |

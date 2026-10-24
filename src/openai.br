@@ -332,6 +332,10 @@ pub string anthropic_input_validation_error(JValue body):
                             let kind = json_get_str(part, "type", "")
                             if kind == "text":
                                 if not jv_is_str(json_get(part, "text")): return "an Anthropic text block must contain string `text`"
+                            elif kind == "thinking" and role == "assistant":
+                                if not jv_is_str(json_get(part, "thinking")): return "an Anthropic thinking block must contain string `thinking`"
+                                let signature = json_get(part, "signature")
+                                if not request_value_is_undefined(signature) and not jv_is_str(signature): return "an Anthropic thinking block `signature` must be a string"
                             elif kind == "tool_use" and role == "assistant":
                                 let id = json_get_str(part, "id", "")
                                 if id == "": return "an Anthropic tool_use block must have a non-empty `id`"
@@ -342,6 +346,8 @@ pub string anthropic_input_validation_error(JValue body):
                             elif kind == "tool_result" and role == "user":
                                 let id = json_get_str(part, "tool_use_id", "")
                                 if id == "" or not tool_ids.contains(id): return "an Anthropic tool_result must reference a preceding tool_use id"
+                                let is_error = json_get(part, "is_error")
+                                if not request_value_is_undefined(is_error) and not jv_is_bool(is_error): return "Anthropic tool_result `is_error` must be a boolean"
                                 match json_get(part, "content"):
                                     JStr(text): true
                                     JList(result_parts):
@@ -370,6 +376,16 @@ pub string anthropic_input_validation_error(JValue body):
                 if not request_value_is_undefined(disable_parallel) and not jv_is_bool(disable_parallel):
                     return "Anthropic `tool_choice.disable_parallel_tool_use` must be a boolean"
             _: return "Anthropic `tool_choice` must be an object"
+    let thinking = json_get(body, "thinking")
+    if not request_value_is_undefined(thinking):
+        match thinking:
+            JDict(fields, keys):
+                if json_get_str(thinking, "type", "") != "enabled": return "Anthropic `thinking.type` must be enabled"
+                match json_get(thinking, "budget_tokens"):
+                    JInt(budget):
+                        if budget <= 0: return "Anthropic `thinking.budget_tokens` must be positive"
+                    _: return "Anthropic `thinking.budget_tokens` must be an integer"
+            _: return "Anthropic `thinking` must be an object"
     ""
 
 pub JValue anthropic_chat_body(JValue body):
@@ -383,8 +399,12 @@ pub JValue anthropic_chat_body(JValue body):
         if role == "assistant" and jv_is_list(content):
             var JValue converted = text_message("assistant", anthropic_text_content(content))
             mut [JValue] calls = []
+            var string reasoning = ""
             for part in json_get_list(message, "content"):
-                if json_get_str(part, "type", "") == "tool_use":
+                let kind = json_get_str(part, "type", "")
+                if kind == "thinking":
+                    reasoning = "{reasoning}{json_get_str(part, "thinking", "")}"
+                elif kind == "tool_use":
                     var JValue function = JValue.JDict({=}, [])
                     function = jv_set(function, "name", json_get(part, "name"))
                     function = jv_set(function, "arguments", json_get(part, "input"))
@@ -392,6 +412,7 @@ pub JValue anthropic_chat_body(JValue body):
                     call = jv_set(call, "id", json_get(part, "id"))
                     call = jv_set(call, "type", JValue.JStr("function"))
                     calls.push(jv_set(call, "function", function))
+            if reasoning != "": converted = jv_set(converted, "reasoning_content", JValue.JStr(reasoning))
             if calls.length > 0: converted = jv_set(converted, "tool_calls", JValue.JList(calls))
             messages.push(converted)
         elif role == "user" and jv_is_list(content):
@@ -402,6 +423,8 @@ pub JValue anthropic_chat_body(JValue body):
                 if json_get_str(part, "type", "") == "tool_result":
                     var JValue result = text_message("tool", anthropic_tool_result_text(json_get(part, "content")))
                     result = jv_set(result, "tool_call_id", json_get(part, "tool_use_id"))
+                    if not request_value_is_undefined(json_get(part, "is_error")):
+                        result = jv_set(result, "is_error", json_get(part, "is_error"))
                     messages.push(result)
                     had_result = true
             if text == "" and not had_result: messages.push(text_message("user", ""))
@@ -433,6 +456,10 @@ pub JValue anthropic_chat_body(JValue body):
             out = jv_set(out, "tool_choice", jv_set(named, "function", function))
         if json_get_bool(choice, "disable_parallel_tool_use", false):
             out = jv_set(out, "parallel_tool_calls", JValue.JBool(false))
+    if not request_value_is_undefined(json_get(body, "thinking")):
+        var JValue kwargs = JValue.JDict({=}, [])
+        kwargs = jv_set(kwargs, "enable_thinking", JValue.JBool(true))
+        out = jv_set(out, "chat_template_kwargs", kwargs)
     out
 
 pub string responses_input_validation_error(JValue body):
@@ -2028,8 +2055,12 @@ pub string endpoint_request_validation_error(JValue body, bool is_chat, bool is_
             if not request_value_is_undefined(value):
                 match value:
                     JInt(count):
-                        if count != 0:
-                            return "native `{key}` requires context shifting, which is not supported"
+                        if key == "n_keep" and count < -1:
+                            return "native `n_keep` must be -1 or non-negative"
+                        if key != "n_keep" and count < 0:
+                            return "native `{key}` must be non-negative"
+                        if key == "n_cache_reuse" and count != 0:
+                            return "native `n_cache_reuse` is not supported"
                     _: return "native `{key}` must be an integer"
         let n_cmpl = json_get(body, "n_cmpl")
         if not request_value_is_undefined(n_cmpl):
@@ -2090,6 +2121,10 @@ pub string native_stopping_word(string stop_type, string stopping_word):
 pub bool native_context_truncated(int prompt_tokens, int completion_tokens, int n_ctx, bool stopped_early):
     not stopped_early and prompt_tokens + completion_tokens >= n_ctx
 
+pub bool native_truncated_status(int prompt_tokens, int completion_tokens, int n_ctx,
+                                 bool stopped_early, bool context_shift_enabled, bool context_was_shifted):
+    context_was_shifted or (not context_shift_enabled and native_context_truncated(prompt_tokens, completion_tokens, n_ctx, stopped_early))
+
 pub string listen_address(string host, int port):
     if host.contains(":") and not host.startsWith("["):
         "[{host}]:{port}"
@@ -2097,7 +2132,8 @@ pub string listen_address(string host, int port):
         "{host}:{port}"
 
 # HTTP header names and the Bearer scheme are case-insensitive; API keys are
-# not. Keeping this pure makes authentication testable without a socket.
+# not. Anthropic clients send the same raw key through x-api-key. Keeping this
+# pure makes authentication testable without a socket.
 pub string http_header_value(string headers, string name):
     let prefix = "{name.toLower()}:"
     for line in headers.split("\r\n"):
@@ -2135,8 +2171,10 @@ pub [string] api_keys_from_file_text(string text):
             keys.push(key)
     keys
 
-pub bool api_key_authorized([string] configured_keys, string authorization):
+pub bool api_key_authorized([string] configured_keys, string authorization, string api_key):
     if configured_keys.length == 0: return true
+    for key in configured_keys:
+        if api_key == key: return true
     let scheme = "bearer "
     guard authorization.toLower().startsWith(scheme) else return false
     let chars = authorization.chars()
@@ -2151,6 +2189,22 @@ pub bool api_key_authorized([string] configured_keys, string authorization):
 
 pub bool api_key_public_path(string path):
     path == "/" or path == "/health" or path == "/v1/health" or path == "/models" or path == "/v1/models"
+
+# Stable scheduler classification for routes that run autoregressive model
+# execution. Zero means the request stays on the control/tokenization path.
+# 1=Anthropic messages, 2=OpenAI chat, 3=OpenAI completion,
+# 4=llama-server native completion, 5=OpenAI Responses.
+pub int generation_route_kind(string method, string path):
+    if method != "POST": return 0
+    if path == "/v1/messages": return 1
+    if path == "/v1/chat/completions" or path == "/chat/completions": return 2
+    if path == "/v1/completions": return 3
+    if path == "/completion" or path == "/completions": return 4
+    if path == "/v1/responses" or path == "/responses": return 5
+    0
+
+pub bool anthropic_api_path(string path):
+    path == "/v1/messages" or path == "/v1/messages/count_tokens"
 
 pub string http_request_path(string target):
     target.split("?")[0]
@@ -2289,6 +2343,12 @@ string usage_json(int prompt_tokens, int completion_tokens, int cached_tokens):
 pub string error_json(string message, string kind, string code):
     "{{\"error\": {{\"message\": \"{json_escape(message)}\", \"type\": \"{kind}\", \"code\": \"{code}\"}}}}"
 
+pub string anthropic_error_json(string request_id, string message, string kind):
+    "{{\"type\":\"error\",\"error\":{{\"type\":\"{json_escape(kind)}\",\"message\":\"{json_escape(message)}\"}},\"request_id\":\"req_{json_escape(request_id)}\"}}"
+
+pub string provider_error_json(bool is_anthropic, string request_id, string message, string kind, string code):
+    if is_anthropic: anthropic_error_json(request_id, message, kind) else: error_json(message, kind, code)
+
 # llama-server uses a numeric code for optional endpoints which are compiled
 # in but disabled. Keep this separate from OpenAI request errors, whose codes
 # are stable strings consumed by SDKs.
@@ -2334,6 +2394,13 @@ pub string context_exceeded_json(int n_prompt, int n_ctx):
     let message = "This model's maximum context length is {n_ctx} tokens. The request exceeds the available context size: your messages resulted in {n_prompt} tokens (the reply needs room too). Shorten the conversation or start the server with a larger --ctx-size."
     "{{\"error\": {{\"message\": \"{json_escape(message)}\", \"type\": \"invalid_request_error\", \"code\": \"context_length_exceeded\", \"param\": \"messages\", \"n_prompt_tokens\": {n_prompt}, \"n_ctx\": {n_ctx}}}}}"
 
+pub string provider_context_exceeded_json(bool is_anthropic, string request_id, int n_prompt, int n_ctx):
+    if is_anthropic:
+        let message = "This model's maximum context length is {n_ctx} tokens. The request exceeds the available context size: your messages resulted in {n_prompt} tokens (the reply needs room too). Shorten the conversation or start the server with a larger --ctx-size."
+        anthropic_error_json(request_id, message, "invalid_request_error")
+    else:
+        context_exceeded_json(n_prompt, n_ctx)
+
 pub uint64 unix_timestamp() throws:
     SystemTime.now().durationSince(UNIX_EPOCH).asSecs()
 
@@ -2366,11 +2433,24 @@ pub string models_json_meta_aliases_tags(string model_id, [string] aliases, [str
 pub string input_tokens_json(int input_tokens):
     "{{\"object\": \"response.input_tokens\", \"input_tokens\": {input_tokens}}}"
 
-pub string anthropic_message_json(string id, string model, ParsedReply reply, string finish_reason,
+pub string anthropic_input_tokens_json(int input_tokens):
+    "{{\"input_tokens\":{input_tokens}}}"
+
+pub int anthropic_uncached_input_tokens(int input_tokens, int cached_tokens):
+    if cached_tokens < input_tokens: input_tokens - cached_tokens else: 0
+
+pub string anthropic_thinking_signature(string id):
+    "boring-llm-{id}"
+
+pub string anthropic_message_json(string id, string model, ParsedReply reply, string reasoning, string finish_reason,
                                   string stop_sequence, int input_tokens, int output_tokens, int cached_tokens):
     var string content = "["
     var bool wrote = false
+    if reasoning != "":
+        content = "{content}{{\"type\":\"thinking\",\"thinking\":\"{json_escape(reasoning)}\",\"signature\":\"{json_escape(anthropic_thinking_signature(id))}\"}}"
+        wrote = true
     if reply.content != "" or reply.calls.length == 0:
+        if wrote: content = "{content},"
         content = "{content}{{\"type\":\"text\",\"text\":\"{json_escape(reply.content)}\"}}"
         wrote = true
     var int i = 0
@@ -2384,19 +2464,30 @@ pub string anthropic_message_json(string id, string model, ParsedReply reply, st
         i += 1
     let stop_reason = if reply.calls.length > 0: "tool_use" elif finish_reason == "length": "max_tokens" elif stop_sequence != "": "stop_sequence" else: "end_turn"
     let stop_sequence_json = if stop_sequence == "": "null" else: "\"{json_escape(stop_sequence)}\""
-    "{{\"id\":\"msg_{id}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":{content}],\"model\":\"{json_escape(model)}\",\"stop_reason\":\"{stop_reason}\",\"stop_sequence\":{stop_sequence_json},\"usage\":{{\"input_tokens\":{input_tokens},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":{cached_tokens},\"output_tokens\":{output_tokens}}}}}"
+    let uncached_tokens = anthropic_uncached_input_tokens(input_tokens, cached_tokens)
+    "{{\"id\":\"msg_{id}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":{content}],\"model\":\"{json_escape(model)}\",\"stop_reason\":\"{stop_reason}\",\"stop_sequence\":{stop_sequence_json},\"usage\":{{\"input_tokens\":{uncached_tokens},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":{cached_tokens},\"output_tokens\":{output_tokens}}}}}"
 
 string anthropic_sse(string event_type, string data):
     "event: {event_type}\ndata: {data}\n\n"
 
 pub string anthropic_message_start_sse(string id, string model, int input_tokens, int cached_tokens):
-    anthropic_sse("message_start", "{{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_{id}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"{json_escape(model)}\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":{input_tokens},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":{cached_tokens},\"output_tokens\":0}}}}}}")
+    let uncached_tokens = anthropic_uncached_input_tokens(input_tokens, cached_tokens)
+    anthropic_sse("message_start", "{{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_{id}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"{json_escape(model)}\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":{uncached_tokens},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":{cached_tokens},\"output_tokens\":0}}}}}}")
 
 pub string anthropic_text_start_sse(int index):
     anthropic_sse("content_block_start", "{{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}")
 
 pub string anthropic_text_delta_sse(int index, string text):
     anthropic_sse("content_block_delta", "{{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"text_delta\",\"text\":\"{json_escape(text)}\"}}}}")
+
+pub string anthropic_thinking_start_sse(int index):
+    anthropic_sse("content_block_start", "{{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}}}")
+
+pub string anthropic_thinking_delta_sse(int index, string text):
+    anthropic_sse("content_block_delta", "{{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"{json_escape(text)}\"}}}}")
+
+pub string anthropic_signature_delta_sse(int index, string signature):
+    anthropic_sse("content_block_delta", "{{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"signature_delta\",\"signature\":\"{json_escape(signature)}\"}}}}")
 
 pub string anthropic_tool_start_sse(string id, int call_index, int content_index, ParsedToolCall call):
     anthropic_sse("content_block_start", "{{\"type\":\"content_block_start\",\"index\":{content_index},\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_{id}_{call_index}\",\"name\":\"{json_escape(call.name)}\",\"input\":{{}}}}}}")
@@ -2415,8 +2506,14 @@ pub string anthropic_message_delta_sse(string finish_reason, string stop_sequenc
 pub string anthropic_message_stop_sse():
     anthropic_sse("message_stop", "{{\"type\":\"message_stop\"}}")
 
+pub string anthropic_ping_sse():
+    anthropic_sse("ping", "{{\"type\":\"ping\"}}")
+
 pub string anthropic_error_sse(string message):
     anthropic_sse("error", "{{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":\"{json_escape(message)}\"}}}}")
+
+pub string anthropic_stream_failure_sse(string message):
+    anthropic_error_sse(message)
 
 string responses_usage_json(int input_tokens, int output_tokens, int cached_tokens):
     "{{\"input_tokens\": {input_tokens}, \"input_tokens_details\": {{\"cached_tokens\": {cached_tokens}}}, \"output_tokens\": {output_tokens}, \"output_tokens_details\": {{\"reasoning_tokens\": 0}}, \"total_tokens\": {input_tokens + output_tokens}}}"
