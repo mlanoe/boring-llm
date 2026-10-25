@@ -1,6 +1,7 @@
 /target
 /weights
 /.venv
+__pycache__/
 # Generated `boring build --target ...` projects anywhere in the repo
 # (src/, test/, etc) — fully regeneratable from the .br source.
 *_rust/
