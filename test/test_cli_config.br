@@ -1,0 +1,23 @@
+use cli_config
+use model
+
+def main() throws:
+    assert_eq(parse_cache_type_arg("cache", " F32 "), "f32" as string)
+    assert_eq(parse_flash_attention_arg("flash", "ON"), "on" as string)
+    assert_eq(parse_flash_attention_arg("flash", " auto "), "auto" as string)
+    assert_eq(parse_gpu_layers_arg("layers", "auto"), -1 as int)
+    assert_eq(parse_gpu_layers_arg("layers", "ALL"), -1 as int)
+    assert_eq(parse_gpu_layers_arg("layers", "99"), 99 as int)
+    validate_gpu_layers(-1, 40)
+    validate_gpu_layers(40, 40)
+    validate_gpu_layers(99, 40)
+    assert_eq(effective_prefill_chunk(2048, 512), 512 as int)
+    assert_eq(effective_prefill_chunk(256, 512), 256 as int)
+    assert_eq(effective_prefill_chunk(2048, 1024), 1024 as int)
+    assert_eq(parse_split_mode_arg("split", " NONE "), "none" as string)
+    assert_eq(parse_main_gpu_arg("gpu", "0"), 0 as int)
+    assert_eq(prefill_chunk_len(), 512 as int)
+    set_prefill_chunk_len(256)
+    assert_eq(prefill_chunk_len(), 256 as int)
+    set_prefill_chunk_len(512)
+    print "test_cli_config: all assertions passed"

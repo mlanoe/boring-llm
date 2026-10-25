@@ -17,6 +17,7 @@ use sampling
 use server
 use json
 use openai
+use cli_config
 
 def print_metadata(GgufFile file):
     print "GGUF version: {file.version}"
@@ -414,7 +415,7 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
     let tok = load_tokenizer(file)
     (file, m, tok)
 
-def run_serve(string path, string model_name, [string] model_tags, string chat_template_override, int ctx_size, int max_tokens, int cache_slots, string prompt_cache_dir, string slot_save_dir, int prompt_cache_files, int prompt_cache_max_mb, string host, int port, [string] api_keys, string api_prefix, string cors_origins, string cors_methods, string cors_headers, bool cors_credentials, bool metrics_enabled, bool slots_enabled, bool cache_prompt_default, bool context_shift, int sse_ping_interval_default, string reasoning_format_default, string reasoning_effort_default, JValue chat_template_kwargs_default, ServerSamplingDefaults extra_defaults, SamplingParams params) throws:
+def run_serve(string path, string model_name, [string] model_tags, string chat_template_override, int ctx_size, int max_tokens, int cache_slots, string prompt_cache_dir, string slot_save_dir, int prompt_cache_files, int prompt_cache_max_mb, string host, int port, [string] api_keys, string api_prefix, string cors_origins, string cors_methods, string cors_headers, bool cors_credentials, bool metrics_enabled, bool slots_enabled, bool cache_prompt_default, bool context_shift, int sse_ping_interval_default, string reasoning_format_default, string reasoning_effort_default, JValue chat_template_kwargs_default, int gpu_layers, ServerSamplingDefaults extra_defaults, SamplingParams params) throws:
     guard host != "" else throw "--host must not be empty"
     guard port >= 1 and port <= 65535 else throw "--port must be between 1 and 65535"
     guard ctx_size >= 2 else throw "--ctx-size must be at least 2"
@@ -426,6 +427,7 @@ def run_serve(string path, string model_name, [string] model_tags, string chat_t
     let prefix_error = api_prefix_validation_error(api_prefix)
     guard prefix_error == "" else throw prefix_error
     let (file, m, tok) = load_for_serving(path, chat_template_override)
+    validate_gpu_layers(gpu_layers, m.config.n_layer)
     let fallback_name = gguf_get_string(file.metadata, "general.name") else "boring-llm"
     let aliases = model_alias_list(model_name, fallback_name)
     let name = aliases[0]
@@ -490,7 +492,7 @@ string usage_text():
 string full_usage_text():
     let auth = usage_text().replace("require a Bearer key; comma separates keys", "require Bearer or x-api-key; comma separates keys").replace("read one Bearer key per line", "read one accepted key per line")
     let cors = auth.replace("  --api-key KEY", "  --cors-origins ORIGINS          allowed browser origins (default: *)\n  --cors-methods METHODS          allowed CORS methods\n  --cors-headers HEADERS          allowed CORS headers\n  --cors-credentials, --no-cors-credentials\n                                  allow or deny browser credentials\n  --api-key KEY")
-    let parallel = cors.replace("  --cache-prompt, --no-cache-prompt", "  -np, --parallel N               concurrent request slots (only 1 supported)\n  --threads-http N                HTTP worker count (only 1 supported)\n  --jinja                         Jinja chat templates (always enabled)\n  --no-warmup                    skip startup warmup (current behavior)\n  -nocb, --no-cont-batching      serialized serving (current behavior)\n  --context-shift, --no-context-shift\n                                  rebuild a retained context, or stop when full\n  --no-webui, --no-ui            API-only server (current behavior)\n  --no-mmproj                    text-only mode (current behavior)\n  --cache-prompt, --no-cache-prompt")
+    let parallel = cors.replace("  --cache-prompt, --no-cache-prompt", "  -np, --parallel N               concurrent request slots (only 1 supported)\n  --threads-http N                HTTP worker count (only 1 supported)\n  -b, --batch-size N              logical prefill batch limit (default: 2048)\n  -ub, --ubatch-size N            physical prefill chunk size (default: 512)\n  -ngl, --gpu-layers N            all-GPU layer limit (auto/all or enough layers)\n  -sm, --split-mode none          single-GPU execution mode\n  -mg, --main-gpu 0              primary GPU index (only 0 supported)\n  -kvo, --kv-offload              keep the KV cache on the GPU (required)\n  --op-offload                    execute model operations on the GPU (required)\n  -fa, --flash-attn [on|auto]     fused attention (always enabled)\n  -ctk, --cache-type-k TYPE       K cache type (only f32 supported)\n  -ctv, --cache-type-v TYPE       V cache type (only f32 supported)\n  --jinja                         Jinja chat templates (always enabled)\n  --no-warmup                    skip startup warmup (current behavior)\n  -nocb, --no-cont-batching      serialized serving (current behavior)\n  --context-shift, --no-context-shift\n                                  rebuild a retained context, or stop when full\n  --no-webui, --no-ui            API-only server (current behavior)\n  --no-mmproj                    text-only mode (current behavior)\n  --cache-prompt, --no-cache-prompt")
     parallel.replace("  -s, --seed S", "  --dry-multiplier N --dry-base N --dry-allowed-length N\n  --dry-penalty-last-n N\n  --presence-penalty N --frequency-penalty N\n  --mirostat N --mirostat-ent N --mirostat-lr N (server)\n  --adaptive-target N --adaptive-decay N (server)\n  --samplers LIST --sampler-seq SEQUENCE\n  --ignore-eos                    suppress the EOS token (server)\n  -s, --seed S")
 
 def main() throws:
@@ -600,6 +602,28 @@ def main() throws:
     let threads_http_env = environment_default(argv, ["--threads-http"], "LLAMA_ARG_THREADS_HTTP", "1")
     let threads_http_default = parse_int_arg("LLAMA_ARG_THREADS_HTTP", threads_http_env)
     guard threads_http_default == 1 else throw "LLAMA_ARG_THREADS_HTTP currently supports only 1 because requests are serialized"
+    let cache_type_k_env = environment_default(argv, ["--cache-type-k", "-ctk"], "LLAMA_ARG_CACHE_TYPE_K", "f32")
+    let cache_type_k = parse_cache_type_arg("LLAMA_ARG_CACHE_TYPE_K", cache_type_k_env)
+    let cache_type_v_env = environment_default(argv, ["--cache-type-v", "-ctv"], "LLAMA_ARG_CACHE_TYPE_V", "f32")
+    let cache_type_v = parse_cache_type_arg("LLAMA_ARG_CACHE_TYPE_V", cache_type_v_env)
+    let flash_attention_env = environment_default(argv, ["--flash-attn", "-fa"], "LLAMA_ARG_FLASH_ATTN", "auto")
+    let flash_attention = parse_flash_attention_arg("LLAMA_ARG_FLASH_ATTN", flash_attention_env)
+    let gpu_layers_env = environment_default(argv, ["--gpu-layers", "--n-gpu-layers", "-ngl"], "LLAMA_ARG_N_GPU_LAYERS", "auto")
+    var int gpu_layers = parse_gpu_layers_arg("LLAMA_ARG_N_GPU_LAYERS", gpu_layers_env)
+    let ubatch_env = environment_default(argv, ["--ubatch-size", "-ub"], "LLAMA_ARG_UBATCH", "512")
+    var int ubatch_size = parse_int_arg("LLAMA_ARG_UBATCH", ubatch_env)
+    guard ubatch_size > 0 else throw "LLAMA_ARG_UBATCH must be positive"
+    let batch_env = environment_default(argv, ["--batch-size", "-b"], "LLAMA_ARG_BATCH", "2048")
+    var int batch_size = parse_int_arg("LLAMA_ARG_BATCH", batch_env)
+    guard batch_size > 0 else throw "LLAMA_ARG_BATCH must be positive"
+    let kv_offload_env = environment_default(argv, ["--kv-offload", "-kvo", "--no-kv-offload", "-nkvo"], "LLAMA_ARG_KV_OFFLOAD", "true")
+    guard parse_bool_arg("LLAMA_ARG_KV_OFFLOAD", kv_offload_env) else throw "LLAMA_ARG_KV_OFFLOAD cannot disable GPU KV storage"
+    let op_offload_env = environment_default(argv, ["--op-offload", "--no-op-offload"], "LLAMA_ARG_OP_OFFLOAD", "true")
+    guard parse_bool_arg("LLAMA_ARG_OP_OFFLOAD", op_offload_env) else throw "LLAMA_ARG_OP_OFFLOAD cannot disable GPU model operations"
+    let split_mode_env = environment_default(argv, ["--split-mode", "-sm"], "LLAMA_ARG_SPLIT_MODE", "none")
+    let split_mode = parse_split_mode_arg("LLAMA_ARG_SPLIT_MODE", split_mode_env)
+    let main_gpu_env = environment_default(argv, ["--main-gpu", "-mg"], "LLAMA_ARG_MAIN_GPU", "0")
+    let main_gpu = parse_main_gpu_arg("LLAMA_ARG_MAIN_GPU", main_gpu_env)
     let ui_env = environment_default(argv, ["--ui", "--webui", "--no-ui", "--no-webui"], "LLAMA_ARG_UI", "false")
     guard !parse_bool_arg("LLAMA_ARG_UI", ui_env) else throw "LLAMA_ARG_UI cannot enable the unsupported Web UI"
     let jinja_env = environment_default(argv, ["--jinja", "--no-jinja"], "LLAMA_ARG_JINJA", "true")
@@ -798,6 +822,46 @@ def main() throws:
         elif a == "--threads-http" and i + 1 < argv.length:
             let threads_http = parse_int_arg("--threads-http", argv[i + 1])
             guard threads_http == 1 else throw "--threads-http currently supports only 1 because requests are serialized"
+            i += 2
+        elif (a == "--cache-type-k" or a == "-ctk") and i + 1 < argv.length:
+            let requested_cache_type_k = parse_cache_type_arg("--cache-type-k", argv[i + 1])
+            i += 2
+        elif (a == "--cache-type-v" or a == "-ctv") and i + 1 < argv.length:
+            let requested_cache_type_v = parse_cache_type_arg("--cache-type-v", argv[i + 1])
+            i += 2
+        elif a == "--flash-attn" or a == "-fa":
+            if i + 1 < argv.length and !argv[i + 1].startsWith("-"):
+                let requested_flash_attention = parse_flash_attention_arg("--flash-attn", argv[i + 1])
+                i += 2
+            else:
+                # The value is optional in llama.cpp; a bare switch means on.
+                i += 1
+        elif (a == "--gpu-layers" or a == "--n-gpu-layers" or a == "-ngl") and i + 1 < argv.length:
+            gpu_layers = parse_gpu_layers_arg("--gpu-layers", argv[i + 1])
+            i += 2
+        elif (a == "--ubatch-size" or a == "-ub") and i + 1 < argv.length:
+            ubatch_size = parse_int_arg("--ubatch-size", argv[i + 1])
+            guard ubatch_size > 0 else throw "--ubatch-size must be positive"
+            i += 2
+        elif (a == "--batch-size" or a == "-b") and i + 1 < argv.length:
+            batch_size = parse_int_arg("--batch-size", argv[i + 1])
+            guard batch_size > 0 else throw "--batch-size must be positive"
+            i += 2
+        elif a == "--kv-offload" or a == "-kvo":
+            # LayerCache uses GPU-resident unified buffers already.
+            i += 1
+        elif a == "--no-kv-offload" or a == "-nkvo":
+            throw "--no-kv-offload is not supported because boring-llm requires GPU-resident KV buffers"
+        elif a == "--op-offload":
+            # The inference path consists of GPU tensor kernels already.
+            i += 1
+        elif a == "--no-op-offload":
+            throw "--no-op-offload is not supported because boring-llm has no CPU inference path"
+        elif (a == "--split-mode" or a == "-sm") and i + 1 < argv.length:
+            let requested_split_mode = parse_split_mode_arg("--split-mode", argv[i + 1])
+            i += 2
+        elif (a == "--main-gpu" or a == "-mg") and i + 1 < argv.length:
+            let requested_main_gpu = parse_main_gpu_arg("--main-gpu", argv[i + 1])
             i += 2
         elif a == "--no-webui" or a == "--no-ui":
             # boring-llm exposes API routes only and has no embedded Web UI.
@@ -998,6 +1062,7 @@ def main() throws:
         chat_template_kwargs_default = jv_set(chat_template_kwargs_default, "preserve_reasoning", JValue.JBool(reasoning_preserve_default == "on"))
 
     set_decode_profile_stage(requested_profile_stage)
+    set_prefill_chunk_len(effective_prefill_chunk(batch_size, ubatch_size))
 
     if serve_mode:
         # OpenAI-compatible HTTP server (see server.br) — always the packed-
@@ -1005,12 +1070,14 @@ def main() throws:
         # kept resident for every request. Handled before the generic parse
         # below (which would also be fine now: no mode holds the file in memory).
         let extra_defaults = ServerSamplingDefaults(presence_penalty, frequency_penalty, mirostat, mirostat_tau, mirostat_eta, adaptive_target, adaptive_decay, samplers, ignore_eos)
-        run_serve(gguf_path, model_name, model_tags, chat_template_override, ctx_size, max_tokens, cache_slots, prompt_cache_dir, slot_save_dir, prompt_cache_files, prompt_cache_max_mb, host, port, api_keys, api_prefix, cors_origins, cors_methods, cors_headers, cors_credentials, metrics_enabled, slots_enabled, cache_prompt_default, context_shift, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, extra_defaults, SamplingParams(temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, []))
+        run_serve(gguf_path, model_name, model_tags, chat_template_override, ctx_size, max_tokens, cache_slots, prompt_cache_dir, slot_save_dir, prompt_cache_files, prompt_cache_max_mb, host, port, api_keys, api_prefix, cors_origins, cors_methods, cors_headers, cors_credentials, metrics_enabled, slots_enabled, cache_prompt_default, context_shift, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, gpu_layers, extra_defaults, SamplingParams(temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, []))
         return
 
     print "[diag] parsing {gguf_path}..."
     let file = parse_gguf_path(gguf_path)
     print "[diag] parsed ({file.file_size} bytes, {file.tensors.length} tensors, {file.metadata.length} metadata keys)"
+    if gpu_layers != -1:
+        validate_gpu_layers(gpu_layers, config_from_gguf(file).n_layer)
 
     if dump_metadata:
         print_metadata(file)

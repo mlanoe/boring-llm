@@ -1,0 +1,35 @@
+# Pure compatibility-option parsing kept separate from main so the accepted
+# llama.cpp spellings can be checked without loading a model.
+
+pub string parse_cache_type_arg(string name, string s) throws:
+    let value = s.trim().lower()
+    guard value == "f32" else throw "{name} currently supports only f32; Boring has no native float16 buffer type"
+    value
+
+pub string parse_flash_attention_arg(string name, string s) throws:
+    let value = s.trim().lower()
+    guard value == "on" or value == "auto" else throw "{name} expects on or auto; boring-llm always uses its fused attention kernels"
+    value
+
+pub int parse_gpu_layers_arg(string name, string s) throws:
+    let value = s.trim().lower()
+    if value == "auto" or value == "all": return -1
+    guard let count = (value as int) else throw "invalid {name} value: '{s}' (expected auto, all, or a non-negative integer)"
+    guard count >= 0 else throw "{name} expects auto, all, or a non-negative integer"
+    count
+
+pub def validate_gpu_layers(int requested, int actual) throws:
+    guard requested == -1 or requested >= actual else throw "--gpu-layers {requested} requests partial GPU offload, but boring-llm requires all {actual} transformer layers on the GPU"
+
+pub int effective_prefill_chunk(int batch_size, int ubatch_size):
+    if batch_size < ubatch_size: batch_size else: ubatch_size
+
+pub string parse_split_mode_arg(string name, string s) throws:
+    let value = s.trim().lower()
+    guard value == "none" else throw "{name} currently supports only none because boring-llm uses one GPU"
+    value
+
+pub int parse_main_gpu_arg(string name, string s) throws:
+    guard let index = (s as int) else throw "invalid {name} value: '{s}'"
+    guard index == 0 else throw "{name} currently supports only GPU index 0"
+    index

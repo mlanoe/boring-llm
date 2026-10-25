@@ -967,7 +967,10 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
 # each chunk attending over the already-cached keys plus its own (causal offset
 # = tokens already cached). Only the last chunk's logits matter and are returned.
 # A cache that is still empty is handled by prefill_step_gpu_quantized itself.
-let int PREFILL_CHUNK = 512
+static var int prefill_chunk_size = 512
+
+pub def set_prefill_chunk_len(int size):
+    prefill_chunk_size = size
 
 pub ([float32], GenCache) prefill_chunked(QuantModel model, GenCache cache0, [int] tokens) throws:
     guard tokens.length > 0 else throw "prefill_chunked: no tokens"
@@ -975,7 +978,7 @@ pub ([float32], GenCache) prefill_chunked(QuantModel model, GenCache cache0, [in
     var [float32] logits = []
     var int start = 0
     while start < tokens.length:
-        var int end = start + PREFILL_CHUNK
+        var int end = start + prefill_chunk_size
         if end > tokens.length:
             end = tokens.length
         let (lg, c) = prefill_step_gpu_quantized(model, cache, tokens[start..<end])
@@ -1059,7 +1062,7 @@ pub GenCache resume_cache(QuantModel model, GenCache cache, int reuse, int n_pro
 # Tokens per `prefill_step_gpu_quantized` call in `prefill_chunked`, for a
 # caller that drives the chunks itself (the server, to show progress).
 pub int prefill_chunk_len():
-    PREFILL_CHUNK
+    prefill_chunk_size
 
 # ── Chat mode: KV-cache reuse across turns ───────────────────────────────
 # generate_kv() above is single-shot — it always calls prefill_gpu_quantized
