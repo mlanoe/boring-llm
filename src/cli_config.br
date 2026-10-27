@@ -33,3 +33,40 @@ pub int parse_main_gpu_arg(string name, string s) throws:
     guard let index = (s as int) else throw "invalid {name} value: '{s}'"
     guard index == 0 else throw "{name} currently supports only GPU index 0"
     index
+
+# llama.cpp uses -1 for automatic CPU thread selection. boring-llm's model
+# execution is GPU-resident, so the value is accepted for launcher
+# compatibility but does not alter kernel scheduling.
+pub int parse_thread_count_arg(string name, string s) throws:
+    guard let count = (s as int) else throw "invalid {name} value: '{s}'"
+    guard count == -1 or count > 0 else throw "{name} expects -1 or a positive integer"
+    count
+
+pub int parse_bounded_int_arg(string name, string s, int minimum, int maximum) throws:
+    guard let value = (s as int) else throw "invalid {name} value: '{s}'"
+    guard value >= minimum and value <= maximum else throw "{name} must be between {minimum} and {maximum}"
+    value
+
+pub string parse_cpu_mask_arg(string name, string s) throws:
+    let value = s.trim()
+    var string digits = value
+    if value.lower().startsWith("0x"):
+        digits = ""
+        let chars = value.chars()
+        var int i = 2
+        while i < chars.length:
+            digits = "{digits}{chars[i]}"
+            i += 1
+    guard digits != "" else throw "{name} expects a non-empty hexadecimal mask"
+    for ch in digits.chars():
+        guard (ch >= "0" and ch <= "9") or (ch >= "a" and ch <= "f") or (ch >= "A" and ch <= "F") else throw "{name} expects a hexadecimal mask"
+    value
+
+pub string parse_cpu_range_arg(string name, string s) throws:
+    let value = s.trim()
+    let parts = value.split("-")
+    guard parts.length == 2 else throw "{name} expects a range formatted lo-hi"
+    guard let first = (parts[0] as int) else throw "{name} expects a range formatted lo-hi"
+    guard let last = (parts[1] as int) else throw "{name} expects a range formatted lo-hi"
+    guard first >= 0 and last >= first else throw "{name} expects 0 <= lo <= hi"
+    value

@@ -2239,8 +2239,24 @@ pub string unsupported_model_endpoint(string method, string path):
         if path == "/infill": return "infill"
         if path == "/v1/systemone": return "decision models"
         if path == "/v1/chat/completions/control": return "in-flight completion control"
+        if path == "/v1/streams/lookup": return "resumable stream lookup"
+        if path == "/predict": return "Vertex AI prediction"
     if (method == "GET" or method == "POST") and path == "/v1/realtime":
         return "Realtime API"
+    if (method == "GET" or method == "DELETE") and path == "/v1/stream":
+        return "resumable streams"
+    ""
+
+pub bool feature_disabled_endpoint(string method, string path):
+    (method == "GET" or method == "POST") and (path == "/tools" or path == "/cors-proxy")
+
+pub string unsupported_router_endpoint(string method, string path):
+    if method == "POST" and (path == "/models" or path == "/models/load" or path == "/models/unload"):
+        return "dynamic model routing"
+    if (method == "GET" or method == "HEAD") and path == "/models/sse":
+        return "model router events"
+    if method == "DELETE" and path == "/models":
+        return "model cache deletion"
     ""
 
 pub bool anthropic_api_path(string path):
@@ -2480,7 +2496,9 @@ pub int anthropic_uncached_input_tokens(int input_tokens, int cached_tokens):
     if cached_tokens < input_tokens: input_tokens - cached_tokens else: 0
 
 pub string anthropic_thinking_signature(string id):
-    "boring-llm-{id}"
+    # Local models cannot produce Anthropic's cryptographic reasoning
+    # signatures. llama-server represents that honestly with an empty value.
+    ""
 
 pub string anthropic_message_json(string id, string model, ParsedReply reply, string reasoning, string finish_reason,
                                   string stop_sequence, int input_tokens, int output_tokens, int cached_tokens):

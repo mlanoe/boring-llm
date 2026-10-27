@@ -492,8 +492,9 @@ string usage_text():
 string full_usage_text():
     let auth = usage_text().replace("require a Bearer key; comma separates keys", "require Bearer or x-api-key; comma separates keys").replace("read one Bearer key per line", "read one accepted key per line")
     let cors = auth.replace("  --api-key KEY", "  --cors-origins ORIGINS          allowed browser origins (default: *)\n  --cors-methods METHODS          allowed CORS methods\n  --cors-headers HEADERS          allowed CORS headers\n  --cors-credentials, --no-cors-credentials\n                                  allow or deny browser credentials\n  --api-key KEY")
-    let parallel = cors.replace("  --cache-prompt, --no-cache-prompt", "  -np, --parallel N               concurrent request slots (only 1 supported)\n  --threads-http N                HTTP worker count (only 1 supported)\n  -b, --batch-size N              logical prefill batch limit (default: 2048)\n  -ub, --ubatch-size N            physical prefill chunk size (default: 512)\n  -ngl, --gpu-layers N            all-GPU layer limit (auto/all or enough layers)\n  -sm, --split-mode none          single-GPU execution mode\n  -mg, --main-gpu 0              primary GPU index (only 0 supported)\n  -kvo, --kv-offload              keep the KV cache on the GPU (required)\n  --op-offload                    execute model operations on the GPU (required)\n  -fa, --flash-attn [on|auto]     fused attention (always enabled)\n  -ctk, --cache-type-k TYPE       K cache type (only f32 supported)\n  -ctv, --cache-type-v TYPE       V cache type (only f32 supported)\n  --jinja                         Jinja chat templates (always enabled)\n  --no-warmup                    skip startup warmup (current behavior)\n  -nocb, --no-cont-batching      serialized serving (current behavior)\n  --context-shift, --no-context-shift\n                                  rebuild a retained context, or stop when full\n  --no-webui, --no-ui            API-only server (current behavior)\n  --no-mmproj                    text-only mode (current behavior)\n  --cache-prompt, --no-cache-prompt")
-    parallel.replace("  -s, --seed S", "  --dry-multiplier N --dry-base N --dry-allowed-length N\n  --dry-penalty-last-n N\n  --presence-penalty N --frequency-penalty N\n  --mirostat N --mirostat-ent N --mirostat-lr N (server)\n  --adaptive-target N --adaptive-decay N (server)\n  --samplers LIST --sampler-seq SEQUENCE\n  --ignore-eos                    suppress the EOS token (server)\n  -s, --seed S")
+    let parallel = cors.replace("  --cache-prompt, --no-cache-prompt", "  -np, --parallel N               concurrent request slots (only 1 supported)\n  -t, --threads N                 accepted CPU-thread compatibility setting\n  -tb, --threads-batch N          accepted batch-thread compatibility setting\n  -C, --cpu-mask M                accepted hexadecimal CPU affinity mask\n  -Cr, --cpu-range lo-hi          accepted CPU affinity range\n  -Cb, --cpu-mask-batch M         accepted batch CPU affinity mask\n  -Crb, --cpu-range-batch lo-hi   accepted batch CPU affinity range\n  --cpu-strict N, --cpu-strict-batch N\n                                  accepted 0/1 affinity settings\n  --prio N, --prio-batch N        accepted CPU-priority settings\n  --poll N, --poll-batch N        accepted CPU-polling settings\n  --threads-http N                HTTP worker count (only 1 supported)\n  -b, --batch-size N              logical prefill batch limit (default: 2048)\n  -ub, --ubatch-size N            physical prefill chunk size (default: 512)\n  -ngl, --gpu-layers N            all-GPU layer limit (auto/all or enough layers)\n  -sm, --split-mode none          single-GPU execution mode\n  -mg, --main-gpu 0              primary GPU index (only 0 supported)\n  -kvo, --kv-offload              keep the KV cache on the GPU (required)\n  --op-offload                    execute model operations on the GPU (required)\n  -fa, --flash-attn [on|auto]     fused attention (always enabled)\n  -ctk, --cache-type-k TYPE       K cache type (only f32 supported)\n  -ctv, --cache-type-v TYPE       V cache type (only f32 supported)\n  --jinja                         Jinja chat templates (always enabled)\n  --no-warmup                    skip startup warmup (current behavior)\n  -nocb, --no-cont-batching      serialized serving (current behavior)\n  --context-shift, --no-context-shift\n                                  rebuild a retained context, or stop when full\n  --no-webui, --no-ui            API-only server (current behavior)\n  --no-mmproj                    text-only mode (current behavior)\n  --cache-prompt, --no-cache-prompt")
+    let memory = parallel.replace("  -c, --ctx-size N", "  --no-mmap                      streamed GGUF reads (current behavior)\n  -c, --ctx-size N")
+    memory.replace("  -s, --seed S", "  --dry-multiplier N --dry-base N --dry-allowed-length N\n  --dry-penalty-last-n N\n  --presence-penalty N --frequency-penalty N\n  --mirostat N --mirostat-ent N --mirostat-lr N (server)\n  --adaptive-target N --adaptive-decay N (server)\n  --samplers LIST --sampler-seq SEQUENCE\n  --ignore-eos                    suppress the EOS token (server)\n  -s, --seed S")
 
 def main() throws:
     let [string] argv = args()
@@ -602,6 +603,10 @@ def main() throws:
     let threads_http_env = environment_default(argv, ["--threads-http"], "LLAMA_ARG_THREADS_HTTP", "1")
     let threads_http_default = parse_int_arg("LLAMA_ARG_THREADS_HTTP", threads_http_env)
     guard threads_http_default == 1 else throw "LLAMA_ARG_THREADS_HTTP currently supports only 1 because requests are serialized"
+    let threads_env = environment_default(argv, ["--threads", "-t"], "LLAMA_ARG_THREADS", "-1")
+    let threads_default = parse_thread_count_arg("LLAMA_ARG_THREADS", threads_env)
+    let threads_batch_env = environment_default(argv, ["--threads-batch", "-tb"], "LLAMA_ARG_THREADS_BATCH", "-1")
+    let threads_batch_default = parse_thread_count_arg("LLAMA_ARG_THREADS_BATCH", threads_batch_env)
     let cache_type_k_env = environment_default(argv, ["--cache-type-k", "-ctk"], "LLAMA_ARG_CACHE_TYPE_K", "f32")
     let cache_type_k = parse_cache_type_arg("LLAMA_ARG_CACHE_TYPE_K", cache_type_k_env)
     let cache_type_v_env = environment_default(argv, ["--cache-type-v", "-ctv"], "LLAMA_ARG_CACHE_TYPE_V", "f32")
@@ -808,6 +813,11 @@ def main() throws:
             i += 1
         elif a == "--warmup":
             throw "--warmup is not supported; boring-llm starts without an inference warmup"
+        elif a == "--no-mmap":
+            # The loader reads one header/tensor range at a time with read_at.
+            i += 1
+        elif a == "--mlock":
+            throw "--mlock is not supported because model weights are streamed to GPU memory instead of retained in host RAM"
         elif a == "--no-cont-batching" or a == "-nocb":
             # Requests are serialized, so continuous batching is already off.
             i += 1
@@ -822,6 +832,42 @@ def main() throws:
         elif a == "--threads-http" and i + 1 < argv.length:
             let threads_http = parse_int_arg("--threads-http", argv[i + 1])
             guard threads_http == 1 else throw "--threads-http currently supports only 1 because requests are serialized"
+            i += 2
+        elif (a == "--threads" or a == "-t") and i + 1 < argv.length:
+            let requested_threads = parse_thread_count_arg("--threads", argv[i + 1])
+            i += 2
+        elif (a == "--threads-batch" or a == "-tb") and i + 1 < argv.length:
+            let requested_threads_batch = parse_thread_count_arg("--threads-batch", argv[i + 1])
+            i += 2
+        elif a == "--prio" and i + 1 < argv.length:
+            let requested_priority = parse_bounded_int_arg("--prio", argv[i + 1], -1, 3)
+            i += 2
+        elif a == "--prio-batch" and i + 1 < argv.length:
+            let requested_batch_priority = parse_bounded_int_arg("--prio-batch", argv[i + 1], 0, 3)
+            i += 2
+        elif a == "--poll" and i + 1 < argv.length:
+            let requested_poll = parse_bounded_int_arg("--poll", argv[i + 1], 0, 100)
+            i += 2
+        elif a == "--poll-batch" and i + 1 < argv.length:
+            let requested_batch_poll = parse_bounded_int_arg("--poll-batch", argv[i + 1], 0, 1)
+            i += 2
+        elif (a == "--cpu-mask" or a == "-C") and i + 1 < argv.length:
+            let requested_cpu_mask = parse_cpu_mask_arg("--cpu-mask", argv[i + 1])
+            i += 2
+        elif (a == "--cpu-range" or a == "-Cr") and i + 1 < argv.length:
+            let requested_cpu_range = parse_cpu_range_arg("--cpu-range", argv[i + 1])
+            i += 2
+        elif (a == "--cpu-mask-batch" or a == "-Cb") and i + 1 < argv.length:
+            let requested_batch_cpu_mask = parse_cpu_mask_arg("--cpu-mask-batch", argv[i + 1])
+            i += 2
+        elif (a == "--cpu-range-batch" or a == "-Crb") and i + 1 < argv.length:
+            let requested_batch_cpu_range = parse_cpu_range_arg("--cpu-range-batch", argv[i + 1])
+            i += 2
+        elif a == "--cpu-strict" and i + 1 < argv.length:
+            let requested_cpu_strict = parse_bounded_int_arg("--cpu-strict", argv[i + 1], 0, 1)
+            i += 2
+        elif a == "--cpu-strict-batch" and i + 1 < argv.length:
+            let requested_batch_cpu_strict = parse_bounded_int_arg("--cpu-strict-batch", argv[i + 1], 0, 1)
             i += 2
         elif (a == "--cache-type-k" or a == "-ctk") and i + 1 < argv.length:
             let requested_cache_type_k = parse_cache_type_arg("--cache-type-k", argv[i + 1])

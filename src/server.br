@@ -1484,6 +1484,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     let path = strip_api_prefix(http_request_path(r.path), ctx.api_prefix)
     let generation_kind = generation_route_kind(r.method, path)
     let unsupported_endpoint = unsupported_model_endpoint(r.method, path)
+    let unsupported_router = unsupported_router_endpoint(r.method, path)
     response.request_is_anthropic = anthropic_api_path(path)
     let action = http_query_value(r.path, "action")
     if r.method == "OPTIONS":
@@ -1504,12 +1505,8 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         respond_json(response, sock, 200, "OK", model_json_meta_aliases(ctx.model_name, ctx.model_aliases, ctx.model_tags, vocab_type,
                      ctx.model.config.vocab_size, ctx.max_ctx, n_ctx_train,
                      ctx.model.config.d_model, gguf_parameter_count(ctx.file), ctx.file.file_size, unix_timestamp()))
-    elif r.method == "POST" and (path == "/models/load" or path == "/models/unload"):
-        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("dynamic model routing"))
-    elif (r.method == "GET" or r.method == "HEAD") and path == "/models/sse":
-        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("model router events"))
-    elif r.method == "DELETE" and path == "/models":
-        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("model cache deletion"))
+    elif unsupported_router != "":
+        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json(unsupported_router))
     elif (r.method == "GET" or r.method == "HEAD") and (path == "/health" or path == "/v1/health" or path == "/"):
         respond_json(response, sock, 200, "OK", "{{\"status\": \"ok\"}}")
     elif (r.method == "GET" or r.method == "HEAD") and path == "/props":
@@ -1628,7 +1625,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         respond_json(response, sock, 200, "OK", lora_adapters_json())
     elif r.method == "POST" and path == "/lora-adapters":
         respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("lora-adapters"))
-    elif (r.method == "GET" or r.method == "POST") and path == "/tools":
+    elif feature_disabled_endpoint(r.method, path):
         respond_json(response, sock, 403, "Forbidden", feature_disabled_json())
     elif unsupported_endpoint != "":
         respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json(unsupported_endpoint))
