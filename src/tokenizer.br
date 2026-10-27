@@ -27,6 +27,7 @@
 use gguf
 use io
 use jinja
+use sampling
 
 pub [int] add_configured_special_tokens([int] ids, int bos_token_id, int eos_token_id,
                                          bool tokenizer_adds_bos, bool tokenizer_adds_eos,
@@ -703,6 +704,27 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
         if token_types[ti] == 3 or token_types[ti] == 4:
             special_tokens[tokens[ti]] = ti
         ti += 1
+
+    # End-of-generation tokens, as llama.cpp collects them: the EOS, the GGUF's
+    # eot / eom ids, and the well-known end-of-turn control tokens present in the vocabulary.
+    mut [int] eog = [eos]
+    for key in ["tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"]:
+        if let id = gguf_get_int(file.metadata, key):
+            if id >= 0 and id < tokens.length and not eog.contains(id):
+                eog.push(id)
+    let end_names = ["<|eot_id|>", "<|im_end|>", "<|end|>", "<end_of_turn>", "<|endoftext|>", "<EOT>", "_<EOT>", "<|end_of_text|>"]
+    for name in end_names:
+        if let id = vocab[name]:
+            if not eog.contains(id):
+                eog.push(id)
+    # What the chat template writes after a model turn: Gemma's `<end_of_turn>` is
+    # not its EOS, and a Llama 3 file may name `<|end_of_text|>` as EOS but close turns with `<|eot_id|>`.
+    var int close_id = eos
+    for name in ["<end_of_turn>", "<|eot_id|>"]:
+        if let id = vocab[name]:
+            if eog.contains(id) and tokens.length > eos and tokens[eos] != name:
+                close_id = id
+    set_eog_tokens(eog, close_id)
 
     Tokenizer(vocab, reverse, merge_rank, byte_to_uni, uni_to_byte, bos, eos, add_bos, add_eos, is_spm, scores, byte_token_id, special_tokens)
 

@@ -1765,6 +1765,1342 @@ pub req [float32]'kernel'unified q4nl_linear_warp_broadcast_gpu([float32]'kernel
 # (1 for a decode step, the prompt/turn length for a prefill), so this
 # dispatch needs no new parameter or a decode-specific entry point — it
 # reads `seq` off the same call every other format's branch below ignores.
+# ── Hand-written tiled linear kernels for Q4_1, Q5_1, Q5_K and unquantized F16 / BF16
+# weights: one weight element decoded per thread per tile, the same shape as Q5LinearKernel.
+# These formats have no native tensor schedule (see tensor_linear_gpu), so every
+# row count, decode included, takes these kernels.
+
+kernel Q41LinearKernel:
+    let [float32]'global  x           # (seq × d_in)
+    let [uint8]'global    w_packed    # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv          # (d_out,)
+    mut [float32]'unified y           # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    mut [float32, width = 16, height = 16]'actor tile_x
+    mut [float32, width = 16, height = 16]'actor tile_w
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout):
+        x        = xi
+        w_packed = wi
+        bv       = bi
+        seq      = s
+        d_in     = din
+        d_out    = dout
+        y        = [0.0 for ..<s * dout]
+
+    def ():
+        let tx = .thread.x
+        let ty = .thread.y
+        let row = .block.y * .block_dim.y + ty
+        let col = .block.x * .block_dim.x + tx
+        var float32 acc = 0.0
+        let num_tiles = (d_in + 15) / 16
+        for t in 0..<num_tiles:
+            let x_col = t * 16 + tx
+            let w_row = t * 16 + ty
+            if row < seq and x_col < d_in:
+                tile_x[width = tx, height = ty] = x[row * d_in + x_col]
+            else:
+                tile_x[width = tx, height = ty] = 0.0
+            if w_row < d_in and col < d_out:
+                let flat_idx = col * d_in + w_row
+                let block_byte = (flat_idx / 32) * 20
+                let off = flat_idx % 32
+                let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
+                let w_m = f16_bits_to_f32_fast(int(w_packed[block_byte + 2]) | (int(w_packed[block_byte + 3]) << 8))
+                let j = if off < 16: off else: off - 16
+                let byte_val = int(w_packed[block_byte + 4 + j])
+                let nib = if off < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
+                let wv = (nib as float32) * w_d + w_m
+                tile_w[width = tx, height = ty] = wv
+            else:
+                tile_w[width = tx, height = ty] = 0.0
+            sync
+            for kk in 0..<16:
+                acc += tile_x[width = kk, height = ty] * tile_w[width = tx, height = kk]
+            sync
+        if row < seq and col < d_out:
+            y[row * d_out + col] = acc + bv[col]
+
+pub req [float32]'kernel'unified q41_linear_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 32 == 0 else throw "q41_linear_gpu: d_in ({d_in}) must be a multiple of 32"
+    let int gx = (d_out + 15) / 16
+    let int gy = (seq + 15) / 16
+    mut k = Q41LinearKernel(x, w_packed, bv, seq, d_in, d_out)
+    kernel:
+        k(block = (16, 16), grid = (gx, gy))
+    k.y
+
+kernel Q51LinearKernel:
+    let [float32]'global  x           # (seq × d_in)
+    let [uint8]'global    w_packed    # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv          # (d_out,)
+    mut [float32]'unified y           # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    mut [float32, width = 16, height = 16]'actor tile_x
+    mut [float32, width = 16, height = 16]'actor tile_w
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout):
+        x        = xi
+        w_packed = wi
+        bv       = bi
+        seq      = s
+        d_in     = din
+        d_out    = dout
+        y        = [0.0 for ..<s * dout]
+
+    def ():
+        let tx = .thread.x
+        let ty = .thread.y
+        let row = .block.y * .block_dim.y + ty
+        let col = .block.x * .block_dim.x + tx
+        var float32 acc = 0.0
+        let num_tiles = (d_in + 15) / 16
+        for t in 0..<num_tiles:
+            let x_col = t * 16 + tx
+            let w_row = t * 16 + ty
+            if row < seq and x_col < d_in:
+                tile_x[width = tx, height = ty] = x[row * d_in + x_col]
+            else:
+                tile_x[width = tx, height = ty] = 0.0
+            if w_row < d_in and col < d_out:
+                let flat_idx = col * d_in + w_row
+                let block_byte = (flat_idx / 32) * 24
+                let off = flat_idx % 32
+                let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
+                let w_m = f16_bits_to_f32_fast(int(w_packed[block_byte + 2]) | (int(w_packed[block_byte + 3]) << 8))
+                let qh = int(w_packed[block_byte + 4]) | (int(w_packed[block_byte + 5]) << 8) | (int(w_packed[block_byte + 6]) << 16) | (int(w_packed[block_byte + 7]) << 24)
+                let j = if off < 16: off else: off - 16
+                let byte_val = int(w_packed[block_byte + 8 + j])
+                let nib = if off < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
+                let hbit = (qh >> off) & 1
+                let wv = (((nib | (hbit << 4))) as float32) * w_d + w_m
+                tile_w[width = tx, height = ty] = wv
+            else:
+                tile_w[width = tx, height = ty] = 0.0
+            sync
+            for kk in 0..<16:
+                acc += tile_x[width = kk, height = ty] * tile_w[width = tx, height = kk]
+            sync
+        if row < seq and col < d_out:
+            y[row * d_out + col] = acc + bv[col]
+
+pub req [float32]'kernel'unified q51_linear_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 32 == 0 else throw "q51_linear_gpu: d_in ({d_in}) must be a multiple of 32"
+    let int gx = (d_out + 15) / 16
+    let int gy = (seq + 15) / 16
+    mut k = Q51LinearKernel(x, w_packed, bv, seq, d_in, d_out)
+    kernel:
+        k(block = (16, 16), grid = (gx, gy))
+    k.y
+
+kernel Q5KLinearKernel:
+    let [float32]'global  x           # (seq × d_in)
+    let [uint8]'global    w_packed    # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv          # (d_out,)
+    mut [float32]'unified y           # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    mut [float32, width = 16, height = 16]'actor tile_x
+    mut [float32, width = 16, height = 16]'actor tile_w
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout):
+        x        = xi
+        w_packed = wi
+        bv       = bi
+        seq      = s
+        d_in     = din
+        d_out    = dout
+        y        = [0.0 for ..<s * dout]
+
+    def ():
+        let tx = .thread.x
+        let ty = .thread.y
+        let row = .block.y * .block_dim.y + ty
+        let col = .block.x * .block_dim.x + tx
+        var float32 acc = 0.0
+        let num_tiles = (d_in + 15) / 16
+        for t in 0..<num_tiles:
+            let x_col = t * 16 + tx
+            let w_row = t * 16 + ty
+            if row < seq and x_col < d_in:
+                tile_x[width = tx, height = ty] = x[row * d_in + x_col]
+            else:
+                tile_x[width = tx, height = ty] = 0.0
+            if w_row < d_in and col < d_out:
+                let flat_idx = col * d_in + w_row
+                let block_byte = (flat_idx / 256) * 176
+                let off = flat_idx % 256
+                let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
+                let w_dmin = f16_bits_to_f32_fast(int(w_packed[block_byte + 2]) | (int(w_packed[block_byte + 3]) << 8))
+                let chunk = off / 64
+                let within = off % 64
+                let high_half = if within >= 32: 1 else: 0
+                let l = within % 32
+                let sub = chunk * 2 + high_half
+                let sc_base = block_byte + 4
+                var int sc = 0
+                var int mn = 0
+                if sub < 4:
+                    sc = int(w_packed[sc_base + sub]) & 63
+                    mn = int(w_packed[sc_base + sub + 4]) & 63
+                else:
+                    sc = (int(w_packed[sc_base + sub + 4]) & 0xF) | ((int(w_packed[sc_base + sub - 4]) >> 6) << 4)
+                    mn = (int(w_packed[sc_base + sub + 4]) >> 4) | ((int(w_packed[sc_base + sub]) >> 6) << 4)
+                let q = int(w_packed[block_byte + 48 + chunk * 32 + l])
+                let nib = if high_half == 1: (q >> 4) & 0xF else: q & 0xF
+                let hbit = (int(w_packed[block_byte + 16 + l]) >> sub) & 1
+                let wv = w_d * (sc as float32) * ((nib + (hbit << 4)) as float32) - w_dmin * (mn as float32)
+                tile_w[width = tx, height = ty] = wv
+            else:
+                tile_w[width = tx, height = ty] = 0.0
+            sync
+            for kk in 0..<16:
+                acc += tile_x[width = kk, height = ty] * tile_w[width = tx, height = kk]
+            sync
+        if row < seq and col < d_out:
+            y[row * d_out + col] = acc + bv[col]
+
+pub req [float32]'kernel'unified q5k_linear_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 256 == 0 else throw "q5k_linear_gpu: d_in ({d_in}) must be a multiple of 256"
+    let int gx = (d_out + 15) / 16
+    let int gy = (seq + 15) / 16
+    mut k = Q5KLinearKernel(x, w_packed, bv, seq, d_in, d_out)
+    kernel:
+        k(block = (16, 16), grid = (gx, gy))
+    k.y
+
+kernel F16LinearKernel:
+    let [float32]'global  x           # (seq × d_in)
+    let [uint8]'global    w_packed    # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv          # (d_out,)
+    mut [float32]'unified y           # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    mut [float32, width = 16, height = 16]'actor tile_x
+    mut [float32, width = 16, height = 16]'actor tile_w
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout):
+        x        = xi
+        w_packed = wi
+        bv       = bi
+        seq      = s
+        d_in     = din
+        d_out    = dout
+        y        = [0.0 for ..<s * dout]
+
+    def ():
+        let tx = .thread.x
+        let ty = .thread.y
+        let row = .block.y * .block_dim.y + ty
+        let col = .block.x * .block_dim.x + tx
+        var float32 acc = 0.0
+        let num_tiles = (d_in + 15) / 16
+        for t in 0..<num_tiles:
+            let x_col = t * 16 + tx
+            let w_row = t * 16 + ty
+            if row < seq and x_col < d_in:
+                tile_x[width = tx, height = ty] = x[row * d_in + x_col]
+            else:
+                tile_x[width = tx, height = ty] = 0.0
+            if w_row < d_in and col < d_out:
+                let flat_idx = col * d_in + w_row
+                let wv = f16_bits_to_f32(int(w_packed[flat_idx * 2]) | (int(w_packed[flat_idx * 2 + 1]) << 8))
+                tile_w[width = tx, height = ty] = wv
+            else:
+                tile_w[width = tx, height = ty] = 0.0
+            sync
+            for kk in 0..<16:
+                acc += tile_x[width = kk, height = ty] * tile_w[width = tx, height = kk]
+            sync
+        if row < seq and col < d_out:
+            y[row * d_out + col] = acc + bv[col]
+
+pub req [float32]'kernel'unified f16_linear_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 1 == 0 else throw "f16_linear_gpu: d_in ({d_in}) must be a multiple of 1"
+    let int gx = (d_out + 15) / 16
+    let int gy = (seq + 15) / 16
+    mut k = F16LinearKernel(x, w_packed, bv, seq, d_in, d_out)
+    kernel:
+        k(block = (16, 16), grid = (gx, gy))
+    k.y
+
+kernel BF16LinearKernel:
+    let [float32]'global  x           # (seq × d_in)
+    let [uint8]'global    w_packed    # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv          # (d_out,)
+    mut [float32]'unified y           # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    mut [float32, width = 16, height = 16]'actor tile_x
+    mut [float32, width = 16, height = 16]'actor tile_w
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout):
+        x        = xi
+        w_packed = wi
+        bv       = bi
+        seq      = s
+        d_in     = din
+        d_out    = dout
+        y        = [0.0 for ..<s * dout]
+
+    def ():
+        let tx = .thread.x
+        let ty = .thread.y
+        let row = .block.y * .block_dim.y + ty
+        let col = .block.x * .block_dim.x + tx
+        var float32 acc = 0.0
+        let num_tiles = (d_in + 15) / 16
+        for t in 0..<num_tiles:
+            let x_col = t * 16 + tx
+            let w_row = t * 16 + ty
+            if row < seq and x_col < d_in:
+                tile_x[width = tx, height = ty] = x[row * d_in + x_col]
+            else:
+                tile_x[width = tx, height = ty] = 0.0
+            if w_row < d_in and col < d_out:
+                let flat_idx = col * d_in + w_row
+                let wv = bf16_bits_to_f32(int(w_packed[flat_idx * 2]) | (int(w_packed[flat_idx * 2 + 1]) << 8))
+                tile_w[width = tx, height = ty] = wv
+            else:
+                tile_w[width = tx, height = ty] = 0.0
+            sync
+            for kk in 0..<16:
+                acc += tile_x[width = kk, height = ty] * tile_w[width = tx, height = kk]
+            sync
+        if row < seq and col < d_out:
+            y[row * d_out + col] = acc + bv[col]
+
+pub req [float32]'kernel'unified bf16_linear_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 1 == 0 else throw "bf16_linear_gpu: d_in ({d_in}) must be a multiple of 1"
+    let int gx = (d_out + 15) / 16
+    let int gy = (seq + 15) / 16
+    mut k = BF16LinearKernel(x, w_packed, bv, seq, d_in, d_out)
+    kernel:
+        k(block = (16, 16), grid = (gx, gy))
+    k.y
+
+# Single-row (decode) variants: one warp per output cell, its lanes striding over d_in and
+# reducing with shuffles; each lane decodes its own weight element (the tiled kernels above
+# would leave 15 of 16 rows idle at seq == 1).
+
+kernel F16LinearWarpKernel:
+    let [float32]'global  x                # (seq × d_in)
+    let [uint8]'global    w_packed         # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv               # (d_out,)
+    mut [float32]'unified y                # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    let int               warps_per_block
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout, int wpb):
+        x               = xi
+        w_packed        = wi
+        bv              = bi
+        seq             = s
+        d_in            = din
+        d_out           = dout
+        warps_per_block = wpb
+        y               = [0.0 for ..<s * dout]
+
+    def ():
+        let lane = .warp.lane
+        let warp_in_block = .thread.y
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let global_warp = block_idx * warps_per_block + warp_in_block
+        let total = seq * d_out
+        if global_warp < total:
+            let row = global_warp / d_out
+            let col = global_warp % d_out
+            var float32 partial = 0.0
+            var int i = lane
+            while i < d_in:
+                let flat_idx = col * d_in + i
+                let wv = f16_bits_to_f32(int(w_packed[flat_idx * 2]) | (int(w_packed[flat_idx * 2 + 1]) << 8))
+                partial += x[row * d_in + i] * wv
+                i += .warp.size
+            var int offset = .warp.size / 2
+            while offset > 0:
+                partial += .warp.shuffle_xor(partial, offset)
+                offset = offset / 2
+            if lane == 0:
+                y[row * d_out + col] = partial + bv[col]
+
+pub req [float32]'kernel'unified f16_linear_warp_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 1 == 0 else throw "f16_linear_warp_gpu: d_in ({d_in}) must be a multiple of 1"
+    let int warps_per_block = 8
+    let int total_warps = seq * d_out
+    let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = F16LinearWarpKernel(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    kernel:
+        k(block = (32, warps_per_block), grid = (gx, gy))
+    k.y
+
+kernel BF16LinearWarpKernel:
+    let [float32]'global  x                # (seq × d_in)
+    let [uint8]'global    w_packed         # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv               # (d_out,)
+    mut [float32]'unified y                # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    let int               warps_per_block
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout, int wpb):
+        x               = xi
+        w_packed        = wi
+        bv              = bi
+        seq             = s
+        d_in            = din
+        d_out           = dout
+        warps_per_block = wpb
+        y               = [0.0 for ..<s * dout]
+
+    def ():
+        let lane = .warp.lane
+        let warp_in_block = .thread.y
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let global_warp = block_idx * warps_per_block + warp_in_block
+        let total = seq * d_out
+        if global_warp < total:
+            let row = global_warp / d_out
+            let col = global_warp % d_out
+            var float32 partial = 0.0
+            var int i = lane
+            while i < d_in:
+                let flat_idx = col * d_in + i
+                let wv = bf16_bits_to_f32(int(w_packed[flat_idx * 2]) | (int(w_packed[flat_idx * 2 + 1]) << 8))
+                partial += x[row * d_in + i] * wv
+                i += .warp.size
+            var int offset = .warp.size / 2
+            while offset > 0:
+                partial += .warp.shuffle_xor(partial, offset)
+                offset = offset / 2
+            if lane == 0:
+                y[row * d_out + col] = partial + bv[col]
+
+pub req [float32]'kernel'unified bf16_linear_warp_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 1 == 0 else throw "bf16_linear_warp_gpu: d_in ({d_in}) must be a multiple of 1"
+    let int warps_per_block = 8
+    let int total_warps = seq * d_out
+    let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = BF16LinearWarpKernel(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    kernel:
+        k(block = (32, warps_per_block), grid = (gx, gy))
+    k.y
+
+# Q4_1 / Q5_1 / Q5_K single-row (decode) kernels: one warp per output cell, each lane owning whole
+# 32-element blocks (Q5_K: sub-blocks), so a lane's loads are independent of the other lanes'. Scale and
+# minimum are applied once per block: sum(w*x) = d * sum(q*x) + m * sum(x). (A version where all
+# lanes decode one block jointly and lane 0 broadcasts its header was ~4x slower.)
+
+kernel Q41LinearWarpKernel:
+    let [float32]'global  x                # (seq × d_in)
+    let [uint8]'global    w_packed         # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv               # (d_out,)
+    mut [float32]'unified y                # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    let int               warps_per_block
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout, int wpb):
+        x               = xi
+        w_packed        = wi
+        bv              = bi
+        seq             = s
+        d_in            = din
+        d_out           = dout
+        warps_per_block = wpb
+        y               = [0.0 for ..<s * dout]
+
+    def ():
+        let lane = .warp.lane
+        let warp_in_block = .thread.y
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let global_warp = block_idx * warps_per_block + warp_in_block
+        let total = seq * d_out
+        if global_warp < total:
+            let row = global_warp / d_out
+            let col = global_warp % d_out
+            var float32 partial = 0.0
+            let n_units = d_in / 32
+            var int unit = lane
+            while unit < n_units:
+                # one lane per 32-element block: no shuffles, independent loads
+                let bb = (col * n_units + unit) * 20
+                let w_d = f16_bits_to_f32_fast(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
+                let w_m = f16_bits_to_f32_fast(int(w_packed[bb + 2]) | (int(w_packed[bb + 3]) << 8))
+                let xb = row * d_in + unit * 32
+                var float32 dot = 0.0
+                var float32 sx = 0.0
+                for j in 0..<16:
+                    let byte_val = int(w_packed[bb + 4 + j])
+                    let xl = x[xb + j]
+                    let xh = x[xb + 16 + j]
+                    dot += xl * ((byte_val & 0xF) as float32) + xh * (((byte_val >> 4) & 0xF) as float32)
+                    sx += xl + xh
+                partial += w_d * dot + w_m * sx
+                unit += .warp.size
+            var int offset = .warp.size / 2
+            while offset > 0:
+                partial += .warp.shuffle_xor(partial, offset)
+                offset = offset / 2
+            if lane == 0:
+                y[row * d_out + col] = partial + bv[col]
+
+pub req [float32]'kernel'unified q41_linear_warp_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 32 == 0 else throw "q41_linear_warp_gpu: d_in ({d_in}) must be a multiple of 32"
+    let int warps_per_block = 8
+    let int total_warps = seq * d_out
+    let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = Q41LinearWarpKernel(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    kernel:
+        k(block = (32, warps_per_block), grid = (gx, gy))
+    k.y
+
+kernel Q51LinearWarpKernel:
+    let [float32]'global  x                # (seq × d_in)
+    let [uint8]'global    w_packed         # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv               # (d_out,)
+    mut [float32]'unified y                # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    let int               warps_per_block
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout, int wpb):
+        x               = xi
+        w_packed        = wi
+        bv              = bi
+        seq             = s
+        d_in            = din
+        d_out           = dout
+        warps_per_block = wpb
+        y               = [0.0 for ..<s * dout]
+
+    def ():
+        let lane = .warp.lane
+        let warp_in_block = .thread.y
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let global_warp = block_idx * warps_per_block + warp_in_block
+        let total = seq * d_out
+        if global_warp < total:
+            let row = global_warp / d_out
+            let col = global_warp % d_out
+            var float32 partial = 0.0
+            let n_units = d_in / 32
+            var int unit = lane
+            while unit < n_units:
+                # one lane per 32-element block: no shuffles, independent loads
+                let bb = (col * n_units + unit) * 24
+                let w_d = f16_bits_to_f32_fast(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
+                let w_m = f16_bits_to_f32_fast(int(w_packed[bb + 2]) | (int(w_packed[bb + 3]) << 8))
+                let qh = int(w_packed[bb + 4]) | (int(w_packed[bb + 5]) << 8) | (int(w_packed[bb + 6]) << 16) | (int(w_packed[bb + 7]) << 24)
+                let xb = row * d_in + unit * 32
+                var float32 dot = 0.0
+                var float32 sx = 0.0
+                for j in 0..<16:
+                    let byte_val = int(w_packed[bb + 8 + j])
+                    let xl = x[xb + j]
+                    let xh = x[xb + 16 + j]
+                    let lo = (byte_val & 0xF) | (((qh >> j) & 1) << 4)
+                    let hi = ((byte_val >> 4) & 0xF) | (((qh >> (j + 16)) & 1) << 4)
+                    dot += xl * (lo as float32) + xh * (hi as float32)
+                    sx += xl + xh
+                partial += w_d * dot + w_m * sx
+                unit += .warp.size
+            var int offset = .warp.size / 2
+            while offset > 0:
+                partial += .warp.shuffle_xor(partial, offset)
+                offset = offset / 2
+            if lane == 0:
+                y[row * d_out + col] = partial + bv[col]
+
+pub req [float32]'kernel'unified q51_linear_warp_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 32 == 0 else throw "q51_linear_warp_gpu: d_in ({d_in}) must be a multiple of 32"
+    let int warps_per_block = 8
+    let int total_warps = seq * d_out
+    let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = Q51LinearWarpKernel(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    kernel:
+        k(block = (32, warps_per_block), grid = (gx, gy))
+    k.y
+
+kernel Q5KLinearWarpKernel:
+    let [float32]'global  x                # (seq × d_in)
+    let [uint8]'global    w_packed         # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv               # (d_out,)
+    mut [float32]'unified y                # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    let int               warps_per_block
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout, int wpb):
+        x               = xi
+        w_packed        = wi
+        bv              = bi
+        seq             = s
+        d_in            = din
+        d_out           = dout
+        warps_per_block = wpb
+        y               = [0.0 for ..<s * dout]
+
+    def ():
+        let lane = .warp.lane
+        let warp_in_block = .thread.y
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let global_warp = block_idx * warps_per_block + warp_in_block
+        let total = seq * d_out
+        if global_warp < total:
+            let row = global_warp / d_out
+            let col = global_warp % d_out
+            var float32 partial = 0.0
+            let n_units = d_in / 32
+            var int unit = lane
+            while unit < n_units:
+                # one lane per 32-element sub-block of a 256-element superblock
+                let blocks_per_row = d_in / 256
+                let sblock = unit / 8
+                let sub = unit % 8
+                let chunk = sub / 2
+                let high_half = sub % 2
+                let bb = (col * blocks_per_row + sblock) * 176
+                let w_d = f16_bits_to_f32_fast(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
+                let w_dmin = f16_bits_to_f32_fast(int(w_packed[bb + 2]) | (int(w_packed[bb + 3]) << 8))
+                let sc_base = bb + 4
+                var int sc = 0
+                var int mn = 0
+                if sub < 4:
+                    sc = int(w_packed[sc_base + sub]) & 63
+                    mn = int(w_packed[sc_base + sub + 4]) & 63
+                else:
+                    sc = (int(w_packed[sc_base + sub + 4]) & 0xF) | ((int(w_packed[sc_base + sub - 4]) >> 6) << 4)
+                    mn = (int(w_packed[sc_base + sub + 4]) >> 4) | ((int(w_packed[sc_base + sub]) >> 6) << 4)
+                let xb = row * d_in + unit * 32
+                var float32 dot = 0.0
+                var float32 sx = 0.0
+                for l in 0..<32:
+                    let q = int(w_packed[bb + 48 + chunk * 32 + l])
+                    let nib = if high_half == 1: (q >> 4) & 0xF else: q & 0xF
+                    let hbit = (int(w_packed[bb + 16 + l]) >> sub) & 1
+                    let xv = x[xb + l]
+                    dot += xv * ((nib + (hbit << 4)) as float32)
+                    sx += xv
+                partial += w_d * (sc as float32) * dot - w_dmin * (mn as float32) * sx
+                unit += .warp.size
+            var int offset = .warp.size / 2
+            while offset > 0:
+                partial += .warp.shuffle_xor(partial, offset)
+                offset = offset / 2
+            if lane == 0:
+                y[row * d_out + col] = partial + bv[col]
+
+pub req [float32]'kernel'unified q5k_linear_warp_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 256 == 0 else throw "q5k_linear_warp_gpu: d_in ({d_in}) must be a multiple of 256"
+    let int warps_per_block = 8
+    let int total_warps = seq * d_out
+    let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = Q5KLinearWarpKernel(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    kernel:
+        k(block = (32, warps_per_block), grid = (gx, gy))
+    k.y
+
+# Prefill for these formats: dequantize the matrix once into a float32 buffer, then run the
+# float32 tiled matmul. Decoding inside the matmul's tile loads re-decodes every weight once per
+# 16-row tile of the prompt (39x for a 613-token prompt).
+
+kernel Q41DequantKernel:
+    let [uint8]'global    w_packed
+    mut [float32]'unified out
+    let int               n
+
+    init([uint8]'global wi, int count):
+        w_packed = wi
+        n        = count
+        out      = [0.0 for ..<count]
+
+    def ():
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let flat_idx = .thread.x + block_idx * .block_dim.x
+        if flat_idx < n:
+            let block_byte = (flat_idx / 32) * 20
+            let off = flat_idx % 32
+            let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
+            let w_m = f16_bits_to_f32_fast(int(w_packed[block_byte + 2]) | (int(w_packed[block_byte + 3]) << 8))
+            let j = if off < 16: off else: off - 16
+            let byte_val = int(w_packed[block_byte + 4 + j])
+            let nib = if off < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
+            let wv = (nib as float32) * w_d + w_m
+            out[flat_idx] = wv
+
+pub req [float32]'kernel'unified q41_dequantize_gpu([uint8]'kernel'global w_packed, int n) throws:
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = Q41DequantKernel(w_packed, n)
+    kernel:
+        k(block = 256, grid = (gx, gy))
+    k.out
+
+kernel Q51DequantKernel:
+    let [uint8]'global    w_packed
+    mut [float32]'unified out
+    let int               n
+
+    init([uint8]'global wi, int count):
+        w_packed = wi
+        n        = count
+        out      = [0.0 for ..<count]
+
+    def ():
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let flat_idx = .thread.x + block_idx * .block_dim.x
+        if flat_idx < n:
+            let block_byte = (flat_idx / 32) * 24
+            let off = flat_idx % 32
+            let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
+            let w_m = f16_bits_to_f32_fast(int(w_packed[block_byte + 2]) | (int(w_packed[block_byte + 3]) << 8))
+            let qh = int(w_packed[block_byte + 4]) | (int(w_packed[block_byte + 5]) << 8) | (int(w_packed[block_byte + 6]) << 16) | (int(w_packed[block_byte + 7]) << 24)
+            let j = if off < 16: off else: off - 16
+            let byte_val = int(w_packed[block_byte + 8 + j])
+            let nib = if off < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
+            let hbit = (qh >> off) & 1
+            let wv = (((nib | (hbit << 4))) as float32) * w_d + w_m
+            out[flat_idx] = wv
+
+pub req [float32]'kernel'unified q51_dequantize_gpu([uint8]'kernel'global w_packed, int n) throws:
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = Q51DequantKernel(w_packed, n)
+    kernel:
+        k(block = 256, grid = (gx, gy))
+    k.out
+
+kernel Q5KDequantKernel:
+    let [uint8]'global    w_packed
+    mut [float32]'unified out
+    let int               n
+
+    init([uint8]'global wi, int count):
+        w_packed = wi
+        n        = count
+        out      = [0.0 for ..<count]
+
+    def ():
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let flat_idx = .thread.x + block_idx * .block_dim.x
+        if flat_idx < n:
+            let block_byte = (flat_idx / 256) * 176
+            let off = flat_idx % 256
+            let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
+            let w_dmin = f16_bits_to_f32_fast(int(w_packed[block_byte + 2]) | (int(w_packed[block_byte + 3]) << 8))
+            let chunk = off / 64
+            let within = off % 64
+            let high_half = if within >= 32: 1 else: 0
+            let l = within % 32
+            let sub = chunk * 2 + high_half
+            let sc_base = block_byte + 4
+            var int sc = 0
+            var int mn = 0
+            if sub < 4:
+                sc = int(w_packed[sc_base + sub]) & 63
+                mn = int(w_packed[sc_base + sub + 4]) & 63
+            else:
+                sc = (int(w_packed[sc_base + sub + 4]) & 0xF) | ((int(w_packed[sc_base + sub - 4]) >> 6) << 4)
+                mn = (int(w_packed[sc_base + sub + 4]) >> 4) | ((int(w_packed[sc_base + sub]) >> 6) << 4)
+            let q = int(w_packed[block_byte + 48 + chunk * 32 + l])
+            let nib = if high_half == 1: (q >> 4) & 0xF else: q & 0xF
+            let hbit = (int(w_packed[block_byte + 16 + l]) >> sub) & 1
+            let wv = w_d * (sc as float32) * ((nib + (hbit << 4)) as float32) - w_dmin * (mn as float32)
+            out[flat_idx] = wv
+
+pub req [float32]'kernel'unified q5k_dequantize_gpu([uint8]'kernel'global w_packed, int n) throws:
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = Q5KDequantKernel(w_packed, n)
+    kernel:
+        k(block = 256, grid = (gx, gy))
+    k.out
+
+kernel F16DequantKernel:
+    let [uint8]'global    w_packed
+    mut [float32]'unified out
+    let int               n
+
+    init([uint8]'global wi, int count):
+        w_packed = wi
+        n        = count
+        out      = [0.0 for ..<count]
+
+    def ():
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let flat_idx = .thread.x + block_idx * .block_dim.x
+        if flat_idx < n:
+            let wv = f16_bits_to_f32_fast(int(w_packed[flat_idx * 2]) | (int(w_packed[flat_idx * 2 + 1]) << 8))
+            out[flat_idx] = wv
+
+pub req [float32]'kernel'unified f16_dequantize_gpu([uint8]'kernel'global w_packed, int n) throws:
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = F16DequantKernel(w_packed, n)
+    kernel:
+        k(block = 256, grid = (gx, gy))
+    k.out
+
+kernel BF16DequantKernel:
+    let [uint8]'global    w_packed
+    mut [float32]'unified out
+    let int               n
+
+    init([uint8]'global wi, int count):
+        w_packed = wi
+        n        = count
+        out      = [0.0 for ..<count]
+
+    def ():
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let flat_idx = .thread.x + block_idx * .block_dim.x
+        if flat_idx < n:
+            let wv = bf16_bits_to_f32(int(w_packed[flat_idx * 2]) | (int(w_packed[flat_idx * 2 + 1]) << 8))
+            out[flat_idx] = wv
+
+pub req [float32]'kernel'unified bf16_dequantize_gpu([uint8]'kernel'global w_packed, int n) throws:
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = BF16DequantKernel(w_packed, n)
+    kernel:
+        k(block = 256, grid = (gx, gy))
+    k.out
+
+kernel Q40DequantKernel:
+    let [uint8]'global    w_packed
+    mut [float32]'unified out
+    let int               n
+
+    init([uint8]'global wi, int count):
+        w_packed = wi
+        n        = count
+        out      = [0.0 for ..<count]
+
+    def ():
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let flat_idx = .thread.x + block_idx * .block_dim.x
+        if flat_idx < n:
+            let block_byte = (flat_idx / 32) * 18
+            let off = flat_idx % 32
+            let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
+            let j = if off < 16: off else: off - 16
+            let byte_val = int(w_packed[block_byte + 2 + j])
+            let nib = if off < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
+            let wv = ((nib - 8) as float32) * w_d
+            out[flat_idx] = wv
+
+pub req [float32]'kernel'unified q40_dequantize_gpu([uint8]'kernel'global w_packed, int n) throws:
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = Q40DequantKernel(w_packed, n)
+    kernel:
+        k(block = 256, grid = (gx, gy))
+    k.out
+
+kernel Q50DequantKernel:
+    let [uint8]'global    w_packed
+    mut [float32]'unified out
+    let int               n
+
+    init([uint8]'global wi, int count):
+        w_packed = wi
+        n        = count
+        out      = [0.0 for ..<count]
+
+    def ():
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let flat_idx = .thread.x + block_idx * .block_dim.x
+        if flat_idx < n:
+            let block_byte = (flat_idx / 32) * 22
+            let off = flat_idx % 32
+            let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
+            let qh = int(w_packed[block_byte + 2]) | (int(w_packed[block_byte + 3]) << 8) | (int(w_packed[block_byte + 4]) << 16) | (int(w_packed[block_byte + 5]) << 24)
+            let j = if off < 16: off else: off - 16
+            let byte_val = int(w_packed[block_byte + 6 + j])
+            let nib = if off < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
+            let hbit = (qh >> off) & 1
+            let wv = (((nib | (hbit << 4)) - 16) as float32) * w_d
+            out[flat_idx] = wv
+
+pub req [float32]'kernel'unified q50_dequantize_gpu([uint8]'kernel'global w_packed, int n) throws:
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = Q50DequantKernel(w_packed, n)
+    kernel:
+        k(block = 256, grid = (gx, gy))
+    k.out
+
+# IQ4_XS and IQ4_NL (codebook formats): same kernel shapes as the Q4_x / Q5_x ones above.
+
+kernel IQ4XSLinearKernel:
+    let [float32]'global  x           # (seq × d_in)
+    let [uint8]'global    w_packed    # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv          # (d_out,)
+    mut [float32]'unified y           # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    mut [float32, width = 16, height = 16]'actor tile_x
+    mut [float32, width = 16, height = 16]'actor tile_w
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout):
+        x        = xi
+        w_packed = wi
+        bv       = bi
+        seq      = s
+        d_in     = din
+        d_out    = dout
+        y        = [0.0 for ..<s * dout]
+
+    def ():
+        let tx = .thread.x
+        let ty = .thread.y
+        let row = .block.y * .block_dim.y + ty
+        let col = .block.x * .block_dim.x + tx
+        var float32 acc = 0.0
+        let num_tiles = (d_in + 15) / 16
+        for t in 0..<num_tiles:
+            let x_col = t * 16 + tx
+            let w_row = t * 16 + ty
+            if row < seq and x_col < d_in:
+                tile_x[width = tx, height = ty] = x[row * d_in + x_col]
+            else:
+                tile_x[width = tx, height = ty] = 0.0
+            if w_row < d_in and col < d_out:
+                let flat_idx = col * d_in + w_row
+                let block_byte = (flat_idx / 256) * 136
+                let off = flat_idx % 256
+                let ib = off / 32
+                let within = off % 32
+                let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
+                let sh = int(w_packed[block_byte + 2]) | (int(w_packed[block_byte + 3]) << 8)
+                let low = (int(w_packed[block_byte + 4 + ib / 2]) >> (4 * (ib % 2))) & 0xF
+                let high = (sh >> (2 * ib)) & 3
+                let dl = w_d * (((low | (high << 4)) - 32) as float32)
+                let q = int(w_packed[block_byte + 8 + ib * 16 + (within % 16)])
+                let nib = if within < 16: q & 0xF else: (q >> 4) & 0xF
+                let wv = dl * (iq4nl_value(nib) as float32)
+                tile_w[width = tx, height = ty] = wv
+            else:
+                tile_w[width = tx, height = ty] = 0.0
+            sync
+            for kk in 0..<16:
+                acc += tile_x[width = kk, height = ty] * tile_w[width = tx, height = kk]
+            sync
+        if row < seq and col < d_out:
+            y[row * d_out + col] = acc + bv[col]
+
+pub req [float32]'kernel'unified iq4xs_linear_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 256 == 0 else throw "iq4xs_linear_gpu: d_in ({d_in}) must be a multiple of 256"
+    let int gx = (d_out + 15) / 16
+    let int gy = (seq + 15) / 16
+    mut k = IQ4XSLinearKernel(x, w_packed, bv, seq, d_in, d_out)
+    kernel:
+        k(block = (16, 16), grid = (gx, gy))
+    k.y
+
+kernel IQ4XSLinearWarpKernel:
+    let [float32]'global  x                # (seq × d_in)
+    let [uint8]'global    w_packed         # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv               # (d_out,)
+    mut [float32]'unified y                # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    let int               warps_per_block
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout, int wpb):
+        x               = xi
+        w_packed        = wi
+        bv              = bi
+        seq             = s
+        d_in            = din
+        d_out           = dout
+        warps_per_block = wpb
+        y               = [0.0 for ..<s * dout]
+
+    def ():
+        let lane = .warp.lane
+        let warp_in_block = .thread.y
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let global_warp = block_idx * warps_per_block + warp_in_block
+        let total = seq * d_out
+        if global_warp < total:
+            let row = global_warp / d_out
+            let col = global_warp % d_out
+            var float32 partial = 0.0
+            let n_units = d_in / 32
+            var int unit = lane
+            while unit < n_units:
+                # one lane per 32-element sub-block of a 256-element superblock
+                let blocks_per_row = d_in / 256
+                let ib = unit % 8
+                let bb = (col * blocks_per_row + unit / 8) * 136
+                let w_d = f16_bits_to_f32_fast(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
+                let sh = int(w_packed[bb + 2]) | (int(w_packed[bb + 3]) << 8)
+                let low = (int(w_packed[bb + 4 + ib / 2]) >> (4 * (ib % 2))) & 0xF
+                let high = (sh >> (2 * ib)) & 3
+                let dl = w_d * (((low | (high << 4)) - 32) as float32)
+                let xb = row * d_in + unit * 32
+                var float32 dot = 0.0
+                for j in 0..<16:
+                    let q = int(w_packed[bb + 8 + ib * 16 + j])
+                    dot += x[xb + j] * (iq4nl_value(q & 0xF) as float32) + x[xb + 16 + j] * (iq4nl_value((q >> 4) & 0xF) as float32)
+                partial += dl * dot
+                unit += .warp.size
+            var int offset = .warp.size / 2
+            while offset > 0:
+                partial += .warp.shuffle_xor(partial, offset)
+                offset = offset / 2
+            if lane == 0:
+                y[row * d_out + col] = partial + bv[col]
+
+pub req [float32]'kernel'unified iq4xs_linear_warp_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 256 == 0 else throw "iq4xs_linear_warp_gpu: d_in ({d_in}) must be a multiple of 256"
+    let int warps_per_block = 8
+    let int total_warps = seq * d_out
+    let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = IQ4XSLinearWarpKernel(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    kernel:
+        k(block = (32, warps_per_block), grid = (gx, gy))
+    k.y
+
+kernel IQ4NLULinearWarpKernel:
+    let [float32]'global  x                # (seq × d_in)
+    let [uint8]'global    w_packed         # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv               # (d_out,)
+    mut [float32]'unified y                # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    let int               warps_per_block
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout, int wpb):
+        x               = xi
+        w_packed        = wi
+        bv              = bi
+        seq             = s
+        d_in            = din
+        d_out           = dout
+        warps_per_block = wpb
+        y               = [0.0 for ..<s * dout]
+
+    def ():
+        let lane = .warp.lane
+        let warp_in_block = .thread.y
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let global_warp = block_idx * warps_per_block + warp_in_block
+        let total = seq * d_out
+        if global_warp < total:
+            let row = global_warp / d_out
+            let col = global_warp % d_out
+            var float32 partial = 0.0
+            let n_units = d_in / 32
+            var int unit = lane
+            while unit < n_units:
+                # one lane per 32-element block (layout of Q4_0, codebook values)
+                let bb = (col * n_units + unit) * 18
+                let w_d = f16_bits_to_f32_fast(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
+                let xb = row * d_in + unit * 32
+                var float32 dot = 0.0
+                for j in 0..<16:
+                    let byte_val = int(w_packed[bb + 2 + j])
+                    dot += x[xb + j] * (iq4nl_value(byte_val & 0xF) as float32) + x[xb + 16 + j] * (iq4nl_value((byte_val >> 4) & 0xF) as float32)
+                partial += w_d * dot
+                unit += .warp.size
+            var int offset = .warp.size / 2
+            while offset > 0:
+                partial += .warp.shuffle_xor(partial, offset)
+                offset = offset / 2
+            if lane == 0:
+                y[row * d_out + col] = partial + bv[col]
+
+pub req [float32]'kernel'unified iq4nlu_linear_warp_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 32 == 0 else throw "iq4nlu_linear_warp_gpu: d_in ({d_in}) must be a multiple of 32"
+    let int warps_per_block = 8
+    let int total_warps = seq * d_out
+    let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = IQ4NLULinearWarpKernel(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    kernel:
+        k(block = (32, warps_per_block), grid = (gx, gy))
+    k.y
+
+kernel IQ4NLUDequantKernel:
+    let [uint8]'global    w_packed
+    mut [float32]'unified out
+    let int               n
+
+    init([uint8]'global wi, int count):
+        w_packed = wi
+        n        = count
+        out      = [0.0 for ..<count]
+
+    def ():
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let flat_idx = .thread.x + block_idx * .block_dim.x
+        if flat_idx < n:
+            let block_byte = (flat_idx / 32) * 18
+            let off = flat_idx % 32
+            let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
+            let j = if off < 16: off else: off - 16
+            let byte_val = int(w_packed[block_byte + 2 + j])
+            let nib = if off < 16: byte_val & 0xF else: (byte_val >> 4) & 0xF
+            let wv = (iq4nl_value(nib) as float32) * w_d
+            out[flat_idx] = wv
+
+pub req [float32]'kernel'unified iq4nlu_dequantize_gpu([uint8]'kernel'global w_packed, int n) throws:
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = IQ4NLUDequantKernel(w_packed, n)
+    kernel:
+        k(block = 256, grid = (gx, gy))
+    k.out
+
+kernel IQ4XSDequantKernel:
+    let [uint8]'global    w_packed
+    mut [float32]'unified out
+    let int               n
+
+    init([uint8]'global wi, int count):
+        w_packed = wi
+        n        = count
+        out      = [0.0 for ..<count]
+
+    def ():
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let flat_idx = .thread.x + block_idx * .block_dim.x
+        if flat_idx < n:
+            let block_byte = (flat_idx / 256) * 136
+            let off = flat_idx % 256
+            let ib = off / 32
+            let within = off % 32
+            let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
+            let sh = int(w_packed[block_byte + 2]) | (int(w_packed[block_byte + 3]) << 8)
+            let low = (int(w_packed[block_byte + 4 + ib / 2]) >> (4 * (ib % 2))) & 0xF
+            let high = (sh >> (2 * ib)) & 3
+            let dl = w_d * (((low | (high << 4)) - 32) as float32)
+            let q = int(w_packed[block_byte + 8 + ib * 16 + (within % 16)])
+            let nib = if within < 16: q & 0xF else: (q >> 4) & 0xF
+            let wv = dl * (iq4nl_value(nib) as float32)
+            out[flat_idx] = wv
+
+pub req [float32]'kernel'unified iq4xs_dequantize_gpu([uint8]'kernel'global w_packed, int n) throws:
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = IQ4XSDequantKernel(w_packed, n)
+    kernel:
+        k(block = 256, grid = (gx, gy))
+    k.out
+
+# `linear_gpu` over a freshly dequantized weight matrix, for prompts of at least this many rows.
+let int DEQUANT_PREFILL_MIN_ROWS = 16
+
+# Q4_0 / Q5_0 single-row kernels in the same lane-per-block shape (the older warp-broadcast kernels
+# above are ~6x slower at decode shapes, see test/bench_decode_formats.br).
+
+kernel Q40LinearWarpKernel:
+    let [float32]'global  x                # (seq × d_in)
+    let [uint8]'global    w_packed         # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv               # (d_out,)
+    mut [float32]'unified y                # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    let int               warps_per_block
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout, int wpb):
+        x               = xi
+        w_packed        = wi
+        bv              = bi
+        seq             = s
+        d_in            = din
+        d_out           = dout
+        warps_per_block = wpb
+        y               = [0.0 for ..<s * dout]
+
+    def ():
+        let lane = .warp.lane
+        let warp_in_block = .thread.y
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let global_warp = block_idx * warps_per_block + warp_in_block
+        let total = seq * d_out
+        if global_warp < total:
+            let row = global_warp / d_out
+            let col = global_warp % d_out
+            var float32 partial = 0.0
+            let n_units = d_in / 32
+            var int unit = lane
+            while unit < n_units:
+                # one lane per 32-element block (see the Q4_1 kernel above)
+                let bb = (col * n_units + unit) * 18
+                let w_d = f16_bits_to_f32_fast(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
+                let xb = row * d_in + unit * 32
+                var float32 dot = 0.0
+                var float32 sx = 0.0
+                for j in 0..<16:
+                    let byte_val = int(w_packed[bb + 2 + j])
+                    let xl = x[xb + j]
+                    let xh = x[xb + 16 + j]
+                    dot += xl * ((byte_val & 0xF) as float32) + xh * (((byte_val >> 4) & 0xF) as float32)
+                    sx += xl + xh
+                partial += w_d * (dot - 8.0 * sx)
+                unit += .warp.size
+            var int offset = .warp.size / 2
+            while offset > 0:
+                partial += .warp.shuffle_xor(partial, offset)
+                offset = offset / 2
+            if lane == 0:
+                y[row * d_out + col] = partial + bv[col]
+
+pub req [float32]'kernel'unified q40_linear_warp_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 32 == 0 else throw "q40_linear_warp_gpu: d_in ({d_in}) must be a multiple of 32"
+    let int warps_per_block = 8
+    let int total_warps = seq * d_out
+    let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = Q40LinearWarpKernel(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    kernel:
+        k(block = (32, warps_per_block), grid = (gx, gy))
+    k.y
+
+kernel Q50LinearWarpKernel:
+    let [float32]'global  x                # (seq × d_in)
+    let [uint8]'global    w_packed         # (d_out × d_in), GGUF's native layout
+    let [float32]'global  bv               # (d_out,)
+    mut [float32]'unified y                # output: seq × d_out
+    let int               seq
+    let int               d_in
+    let int               d_out
+    let int               warps_per_block
+
+    init([float32]'global xi, [uint8]'global wi, [float32]'global bi,
+         int s, int din, int dout, int wpb):
+        x               = xi
+        w_packed        = wi
+        bv              = bi
+        seq             = s
+        d_in            = din
+        d_out           = dout
+        warps_per_block = wpb
+        y               = [0.0 for ..<s * dout]
+
+    def ():
+        let lane = .warp.lane
+        let warp_in_block = .thread.y
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let global_warp = block_idx * warps_per_block + warp_in_block
+        let total = seq * d_out
+        if global_warp < total:
+            let row = global_warp / d_out
+            let col = global_warp % d_out
+            var float32 partial = 0.0
+            let n_units = d_in / 32
+            var int unit = lane
+            while unit < n_units:
+                # one lane per 32-element block (see the Q4_1 kernel above)
+                let bb = (col * n_units + unit) * 22
+                let w_d = f16_bits_to_f32_fast(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
+                let qh = int(w_packed[bb + 2]) | (int(w_packed[bb + 3]) << 8) | (int(w_packed[bb + 4]) << 16) | (int(w_packed[bb + 5]) << 24)
+                let xb = row * d_in + unit * 32
+                var float32 dot = 0.0
+                var float32 sx = 0.0
+                for j in 0..<16:
+                    let byte_val = int(w_packed[bb + 6 + j])
+                    let xl = x[xb + j]
+                    let xh = x[xb + 16 + j]
+                    let lo = (byte_val & 0xF) | (((qh >> j) & 1) << 4)
+                    let hi = ((byte_val >> 4) & 0xF) | (((qh >> (j + 16)) & 1) << 4)
+                    dot += xl * (lo as float32) + xh * (hi as float32)
+                    sx += xl + xh
+                partial += w_d * (dot - 16.0 * sx)
+                unit += .warp.size
+            var int offset = .warp.size / 2
+            while offset > 0:
+                partial += .warp.shuffle_xor(partial, offset)
+                offset = offset / 2
+            if lane == 0:
+                y[row * d_out + col] = partial + bv[col]
+
+pub req [float32]'kernel'unified q50_linear_warp_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    guard d_in % 32 == 0 else throw "q50_linear_warp_gpu: d_in ({d_in}) must be a multiple of 32"
+    let int warps_per_block = 8
+    let int total_warps = seq * d_out
+    let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = Q50LinearWarpKernel(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    kernel:
+        k(block = (32, warps_per_block), grid = (gx, gy))
+    k.y
+
 pub req [float32]'kernel'unified fused_linear_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed, int w_type,
                        [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
     if w_type == 8:
@@ -1774,7 +3110,10 @@ pub req [float32]'kernel'unified fused_linear_gpu([float32]'kernel'global x, [ui
             q8_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 6:
         if seq == 1:
-            q5_linear_warp_broadcast_gpu(x, w_packed, bv, seq, d_in, d_out)
+            q50_linear_warp_gpu(x, w_packed, bv, seq, d_in, d_out)
+        elif seq >= DEQUANT_PREFILL_MIN_ROWS:
+            let [float32]'kernel'unified w_f32 = q50_dequantize_gpu(w_packed, d_out * d_in)
+            linear_gpu(x, w_f32, bv, seq, d_in, d_out)
         else:
             q5_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 12:
@@ -1783,7 +3122,10 @@ pub req [float32]'kernel'unified fused_linear_gpu([float32]'kernel'global x, [ui
         q6k_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 2:
         if seq == 1:
-            q4_linear_warp_broadcast_gpu(x, w_packed, bv, seq, d_in, d_out)
+            q40_linear_warp_gpu(x, w_packed, bv, seq, d_in, d_out)
+        elif seq >= DEQUANT_PREFILL_MIN_ROWS:
+            let [float32]'kernel'unified w_f32 = q40_dequantize_gpu(w_packed, d_out * d_in)
+            linear_gpu(x, w_f32, bv, seq, d_in, d_out)
         else:
             q4_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 10:
@@ -1792,11 +3134,62 @@ pub req [float32]'kernel'unified fused_linear_gpu([float32]'kernel'global x, [ui
         q3k_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif w_type == 20:
         if seq == 1:
-            q4nl_linear_warp_broadcast_gpu(x, w_packed, bv, seq, d_in, d_out)
+            iq4nlu_linear_warp_gpu(x, w_packed, bv, seq, d_in, d_out)
+        elif seq >= DEQUANT_PREFILL_MIN_ROWS:
+            let [float32]'kernel'unified w_f32 = iq4nlu_dequantize_gpu(w_packed, d_out * d_in)
+            linear_gpu(x, w_f32, bv, seq, d_in, d_out)
         else:
             q4nl_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
+    elif w_type == 23:
+        if seq == 1:
+            iq4xs_linear_warp_gpu(x, w_packed, bv, seq, d_in, d_out)
+        elif seq >= DEQUANT_PREFILL_MIN_ROWS:
+            let [float32]'kernel'unified w_f32 = iq4xs_dequantize_gpu(w_packed, d_out * d_in)
+            linear_gpu(x, w_f32, bv, seq, d_in, d_out)
+        else:
+            iq4xs_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
+    elif w_type == 3:
+        if seq == 1:
+            q41_linear_warp_gpu(x, w_packed, bv, seq, d_in, d_out)
+        elif seq >= DEQUANT_PREFILL_MIN_ROWS:
+            let [float32]'kernel'unified w_f32 = q41_dequantize_gpu(w_packed, d_out * d_in)
+            linear_gpu(x, w_f32, bv, seq, d_in, d_out)
+        else:
+            q41_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
+    elif w_type == 7:
+        if seq == 1:
+            q51_linear_warp_gpu(x, w_packed, bv, seq, d_in, d_out)
+        elif seq >= DEQUANT_PREFILL_MIN_ROWS:
+            let [float32]'kernel'unified w_f32 = q51_dequantize_gpu(w_packed, d_out * d_in)
+            linear_gpu(x, w_f32, bv, seq, d_in, d_out)
+        else:
+            q51_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
+    elif w_type == 13:
+        if seq == 1:
+            q5k_linear_warp_gpu(x, w_packed, bv, seq, d_in, d_out)
+        elif seq >= DEQUANT_PREFILL_MIN_ROWS:
+            let [float32]'kernel'unified w_f32 = q5k_dequantize_gpu(w_packed, d_out * d_in)
+            linear_gpu(x, w_f32, bv, seq, d_in, d_out)
+        else:
+            q5k_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
+    elif w_type == 1:
+        if seq == 1:
+            f16_linear_warp_gpu(x, w_packed, bv, seq, d_in, d_out)
+        elif seq >= DEQUANT_PREFILL_MIN_ROWS:
+            let [float32]'kernel'unified w_f32 = f16_dequantize_gpu(w_packed, d_out * d_in)
+            linear_gpu(x, w_f32, bv, seq, d_in, d_out)
+        else:
+            f16_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
+    elif w_type == 30:
+        if seq == 1:
+            bf16_linear_warp_gpu(x, w_packed, bv, seq, d_in, d_out)
+        elif seq >= DEQUANT_PREFILL_MIN_ROWS:
+            let [float32]'kernel'unified w_f32 = bf16_dequantize_gpu(w_packed, d_out * d_in)
+            linear_gpu(x, w_f32, bv, seq, d_in, d_out)
+        else:
+            bf16_linear_gpu(x, w_packed, bv, seq, d_in, d_out)
     else:
-        throw "fused_linear_gpu: unsupported ggml type id {w_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
+        throw "fused_linear_gpu: unsupported ggml type id {w_type} (supported: F16=1, Q4_0=2, Q4_1=3, Q5_0=6, Q5_1=7, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q5_K=13, Q6_K=14, IQ4_NL=20, IQ4_XS=23, BF16=30)"
 
 pub req [float32]'kernel'unified fused_linear_nobias_gpu([float32] x, [uint8] w_packed, int w_type,
                        int seq, int d_in, int d_out) throws:
@@ -1863,10 +3256,16 @@ pub def set_gpu_batch_limit(int limit): native
 pub def set_kquant_prefill_handwritten(bool v):
     kquant_prefill_handwritten = v
 
+# Formats that still take the compiler's `kernel.tensors.linear` schedule at decode shapes. Q4_0 and
+# Q5_0 left this list: the lane-per-block kernels above are ~6x faster than the compiler's schedule
+# for them (test/bench_decode_formats.br).
+bool has_tensor_schedule(int w_type):
+    w_type == 8 or w_type == 10 or w_type == 11 or w_type == 12 or w_type == 14
+
 pub req [float32]'kernel'unified tensor_linear_gpu([float32]'kernel'global x,
                        [uint8]'kernel'global w_packed, int w_type,
                        [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
-    if seq == 1 or w_type == 8 or ((w_type == 12 or w_type == 14) and not kquant_prefill_handwritten):
+    if has_tensor_schedule(w_type) and (seq == 1 or w_type == 8 or ((w_type == 12 or w_type == 14) and not kquant_prefill_handwritten)):
         tensor_linear_schedule_gpu(x, w_packed, w_type, bv, seq, d_in, d_out)
     else:
         fused_linear_gpu(x, w_packed, w_type, bv, seq, d_in, d_out)
@@ -1874,7 +3273,7 @@ pub req [float32]'kernel'unified tensor_linear_gpu([float32]'kernel'global x,
 pub req [float32]'kernel'unified tensor_linear_nobias_gpu([float32]'kernel'global x,
                        [uint8]'kernel'global w_packed, int w_type,
                        int seq, int d_in, int d_out) throws:
-    if seq == 1 or w_type == 8 or ((w_type == 12 or w_type == 14) and not kquant_prefill_handwritten):
+    if has_tensor_schedule(w_type) and (seq == 1 or w_type == 8 or ((w_type == 12 or w_type == 14) and not kquant_prefill_handwritten)):
         tensor_linear_nobias_schedule_gpu(x, w_packed, w_type, seq, d_in, d_out)
     else:
         let [float32] zero_bias = [0.0 for i in 0..<d_out]
@@ -1947,18 +3346,18 @@ pub req [float32]'kernel'unified rms_norm_gpu([float32]'kernel'global x, [float3
 # architecture needs `neox = 1` vs `neox = 0`.
 
 pub req [float32]'kernel'unified rope_apply_gpu([float32]'kernel'global x, int seq, int n_heads,
-                       int d_head, float32 freq_base, int neox) throws:
-    rope_apply_at_gpu(x, seq, n_heads, d_head, freq_base, 0, neox)
+                       int d_head, [float32]'kernel'global rope_freqs, int neox) throws:
+    rope_apply_at_gpu(x, seq, n_heads, d_head, rope_freqs, 0, neox)
 
 pub req [float32]'kernel'unified rope_apply_at_gpu([float32]'kernel'global x, int seq, int n_heads,
-                       int d_head, float32 freq_base, int start_pos, int neox) throws:
-    rope_apply_slice_at_gpu(x, 0, seq, n_heads, d_head, freq_base, start_pos, neox)
+                       int d_head, [float32]'kernel'global rope_freqs, int start_pos, int neox) throws:
+    rope_apply_slice_at_gpu(x, 0, seq, n_heads, d_head, rope_freqs, start_pos, neox)
 
 # Applies RoPE to a compact logical tensor starting at `input_offset` in a
 # larger resident buffer. Decode uses this to consume Q and K directly from a
 # concatenated QKV projection, without first launching a split/copy kernel.
 pub req [float32]'kernel'unified rope_apply_slice_at_gpu([float32]'kernel'global x, int input_offset,
-                       int seq, int n_heads, int d_head, float32 freq_base,
+                       int seq, int n_heads, int d_head, [float32]'kernel'global rope_freqs,
                        int start_pos, int neox) throws:
     let int half_dim = d_head / 2
     let int total = seq * n_heads * half_dim
@@ -1973,11 +3372,9 @@ pub req [float32]'kernel'unified rope_apply_slice_at_gpu([float32]'kernel'global
             let j = rem % half_dim
             let base_idx = p * n_heads * d_head + h * d_head
             let abs_pos = p + start_pos
-            let freq_exp = (2.0 * (j as float32)) / (d_head as float32)
-            let theta = 1.0 / freq_base.powf(freq_exp)
-            let angle = (abs_pos as float32) * theta
-            let cos_a = angle.cos()
-            let sin_a = angle.sin()
+            let angle = (abs_pos as float32) * rope_freqs[j]
+            let cos_a = angle.cos() * rope_freqs[half_dim]
+            let sin_a = angle.sin() * rope_freqs[half_dim]
             var int idx0 = base_idx + j
             var int idx1 = base_idx + j + half_dim
             if neox == 0:
@@ -2086,11 +3483,11 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
         [float32]'kernel'global q_norm_w, [float32]'kernel'global k_norm_w, bool qk_norm,
         [float32]'kernel'global prev_tk, [float32]'kernel'global prev_tv, int tail_len,
         int d_in, int q_dim, int kv_dim, int n_head, int n_kv_head, int d_head,
-        float32 eps, float32 freq_base, int pos, int neox) throws:
+        float32 eps, [float32]'kernel'global rope_freqs, int pos, int neox) throws:
     if fused and not qk_norm:
         let joined = tensor_linear_gpu(x, qkvw, 8, qkvb, 1, d_in, q_dim + 2 * kv_dim)
         prepare_qkv_decode_slice(prev_tk, prev_tv, joined, tail_len * kv_dim,
-            n_head, n_kv_head, d_head, freq_base, pos, neox)
+            n_head, n_kv_head, d_head, rope_freqs, pos, neox)
     else:
         let ([float32]'kernel'unified q0, [float32]'kernel'unified k0, [float32]'kernel'unified v) = project_qkv_decode_gpu(x,
             qw, qt, qb, kw, kt, kb, vw, vt, vb, qkvw, qkvb, fused,
@@ -2100,8 +3497,8 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
         if qk_norm:
             q = rms_norm_gpu(q, q_norm_w, n_head, d_head, eps)
             k = rms_norm_gpu(k, k_norm_w, n_kv_head, d_head, eps)
-        q = rope_apply_at_gpu(q, 1, n_head, d_head, freq_base, pos, neox)
-        k = rope_apply_at_gpu(k, 1, n_kv_head, d_head, freq_base, pos, neox)
+        q = rope_apply_at_gpu(q, 1, n_head, d_head, rope_freqs, pos, neox)
+        k = rope_apply_at_gpu(k, 1, n_kv_head, d_head, rope_freqs, pos, neox)
         let tk = kv_tail_push(prev_tk, k, tail_len * kv_dim, kv_dim)
         let tv = kv_tail_push(prev_tv, v, tail_len * kv_dim, kv_dim)
         (q, tk, tv)
@@ -2133,6 +3530,23 @@ pub req [float32]'kernel'unified swiglu_combine_gpu([float32]'kernel'global gate
             let g = gate[i]
             let silu_g = g / (1.0 + (0.0 - g).exp())
             out[i] = silu_g * up[i]
+        out
+
+# Gated-FFN combine with a selectable activation: `act` 0 = silu (SwiGLU),
+# 1 = gelu, tanh approximation (GeGLU, Gemma). Same shape as swiglu_combine_gpu.
+pub req [float32]'kernel'unified glu_combine_gpu([float32]'kernel'global gate, [float32]'kernel'global up, int act) throws:
+    let int n = gate.length
+    let int blocks = (n + 255) / 256
+    kernel(block = 256, grid = blocks):
+        mut [float32]'unified out = [0.0 for ..<n]
+        let i = .thread.x + .block.x * .block_dim.x
+        if i < n:
+            let g = gate[i]
+            var float32 activated = g / (1.0 + (0.0 - g).exp())
+            if act == 1:
+                let inner = 0.7978845608 * (g + 0.044715 * g * g * g)
+                activated = 0.5 * g * (1.0 + inner.tanh())
+            out[i] = activated * up[i]
         out
 
 # ── Kernel: elementwise add (residual connection) ────────────────────────
@@ -2201,6 +3615,17 @@ pub req [float32]'kernel'unified kv_append_gpu([float32]'kernel'global prev, [fl
                 out[i] = fresh[i - old_n]
         out
 
+# Attention for one layer of a prefill chunk. Plain models take the fused fast
+# paths; Gemma 2/3 (`general`) need the explicit scale, score soft-capping and
+# per-layer sliding window, which only the general path implements.
+pub req [float32]'kernel'unified attention_layer_gpu([float32]'kernel'global q, [float32]'kernel'global k, [float32]'kernel'global v,
+                          int seq_q, int seq_k, int n_head, int n_kv_head, int d_head, int causal_offset,
+                          bool general, float32 scale, float32 softcap, int window) throws:
+    if general:
+        attention_gqa_ext_gpu(q, k, v, seq_q, seq_k, n_head, n_kv_head, d_head, true, causal_offset, scale, softcap, window)
+    else:
+        attention_gqa_gpu(q, k, v, seq_q, seq_k, n_head, n_kv_head, d_head, true, causal_offset)
+
 # ── Kernel: attention scores, ALL HEADS in one dispatch, GQA-aware ───────
 # `q` is (seq_q × n_head*d_head); `k` (pre-transposed by attention_gqa_gpu)
 # is (n_kv_head*d_head × seq_k). grid.z selects the QUERY head `h`; the key
@@ -2223,11 +3648,14 @@ kernel MatMulBTHeadsKernel:
                                         # from-scratch prefill (seq_q == seq_k), or an
                                         # existing KV-cache's length when appending new
                                         # queries to it (seq_q < seq_k)
+    let float32         softcap    # > 0: scores become softcap * tanh(scores / softcap) (Gemma 2)
+    let int             window     # > 0: a query also cannot see keys `window` or more positions back (sliding window)
     mut [float32, width = 16, height = 16]'actor tile_q
     mut [float32, width = 16, height = 16]'actor tile_k
 
     init([float32]'global qi, [float32]'global ki,
-         int sq, int sk, int d_q, int d_kv, int dh, int nh, int grp, float32 sc, int caus, int caus_off):
+         int sq, int sk, int d_q, int d_kv, int dh, int nh, int grp, float32 sc, int caus, int caus_off,
+         float32 cap, int win):
         q      = qi.reshape(col = d_q, row = sq)
         k      = ki.reshape(col = sk, row = d_kv)
         seq_q  = sq
@@ -2238,6 +3666,8 @@ kernel MatMulBTHeadsKernel:
         scale  = sc
         causal = caus
         causal_offset = caus_off
+        softcap = cap
+        window = win
         c      = [0.0 for j = sk, i = sq, h = nh]
 
     def ():
@@ -2266,7 +3696,11 @@ kernel MatMulBTHeadsKernel:
                 s += tile_q[width = kk, height = ty] * tile_k[width = tx, height = kk]
             sync
         s = s * scale
+        if softcap > 0.0:
+            s = softcap * (s / softcap).tanh()
         if causal == 1 and j > i + causal_offset:
+            s = -1.0e9 as float32
+        if causal == 1 and window > 0 and j + window <= i + causal_offset:
             s = -1.0e9 as float32
         if i < seq_q and j < seq_k:
             c[j = j, i = i, h = h] = s
@@ -3126,6 +4560,18 @@ pub req [float32]'kernel'unified attention_gqa_tail_gpu([float32]'kernel'global 
         let full_v = kv_append_gpu(v, tv, main_len * kv_dim, (seq_k - main_len) * kv_dim)
         attention_gqa_three_kernel_gpu(q, full_k, full_v, 1, seq_k, n_head, n_kv_head, d_head, false, 0)
 
+# Single-query attention over a main + tail cache for Gemma 2/3: joins the tail
+# into a full cache, then runs the general path with the layer's scale, score
+# soft-cap and sliding window (the query sits at position seq_k - 1).
+pub req [float32]'kernel'unified attention_tail_ext_gpu([float32]'kernel'global q, [float32]'kernel'global k, [float32]'kernel'global v,
+                          [float32]'kernel'global tk, [float32]'kernel'global tv, int main_len,
+                          int seq_k, int n_head, int n_kv_head, int d_head,
+                          float32 scale, float32 softcap, int window) throws:
+    let kv_dim = n_kv_head * d_head
+    let full_k = kv_append_gpu(k, tk, main_len * kv_dim, (seq_k - main_len) * kv_dim)
+    let full_v = kv_append_gpu(v, tv, main_len * kv_dim, (seq_k - main_len) * kv_dim)
+    attention_gqa_ext_gpu(q, full_k, full_v, 1, seq_k, n_head, n_kv_head, d_head, true, seq_k - 1, scale, softcap, window)
+
 # Appends `fresh` (new_n floats) to a tail buffer holding `old_n` floats; an
 # empty tail (`old_n` = 0) has nothing to bind, so the result is a copy of `fresh`.
 pub req [float32]'kernel'unified kv_tail_push([float32]'kernel'global prev, [float32]'kernel'global fresh,
@@ -3141,7 +4587,7 @@ pub req [float32]'kernel'unified kv_tail_push([float32]'kernel'global prev, [flo
 pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'unified) prepare_qkv_decode_slice(
         [float32]'kernel'global prev_k, [float32]'kernel'global prev_v,
         [float32]'kernel'global qkv, int old_n, int n_head, int n_kv_head,
-        int d_head, float32 freq_base, int pos, int neox) throws:
+        int d_head, [float32]'kernel'global rope_freqs, int pos, int neox) throws:
     let int q_dim = n_head * d_head
     let int kv_dim = n_kv_head * d_head
     let int tail_n = old_n + kv_dim
@@ -3177,10 +4623,9 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
             else:
                 first = head_base + 2 * pair
                 second = first + 1
-            let freq_exp = (2.0 * (pair as float32)) / (d_head as float32)
-            let angle = (pos as float32) / freq_base.powf(freq_exp)
-            let cos_a = angle.cos()
-            let sin_a = angle.sin()
+            let angle = (pos as float32) * rope_freqs[pair]
+            let cos_a = angle.cos() * rope_freqs[half_dim]
+            let sin_a = angle.sin() * rope_freqs[half_dim]
             let x0 = qkv[first]
             let x1 = qkv[second]
             out_q[first] = x0 * cos_a - x1 * sin_a
@@ -3199,10 +4644,9 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
             else:
                 first = head_base + 2 * pair
                 second = first + 1
-            let freq_exp = (2.0 * (pair as float32)) / (d_head as float32)
-            let angle = (pos as float32) / freq_base.powf(freq_exp)
-            let cos_a = angle.cos()
-            let sin_a = angle.sin()
+            let angle = (pos as float32) * rope_freqs[pair]
+            let cos_a = angle.cos() * rope_freqs[half_dim]
+            let sin_a = angle.sin() * rope_freqs[half_dim]
             let x0 = qkv[q_dim + first]
             let x1 = qkv[q_dim + second]
             out_k[old_n + first] = x0 * cos_a - x1 * sin_a
@@ -3216,17 +4660,24 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
 pub req [float32]'kernel'unified attention_gqa_three_kernel_gpu([float32]'kernel'global q, [float32]'kernel'global k, [float32]'kernel'global v,
                           int seq_q, int seq_k, int n_head, int n_kv_head, int d_head,
                           bool causal, int causal_offset) throws:
+    attention_gqa_ext_gpu(q, k, v, seq_q, seq_k, n_head, n_kv_head, d_head, causal, causal_offset,
+                          1.0 / (d_head as float32).sqrt(), 0.0, 0)
+
+# The general attention path (any head size): explicit score `scale`, optional
+# Gemma-2 score soft-capping (`softcap` > 0) and sliding window (`window` > 0).
+pub req [float32]'kernel'unified attention_gqa_ext_gpu([float32]'kernel'global q, [float32]'kernel'global k, [float32]'kernel'global v,
+                          int seq_q, int seq_k, int n_head, int n_kv_head, int d_head,
+                          bool causal, int causal_offset, float32 scale, float32 softcap, int window) throws:
     let int d_q     = n_head * d_head
     let int d_kv    = n_kv_head * d_head
     let int group   = n_head / n_kv_head
-    let float32 scale = 1.0 / (d_head as float32).sqrt()
     let int causal_i = if causal: 1 else: 0
 
     let [float32]'kernel'unified k_t = transpose_gpu(k, seq_k, d_kv)
 
     let int score_gx = (seq_k + 15) / 16
     let int score_gy = (seq_q + 15) / 16
-    mut k_scores = MatMulBTHeadsKernel(q, k_t, seq_q, seq_k, d_q, d_kv, d_head, n_head, group, scale, causal_i, causal_offset)
+    mut k_scores = MatMulBTHeadsKernel(q, k_t, seq_q, seq_k, d_q, d_kv, d_head, n_head, group, scale, causal_i, causal_offset, softcap, window)
     kernel:
         k_scores(block = (16, 16), grid = (score_gx, score_gy, n_head))
 

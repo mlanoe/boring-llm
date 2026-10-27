@@ -1,0 +1,48 @@
+# Architecture and RoPE-scaling tests: tiny synthetic GGUF models (F32, built by
+# tools/make_arch_test_ggufs.py) whose expected logits come from an independent
+# float64 numpy transcription of llama.cpp's graph. Covers Phi-3's fused
+# attn_qkv/ffn_up tensors and per-pair RoPE factors, Gemma's GeGLU, embedding
+# scale and head size != d_model / n_head, Gemma 2/3's post-norms, soft-capping,
+# sliding windows and per-layer RoPE tables, and linear / YaRN RoPE scaling.
+#   boring run test/test_arch.br
+
+use io
+use gguf
+use model
+
+def check_case(string name) throws:
+    check_case_ctx(name, name, 4096)
+
+# `fixture` names the GGUF, `name` the expected-logits file; `n_ctx` is the engine's context size
+# (Phi-3 LongRoPE takes its short or long factors from it).
+def check_case_ctx(string name, string fixture, int n_ctx) throws:
+    set_rope_context_size(n_ctx)
+    let file = parse_gguf(fs.readBytes("test/fixtures/arch-{fixture}.gguf"))
+    let m = load_model(file)
+    let tokens = [3, 1, 4, 1, 5, 9, 2, 6]
+    let logits = forward(m, tokens)
+    let expected = fs.readBytes("test/fixtures/arch-{name}.logits.f32")
+    assert_eq(logits.length, tokens.length * m.config.vocab_size)
+    var float32 worst = 0.0
+    var int i = 0
+    while i < logits.length:
+        let want = read_f32_le(expected, i * 4) as float32
+        let err = (logits[i] - want).abs()
+        if err > worst:
+            worst = err
+        i += 1
+    assert(worst < 0.002 as float32, "{name}: max |logit - reference| = {worst}")
+    print "{name}: OK (max logit error {worst})"
+
+def main() throws:
+    check_case("plain")
+    check_case("yarn")
+    check_case("linear-llama")
+    check_case("phi3")
+    check_case("gemma")
+    check_case("gemma2")
+    check_case("gemma3")
+    # Phi-3 with both factor sets (original context 1024): short up to a 1024 context, long beyond
+    check_case_ctx("phi3-short", "phi3-short", 64)
+    check_case_ctx("phi3-long", "phi3-short", 2048)
+    set_rope_context_size(4096)

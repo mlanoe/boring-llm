@@ -174,6 +174,61 @@ float32 pow2i(int e):
 # are stored as f16, so this hand-rolled decode is required regardless.
 # Handles zero/subnormals, normals, and infinity/NaN (GGUF scales are always
 # finite in practice, but a truncated/corrupt file could produce anything).
+# Same decode as f16_bits_to_f32 with the power of two taken from `powf` instead of a
+# repeated-multiplication loop (cheap enough to run once per weight element in a GPU
+# kernel; `powf(2, n)` is exact for integer n). Used by the Q4_1 / Q5_1 / Q5_K kernels.
+pub float32 f16_bits_to_f32_fast(int bits):
+    let sign = (bits >> 15) & 1
+    let exp = (bits >> 10) & 0x1F
+    let frac = bits & 0x3FF
+
+    var float32 mag = 0.0
+    if exp == 0:
+        mag = (frac as float32) * 5.960464477539063e-08
+    elif exp == 0x1F:
+        mag = if frac == 0: (1.0 / 0.0) else: (0.0 / 0.0)
+    else:
+        mag = (1.0 + (frac as float32) / 1024.0) * (2.0 as float32).powf((exp - 15) as float32)
+
+    if sign == 1:
+        0.0 - mag
+    else:
+        mag
+
+# The 16-entry non-linear codebook of IQ4_NL / IQ4_XS (ggml's kvalues_iq4nl). A function rather than an
+# array so that GPU kernels can call it.
+pub int iq4nl_value(int nib):
+    if nib < 8:
+        if nib < 4:
+            if nib == 0: -127 elif nib == 1: -104 elif nib == 2: -83 else: -65
+        else:
+            if nib == 4: -49 elif nib == 5: -35 elif nib == 6: -22 else: -10
+    else:
+        if nib < 12:
+            if nib == 8: 1 elif nib == 9: 13 elif nib == 10: 25 else: 38
+        else:
+            if nib == 12: 53 elif nib == 13: 69 elif nib == 14: 89 else: 113
+
+# bfloat16 is the top 16 bits of a float32: 1 sign, 8 exponent, 7 fraction bits.
+pub float32 bf16_bits_to_f32(int bits):
+    let sign = (bits >> 15) & 1
+    let exp = (bits >> 7) & 0xFF
+    let frac = bits & 0x7F
+
+    var float32 mag = 0.0
+    if exp == 0:
+        mag = (frac as float32) * pow2i(-126) / 128.0
+    elif exp == 0xFF:
+        mag = if frac == 0: (1.0 / 0.0) else: (0.0 / 0.0)
+    else:
+        let mantissa = 1.0 + (frac as float32) / 128.0
+        mag = mantissa * pow2i(exp - 127)
+
+    if sign == 1:
+        0.0 - mag
+    else:
+        mag
+
 pub float32 f16_bits_to_f32(int bits):
     let sign = (bits >> 15) & 1
     let exp = (bits >> 10) & 0x1F

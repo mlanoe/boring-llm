@@ -28,7 +28,38 @@ def main() throws:
 
     # --- rope_apply: position 0 is always the identity rotation ---
     let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
-    let roped = rope_apply(x, 2, 1, 4, 10000.0 as float32, 1)
+    # --- RoPE scaling tables ---
+    # linear factor 2: position 2 rotates exactly like position 1 unscaled
+    let lin = rope_apply_at(x, 1, 1, 4, rope_freqs_linear(4, 10000.0 as float32, 2.0 as float32), 2, 1)
+    let unscaled_p1 = rope_apply_at(x, 1, 1, 4, rope_freqs_plain(4, 10000.0 as float32), 1, 1)
+    var int li = 0
+    while li < 4:
+        assert_close(lin[li], unscaled_p1[li], "rope linear == half position [{li}]")
+        li += 1
+    # YaRN with factor 1 is the plain table
+    let y1 = rope_freqs_yarn(128, 1000000.0 as float32, 1.0 as float32, 32768.0 as float32, 32.0 as float32, 1.0 as float32, 1.0 as float32)
+    let plain128 = rope_freqs_plain(128, 1000000.0 as float32)
+    var yi = 0
+    while yi < 65:
+        assert_close(y1[yi] * 1000000.0 as float32, plain128[yi] * 1000000.0 as float32, "yarn factor 1 [{yi}]")
+        yi += 1
+    # YaRN factor 4, values cross-checked against a Python transcription of ggml_rope_yarn
+    # (Qwen2.5-style: base 1e6, original context 32768): high frequencies untouched,
+    # low ones divided by 4, linear ramp between dims 23 and 40, cos/sin scaled by 1 + 0.1 ln 4.
+    let y4 = rope_freqs_yarn(128, 1000000.0 as float32, 4.0 as float32, 32768.0 as float32, 32.0 as float32, 1.0 as float32, 1.0 as float32)
+    assert_close(y4[0], 1.0 as float32, "yarn4 j=0")
+    assert_close(y4[10] * 100.0 as float32, 11.547819846894582 as float32, "yarn4 j=10")
+    assert_close(y4[30] * 10000.0 as float32, 10.64360981247002 as float32, "yarn4 j=30 (ramp)")
+    assert_close(y4[40] * 100000.0 as float32, 4.445698525097307 as float32, "yarn4 j=40")
+    assert_close(y4[63] * 10000000.0 as float32, 3.102344401879299 as float32, "yarn4 j=63")
+    assert_close(y4[64], 1.138629436111989 as float32, "yarn4 mscale")
+    # per-pair divisors (Llama 3.1 rope_freqs / Phi-3 factors)
+    let fac = rope_freqs_factors(4, 10000.0 as float32, [1.0, 4.0], 0.5 as float32)
+    assert_close(fac[0], 1.0 as float32, "factors j=0")
+    assert_close(fac[1] * 400.0 as float32, 1.0 as float32, "factors j=1: 0.01 / 4")
+    assert_close(fac[2], 0.5 as float32, "factors mscale")
+
+    let roped = rope_apply(x, 2, 1, 4, rope_freqs_plain(4, 10000.0 as float32), 1)
     assert_close(roped[0], 1.0 as float32, "rope pos0[0]")
     assert_close(roped[1], 2.0 as float32, "rope pos0[1]")
     assert_close(roped[2], 3.0 as float32, "rope pos0[2]")

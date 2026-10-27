@@ -180,8 +180,8 @@ def main() throws:
 
     # --- rope_apply_gpu vs. CPU rope_apply, seq=2, n_heads=1, d_head=4 ---
     let rx = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
-    let cpu_rope = rope_apply(rx, 2, 1, 4, 10000.0 as float32, 1)
-    let gpu_rope_raw = rope_apply_gpu(rx, 2, 1, 4, 10000.0 as float32, 1)
+    let cpu_rope = rope_apply(rx, 2, 1, 4, rope_freqs_plain(4, 10000.0 as float32), 1)
+    let gpu_rope_raw = rope_apply_gpu(rx, 2, 1, 4, rope_freqs_plain(4, 10000.0 as float32), 1)
     let gpu_rope = passthrough(gpu_rope_raw)
     i = 0
     while i < cpu_rope.length:

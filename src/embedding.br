@@ -1,0 +1,150 @@
+# boring-llm — embeddings (pure: pooling, normalization, JSON bodies; no sockets, no GPU)
+#
+# A decoder-only model's embedding is the final-norm hidden state, pooled over the
+# prompt the way llama.cpp's `--pooling` does:
+#   0 none (one vector per token), 1 mean, 2 cls (first token), 3 last token, 4 rank (not supported here).
+# `normalize` follows llama-server's `embd_normalize`: -1 none, 0 max-abs scaled into the
+# int16 range, 1 taxicab (L1), 2 euclidean (L2, the default).
+
+use jinja
+
+
+# `--pooling` names -> ids; -2 for an unknown name.
+pub int pooling_from_name(string name):
+    if name == "none": 0
+    elif name == "mean": 1
+    elif name == "cls": 2
+    elif name == "last": 3
+    elif name == "rank": 4
+    else: -2
+
+pub string pooling_name(int pooling):
+    if pooling == 0: "none"
+    elif pooling == 1: "mean"
+    elif pooling == 2: "cls"
+    elif pooling == 3: "last"
+    elif pooling == 4: "rank"
+    else: "unspecified"
+
+# Pools `hidden` (seq rows of d floats, row-major) into one vector of d floats.
+# `pooling` must be 1, 2 or 3 (none keeps every row: use the rows directly).
+pub [float32] pool_hidden([float32] hidden, int seq, int d, int pooling):
+    mut [float32] out = [0.0 for i in 0..<d]
+    if pooling == 1:
+        var int p = 0
+        while p < seq:
+            var int i = 0
+            while i < d:
+                out[i] = out[i] + hidden[p * d + i]
+                i += 1
+            p += 1
+        var int j = 0
+        while j < d:
+            out[j] = out[j] / (seq as float32)
+            j += 1
+    else:
+        let row = if pooling == 2: 0 else: seq - 1
+        var int i = 0
+        while i < d:
+            out[i] = hidden[row * d + i]
+            i += 1
+    out
+
+# llama.cpp's common_embd_normalize.
+pub [float32] normalize_embedding([float32] v, int mode):
+    if mode < 0:
+        return v
+    var float32 sum = 0.0
+    var float32 amax = 0.0
+    var int i = 0
+    while i < v.length:
+        let a = v[i].abs()
+        if a > amax:
+            amax = a
+        if mode == 1:
+            sum = sum + a
+        else:
+            sum = sum + v[i] * v[i]
+        i += 1
+    var float32 scale = 0.0
+    if mode == 0:
+        scale = if amax > 0.0: (32760.0 / amax) else: (0.0 as float32)
+    elif mode == 1:
+        scale = if sum > 0.0: (1.0 / sum) else: (0.0 as float32)
+    else:
+        let norm = sum.sqrt()
+        scale = if norm > 0.0: (1.0 / norm) else: (0.0 as float32)
+    [v[k] * scale for k in 0..<v.length]
+
+# ── JSON bodies ──────────────────────────────────────────────────────────
+
+pub string floats_json([float32] v):
+    var string out = "["
+    var int i = 0
+    while i < v.length:
+        if i > 0:
+            out = "{out}, "
+        out = "{out}{v[i]}"
+        i += 1
+    "{out}]"
+
+let string BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+pub string base64_encode([uint8] bytes):
+    let chars = BASE64_ALPHABET.chars()
+    var string out = ""
+    var int i = 0
+    while i < bytes.length:
+        let b0 = int(bytes[i])
+        let b1 = if i + 1 < bytes.length: int(bytes[i + 1]) else: 0
+        let b2 = if i + 2 < bytes.length: int(bytes[i + 2]) else: 0
+        let n = (b0 << 16) | (b1 << 8) | b2
+        out = "{out}{chars[(n >> 18) & 63]}{chars[(n >> 12) & 63]}"
+        out = if i + 1 < bytes.length: "{out}{chars[(n >> 6) & 63]}" else: "{out}="
+        out = if i + 2 < bytes.length: "{out}{chars[n & 63]}" else: "{out}="
+        i += 3
+    out
+
+# The vector as little-endian float32 bytes, base64 encoded (OpenAI `encoding_format: "base64"`).
+pub string floats_base64([float32] v):
+    mut [uint8] bytes = []
+    var int i = 0
+    while i < v.length:
+        let bits = floatToBits(v[i])
+        bytes.push((bits % 256) as uint8)
+        bytes.push(((bits / 256) % 256) as uint8)
+        bytes.push(((bits / 65536) % 256) as uint8)
+        bytes.push(((bits / 16777216) % 256) as uint8)
+        i += 1
+    base64_encode(bytes)
+
+# OpenAI /v1/embeddings body. `vectors`: one pooled vector per input; `base64`: encoding_format.
+pub string openai_embeddings_json([[float32]] vectors, string model, int prompt_tokens, bool base64):
+    var string data = ""
+    var int i = 0
+    while i < vectors.length:
+        if i > 0:
+            data = "{data}, "
+        let body = if base64: "\"{floats_base64(vectors[i])}\"" else: floats_json(vectors[i])
+        data = "{data}{{\"object\": \"embedding\", \"embedding\": {body}, \"index\": {i}}}"
+        i += 1
+    "{{\"object\": \"list\", \"data\": [{data}], \"model\": \"{json_escape(model)}\", \"usage\": {{\"prompt_tokens\": {prompt_tokens}, \"total_tokens\": {prompt_tokens}}}}}"
+
+# llama-server native /embedding body: a list of {index, embedding: [[...]]}; with pooling `none`
+# the inner list holds one vector per token, otherwise a single pooled vector.
+pub string native_embeddings_json([[[float32]]] rows_per_input):
+    var out = ""
+    var int i = 0
+    while i < rows_per_input.length:
+        if i > 0:
+            out = "{out}, "
+        var string rows = ""
+        var int r = 0
+        while r < rows_per_input[i].length:
+            if r > 0:
+                rows = "{rows}, "
+            rows = "{rows}{floats_json(rows_per_input[i][r])}"
+            r += 1
+        out = "{out}{{\"index\": {i}, \"embedding\": [{rows}]}}"
+        i += 1
+    "[{out}]"

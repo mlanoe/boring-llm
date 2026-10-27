@@ -14,6 +14,7 @@ use math_gpu
 use model
 use tokenizer
 use sampling
+use embedding
 use server
 use json
 use openai
@@ -227,7 +228,7 @@ def run_generate(GgufFile file, string system_msg, string user_msg, int max_new_
         # displayed reply text — it's a real generated token (kept in
         # `all_tokens`/counted below), just not part of the human-readable
         # message.
-        if all_tokens[i] != tok.eos_token_id:
+        if not is_eog_token(all_tokens[i], tok.eos_token_id):
             new_tokens.push(all_tokens[i])
         i += 1
 
@@ -331,7 +332,7 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
                 mut [int] reply_tokens = []
                 var int i = reply_start
                 while i < all_tokens.length:
-                    if all_tokens[i] != tok.eos_token_id:
+                    if not is_eog_token(all_tokens[i], tok.eos_token_id):
                         reply_tokens.push(all_tokens[i])
                     i += 1
                 let reply = tok.decode(reply_tokens)
@@ -355,7 +356,7 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
                 mut [int] new_tokens = []
                 var int i = prompt_tokens.length
                 while i < all_tokens.length:
-                    if all_tokens[i] != tok.eos_token_id:
+                    if not is_eog_token(all_tokens[i], tok.eos_token_id):
                         new_tokens.push(all_tokens[i])
                     i += 1
                 let reply = tok.decode(new_tokens)
@@ -383,7 +384,7 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
             mut [int] new_tokens = []
             var int i = prompt_tokens.length
             while i < all_tokens.length:
-                if all_tokens[i] != tok.eos_token_id:
+                if not is_eog_token(all_tokens[i], tok.eos_token_id):
                     new_tokens.push(all_tokens[i])
                 i += 1
             let reply = tok.decode(new_tokens)
@@ -415,7 +416,7 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
     let tok = load_tokenizer(file)
     (file, m, tok)
 
-def run_serve(string path, string model_name, [string] model_tags, string chat_template_override, int ctx_size, int max_tokens, int cache_slots, string prompt_cache_dir, string slot_save_dir, int prompt_cache_files, int prompt_cache_max_mb, string host, int port, [string] api_keys, string api_prefix, string cors_origins, string cors_methods, string cors_headers, bool cors_credentials, bool metrics_enabled, bool slots_enabled, bool cache_prompt_default, bool context_shift, int sse_ping_interval_default, string reasoning_format_default, string reasoning_effort_default, JValue chat_template_kwargs_default, int gpu_layers, ServerSamplingDefaults extra_defaults, SamplingParams params) throws:
+def run_serve(string path, string model_name, [string] model_tags, string chat_template_override, int ctx_size, int max_tokens, int cache_slots, string prompt_cache_dir, string slot_save_dir, int prompt_cache_files, int prompt_cache_max_mb, string host, int port, [string] api_keys, string api_prefix, string cors_origins, string cors_methods, string cors_headers, bool cors_credentials, bool metrics_enabled, bool slots_enabled, bool cache_prompt_default, bool context_shift, int sse_ping_interval_default, string reasoning_format_default, string reasoning_effort_default, JValue chat_template_kwargs_default, int gpu_layers, ServerSamplingDefaults extra_defaults, SamplingParams params, bool embeddings_enabled, string pooling_name_arg) throws:
     guard host != "" else throw "--host must not be empty"
     guard port >= 1 and port <= 65535 else throw "--port must be between 1 and 65535"
     guard ctx_size >= 2 else throw "--ctx-size must be at least 2"
@@ -448,7 +449,19 @@ def run_serve(string path, string model_name, [string] model_tags, string chat_t
     if slot_save_dir != "":
         ensure_dir(slot_save_dir)
         print "[serve] named slot snapshots: {slot_save_dir}"
-    let ctx = ServerCtx(file, tok, m, path, name, aliases, model_tags, ctx_size, max_tokens, cache_slots, params, extra_defaults, prompt_cache_dir, fp, prompt_cache_files, prompt_cache_max_mb * 1048576, bpt, metrics_enabled, slot_save_dir, api_keys, api_prefix, slots_enabled, cache_prompt_default, context_shift, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, cors_origins, cors_methods, cors_headers, cors_credentials)
+    # Embeddings (--embeddings): the pooling comes from --pooling, else from the GGUF's `{arch}.pooling_type`,
+    # else none (one vector per token on the native route).
+    let arch_name = gguf_get_string(file.metadata, "general.architecture") else ""
+    var int pooling = 0
+    if pooling_name_arg != "":
+        pooling = pooling_from_name(pooling_name_arg)
+        guard pooling >= 0 else throw "--pooling must be none, mean, cls, last or rank, got '{pooling_name_arg}'"
+    else:
+        pooling = gguf_get_int(file.metadata, "{arch_name}.pooling_type") else 0
+    guard pooling <= 3 else throw "pooling type {pooling_name(pooling)} (reranking) is not supported; boring-llm does not load ranking models"
+    if embeddings_enabled:
+        print "[serve] embeddings enabled (pooling: {pooling_name(pooling)}, default normalization: euclidean)"
+    let ctx = ServerCtx(file, tok, m, path, name, aliases, model_tags, ctx_size, max_tokens, cache_slots, params, extra_defaults, prompt_cache_dir, fp, prompt_cache_files, prompt_cache_max_mb * 1048576, bpt, metrics_enabled, slot_save_dir, api_keys, api_prefix, slots_enabled, cache_prompt_default, context_shift, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, cors_origins, cors_methods, cors_headers, cors_credentials, embeddings_enabled, pooling)
     serve(ctx, host, port, disk)
 
 def run_render_request(GgufFile file, string path) throws:
@@ -634,7 +647,9 @@ def main() throws:
     let jinja_env = environment_default(argv, ["--jinja", "--no-jinja"], "LLAMA_ARG_JINJA", "true")
     guard parse_bool_arg("LLAMA_ARG_JINJA", jinja_env) else throw "LLAMA_ARG_JINJA cannot disable the chat-template engine"
     let embeddings_env = environment_default(argv, ["--embedding", "--embeddings"], "LLAMA_ARG_EMBEDDINGS", "false")
-    guard !parse_bool_arg("LLAMA_ARG_EMBEDDINGS", embeddings_env) else throw "LLAMA_ARG_EMBEDDINGS is not supported; boring-llm serves causal text generation only"
+    var bool embeddings_enabled = parse_bool_arg("LLAMA_ARG_EMBEDDINGS", embeddings_env)
+    let pooling_env = environment_default(argv, ["--pooling"], "LLAMA_ARG_POOLING", "")
+    var string pooling_name_arg = pooling_env
     let reranking_env = environment_default(argv, ["--rerank", "--reranking"], "LLAMA_ARG_RERANKING", "false")
     guard !parse_bool_arg("LLAMA_ARG_RERANKING", reranking_env) else throw "LLAMA_ARG_RERANKING is not supported; boring-llm does not load ranking models"
     let cont_batching_env = environment_default(argv, ["--cont-batching", "-cb", "--no-cont-batching", "-nocb"], "LLAMA_ARG_CONT_BATCHING", "false")
@@ -922,7 +937,11 @@ def main() throws:
         elif (a == "--mmproj" or a == "-mm" or a == "--mmproj-url" or a == "-mmu") and i + 1 < argv.length:
             throw "{a} is not supported because boring-llm is text-only"
         elif a == "--embedding" or a == "--embeddings":
-            throw "{a} is not supported; boring-llm currently serves causal text generation only"
+            embeddings_enabled = true
+            i += 1
+        elif a == "--pooling" and i + 1 < argv.length:
+            pooling_name_arg = argv[i + 1]
+            i += 2
         elif a == "--rerank" or a == "--reranking":
             throw "{a} is not supported; boring-llm does not load ranking models"
         elif a == "--serve":
@@ -1108,8 +1127,10 @@ def main() throws:
     if reasoning_preserve_default == "on" or reasoning_preserve_default == "off":
         chat_template_kwargs_default = jv_set(chat_template_kwargs_default, "preserve_reasoning", JValue.JBool(reasoning_preserve_default == "on"))
 
+    guard not embeddings_enabled or serve_mode else throw "--embeddings requires --serve"
     set_decode_profile_stage(requested_profile_stage)
     set_kv_cache_type(cache_type_k)
+    set_rope_context_size(ctx_size)
     set_prefill_chunk_len(effective_prefill_chunk(batch_size, ubatch_size))
 
     if serve_mode:
@@ -1118,7 +1139,7 @@ def main() throws:
         # kept resident for every request. Handled before the generic parse
         # below (which would also be fine now: no mode holds the file in memory).
         let extra_defaults = ServerSamplingDefaults(presence_penalty, frequency_penalty, mirostat, mirostat_tau, mirostat_eta, adaptive_target, adaptive_decay, samplers, ignore_eos)
-        run_serve(gguf_path, model_name, model_tags, chat_template_override, ctx_size, max_tokens, cache_slots, prompt_cache_dir, slot_save_dir, prompt_cache_files, prompt_cache_max_mb, host, port, api_keys, api_prefix, cors_origins, cors_methods, cors_headers, cors_credentials, metrics_enabled, slots_enabled, cache_prompt_default, context_shift, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, gpu_layers, extra_defaults, SamplingParams(temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, []))
+        run_serve(gguf_path, model_name, model_tags, chat_template_override, ctx_size, max_tokens, cache_slots, prompt_cache_dir, slot_save_dir, prompt_cache_files, prompt_cache_max_mb, host, port, api_keys, api_prefix, cors_origins, cors_methods, cors_headers, cors_credentials, metrics_enabled, slots_enabled, cache_prompt_default, context_shift, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, gpu_layers, extra_defaults, SamplingParams(temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, []), embeddings_enabled, pooling_name_arg)
         return
 
     print "[diag] parsing {gguf_path}..."

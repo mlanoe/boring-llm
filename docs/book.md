@@ -195,11 +195,12 @@ For `--serve`, the sampling flags set server defaults. Alongside `temperature`, 
 | `--no-mmap` | current behavior | accepted because the loader reads only the GGUF header and one tensor range at a time; `--mlock` is rejected because weights move to GPU memory instead of remaining resident in host RAM |
 | `-ctk`, `--cache-type-k TYPE`; `-ctv`, `--cache-type-v TYPE` | `f32` | select `f32` or a half-sized `f16` main KV cache; K and V must match, and f16 currently supports attention head widths 64 and 128 |
 | `--no-webui`, `--no-ui` | current behavior | accepted because boring-llm is API-only; `--webui`/`--ui` is rejected |
+| `--embeddings`, `--embedding`; `--pooling none\|mean\|cls\|last`; `LLAMA_ARG_EMBEDDINGS`, `LLAMA_ARG_POOLING` | off; the GGUF's `{arch}.pooling_type`, else none | serve the embeddings routes (chapter 4) from a decoder model's pooled final-norm hidden state; requires `--serve`; `rank` is rejected |
 | `--no-mmproj`, `--no-mmproj-auto` | current behavior | accepted because boring-llm is text-only; `--mmproj`, `--mmproj-url`, embeddings and reranking modes are rejected before model loading |
 | `LLAMA_ARG_MODEL`, `LLAMA_ARG_ALIAS`, `LLAMA_ARG_TAGS`, `LLAMA_ARG_HOST`, `LLAMA_ARG_PORT`, `LLAMA_ARG_CTX_SIZE`, `LLAMA_ARG_N_PREDICT`, `LLAMA_API_KEY` | unset | core llama-server environment defaults; an explicit command-line option takes precedence |
 | `LLAMA_ARG_CORS_ORIGINS`, `LLAMA_ARG_CORS_METHODS`, `LLAMA_ARG_CORS_HEADERS`, `LLAMA_ARG_ENDPOINT_METRICS`, `LLAMA_ARG_ENDPOINT_SLOTS`, `LLAMA_ARG_CACHE_PROMPT`, `LLAMA_ARG_SSE_PING_INTERVAL` | matching CLI defaults | server environment defaults, including llama.cpp boolean spellings (`1`/`0`, `true`/`false`, `on`/`off`, `enabled`/`disabled`) |
 | `LLAMA_ARG_API_KEY_FILE`, `LLAMA_ARG_SLOT_SAVE_PATH`, `LLAMA_ARG_CHAT_TEMPLATE_KWARGS`, `LLAMA_ARG_REASONING_FORMAT`, `LLAMA_ARG_N_PARALLEL`, `LLAMA_ARG_THREADS`, `LLAMA_ARG_THREADS_BATCH`, `LLAMA_ARG_THREADS_HTTP` | matching CLI defaults | additional llama-server settings; CPU thread counts are accepted but inert, while parallel and HTTP worker counts currently accept only `1` |
-| `LLAMA_ARG_UI`, `LLAMA_ARG_JINJA`, `LLAMA_ARG_EMBEDDINGS`, `LLAMA_ARG_RERANKING` | API-only Jinja text generation | accepted when matching the current mode; requests to enable unsupported modes are rejected explicitly |
+| `LLAMA_ARG_UI`, `LLAMA_ARG_JINJA`, `LLAMA_ARG_RERANKING` | API-only Jinja text generation | accepted when matching the current mode; requests to enable unsupported modes are rejected explicitly |
 | `LLAMA_ARG_TEMPERATURE`, `LLAMA_ARG_TOP_K`, `LLAMA_ARG_TOP_P`, `LLAMA_ARG_MIN_P`, `LLAMA_ARG_REPEAT_PENALTY`, `LLAMA_ARG_PRESENCE_PENALTY`, `LLAMA_ARG_FREQUENCY_PENALTY` | matching sampling defaults | official llama.cpp environment names for supported generation defaults |
 | `LLAMA_ARG_CONTEXT_SHIFT` | disabled | environment equivalent of `--context-shift` |
 | `LLAMA_ARG_CONT_BATCHING`, `LLAMA_ARG_MMPROJ`, `LLAMA_ARG_MMPROJ_URL`, `LLAMA_ARG_MMPROJ_AUTO` | disabled | serialized text-only settings are accepted; unsupported activation is rejected explicitly |
@@ -269,7 +270,8 @@ The server listens on `127.0.0.1` only and has no authentication. To reach it fr
 | `POST /lora-adapters` | recognized and returns 501 because runtime LoRA loading is not supported |
 | `GET /tools`, `POST /tools` | return llama-server's 403 `feature_disabled`; server-executed tools are disabled and are distinct from OpenAI request tool calling |
 | `GET /cors-proxy`, `POST /cors-proxy` | return llama-server's 403 `feature_disabled`; the Web UI's experimental MCP proxy is not exposed |
-| `POST /embedding`, `/embeddings`, `/v1/embeddings` | recognized and return 501; the loaded causal text model does not expose a pooled embedding output |
+| `POST /v1/embeddings` | with `--embeddings`: OpenAI embeddings. `input` is a string, an array of strings, an array of token ids or an array of token-id arrays; `encoding_format` `float` (default) or `base64`; `usage` counts prompt tokens. The vector is the final-norm hidden state pooled with `--pooling` (`mean`, `cls`, `last`; the GGUF's `{arch}.pooling_type` by default) and L2-normalized; pooling `none` is refused, as in llama-server. Without `--embeddings`: 501 |
+| `POST /embedding`, `/embeddings` | with `--embeddings`: llama-server's native form, `content` (or `input`) as above, `embd_normalize` (`-1` none, `0` max-abs to int16, `1` L1, `2` L2 default), answer `[{"index", "embedding": [[...]]}]` (one vector per token when pooling is `none`) |
 | `POST /rerank`, `/reranking`, `/v1/rerank`, `/v1/reranking` | recognized and return 501; dedicated ranking models are not supported |
 | `POST /audio/transcriptions`, `/v1/audio/transcriptions` | recognized and return 501; boring-llm does not load audio-capable models |
 | `POST /tts`, `/infill`, `/v1/systemone` | recognized and return 501; text-to-speech, infill and decision-model execution are not supported |
@@ -310,7 +312,7 @@ Any other route returns `404` with an OpenAI-shaped error body.
 | `tool_choice` | `"none"` leaves tools out; `"auto"` exposes all tools; `"required"` grammar-enforces a valid `{name, arguments}` call; a named function becomes the only exposed tool and grammar-enforces an arguments object matching its schema |
 | `parallel_tool_calls` | boolean exposed to the chat template like llama-server, allowing templates which support it to enable or suppress multiple calls |
 | `stop` | a string or an array of strings; the reply is cut at the earliest match, reported as `stopping_word` by the native API |
-| `ignore_eos` | llama-server extension; suppress the EOS token and continue until another stop condition or the token/context limit |
+| `ignore_eos` | llama-server extension; suppress every end-of-generation token (the EOS and the model's end-of-turn tokens, e.g. Gemma's `<end_of_turn>`) and continue until another stop condition or the token/context limit |
 | `id_slot` | Native `/completion` extension; `-1` automatically chooses a cache slot, while a non-negative id pins both cache reuse and the resulting sequence to that slot. The actual slot id is returned in buffered responses and the terminal SSE event. |
 | `cache_prompt` | llama-server extension, enabled by default. Set it to `false` to evaluate the complete prompt without reusing an in-memory or persistent cached prefix. This and the other native response controls are reflected in effective `generation_settings`. |
 | `n_keep`, `n_discard`, `n_cache_reuse` | Native context-shift controls. With server context shifting enabled, `n_keep` retains the prompt prefix (`-1` means the complete initial prompt) and positive `n_discard` selects how many middle tokens to drop; zero discards roughly half of the movable context. `n_cache_reuse` currently accepts only `0`. |
@@ -483,15 +485,23 @@ Weights stay in their quantized form on the GPU and are decoded inside the matri
 | Q3_K | 256 values | 110 | |
 | Q4_K | 256 values | 144 | the bulk of `Q4_K_M` files |
 | Q6_K | 256 values | 210 | `Q4_K_M` files keep some tensors in Q6_K |
-| IQ4_NL | 32 values | 18 | |
+| IQ4_NL | 32 values | 18 | codebook values; lane-per-block kernels like Q4_0 |
+| IQ4_XS | 256 values | 136 | 6-bit sub-block scales over the IQ4_NL codebook; hand-written kernels only |
+| Q4_1 | 32 values | 20 | scale and minimum; hand-written kernels only |
+| Q5_1 | 32 values | 24 | scale, minimum and a high-bit word; hand-written kernels only |
+| Q5_K | 256 values | 176 | the bulk of `Q5_K_M` files; hand-written kernels only |
+| F16, BF16 | 1 value | 2 | unquantized matrix weights; hand-written kernels only (F32 matrices are decoded on the CPU path only) |
 
-Files produced by llama.cpp mix formats per tensor (`*-Q4_K_M.gguf` holds Q4_K and Q6_K tensors, F32 norms and biases); each tensor is dispatched on its own type. The K-quant formats need the row length (`k`) to be a multiple of 256.
+Q4_1, Q5_1, Q5_K, F16 and BF16 run on tiled and single-row (one warp per output) kernels written for this project; they have no native tensor schedule yet, so they are slower than Q8_0, Q4_K and Q6_K: a Qwen2.5-0.5B Q5_K_M file (mostly Q5_1) decodes ~2x slower than Q8_0 and prefills ~2x slower. Decode uses one warp per output with each lane owning whole blocks (Q4_0 and Q5_0 moved to the same kernels: ~6x faster than the compiler's schedule for them; `test/bench_decode_formats.br` compares formats on resident matvecs), prompts of 16 rows or more dequantize the matrix once and run the float32 tiled matmul. Files produced by llama.cpp mix formats per tensor (`*-Q4_K_M.gguf` holds Q4_K and Q6_K tensors, F32 norms and biases); each tensor is dispatched on its own type. The K-quant formats need the row length (`k`) to be a multiple of 256.
 
 ### 6.2 Architectures
 
 Every hyperparameter is read from the GGUF's own `{arch}.*` metadata keys, never hard-coded to one model. The head size is `{arch}.attention.key_length` when the file gives one (Qwen3 4B: 128, although 2560 / 32 heads would say 80) and `d_model / n_head` otherwise. Two things GGUF does not carry are hard-coded per architecture, mirroring llama.cpp's own table:
 
-- **RoPE rotation convention**: `qwen2` and `qwen3` use the NEOX "rotate-half" pairing, `llama` (which also covers Mistral) the interleaved one. Any other architecture string is rejected with an error naming the llama.cpp function to check.
+- **RoPE rotation convention**: `qwen2`, `qwen3`, `phi3` and `gemma` use the NEOX "rotate-half" pairing, `llama` (which also covers Mistral) the interleaved one. Any other architecture string is rejected with an error naming the llama.cpp function to check.
+- **RoPE scaling**: every variant is a per-pair table of angular frequencies (plus a cos/sin magnitude, `config.rope_freqs`), so the CPU and GPU rotation code never branches on the variant. Built from the GGUF: a `rope_freqs.weight` tensor (Llama 3.1+) or Phi-3's `rope_factors_short.weight` divide the plain frequencies; `{arch}.rope.scaling.type` = `linear` divides all of them by `factor`; `yarn` follows ggml's `rope_yarn` (`factor`, `original_context_length`, `yarn_beta_fast`/`slow`, `attn_factor`). Phi-3's `rope_factors_short.weight` / `rope_factors_long.weight` are chosen like llama.cpp does: long once `--ctx-size` (rounded up to a multiple of 256) exceeds `original_context_length`, short otherwise.
+- **Phi-3**: `attn_qkv.weight` (rows Q, K, V) and `ffn_up.weight` (rows gate, up) are split by row range at load; no other change.
+- **Gemma (v1)**: the gated FFN uses tanh-GELU instead of SiLU and token embeddings are multiplied by sqrt(d_model) (the output head, tied to the embeddings, is not). Its converter already stores RMSNorm weights as w + 1. - **Gemma 2 / 3**: RMS norms on the attention and FFN outputs before each residual add (`post_attention_norm`, `post_ffw_norm`); score scale 1/sqrt(head size) (1/sqrt(d_model / n_head) for the 46-layer Gemma 2 and 62-layer Gemma 3); Gemma 2 soft-caps attention scores and final logits (`cap * tanh(x / cap)`); sliding-window layers (`{arch}.attention.sliding_window`; every other layer for Gemma 2, five of six for Gemma 3) mask keys a window or more behind, and Gemma 3's use their own unscaled RoPE base (`rope.freq_base_swa`, default 10000) while the global layers use the scaled one. These models take the general attention kernels (explicit scale, soft-cap and window; any head size), not the fused 64/128 ones, and the float16 KV cache is rejected. The window is a mask over the full cache: no memory is saved.
 - **Attention biases**: Qwen2 has Q, K and V biases, Llama and Qwen3 do not; a missing bias tensor becomes an all-zero vector.
 - **Query and key norms** (`qwen3`): an RMS norm over each head's query and key vectors, with its own `attn_q_norm` and `attn_k_norm` weights of one head's size, applied after the projection and before RoPE. It is switched on when the file has those tensors.
 

@@ -1,0 +1,63 @@
+# Resident single-row (decode) matvec benchmark for the weight formats, in the
+# style of bench_linear_warp's `q8resident` mode: inputs uploaded once, N launches
+# queued eight per command buffer, only the last output read back. Time one run
+# with the shell's `time`; subtract the empty-run overhead (`n_iter` 1).
+#
+#   boring build --target metal test/bench_decode_formats.br
+#   cd test/bench_decode_formats_metal && cargo build --release
+#   time ./target/release/bench_decode_formats <q8|q4_0|q5_0|q5_1|q4_1|q5_k|f16> <gate|down|q> [iters]
+#     gate: 896 -> 4864, down: 4864 -> 896, q: 896 -> 896 (Qwen2.5-0.5B shapes; q5_k, which needs d_in % 256, uses 1024 / 5120)
+
+use math_gpu
+
+def main() throws:
+    let [string] argv = args()
+    guard argv.length > 2 else throw "usage: bench_decode_formats <q8|q4_0|q5_0|q5_1|q4_1|q5_k|f16> <gate|down|q> [iters]"
+    let fmt = argv[1]
+    let shape = argv[2]
+    var int iters = 2000
+    if argv.length > 3:
+        if let v = (argv[3] as int):
+            iters = v
+    let wide = fmt == "q5_k"
+    let d_model = if wide: 1024 else: 896
+    let d_ffn = if wide: 5120 else: 4864
+    let d_in = if shape == "down": d_ffn else: d_model
+    let d_out = if shape == "gate": d_ffn else: d_model
+
+    # (type id, bytes per block, elements per block)
+    let ty = if fmt == "q8": 8 elif fmt == "q4_0": 2 elif fmt == "q5_0": 6 elif fmt == "q5_1": 7 elif fmt == "q4_1": 3 elif fmt == "q5_k": 13 else: 1
+    let blk_bytes = if fmt == "q8": 34 elif fmt == "q4_0": 18 elif fmt == "q5_0": 22 elif fmt == "q5_1": 24 elif fmt == "q4_1": 20 elif fmt == "q5_k": 176 else: 2
+    let blk_elems = if fmt == "q5_k": 256 elif fmt == "f16": 1 else: 32
+    guard d_in % blk_elems == 0 else throw "{fmt}: d_in {d_in} is not a multiple of {blk_elems}"
+    let n_blocks = (d_out * d_in) / blk_elems
+
+    mut [uint8] w = []
+    var b = 0
+    while b < n_blocks:
+        var j = 0
+        while j < blk_bytes:
+            # small positive f16 scales (0x2C00 ~ 0.0625) in the first four bytes, varied payload after
+            let v = if j == 1 or j == 3: 0x2C else: ((j * 7 + b) % 251)
+            w.push(v as uint8)
+            j += 1
+        b += 1
+    mut [float32] x = [0.0 for i in 0..<d_in]
+    var i = 0
+    while i < d_in:
+        x[i] = ((i % 13) as float32) * (0.01 as float32)
+        i += 1
+    let bv = [0.0 for i in 0..<d_out]
+
+    let x_gpu = upload_floats_gpu(x)
+    let w_gpu = upload_bytes_gpu(w)
+    let bv_gpu = upload_floats_gpu(bv)
+    set_gpu_batch_limit(8)
+    var out = tensor_linear_gpu(x_gpu, w_gpu, ty, bv_gpu, 1, d_in, d_out)
+    var n = 0
+    while n < iters:
+        out = tensor_linear_gpu(x_gpu, w_gpu, ty, bv_gpu, 1, d_in, d_out)
+        n += 1
+    set_gpu_batch_limit(1)
+    let sink = passthrough(out)
+    print "{fmt} {shape} d_in={d_in} d_out={d_out}: {iters + 1} launches done"

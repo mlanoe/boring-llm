@@ -1,0 +1,32 @@
+# CPU dequantization of Q4_1, Q5_1, Q5_K, F16 and BF16 against the values the
+# Python `gguf` package produces from the same raw bytes
+# (tools/make_quant_test_fixtures.py).   boring run test/test_quant_formats.br
+
+use io
+use quant
+
+def check(string name, int ggml_type, int n) throws:
+    let raw = fs.readBytes("test/fixtures/quant-{name}.bin")
+    let expected = fs.readBytes("test/fixtures/quant-{name}.f32")
+    assert_eq(raw.length, quantized_row_bytes(ggml_type, n))
+    let got = dequantize_row(ggml_type, raw, 0, n)
+    assert_eq(got.length, n)
+    var float32 worst = 0.0
+    var int i = 0
+    while i < n:
+        let want = read_f32_le(expected, i * 4) as float32
+        let err = (got[i] - want).abs()
+        if err > worst:
+            worst = err
+        i += 1
+    assert(worst == 0.0 as float32, "{name}: max |dequantized - gguf.py| = {worst}")
+    print "{name}: OK ({n} values identical to gguf.py)"
+
+def main() throws:
+    check("q4_1", 3, 96)
+    check("q5_1", 7, 96)
+    check("q5_k", 13, 768)
+    check("iq4_xs", 23, 768)
+    check("iq4_nl", 20, 96)
+    check("f16", 1, 64)
+    check("bf16", 30, 64)

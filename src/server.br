@@ -22,6 +22,7 @@ use cache_policy
 use model
 use prompt_cache
 use sampling
+use embedding
 use std.net.TcpListener, TcpStream
 use std.io.Read, Write
 use std.time.Instant
@@ -70,6 +71,8 @@ pub struct ServerCtx:
     string cors_methods
     string cors_headers
     bool cors_credentials
+    bool embeddings_enabled # `--embeddings`: serve /embedding, /embeddings and /v1/embeddings
+    int pooling             # 0 none, 1 mean, 2 cls, 3 last (see embedding.br)
 
 # A finished request's KV cache and the token ids it covers. A later prompt
 # starts from the slot sharing the longest prefix with it (an agent client
@@ -272,7 +275,7 @@ pub (int, Rng) sample_json_token(Tokenizer tok, Rng rng, [float32] logits,
         while i < ranked_ids.length:
             let candidate = ranked_ids[i]
             var bool allowed = false
-            if candidate == tok.eos_token_id:
+            if is_eog_token(candidate, tok.eos_token_id):
                 allowed = not ignore_eos and (if request_value_is_undefined(schema): json_object_decoded_candidate_allowed(decoded_before, "", true) else: json_schema_decoded_candidate_allowed(schema, decoded_before, "", true))
             else:
                 mut [int] candidate_reply = []
@@ -317,7 +320,7 @@ pub (int, Rng) sample_tool_choice_token(Tokenizer tok, Rng rng, [float32] logits
         while i < ranked_ids.length:
             let candidate = ranked_ids[i]
             var bool allowed = false
-            if candidate == tok.eos_token_id:
+            if is_eog_token(candidate, tok.eos_token_id):
                 allowed = not ignore_eos and tool_choice_decoded_candidate_allowed(body, tools, decoded_before, "", true)
             else:
                 mut [int] candidate_reply = []
@@ -826,7 +829,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     var float32 adaptive_total_weight = if adaptive_target >= 0.0 as float32: 1.0 as float32 / (1.0 as float32 - adaptive_decay) else: 0.0 as float32
     while generated < max_new and not hit_eos and not stopped and not prediction_timed_out:
         let request_biased = apply_logit_bias(logits, logit_bias)
-        let biased = if ignore_eos: suppress_token(request_biased, ctx.tok.eos_token_id) else: request_biased
+        let biased = if ignore_eos: suppress_eog_tokens(request_biased, ctx.tok.eos_token_id) else: request_biased
         let penalized = apply_presence_frequency_penalty(biased, reply_tokens, sampling_frequency_penalty, sampling_presence_penalty)
         let effective_logits = if wants_logprobs:
             let repeated_logits = sampling_logits(penalized, tokens, params.repeat_penalty, params.repeat_last_n)
@@ -891,7 +894,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         generated += 1
         if first_token_ms < 0:
             first_token_ms = started.elapsed().asMillis() as int
-        if next_tok == ctx.tok.eos_token_id:
+        if is_eog_token(next_tok, ctx.tok.eos_token_id):
             hit_eos = true
         else:
             if wants_logprobs:
@@ -1475,6 +1478,97 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     respond_json(response, sock, 200, "OK", prompt_json(prompt))
     slots
 
+# Embeddings: /v1/embeddings (OpenAI) and /embedding, /embeddings (llama-server native). Every input is
+# run through the model on its own (the engine serves one request at a time); the vector is the pooled
+# final-norm hidden state, normalized with `embd_normalize` (default 2, euclidean).
+[CacheSlot] handle_embeddings(ServerCtx& ctx, mut ResponseState& response, var TcpStream sock, string body_text, bool is_oai, [CacheSlot] slots) throws:
+    let parsed = try? json_parse(body_text)
+    guard let body = parsed else:
+        respond_json(response, sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
+        return slots
+    if is_oai and ctx.pooling == 0:
+        respond_json(response, sock, 400, "Bad Request", error_json("Pooling type 'none' is not OAI compatible. Please use a different pooling type (--pooling)", "invalid_request_error", "invalid_pooling"))
+        return slots
+    var JValue raw = json_get(body, if is_oai: "input" else: "content")
+    if request_value_is_undefined(raw):
+        raw = json_get(body, "input")
+    # one text, one token array, a list of texts, or a list of token arrays
+    mut [[int]] inputs = []
+    var bool bad = false
+    match raw:
+        JStr(text):
+            inputs.push(embedding_input_tokens(ctx, text))
+        JList(items):
+            if items.length > 0 and jv_all_ints(items):
+                inputs.push(jv_int_list(items))
+            else:
+                for item in items:
+                    match item:
+                        JStr(text): inputs.push(embedding_input_tokens(ctx, text))
+                        JList(sub):
+                            if jv_all_ints(sub):
+                                inputs.push(jv_int_list(sub))
+                            else:
+                                bad = true
+                        _: bad = true
+        _: bad = true
+    if bad or inputs.length == 0:
+        let field = if is_oai: "input" else: "content"
+        respond_json(response, sock, 400, "Bad Request", error_json("`{field}` must be a string, an array of strings, an array of token ids, or an array of token id arrays", "invalid_request_error", "invalid_input"))
+        return slots
+    let normalize = json_get_int(body, "embd_normalize", 2)
+    let base64 = is_oai and json_get_str(body, "encoding_format", "float") == "base64"
+    mut [[float32]] pooled = []
+    mut [[[float32]]] per_input = []
+    var int prompt_tokens = 0
+    for ids in inputs:
+        if ids.length == 0 or ids.length > ctx.max_ctx:
+            respond_json(response, sock, 400, "Bad Request", error_json("an input of {ids.length} tokens does not fit the context of {ctx.max_ctx} tokens (and must not be empty)", "invalid_request_error", "context_length_exceeded"))
+            return slots
+        for id in ids:
+            if id < 0 or id >= ctx.model.config.vocab_size:
+                respond_json(response, sock, 400, "Bad Request", error_json("token id {id} is outside the vocabulary", "invalid_request_error", "invalid_token"))
+                return slots
+        prompt_tokens += ids.length
+        let hidden = hidden_states_gpu_quantized(ctx.model, ids)
+        let d = ctx.model.config.d_model
+        if ctx.pooling == 0:
+            mut [[float32]] rows = []
+            var int p = 0
+            while p < ids.length:
+                rows.push(normalize_embedding([hidden[p * d + i] for i in 0..<d], normalize))
+                p += 1
+            per_input.push(rows)
+        else:
+            let vector = normalize_embedding(pool_hidden(hidden, ids.length, d, ctx.pooling), normalize)
+            pooled.push(vector)
+            per_input.push([vector])
+    if is_oai:
+        respond_json(response, sock, 200, "OK", openai_embeddings_json(pooled, ctx.model_name, prompt_tokens, base64))
+    else:
+        respond_json(response, sock, 200, "OK", native_embeddings_json(per_input))
+    slots
+
+[int] embedding_input_tokens(ServerCtx& ctx, string text):
+    add_configured_special_tokens(ctx.tok.encode_with_specials(text), ctx.tok.bos_token_id, ctx.tok.eos_token_id,
+        ctx.tok.add_bos_token, ctx.tok.add_eos_token, true)
+
+bool jv_all_ints([JValue] items):
+    var bool ok = true
+    for item in items:
+        match item:
+            JInt(n): ok = ok
+            _: ok = false
+    ok
+
+[int] jv_int_list([JValue] items):
+    mut [int] out = []
+    for item in items:
+        match item:
+            JInt(n): out.push(n)
+            _: out.push(0)
+    out
+
 [CacheSlot] dispatch_request(ServerCtx& ctx, mut ServerMetrics& metrics, mut ResponseState& response,
                              var TcpStream sock, int counter, HttpRequest& r,
                              [CacheSlot] slots, [DiskSnap] disk) throws:
@@ -1627,6 +1721,10 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("lora-adapters"))
     elif feature_disabled_endpoint(r.method, path):
         respond_json(response, sock, 403, "Forbidden", feature_disabled_json())
+    elif ctx.embeddings_enabled and r.method == "POST" and (path == "/embedding" or path == "/embeddings" or path == "/v1/embeddings"):
+        return handle_embeddings(ctx, response, sock, r.body, path == "/v1/embeddings", slots)
+    elif unsupported_endpoint == "embeddings":
+        respond_json(response, sock, 501, "Not Implemented", "{{\"error\": {{\"code\": 501, \"message\": \"This server does not support embeddings. Start it with `--embeddings`\", \"type\": \"not_supported_error\"}}}}")
     elif unsupported_endpoint != "":
         respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json(unsupported_endpoint))
     elif r.method == "POST" and path == "/v1/messages/count_tokens":

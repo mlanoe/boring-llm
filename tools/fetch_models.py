@@ -41,9 +41,12 @@ MIN_FREE_AFTER = 2 * 1024**3
 CATALOG = {
     "qwen2.5-0.5b-instruct-q8_0": ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", "qwen2.5-0.5b-instruct-q8_0.gguf", "accuracy checks, most tests"),
     "qwen2.5-0.5b-instruct-q4_k_m": ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q4_k_m.gguf", "qwen2.5-0.5b-instruct-q4_k_m.gguf", "K-quant tests (Q4_K and Q6_K tensors)"),
+    "qwen2.5-0.5b-instruct-q5_k_m": ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q5_k_m.gguf", "qwen2.5-0.5b-instruct-q5_k_m.gguf", "Q5_K and Q6_K tensors"),
+    "qwen2.5-0.5b-instruct-iq4_xs": ("bartowski/Qwen2.5-0.5B-Instruct-GGUF", "Qwen2.5-0.5B-Instruct-IQ4_XS.gguf", "qwen2.5-0.5b-instruct-iq4_xs.gguf", "IQ4_XS tensors"),
     "qwen2.5-0.5b-instruct-q4_0": ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q4_0.gguf", "qwen2.5-0.5b-instruct-q4_0.gguf", "test_quant_kernels_real"),
     "qwen2.5-0.5b-instruct-q2_k": ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q2_k.gguf", "qwen2.5-0.5b-instruct-q2_k.gguf", "test_quant_kernels_real"),
     "qwen2.5-0.5b-instruct-fp16": ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-fp16.gguf", "qwen2.5-0.5b-instruct-fp16.gguf", "float reference"),
+    "gemma-3-270m-it-q8_0": ("ggml-org/gemma-3-270m-it-GGUF", "gemma-3-270m-it-Q8_0.gguf", "gemma-3-270m-it-Q8_0.gguf", "gemma3 architecture (sliding window, post-norms, 262k vocabulary)"),
     "qwen2.5-3b-instruct-q4_k_m": ("Qwen/Qwen2.5-3B-Instruct-GGUF", "qwen2.5-3b-instruct-q4_k_m.gguf", "qwen2.5-3b-instruct-q4_k_m.gguf", "OpenCode trials, server checks"),
     "qwen2.5-7b-instruct-q4_k_m": ("bartowski/Qwen2.5-7B-Instruct-GGUF", "Qwen2.5-7B-Instruct-Q4_K_M.gguf", "qwen2.5-7b-instruct-q4_k_m.gguf", "speed and accuracy references (the official repository splits this file in two)"),
     "tinyllama-1.1b-chat-v1.0-q8_0": ("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF", "tinyllama-1.1b-chat-v1.0.Q8_0.gguf", "tinyllama-1.1b-chat-v1.0-q8_0.gguf", "Llama architecture, SentencePiece tokenizer"),

@@ -190,6 +190,41 @@ pub [float32] apply_logit_bias([float32] logits, {int=float32} biases):
 # llama.cpp implements `ignore_eos` as an EOS logit bias of negative
 # infinity. A large finite sentinel is sufficient for the float32 ranking and
 # avoids backend-specific infinity literals.
+# End-of-generation tokens (llama.cpp's "EOG" set). A model can end a turn with
+# a token that is not its EOS: Gemma's chat turns end with `<end_of_turn>` while
+# `tokenizer.ggml.eos_token_id` is `<eos>`; Qwen also stops on `<|endoftext|>`.
+# The tokenizer registers them once when it is loaded (tokenizer.br), and every
+# generation loop asks `is_eog_token` instead of comparing with a single EOS id.
+# `turn_close` is the token a chat template writes after a model turn, which a
+# reply cut off by the length limit is closed with (-1: the EOS id).
+static var [int] eog_ids = []
+static var int turn_close = -1
+
+pub def set_eog_tokens([int] ids, int close_id):
+    eog_ids = ids
+    turn_close = close_id
+
+pub bool is_eog_token(int token, int eos_id):
+    if token == eos_id:
+        return true
+    for id in eog_ids:
+        if id == token:
+            return true
+    false
+
+pub int turn_close_token(int eos_id):
+    if turn_close >= 0:
+        turn_close
+    else:
+        eos_id
+
+# `ignore_eos`: no end-of-generation token may be sampled.
+pub [float32] suppress_eog_tokens([float32] logits, int eos_id):
+    var [float32] out = suppress_token(logits, eos_id)
+    for id in eog_ids:
+        out = suppress_token(out, id)
+    out
+
 pub [float32] suppress_token([float32] logits, int token):
     if token < 0 or token >= logits.length:
         return logits

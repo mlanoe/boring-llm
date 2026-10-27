@@ -1,0 +1,48 @@
+# Pooling, normalization and JSON bodies of src/embedding.br.   boring run test/test_embedding.br
+
+use embedding
+
+def close(float32 a, float32 b, string what):
+    assert((a - b).abs() < 0.00001 as float32, "{what}: {a} vs {b}")
+
+def main() throws:
+    let h = [1.0, 2.0, 3.0, 5.0, 6.0, 9.0]   # 3 rows of 2
+    let mean = pool_hidden(h, 3, 2, 1)
+    close(mean[0], 10.0 / 3.0, "mean[0]")
+    close(mean[1], 16.0 / 3.0, "mean[1]")
+    let cls = pool_hidden(h, 3, 2, 2)
+    close(cls[0], 1.0, "cls[0]")
+    close(cls[1], 2.0, "cls[1]")
+    let last = pool_hidden(h, 3, 2, 3)
+    close(last[0], 6.0, "last[0]")
+    close(last[1], 9.0, "last[1]")
+    assert_eq(pooling_from_name("last"), 3)
+    assert_eq(pooling_from_name("bogus"), -2)
+
+    let l2 = normalize_embedding([3.0, 4.0], 2)
+    close(l2[0], 0.6, "l2[0]")
+    close(l2[1], 0.8, "l2[1]")
+    let l1 = normalize_embedding([1.0, -3.0], 1)
+    close(l1[0], 0.25, "l1[0]")
+    close(l1[1], -0.75, "l1[1]")
+    let mx = normalize_embedding([1.0, -2.0], 0)
+    close(mx[1], -32760.0, "max-abs scaled")
+    let raw = normalize_embedding([1.0, 2.0], -1)
+    close(raw[1], 2.0, "no normalization")
+    let zero = normalize_embedding([0.0, 0.0], 2)
+    close(zero[0], 0.0, "zero vector")
+
+    # base64 (RFC 4648 vectors) and the float32 little-endian encoding of 1.0 (00 00 80 3F)
+    assert_eq(base64_encode([]), "")
+    assert_eq(base64_encode([0x66 as uint8]), "Zg==")
+    assert_eq(base64_encode([0x66 as uint8, 0x6F as uint8]), "Zm8=")
+    assert_eq(base64_encode([0x66 as uint8, 0x6F as uint8, 0x6F as uint8]), "Zm9v")
+    assert_eq(floats_base64([1.0]), "AACAPw==")
+
+    assert_eq(floats_json([1.5, 2.0]), "[1.5, 2]")
+    let body = openai_embeddings_json([[0.5, 1.0]], "m", 3, false)
+    assert(body.contains("\"embedding\": [0.5, 1]") and body.contains("\"prompt_tokens\": 3") and body.contains("\"index\": 0"), body)
+    let ob = chr(123)
+    let cb = chr(125)
+    assert_eq(native_embeddings_json([[[0.5, 1.0]]]), "[{ob}\"index\": 0, \"embedding\": [[0.5, 1]]{cb}]")
+    print "test_embedding: all assertions passed"

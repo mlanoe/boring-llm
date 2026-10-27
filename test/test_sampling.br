@@ -271,4 +271,15 @@ def main() throws:
         assert_eq(tok_min_p, 0)
         seed += 1
 
+    # end-of-generation set (Gemma ends turns with <end_of_turn>, which is not its EOS)
+    assert(is_eog_token(1, 1), "the EOS id always stops")
+    assert(not is_eog_token(106, 1), "no registry: only the EOS stops")
+    assert_eq(turn_close_token(1), 1)
+    set_eog_tokens([1, 106], 106)
+    assert(is_eog_token(106, 1) and is_eog_token(1, 1) and not is_eog_token(5, 1), "registered EOG tokens stop")
+    assert_eq(turn_close_token(1), 106)
+    let suppressed = suppress_eog_tokens([0.0, 1.0, 2.0, 3.0], 1)
+    assert(suppressed[1] < -1000.0 as float32 and suppressed[0] == 0.0 as float32 and suppressed[3] == 3.0 as float32, "EOS suppressed, others kept")
+    set_eog_tokens([], -1)
+
     print "test_sampling: all assertions passed"

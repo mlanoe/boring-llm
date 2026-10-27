@@ -72,16 +72,24 @@ pub [float32] linear_bias([float32] x, [float32] w, [float32] b, int seq, int d_
 # original/NORM "interleaved" GPT-J style (Llama, Mistral) — rotate
 # adjacent pairs (2j, 2j+1) instead. x is (seq x n_heads*d_head), same
 # position index applies to every head.
-pub [float32] rope_apply([float32] x, int seq, int n_heads, int d_head, float32 freq_base, int neox):
-    rope_apply_at(x, seq, n_heads, d_head, freq_base, 0, neox)
+pub [float32] rope_apply([float32] x, int seq, int n_heads, int d_head, [float32] rope_freqs, int neox):
+    rope_apply_at(x, seq, n_heads, d_head, rope_freqs, 0, neox)
 
+# `rope_freqs` is the per-pair rotation table built by `rope_freqs_*` below:
+# `d_head / 2` angular frequencies (theta_j, scaling already folded in) followed
+# by one extra element, the magnitude scale applied to cos/sin (YaRN's
+# attention factor, 1.0 otherwise). Every RoPE variant (plain, linear, YaRN,
+# Llama-3, Phi-3 long-factors) is just a different table, so the CPU and GPU
+# rotation code never branches on the variant.
+#
 # Same rotation, but position `p` in the angle computation is offset by
 # `start_pos` — needed for KV-cache incremental decode, where a single new
 # token's ABSOLUTE position in the sequence (prompt length + steps taken so
 # far) is not the same as its LOCAL row index (always 0) within this one
 # call's (seq x ...) buffer.
-pub [float32] rope_apply_at([float32] x, int seq, int n_heads, int d_head, float32 freq_base, int start_pos, int neox):
+pub [float32] rope_apply_at([float32] x, int seq, int n_heads, int d_head, [float32] rope_freqs, int start_pos, int neox):
     let half_dim = d_head / 2
+    let mscale = rope_freqs[half_dim]
     mut [float32] result = [0.0 for i in 0..<x.length]
     var int p = 0
     while p < seq:
@@ -91,11 +99,9 @@ pub [float32] rope_apply_at([float32] x, int seq, int n_heads, int d_head, float
             let base_idx = p * n_heads * d_head + h * d_head
             var int j = 0
             while j < half_dim:
-                let freq_exp = (2.0 * (j as float32)) / (d_head as float32)
-                let theta = 1.0 / freq_base.powf(freq_exp)
-                let angle = (abs_pos as float32) * theta
-                let cos_a = angle.cos()
-                let sin_a = angle.sin()
+                let angle = (abs_pos as float32) * rope_freqs[j]
+                let cos_a = angle.cos() * mscale
+                let sin_a = angle.sin() * mscale
                 var int idx0 = base_idx + j
                 var int idx1 = base_idx + j + half_dim
                 if neox == 0:
@@ -110,17 +116,94 @@ pub [float32] rope_apply_at([float32] x, int seq, int n_heads, int d_head, float
         p += 1
     result
 
+# Plain RoPE: theta_j = 1 / base^(2j / d_head).
+pub [float32] rope_freqs_plain(int d_head, float32 freq_base):
+    let half_dim = d_head / 2
+    mut [float32] f = [0.0 for i in 0..<(half_dim + 1)]
+    var int j = 0
+    while j < half_dim:
+        f[j] = 1.0 / freq_base.powf((2.0 * (j as float32)) / (d_head as float32))
+        j += 1
+    f[half_dim] = 1.0
+    f
+
+# Linear scaling (`rope.scaling.type = linear`): every frequency divided by `factor`.
+pub [float32] rope_freqs_linear(int d_head, float32 freq_base, float32 factor):
+    let half_dim = d_head / 2
+    mut [float32] f = rope_freqs_plain(d_head, freq_base)
+    var int j = 0
+    while j < half_dim:
+        f[j] = f[j] / factor
+        j += 1
+    f
+
+# YaRN (`rope.scaling.type = yarn`), as llama.cpp's ggml_rope_yarn: a per-frequency
+# blend of the interpolated (theta / factor) and the original frequency, with the
+# ramp bounded by the correction dims for beta_fast/beta_slow, and cos/sin scaled
+# by `attn_factor * (1 + 0.1 * ln(factor))`.
+pub float32 rope_yarn_corr_dim(int d_head, float32 orig_ctx, float32 n_rot, float32 base):
+    (d_head as float32) * (orig_ctx / (n_rot * 6.283185307179586)).ln() / (2.0 * base.ln())
+
+pub [float32] rope_freqs_yarn(int d_head, float32 freq_base, float32 factor, float32 orig_ctx,
+                               float32 beta_fast, float32 beta_slow, float32 attn_factor):
+    let half_dim = d_head / 2
+    mut [float32] f = rope_freqs_plain(d_head, freq_base)
+    var float32 low = rope_yarn_corr_dim(d_head, orig_ctx, beta_fast, freq_base).floor()
+    var float32 high = rope_yarn_corr_dim(d_head, orig_ctx, beta_slow, freq_base).ceil()
+    if low < 0.0:
+        low = 0.0 as float32
+    if high > ((d_head - 1) as float32):
+        high = (d_head - 1) as float32
+    var float32 denom = high - low
+    if denom < 0.001:
+        denom = 0.001 as float32
+    var int j = 0
+    while j < half_dim:
+        let y = ((j as float32) - low) / denom
+        var float32 ramp = y
+        if ramp < 0.0:
+            ramp = 0.0 as float32
+        if ramp > 1.0:
+            ramp = 1.0 as float32
+        let extrap = f[j]
+        let interp = f[j] / factor
+        f[j] = interp * ramp + extrap * (1.0 - ramp)
+        j += 1
+    f[half_dim] = attn_factor * (1.0 + 0.1 * factor.ln())
+    f
+
+# Per-pair divisors (Phi-3 "longrope": `rope_factors_short/long.weight`):
+# theta_j / factors[j], and cos/sin scaled by `mscale`.
+pub [float32] rope_freqs_factors(int d_head, float32 freq_base, [float32] factors, float32 mscale):
+    let half_dim = d_head / 2
+    mut [float32] f = rope_freqs_plain(d_head, freq_base)
+    var int j = 0
+    while j < half_dim:
+        f[j] = f[j] / factors[j]
+        j += 1
+    f[half_dim] = mscale
+    f
+
 pub float32 silu(float32 x):
     x / (1.0 + (0.0 - x).exp())
 
+# GELU, tanh approximation (ggml_gelu; Gemma's GeGLU).
+pub float32 gelu(float32 x):
+    let inner = 0.7978845608 * (x + 0.044715 * x * x * x)
+    0.5 * x * (1.0 + inner.tanh())
+
+# Gated FFN: `act` 0 = SwiGLU (silu(gate) * up), 1 = GeGLU (gelu(gate) * up).
 pub [float32] swiglu_ffn([float32] x, [float32] gate_w, [float32] up_w, [float32] down_w,
-                          int seq, int d_model, int ffn_dim):
+                          int seq, int d_model, int ffn_dim, int act):
     let gate = linear(x, gate_w, seq, d_model, ffn_dim)
     let up = linear(x, up_w, seq, d_model, ffn_dim)
     mut [float32] hidden = [0.0 for i in 0..<(seq * ffn_dim)]
     var int idx = 0
     while idx < seq * ffn_dim:
-        hidden[idx] = silu(gate[idx]) * up[idx]
+        if act == 1:
+            hidden[idx] = gelu(gate[idx]) * up[idx]
+        else:
+            hidden[idx] = silu(gate[idx]) * up[idx]
         idx += 1
     linear(hidden, down_w, seq, ffn_dim, d_model)
 
@@ -129,7 +212,14 @@ pub [float32] swiglu_ffn([float32] x, [float32] gate_w, [float32] up_w, [float32
 # key/value heads via integer-divide head mapping (kv_h = h / group).
 pub [float32] gqa_attention([float32] q, [float32] k, [float32] v,
                              int seq, int n_head, int n_kv_head, int d_head):
-    let scale = 1.0 / (d_head as float32).sqrt()
+    gqa_attention_ext(q, k, v, seq, n_head, n_kv_head, d_head, 1.0 / (d_head as float32).sqrt(), 0.0, 0)
+
+# Same, with an explicit score scale, optional Gemma-2 soft-capping of the
+# scores (softcap > 0) and a sliding window (window > 0: a query sees only
+# the last `window` positions, itself included).
+pub [float32] gqa_attention_ext([float32] q, [float32] k, [float32] v,
+                             int seq, int n_head, int n_kv_head, int d_head,
+                             float32 scale, float32 softcap, int window):
     let group = n_head / n_kv_head
     mut [float32] out = [0.0 for i in 0..<(seq * n_head * d_head)]
     var int h = 0
@@ -145,7 +235,12 @@ pub [float32] gqa_attention([float32] q, [float32] k, [float32] v,
                 while d < d_head:
                     dot = dot + q[i * n_head * d_head + h * d_head + d] * k[j * n_kv_head * d_head + kv_h * d_head + d]
                     d += 1
-                scores[j] = dot * scale
+                var float32 sc = dot * scale
+                if softcap > 0.0:
+                    sc = softcap * (sc / softcap).tanh()
+                if window > 0 and j + window <= i:
+                    sc = -1.0e30 as float32
+                scores[j] = sc
                 j += 1
 
             var float32 mx = scores[0]

@@ -12,3 +12,4 @@ __pycache__/
 Cargo.lock
 .claude/worktrees/
 .accuracy-cache/
+test/fixtures/fmt-*
