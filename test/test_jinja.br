@@ -8,6 +8,7 @@
 # literal `{`") — this sidesteps needing to hand-count brace-doubling for
 # every Jinja delimiter.
 
+use io
 use jinja
 
 def main() throws:
@@ -133,5 +134,22 @@ def main() throws:
     tl_msgs.push(jv_chat_message("user", "Bye"))
     mut {string=JValue} tl_env = build_chat_env(tl_msgs, true, "<s>", "</s>")
     assert_eq(render_jinja(tl, tl_env), "\n\n<|system|>\nBe brief.</s>\n\n\n\n\n<|user|>\nHi</s>\n\n\n\n\n<|assistant|>\nHello!</s>\n\n\n\n\n<|user|>\nBye</s>\n\n\n<|assistant|>\n\n" as string)
+
+    # Gemma 3's real chat template (slices `messages[1:]`, the `trim` filter, `is iterable`,
+    # a parenthesized `!=`); expected text rendered by real jinja2 (see git history of the fixture)
+    let gem_tpl = bytes_to_str(fs.readBytes("test/fixtures/gemma3-chat-template.jinja"))
+    mut [JValue] gem_msgs = []
+    gem_msgs.push(jv_chat_message("system", "Be brief."))
+    gem_msgs.push(jv_chat_message("user", "  Hi  "))
+    gem_msgs.push(jv_chat_message("assistant", "Hello!"))
+    gem_msgs.push(jv_chat_message("user", "Bye"))
+    mut {string=JValue} gem_env = build_chat_env(gem_msgs, true, "<bos>", "<eos>")
+    assert_eq(render_jinja(gem_tpl, gem_env), bytes_to_str(fs.readBytes("test/fixtures/gemma3-chat-template.expected.txt")))
+    mut {string=JValue} gem_env2 = build_chat_env([gem_msgs[1], gem_msgs[2], gem_msgs[3]], true, "<bos>", "<eos>")
+    assert_eq(render_jinja(gem_tpl, gem_env2), bytes_to_str(fs.readBytes("test/fixtures/gemma3-chat-template-nosystem.expected.txt")))
+    # slices
+    mut {string=JValue} sl_env = {=}
+    sl_env["xs"] = JValue.JList([JValue.JInt(1), JValue.JInt(2), JValue.JInt(3), JValue.JInt(4)])
+    assert_eq(render_jinja("{ob}% for x in xs[1:3] %{cb}{ob}{ob} x {cb}{cb}{ob}% endfor %{cb}|{ob}% for x in xs[:-1] %{cb}{ob}{ob} x {cb}{cb}{ob}% endfor %{cb}|{ob}% for x in xs[2:] %{cb}{ob}{ob} x {cb}{cb}{ob}% endfor %{cb}", sl_env), "23|123|34" as string)
 
     print "test_jinja: all assertions passed"

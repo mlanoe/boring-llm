@@ -176,6 +176,8 @@ pub enum JExpr:
     EVar(string name)
     EAttr(JExpr base, string name)
     EIndex(JExpr base, JExpr idx)
+    ECond(JExpr cond, JExpr then_e, JExpr else_e)   # `a if cond else b`
+    ESlice(JExpr base, JExpr lo, JExpr hi)   # base[lo:hi]; a missing bound is ELit(JUndefined)
     EBinOp(string op, JExpr left, JExpr right)
     ENot(JExpr e)
     EIsDefined(JExpr e)
@@ -203,6 +205,43 @@ JValue jv_get_index(JValue base, JValue idx):
             match idx:
                 JStr(k): fields[k] else JValue.JUndefined
                 _: JValue.JUndefined
+        _: JValue.JUndefined
+
+# Python/Jinja slice semantics for lists and strings: negative bounds count from
+# the end, out-of-range bounds clamp, a missing bound is open.
+int slice_bound(JValue b, int n, int default_at):
+    match b:
+        JInt(k):
+            let at = if k < 0: k + n else: k
+            if at < 0:
+                0
+            elif at > n:
+                n
+            else:
+                at
+        _: default_at
+
+JValue jv_slice(JValue base, JValue lo, JValue hi):
+    match base:
+        JList(items):
+            let a = slice_bound(lo, items.length, 0)
+            let b = slice_bound(hi, items.length, items.length)
+            mut [JValue] out = []
+            var int i = a
+            while i < b:
+                out.push(items[i])
+                i += 1
+            JValue.JList(out)
+        JStr(str):
+            let cs = str.chars()
+            let a = slice_bound(lo, cs.length, 0)
+            let b = slice_bound(hi, cs.length, cs.length)
+            var string out = ""
+            var int i = a
+            while i < b:
+                out = "{out}{cs[i]}"
+                i += 1
+            JValue.JStr(out)
         _: JValue.JUndefined
 
 JValue apply_filter(string name, JValue v) throws:
@@ -370,6 +409,18 @@ JValue eval_binop(string op, JValue l, JValue r) throws:
                     JInt(b): JValue.JInt(a + b)
                     _: JValue.JStr("{jv_to_str(l)}{jv_to_str(r)}")
             _: JValue.JStr("{jv_to_str(l)}{jv_to_str(r)}")
+    elif op == "%" or op == "*":
+        match l:
+            JInt(a):
+                match r:
+                    JInt(b):
+                        if op == "*":
+                            JValue.JInt(a * b)
+                        else:
+                            guard b != 0 else throw "jinja: modulo by zero"
+                            JValue.JInt(((a % b) + b) % b)
+                    _: throw "jinja: '{op}' needs integers"
+            _: throw "jinja: '{op}' needs integers"
     elif op == "-":
         match l:
             JInt(a):
@@ -409,7 +460,9 @@ pub JValue eval_expr(JExpr e, {string=JValue} env) throws:
         EVar(name): env[name] else JValue.JUndefined
         EAttr(base, name): jv_get_attr(eval_expr(base, env), name)
         EIndex(base, idxe): jv_get_index(eval_expr(base, env), eval_expr(idxe, env))
+        ESlice(base, lo, hi): jv_slice(eval_expr(base, env), eval_expr(lo, env), eval_expr(hi, env))
         ENot(e2): JValue.JBool(not jv_truthy(eval_expr(e2, env)))
+        ECond(c, a, b): if jv_truthy(eval_expr(c, env)): eval_expr(a, env) else: eval_expr(b, env)
         EIsDefined(e2): JValue.JBool(not jv_is_undefined(eval_expr(e2, env)))
         ETest(e2, test): jv_test(test, eval_expr(e2, env))
         EFilter(base, name): apply_filter(name, eval_expr(base, env))
@@ -585,9 +638,28 @@ bool tok_is_ident(EToken t, string s):
             e = JExpr.EAttr(e, toks[j + 1].text)
             j += 2
         elif tok_is_op(toks[j], "["):
-            let (idx_e, j2) = parse_or(toks, j + 1)
-            guard j2 < toks.length and tok_is_op(toks[j2], "]") else throw "jinja: expected ']'"
-            e = JExpr.EIndex(e, idx_e)
+            # `x[i]`, or a slice `x[lo:hi]` with either bound optional
+            var JExpr lo = JExpr.ELit(JValue.JUndefined)
+            var int j2 = j + 1
+            guard j2 < toks.length else throw "jinja: unterminated '['"
+            if not tok_is_op(toks[j2], ":"):
+                let (lo_e, j_lo) = parse_or(toks, j2)
+                lo = lo_e
+                j2 = j_lo
+            guard j2 < toks.length else throw "jinja: unterminated '['"
+            if tok_is_op(toks[j2], ":"):
+                var JExpr hi = JExpr.ELit(JValue.JUndefined)
+                j2 += 1
+                guard j2 < toks.length else throw "jinja: unterminated '['"
+                if not tok_is_op(toks[j2], "]"):
+                    let (hi_e, j_hi) = parse_or(toks, j2)
+                    hi = hi_e
+                    j2 = j_hi
+                guard j2 < toks.length and tok_is_op(toks[j2], "]") else throw "jinja: expected ']'"
+                e = JExpr.ESlice(e, lo, hi)
+            else:
+                guard tok_is_op(toks[j2], "]") else throw "jinja: expected ']'"
+                e = JExpr.EIndex(e, lo)
             j = j2 + 1
         elif tok_is_op(toks[j], "|"):
             guard j + 1 < toks.length and toks[j + 1].kind == "ident" else throw "jinja: expected filter name after '|'"
@@ -616,14 +688,26 @@ bool tok_is_ident(EToken t, string s):
             cont = false
     (e, j)
 
-(JExpr, int) parse_add([EToken] toks, int i) throws:
+# `*` and `%` on integers (Gemma's template alternates roles with `loop.index0 % 2`)
+(JExpr, int) parse_mul([EToken] toks, int i) throws:
     let (e0, i0) = parse_postfix(toks, i)
+    var JExpr e = e0
+    var int j = i0
+    while j < toks.length and (tok_is_op(toks[j], "*") or tok_is_op(toks[j], "%")):
+        let op = toks[j].text
+        let (rhs, j2) = parse_postfix(toks, j + 1)
+        e = JExpr.EBinOp(op, e, rhs)
+        j = j2
+    (e, j)
+
+(JExpr, int) parse_add([EToken] toks, int i) throws:
+    let (e0, i0) = parse_mul(toks, i)
     var JExpr e = e0
     var int j = i0
     var bool cont = true
     while cont and j < toks.length and (tok_is_op(toks[j], "+") or tok_is_op(toks[j], "-")):
         let op = toks[j].text
-        let (rhs, j2) = parse_postfix(toks, j + 1)
+        let (rhs, j2) = parse_mul(toks, j + 1)
         e = JExpr.EBinOp(op, e, rhs)
         j = j2
     (e, j)
@@ -669,7 +753,7 @@ bool tok_is_ident(EToken t, string s):
         j = j2
     (e, j)
 
-pub (JExpr, int) parse_or([EToken] toks, int i) throws:
+(JExpr, int) parse_or_chain([EToken] toks, int i) throws:
     let (e0, i0) = parse_and(toks, i)
     var JExpr e = e0
     var int j = i0
@@ -679,6 +763,20 @@ pub (JExpr, int) parse_or([EToken] toks, int i) throws:
         e = JExpr.EBinOp("or", e, rhs)
         j = j2
     (e, j)
+
+# An expression: an `or` chain with an optional trailing conditional,
+# `value if condition else other` (the lowest precedence, as in Jinja).
+pub (JExpr, int) parse_or([EToken] toks, int i) throws:
+    let (e, j) = parse_or_chain(toks, i)
+    if j < toks.length and tok_is_ident(toks[j], "if"):
+        let (cond, j2) = parse_or_chain(toks, j + 1)
+        if j2 < toks.length and tok_is_ident(toks[j2], "else"):
+            let (other, j3) = parse_or(toks, j2 + 1)
+            (JExpr.ECond(cond, e, other), j3)
+        else:
+            (JExpr.ECond(cond, e, JExpr.ELit(JValue.JStr(""))), j2)
+    else:
+        (e, j)
 
 pub JExpr parse_expr_str(string s) throws:
     let toks = lex_expr_tokens(s)

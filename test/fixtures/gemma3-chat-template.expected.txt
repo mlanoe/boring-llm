@@ -1,0 +1,9 @@
+<bos><start_of_turn>user
+Be brief.
+
+Hi<end_of_turn>
+<start_of_turn>model
+Hello!<end_of_turn>
+<start_of_turn>user
+Bye<end_of_turn>
+<start_of_turn>model
