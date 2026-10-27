@@ -11,6 +11,7 @@
 # (`{{`/`}}`) — Boring's own interpolation syntax otherwise.
 
 use jinja
+use json_pattern
 use json
 use std.time.SystemTime
 use std.time.UNIX_EPOCH
@@ -902,6 +903,12 @@ string tool_schema_validation_error_root(JValue root, JValue schema):
                 match unique_items:
                     JBool(enabled): true
                     _: return "JSON Schema `uniqueItems` must be a boolean"
+            if fields.contains("pattern"):
+                match json_get(schema, "pattern"):
+                    JStr(source):
+                        let invalid_pattern = json_pattern_validation_error(source)
+                        if invalid_pattern != "": return invalid_pattern
+                    _: return "JSON Schema `pattern` must be a string"
         _: return "tool function `parameters` must be a JSON Schema object or boolean"
     ""
 
@@ -1437,6 +1444,8 @@ bool tool_schema_matches_root(JValue root, JValue schema, JValue value, int ref_
             if min_length >= 0 and n < min_length:
                 return false
             if max_length >= 0 and n > max_length:
+                return false
+            if json_object_has_key(schema, "pattern") and not json_pattern_matches(json_get_str(schema, "pattern", ""), text):
                 return false
         JInt(n):
             let value_n = n as float

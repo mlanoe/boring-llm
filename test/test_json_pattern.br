@@ -1,0 +1,15 @@
+use json_pattern
+
+def main():
+    assert(json_pattern_matches("^[a-z][a-z0-9_]*$", "tool_2"), "anchored identifier")
+    assert(not json_pattern_matches("^[a-z][a-z0-9_]*$", "2tool"), "identifier start")
+    assert(json_pattern_matches("\\d+", "item-42-ok"), "unanchored digit run")
+    assert(json_pattern_matches("^colou?r$", "color"), "optional atom absent")
+    assert(json_pattern_matches("^colou?r$", "colour"), "optional atom present")
+    assert(json_pattern_matches("^[^/]+/[^/]+$", "one/two"), "negated class")
+    assert(not json_pattern_matches("^[^/]+/[^/]+$", "one/two/three"), "anchored path shape")
+    assert(json_pattern_matches("^\\w+\\s+ok$", "name  ok"), "word and whitespace classes")
+    assert(json_pattern_validation_error("(a|b)") != "", "groups and alternation are rejected")
+    assert(json_pattern_validation_error("[abc") != "", "unterminated class")
+    assert(json_pattern_validation_error("a{{2}}") != "", "brace quantifiers are rejected")
+    print "test_json_pattern: all assertions passed"

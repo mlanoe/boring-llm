@@ -1,0 +1,135 @@
+# Small regular-expression matcher for JSON Schema `pattern`.
+#
+# JSON Schema uses ECMA-262 regexes. Tool schemas overwhelmingly use the
+# regular subset below; rejecting the remaining constructs is safer than
+# silently weakening a constrained response. Supported: ^ $, ., literals,
+# character classes/ranges, \d/\w/\s (and their uppercase negations), and
+# the greedy quantifiers *, + and ?.
+
+int pattern_ascii_rank(string ch):
+    let ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{{|}}~".chars()
+    var int i = 0
+    while i < ascii.length:
+        if ascii[i] == ch: return i
+        i += 1
+    -1
+
+bool pattern_is_digit(string ch):
+    "0123456789".contains(ch)
+
+bool pattern_is_word(string ch):
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz".contains(ch)
+
+bool pattern_is_space(string ch):
+    ch == " " or ch == "\t" or ch == "\n" or ch == "\r"
+
+# Index immediately after one atom, or -1 for malformed/unsupported syntax.
+int pattern_atom_end([string] pattern, int start):
+    if start >= pattern.length: return -1
+    let ch = pattern[start]
+    if ch == "\\":
+        if start + 1 >= pattern.length: return -1
+        let escaped = pattern[start + 1]
+        if escaped == "b" or escaped == "B": return -1
+        return start + 2
+    if ch == "[":
+        var int i = start + 1
+        if i < pattern.length and pattern[i] == "^": i += 1
+        let first = i
+        while i < pattern.length and pattern[i] != "]":
+            if pattern[i] == "\\":
+                i += 1
+                if i >= pattern.length: return -1
+            i += 1
+        if i >= pattern.length or i == first: return -1
+        return i + 1
+    if ch == "(" or ch == ")" or ch == "|" or ch == "{{" or ch == "}}" or ch == "*" or ch == "+" or ch == "?" or ch == "^" or ch == "$":
+        return -1
+    start + 1
+
+bool pattern_escape_matches(string escaped, string ch):
+    if escaped == "d": return pattern_is_digit(ch)
+    if escaped == "D": return not pattern_is_digit(ch)
+    if escaped == "w": return pattern_is_word(ch)
+    if escaped == "W": return not pattern_is_word(ch)
+    if escaped == "s": return pattern_is_space(ch)
+    if escaped == "S": return not pattern_is_space(ch)
+    if escaped == "t": return ch == "\t"
+    if escaped == "n": return ch == "\n"
+    if escaped == "r": return ch == "\r"
+    ch == escaped
+
+bool pattern_class_matches([string] pattern, int start, int end, string ch):
+    var int i = start + 1
+    var bool negated = false
+    if i < end and pattern[i] == "^":
+        negated = true
+        i += 1
+    var bool matched = false
+    while i < end - 1:
+        if pattern[i] == "\\":
+            if pattern_escape_matches(pattern[i + 1], ch): matched = true
+            i += 2
+        elif i + 2 < end - 1 and pattern[i + 1] == "-":
+            let value = pattern_ascii_rank(ch)
+            let low = pattern_ascii_rank(pattern[i])
+            let high = pattern_ascii_rank(pattern[i + 2])
+            if low >= 0 and high >= low and value >= low and value <= high: matched = true
+            i += 3
+        else:
+            if pattern[i] == ch: matched = true
+            i += 1
+    if negated: not matched else: matched
+
+bool pattern_atom_matches([string] pattern, int start, int end, string ch):
+    if pattern[start] == ".": return true
+    if pattern[start] == "\\": return pattern_escape_matches(pattern[start + 1], ch)
+    if pattern[start] == "[": return pattern_class_matches(pattern, start, end, ch)
+    pattern[start] == ch
+
+bool pattern_match_here([string] text, int text_index, [string] pattern, int pattern_index):
+    if pattern_index >= pattern.length: return true
+    if pattern[pattern_index] == "$" and pattern_index + 1 == pattern.length:
+        return text_index == text.length
+    let atom_end = pattern_atom_end(pattern, pattern_index)
+    if atom_end < 0: return false
+    let quantifier = if atom_end < pattern.length: pattern[atom_end] else: ""
+    let next = if quantifier == "*" or quantifier == "+" or quantifier == "?": atom_end + 1 else: atom_end
+    if quantifier == "?":
+        if pattern_match_here(text, text_index, pattern, next): return true
+        return text_index < text.length and pattern_atom_matches(pattern, pattern_index, atom_end, text[text_index]) and pattern_match_here(text, text_index + 1, pattern, next)
+    if quantifier == "*" or quantifier == "+":
+        var int last = text_index
+        while last < text.length and pattern_atom_matches(pattern, pattern_index, atom_end, text[last]):
+            last += 1
+        let minimum = if quantifier == "+": text_index + 1 else: text_index
+        while last >= minimum:
+            if pattern_match_here(text, last, pattern, next): return true
+            last -= 1
+        return false
+    text_index < text.length and pattern_atom_matches(pattern, pattern_index, atom_end, text[text_index]) and pattern_match_here(text, text_index + 1, pattern, next)
+
+pub string json_pattern_validation_error(string source):
+    let pattern = source.chars()
+    if pattern.length > 256: return "JSON Schema `pattern` must not exceed 256 characters"
+    var int i = 0
+    if i < pattern.length and pattern[i] == "^": i += 1
+    while i < pattern.length:
+        if pattern[i] == "$" and i + 1 == pattern.length: return ""
+        let atom_end = pattern_atom_end(pattern, i)
+        if atom_end < 0: return "JSON Schema `pattern` uses malformed or unsupported regex syntax"
+        i = atom_end
+        if i < pattern.length and (pattern[i] == "*" or pattern[i] == "+" or pattern[i] == "?"): i += 1
+    ""
+
+pub bool json_pattern_matches(string source, string text):
+    if json_pattern_validation_error(source) != "": return false
+    let pattern = source.chars()
+    let chars = text.chars()
+    if pattern.length > 0 and pattern[0] == "^":
+        return pattern_match_here(chars, 0, pattern, 1)
+    var int start = 0
+    while start <= chars.length:
+        if pattern_match_here(chars, start, pattern, 0): return true
+        start += 1
+    false
