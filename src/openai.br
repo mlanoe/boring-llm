@@ -310,6 +310,9 @@ string anthropic_tool_result_text(JValue content):
         _: ""
 
 pub string anthropic_input_validation_error(JValue body):
+    let extra_params = json_get(body, "extra_params")
+    if not request_value_is_undefined(extra_params) and not jv_is_dict(extra_params):
+        return "Anthropic `extra_params` must be an object"
     let system = json_get(body, "system")
     if not request_value_is_undefined(system):
         match system:
@@ -391,6 +394,15 @@ pub string anthropic_input_validation_error(JValue body):
 
 pub JValue anthropic_chat_body(JValue body):
     var JValue out = body.clone()
+    # Match llama-server's Anthropic extension: sampling and other completion
+    # parameters unavailable in the Anthropic schema can be forwarded here.
+    # Structural Anthropic fields are converted below and therefore cannot be
+    # replaced accidentally through extra_params.
+    match json_get(body, "extra_params"):
+        JDict(fields, keys):
+            for key in keys:
+                out = jv_set(out, key, fields[key])
+        _: true
     mut [JValue] messages = []
     let system_text = anthropic_text_content(json_get(body, "system"))
     if system_text != "": messages.push(text_message("system", system_text))
