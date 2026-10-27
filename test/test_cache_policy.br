@@ -49,6 +49,65 @@ def main():
     let shifted = apply_context_shift([0, 1, 2, 3, 4, 5, 6, 7], ContextShiftPlan(2, 3))
     assert(shifted == [0, 1, 5, 6, 7], "shift retains the requested prefix and newest suffix")
 
+    # Exhaust the small state space: every required shift must free at least
+    # one position, preserve the exact prefix and suffix, and never retain
+    # more than n_ctx - 1 tokens before the next decoded token is appended.
+    var int checked_shifts = 0
+    var int small_ctx = 2
+    while small_ctx <= 12:
+        var int n_tokens = small_ctx
+        while n_tokens <= small_ctx * 2:
+            let source = toks(1000, n_tokens)
+            var int requested_keep = 0
+            while requested_keep <= n_tokens + 2:
+                for requested_discard in [0, 1, small_ctx / 2, small_ctx, n_tokens + 3]:
+                    let plan = plan_context_shift(n_tokens, small_ctx, requested_keep, requested_discard)
+                    let retained = apply_context_shift(source, plan)
+                    assert(plan.keep >= 0 and plan.keep < small_ctx, "shift keep is bounded by context")
+                    assert(plan.discard >= 1 and plan.discard <= n_tokens - plan.keep, "shift discard is bounded by movable tokens")
+                    assert(retained.length == n_tokens - plan.discard, "shift removes exactly discard tokens")
+                    assert(retained.length <= small_ctx - 1, "shift leaves a position for the next token")
+                    var int prefix_i = 0
+                    while prefix_i < plan.keep:
+                        assert(retained[prefix_i] == source[prefix_i], "shift preserves prefix token identity")
+                        prefix_i += 1
+                    var int suffix_i = plan.keep
+                    while suffix_i < retained.length:
+                        assert(retained[suffix_i] == source[suffix_i + plan.discard], "shift preserves suffix token identity")
+                        suffix_i += 1
+                    checked_shifts += 1
+                requested_keep += 1
+            n_tokens += 1
+        small_ctx += 1
+    assert(checked_shifts > 2000, "context shift policy received broad exhaustive coverage")
+
+    # Simulate a reply much longer than its context. Each shift rebuilds the
+    # logical sequence before the next generated token is appended, exactly as
+    # server.br does around the real KV cache. The retained prefix stays fixed,
+    # generated tokens remain ordered, and repeated shifts never overfill the
+    # context.
+    let rolling_ctx = 8
+    let rolling_keep = 2
+    var mut [int] rolling = [10, 11, 12, 13, 14, 15, 16, 17]
+    var int next_token = 100
+    var int shift_count = 0
+    while next_token < 200:
+        if rolling.length >= rolling_ctx:
+            let before = rolling.clone()
+            let plan = plan_context_shift(rolling.length, rolling_ctx, rolling_keep, 0)
+            rolling = apply_context_shift(rolling, plan)
+            assert(rolling[0] == 10 and rolling[1] == 11, "repeated shifts preserve the fixed prefix")
+            var int retained_i = rolling_keep
+            while retained_i < rolling.length:
+                assert(rolling[retained_i] == before[retained_i + plan.discard], "repeated shifts preserve suffix order")
+                retained_i += 1
+            shift_count += 1
+        rolling.push(next_token)
+        assert(rolling.length <= rolling_ctx, "repeated shifts keep generation inside the context")
+        next_token += 1
+    assert(shift_count > 20, "long generation exercises repeated context shifts")
+    assert(rolling[rolling.length - 1] == 199, "long generation retains the newest token")
+
     let a = toks(1, 3000)
     let none = plan_save([], toks(1, 1000), 2, 100, 0)
     assert(not none.save, "under 1024 tokens is never written")
