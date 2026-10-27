@@ -1,0 +1,140 @@
+# Build + run:
+#   boring build --target metal test/test_float16_gpu_real.br
+#   cargo run --manifest-path test/test_float16_gpu_real_metal/Cargo.toml
+
+use io
+use float16_gpu
+
+[float32] passthrough([float32] x):
+    x
+
+def assert_close(float32 a, float32 b, float32 tolerance, string msg):
+    let diff = if a > b: a - b else: b - a
+    assert(diff <= tolerance, "{msg}: expected ~{b}, got {a}")
+
+[float32] values(int n, int salt):
+    mut [float32] out = [0.0 as float32 for ..<n]
+    var int i = 0
+    while i < n:
+        out[i] = (((i * 17 + salt * 29) % 127) as float32) / 63.5 - 1.0
+        i += 1
+    out
+
+# Straightforward single-query GQA reference over the exact values stored in
+# the half main cache plus the float32 tail.
+[float32] attention_reference([float32]& q, [float32]& k, [float32]& v,
+        int seq_k, int n_head, int n_kv_head, int d_head):
+    let d_kv = n_kv_head * d_head
+    let group = n_head / n_kv_head
+    let scale = 1.0 / (d_head as float32).sqrt()
+    mut [float32] out = [0.0 as float32 for ..<(n_head * d_head)]
+    var int h = 0
+    while h < n_head:
+        let kv_h = h / group
+        var float32 max_score = -1.0e30
+        var int p = 0
+        while p < seq_k:
+            var float32 dot = 0.0
+            var int d = 0
+            while d < d_head:
+                dot += q[h * d_head + d] * k[p * d_kv + kv_h * d_head + d]
+                d += 1
+            let score = dot * scale
+            if score > max_score:
+                max_score = score
+            p += 1
+        var float32 denom = 0.0
+        p = 0
+        while p < seq_k:
+            var float32 dot = 0.0
+            var int d = 0
+            while d < d_head:
+                dot += q[h * d_head + d] * k[p * d_kv + kv_h * d_head + d]
+                d += 1
+            let weight = (dot * scale - max_score).exp()
+            denom += weight
+            d = 0
+            while d < d_head:
+                out[h * d_head + d] += weight * v[p * d_kv + kv_h * d_head + d]
+                d += 1
+            p += 1
+        var int d = 0
+        while d < d_head:
+            out[h * d_head + d] = out[h * d_head + d] / denom
+            d += 1
+        h += 1
+    out
+
+def check_attention(int d_head) throws:
+    let n_head = 4
+    let n_kv_head = 2
+    let main_len = 137
+    let tail_len = 3
+    let seq_k = main_len + tail_len
+    let d_kv = n_kv_head * d_head
+    let q = values(n_head * d_head, 1)
+    let main_k_source = values(main_len * d_kv, 2)
+    let main_v_source = values(main_len * d_kv, 3)
+    let tail_k = values(tail_len * d_kv, 4)
+    let tail_v = values(tail_len * d_kv, 5)
+    let main_k = pack_float16_gpu(main_k_source)
+    let main_v = pack_float16_gpu(main_v_source)
+
+    # Build the CPU oracle from the values actually representable in the
+    # packed cache, not from their pre-rounding float32 sources.
+    let stored_k_raw = unpack_float16_gpu(main_k)
+    let stored_k = passthrough(stored_k_raw)
+    let stored_v_raw = unpack_float16_gpu(main_v)
+    let stored_v = passthrough(stored_v_raw)
+    mut [float32] all_k = stored_k
+    mut [float32] all_v = stored_v
+    var int i = 0
+    while i < tail_k.length:
+        all_k.push(tail_k[i])
+        all_v.push(tail_v[i])
+        i += 1
+    let expected = attention_reference(q, all_k, all_v, seq_k, n_head, n_kv_head, d_head)
+    let got_raw = attention_gqa_tail_f16_gpu(q, main_k, main_v, tail_k, tail_v,
+        main_len, seq_k, n_head, n_kv_head, d_head)
+    let got = passthrough(got_raw)
+    i = 0
+    while i < expected.length:
+        assert_close(got[i], expected[i], 0.002 as float32, "float16 attention d_head={d_head}[{i}]")
+        i += 1
+    print "float16 mixed-cache attention d_head={d_head}: OK"
+
+def main() throws:
+    # Exact binary fractions, a rounded ordinary value, both signs and the
+    # largest finite binary16 value exercise conversion and native storage.
+    let input = [0.0, 1.0, -2.0, 0.33325, -17.125, 65504.0]
+    let resident = pack_float16_gpu(input)
+    let roundtrip_raw = unpack_float16_gpu(resident)
+    let roundtrip = passthrough(roundtrip_raw)
+    var i = 0
+    while i < input.length:
+        assert_close(roundtrip[i], input[i], 0.001 as float32, "float16 round-trip[{i}]")
+        i += 1
+    print "float16 resident round-trip: OK"
+
+    # Cache growth must preserve already packed values and quantize only the
+    # appended float32 rows. The first segment uses pack_float16_gpu directly,
+    # as a zero-length GPU input has no buffer to bind.
+    let old = pack_float16_gpu([1.25, -2.5, 3.75])
+    let grown = append_float16_gpu(old, [0.33325, -17.125], 3, 2)
+    let grown_raw = unpack_float16_gpu(grown)
+    let grown_host = passthrough(grown_raw)
+    let expected = [1.25, -2.5, 3.75, 0.33325, -17.125]
+    i = 0
+    while i < expected.length:
+        assert_close(grown_host[i], expected[i], 0.001 as float32, "float16 append[{i}]")
+        i += 1
+
+    let from_empty = pack_float16_gpu([4.5, -0.625])
+    let empty_raw = unpack_float16_gpu(from_empty)
+    let empty_host = passthrough(empty_raw)
+    assert_close(empty_host[0], 4.5 as float32, 0.001 as float32, "float16 empty append[0]")
+    assert_close(empty_host[1], -0.625 as float32, 0.001 as float32, "float16 empty append[1]")
+    print "float16 resident append: OK"
+
+    check_attention(64)
+    check_attention(128)

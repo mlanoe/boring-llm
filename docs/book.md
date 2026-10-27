@@ -735,7 +735,7 @@ The README states the minimum commit to use. After any compiler update that touc
 | Tokenization | `llama-cpp-python` | `tools/oracle_encode.py`, `test/test_tokenizer_real.br` |
 | Chat-template rendering | `jinja2` | `tools/oracle_render_request.py` (every fixture of `test/fixtures/requests/` against a build), `test/test_jinja_real.br` |
 | Dequantization | the CPU reference in `quant.br` | `test/test_quant*.br` |
-| GPU kernels | the CPU reference math | `test/test_math_gpu_real.br`, `test/test_quant_kernels_real.br` |
+| GPU kernels | the CPU reference math | `test/test_math_gpu_real.br`, `test/test_quant_kernels_real.br`, `test/test_float16_gpu_real.br` |
 | Forward-pass logits | llama.cpp | `tools/reference_logits.py`, `tools/accuracy_vs_llamacpp.py` |
 | Generation (decode path) | llama.cpp | `tools/decode_vs_llamacpp.py` |
 | Server wire format | the OpenAI protocol | `tools/smoke_server.py` |
@@ -757,9 +757,11 @@ The `test/*_real.br` programs need a compiled build and real weights, and each l
 ```sh
 boring build --target metal test/test_math_gpu_real.br
 (cd test/test_math_gpu_real_metal && cargo build --release && ./target/release/test_math_gpu_real)
+boring build --target metal test/test_float16_gpu_real.br
+(cd test/test_float16_gpu_real_metal && cargo run --release)
 ```
 
-`test_math_gpu_real.br` checks every GPU kernel against the CPU reference, including the split-cache attention against a single-buffer one, on both Metal and wgpu.
+`test_math_gpu_real.br` checks every inference GPU kernel against the CPU reference, including the split-cache attention against a single-buffer one, on both Metal and wgpu. `test_float16_gpu_real.br` independently checks that native binary16 resident buffers round-trip through the GPU; it is the isolated prerequisite for a future half-sized KV cache.
 
 ### 11.4 The accuracy check
 
@@ -847,6 +849,7 @@ This writes `docs/book.html`, `README.html` at the repository root, and one HTML
 
 - **One request at a time.** There is no batching and no concurrent decoding.
 - **Context** is limited by `--ctx-size` and memory. The KV cache is float32, twice the size llama.cpp's float16 cache needs.
+- **Float16 cache activation is deferred, not unimplemented.** Native half-storage, append and mixed-cache decode kernels pass on Metal, but importing them into the server also places f16 declarations in its monolithic wgpu shader. Portable activation waits for Boring's wgpu shader-f16 support so the default f32 wgpu server is not regressed.
 - **Architectures**: Llama-style GGUF layouts only (`qwen2` and `llama` are the tested ones); no mixture-of-experts, no vision.
 - **Chat templates** use a Jinja2 subset; an unsupported construct is reported.
 - **Standard split GGUF naming required.** Multi-file models are discovered from any `model-00001-of-000NN.gguf` shard using their `split.no`, `split.count`, and `split.tensors.count` metadata. Arbitrary shard filenames are not guessed.

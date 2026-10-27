@@ -1,0 +1,212 @@
+# Native IEEE binary16 storage helpers for persistent GPU buffers.
+#
+# Arithmetic remains float32: packing is intended for data whose memory
+# footprint dominates its compute cost, notably the KV cache. Keeping these
+# kernels independent of the cache policy also makes backend support directly
+# testable before the cache representation changes.
+
+pub req [float16]'kernel'unified pack_float16_gpu([float32]'kernel'global src) throws:
+    let int n = src.length
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    kernel(block = 256, grid = (gx, gy)):
+        mut [float16]'unified out = [0.0 as float16 for ..<n]
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let i = .thread.x + block_idx * .block_dim.x
+        if i < n:
+            out[i] = src[i] as float16
+        out
+
+pub req [float32]'kernel'unified unpack_float16_gpu([float16]'kernel'global src) throws:
+    let int n = src.length
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    kernel(block = 256, grid = (gx, gy)):
+        mut [float32]'unified out = [0.0 as float32 for ..<n]
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let i = .thread.x + block_idx * .block_dim.x
+        if i < n:
+            out[i] = src[i] as float32
+        out
+
+# Append freshly computed float32 rows to an existing non-empty packed buffer
+# while keeping the result packed. `old_n`/`new_n` are element counts so
+# callers can reuse this for both whole-cache folds and the short decode tail.
+# As with `kv_append_gpu`, callers use `pack_float16_gpu(fresh)` for the first
+# segment because a zero-length GPU input has no buffer to bind.
+pub req [float16]'kernel'unified append_float16_gpu([float16]'kernel'global old,
+        [float32]'kernel'global fresh, int old_n, int new_n) throws:
+    let int n = old_n + new_n
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    kernel(block = 256, grid = (gx, gy)):
+        mut [float16]'unified out = [0.0 as float16 for ..<n]
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let i = .thread.x + block_idx * .block_dim.x
+        if i < old_n:
+            out[i] = old[i]
+        elif i < n:
+            out[i] = fresh[i - old_n] as float16
+        out
+
+# Single-query grouped attention over a packed main cache and a short float32
+# tail. Cache reads are widened to float32 before dot products and value
+# accumulation; only persistent storage is half precision. One implementation
+# covers the two head widths used by the optimized decode path.
+kernel FlashDecodeTailF16Kernel:
+    let [float32]'global q
+    let [float16]'global k
+    let [float16]'global v
+    let [float32]'global tk
+    let [float32]'global tv
+    let int main_len
+    mut [float32]'unified part
+    let int seq_k
+    let int d_kv
+    let int d_head
+    let int group
+    let int nsplit
+    let int chunk
+    let float32 scale
+    mut [float32, width = 128, height = 1]'actor q_s
+    mut [float32, width = 128, height = 1]'actor p_s
+
+    init([float32]'global qi, [float16]'global ki, [float16]'global vi,
+         [float32]'global tki, [float32]'global tvi, int ml,
+         int sk, int dkv, int dh, int grp, int ns, int ch, float32 sc,
+         int nparts):
+        q = qi
+        k = ki
+        v = vi
+        tk = tki
+        tv = tvi
+        main_len = ml
+        seq_k = sk
+        d_kv = dkv
+        d_head = dh
+        group = grp
+        nsplit = ns
+        chunk = ch
+        scale = sc
+        part = [0.0 as float32 for ..<nparts]
+
+    def ():
+        let t = .thread.x
+        let split = .block.x
+        let h = .block.y
+        let k_off = (h / group) * d_head
+        let start = split * chunk
+        var int stop = start + chunk
+        if stop > seq_k:
+            stop = seq_k
+        q_s[width = t, height = 0] = q[h * d_head + t]
+        var float32 m = -1.0e30
+        var float32 l = 0.0
+        var float32 acc = 0.0
+        var int ntiles = 0
+        if stop > start:
+            ntiles = (stop - start + d_head - 1) / d_head
+        for ti in 0..<ntiles:
+            let j0 = start + ti * d_head
+            let jg = j0 + t
+            sync
+            var float32 s = -1.0e30
+            if jg < stop:
+                var float32 dot = 0.0
+                if jg < main_len:
+                    for d in 0..<d_head:
+                        dot += q_s[width = d, height = 0] * (k[jg * d_kv + k_off + d] as float32)
+                else:
+                    for d in 0..<d_head:
+                        dot += q_s[width = d, height = 0] * tk[(jg - main_len) * d_kv + k_off + d]
+                s = dot * scale
+            p_s[width = t, height = 0] = s
+            sync
+            var float32 mx = m
+            for j in 0..<d_head:
+                let sv = p_s[width = j, height = 0]
+                if sv > mx:
+                    mx = sv
+            let alpha = (m - mx).exp()
+            var float32 pv = 0.0
+            if jg < stop:
+                pv = (s - mx).exp()
+            sync
+            p_s[width = t, height = 0] = pv
+            sync
+            var float32 psum = 0.0
+            var float32 nacc = 0.0
+            for j in 0..<d_head:
+                let pj = p_s[width = j, height = 0]
+                psum += pj
+                if j0 + j < stop:
+                    if j0 + j < main_len:
+                        nacc += pj * (v[(j0 + j) * d_kv + k_off + t] as float32)
+                    else:
+                        nacc += pj * tv[(j0 + j - main_len) * d_kv + k_off + t]
+            l = l * alpha + psum
+            acc = acc * alpha + nacc
+            m = mx
+        let base = (h * nsplit + split) * (d_head + 2)
+        part[base + 2 + t] = acc
+        if t == 0:
+            part[base] = m
+            part[base + 1] = l
+
+kernel FlashDecodeCombineF16Kernel:
+    let [float32]'global part
+    mut [float32]'unified out
+    let int nsplit
+    let int d_head
+
+    init([float32]'global pi, int ns, int dh, int n):
+        part = pi
+        nsplit = ns
+        d_head = dh
+        out = [0.0 as float32 for ..<n]
+
+    def ():
+        let t = .thread.x
+        let h = .block.x
+        var float32 big = -1.0e30
+        for s in 0..<nsplit:
+            let ms = part[(h * nsplit + s) * (d_head + 2)]
+            if ms > big:
+                big = ms
+        var float32 total = 0.0
+        var float32 acc = 0.0
+        for s in 0..<nsplit:
+            let base = (h * nsplit + s) * (d_head + 2)
+            let w = (part[base] - big).exp()
+            total += part[base + 1] * w
+            acc += part[base + 2 + t] * w
+        if total > 0.0:
+            out[h * d_head + t] = acc / total
+
+pub req [float32]'kernel'unified attention_gqa_tail_f16_gpu(
+        [float32]'kernel'global q,
+        [float16]'kernel'global k, [float16]'kernel'global v,
+        [float32]'kernel'global tk, [float32]'kernel'global tv,
+        int main_len, int seq_k, int n_head, int n_kv_head, int d_head) throws:
+    guard d_head == 64 or d_head == 128 else throw "float16 KV attention requires d_head 64 or 128"
+    let int d_kv = n_kv_head * d_head
+    let int group = n_head / n_kv_head
+    let float32 scale = 1.0 / (d_head as float32).sqrt()
+    var int nsplit = (seq_k + 127) / 128
+    if nsplit < 1:
+        nsplit = 1
+    if nsplit > 64:
+        nsplit = 64
+    let int chunk = (seq_k + nsplit - 1) / nsplit
+    mut kd = FlashDecodeTailF16Kernel(q, k, v, tk, tv, main_len, seq_k,
+        d_kv, d_head, group, nsplit, chunk, scale,
+        n_head * nsplit * (d_head + 2))
+    kernel:
+        kd(block = d_head, grid = (nsplit, n_head))
+    mut kc = FlashDecodeCombineF16Kernel(kd.part, nsplit, d_head, n_head * d_head)
+    kernel:
+        kc(block = d_head, grid = n_head)
+    kc.out

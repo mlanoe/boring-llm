@@ -109,7 +109,7 @@ The first request of a session is the slow one, because the ~7.5k-token prompt h
 | `-kvo`, `--kv-offload` | enabled | accepted because KV buffers are GPU-resident; `-nkvo`/`--no-kv-offload` is rejected because no CPU attention path exists |
 | `--op-offload` | enabled | accepted because inference uses GPU tensor kernels; `--no-op-offload` is rejected because no CPU inference path exists |
 | `-fa`, `--flash-attn [on\|auto]` | `auto` | compatibility setting; both values use boring-llm's always-enabled fused attention kernels, while `off` is rejected |
-| `-ctk`, `--cache-type-k TYPE`; `-ctv`, `--cache-type-v TYPE` | `f32` | llama.cpp-compatible KV-cache options; `f32` matches the current cache representation, while narrower and quantized types are rejected explicitly |
+| `-ctk`, `--cache-type-k TYPE`; `-ctv`, `--cache-type-v TYPE` | `f32` | llama.cpp-compatible KV-cache options; portable serving remains f32 until Boring's wgpu backend accepts the already-tested Metal float16 cache kernels |
 | `--no-mmproj`, `--no-mmproj-auto` | current behavior | accepted text-only settings; projector, embeddings and reranking modes are rejected before model loading |
 | `LLAMA_ARG_MODEL`, `LLAMA_ARG_ALIAS`, `LLAMA_ARG_TAGS`, `LLAMA_ARG_HOST`, `LLAMA_ARG_PORT`, `LLAMA_ARG_CTX_SIZE`, `LLAMA_ARG_N_PREDICT`, `LLAMA_API_KEY` | unset | core llama-server environment defaults; an explicit command-line option takes precedence |
 | `LLAMA_ARG_CORS_ORIGINS`, `LLAMA_ARG_CORS_METHODS`, `LLAMA_ARG_CORS_HEADERS`, `LLAMA_ARG_ENDPOINT_METRICS`, `LLAMA_ARG_ENDPOINT_SLOTS`, `LLAMA_ARG_CACHE_PROMPT`, `LLAMA_ARG_SSE_PING_INTERVAL` | matching CLI defaults | server environment defaults, including llama.cpp boolean spellings (`1`/`0`, `true`/`false`, `on`/`off`, `enabled`/`disabled`) |
