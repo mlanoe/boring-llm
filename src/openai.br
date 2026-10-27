@@ -2212,6 +2212,25 @@ pub int generation_route_kind(string method, string path):
     if path == "/v1/responses" or path == "/responses": return 5
     0
 
+# Optional llama-server model endpoints recognized by the HTTP surface but not
+# implemented by the text-only, serialized runtime. An empty string means that
+# normal route dispatch should continue.
+pub string unsupported_model_endpoint(string method, string path):
+    if method == "POST":
+        if path == "/embedding" or path == "/embeddings" or path == "/v1/embeddings":
+            return "embeddings"
+        if path == "/rerank" or path == "/reranking" or path == "/v1/rerank" or path == "/v1/reranking":
+            return "reranking"
+        if path == "/v1/audio/transcriptions" or path == "/audio/transcriptions":
+            return "audio transcriptions"
+        if path == "/tts": return "text-to-speech"
+        if path == "/infill": return "infill"
+        if path == "/v1/systemone": return "decision models"
+        if path == "/v1/chat/completions/control": return "in-flight completion control"
+    if (method == "GET" or method == "POST") and path == "/v1/realtime":
+        return "Realtime API"
+    ""
+
 pub bool anthropic_api_path(string path):
     path == "/v1/messages" or path == "/v1/messages/count_tokens"
 

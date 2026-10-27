@@ -1483,6 +1483,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     print "[serve] {r.method} {r.path}"
     let path = strip_api_prefix(http_request_path(r.path), ctx.api_prefix)
     let generation_kind = generation_route_kind(r.method, path)
+    let unsupported_endpoint = unsupported_model_endpoint(r.method, path)
     response.request_is_anthropic = anthropic_api_path(path)
     let action = http_query_value(r.path, "action")
     if r.method == "OPTIONS":
@@ -1629,16 +1630,10 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("lora-adapters"))
     elif (r.method == "GET" or r.method == "POST") and path == "/tools":
         respond_json(response, sock, 403, "Forbidden", feature_disabled_json())
-    elif r.method == "POST" and (path == "/embedding" or path == "/embeddings" or path == "/v1/embeddings"):
-        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("embeddings"))
-    elif r.method == "POST" and (path == "/rerank" or path == "/v1/rerank" or path == "/v1/reranking"):
-        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("reranking"))
-    elif r.method == "POST" and path == "/v1/chat/completions/control":
-        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("in-flight completion control"))
+    elif unsupported_endpoint != "":
+        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json(unsupported_endpoint))
     elif r.method == "POST" and path == "/v1/messages/count_tokens":
         return handle_anthropic_input_tokens(ctx, response, sock, r.body, counter, slots)
-    elif (r.method == "GET" or r.method == "POST") and path == "/v1/realtime":
-        respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("Realtime API"))
     elif generation_kind > 0:
         let is_anthropic = generation_kind == 1
         let is_chat = generation_kind == 1 or generation_kind == 2 or generation_kind == 5

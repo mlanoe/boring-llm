@@ -145,7 +145,7 @@ One request is served at a time (one GPU). Every response is `Connection: close`
 
 boring-llm is a single-model server. Modern llama-server router routes such as `/models/load`, `/models/unload`, `/models/sse`, and model-cache deletion are recognized but return `501` rather than pretending dynamic model management is available.
 
-Embedding (`/embedding`, `/embeddings`, `/v1/embeddings`) and reranking (`/rerank`, `/v1/rerank`, `/v1/reranking`) routes are likewise recognized and return `501`: boring-llm currently loads causal text-generation models only.
+Embedding (`/embedding`, `/embeddings`, `/v1/embeddings`) and reranking (`/rerank`, `/reranking`, `/v1/rerank`, `/v1/reranking`) routes are likewise recognized and return `501`: boring-llm currently loads causal text-generation models only. The llama-server audio transcription (`/audio/transcriptions`, `/v1/audio/transcriptions`), text-to-speech (`/tts`), infill (`/infill`) and decision-model (`/v1/systemone`) routes are also recognized with structured `501` responses instead of falling through to `404`.
 
 Unsupported modern API families—Realtime and in-flight chat-completion control—also return a structured `501` instead of looking like misspelled paths.
 

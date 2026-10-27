@@ -264,7 +264,9 @@ The server listens on `127.0.0.1` only and has no authentication. To reach it fr
 | `POST /lora-adapters` | recognized and returns 501 because runtime LoRA loading is not supported |
 | `GET /tools`, `POST /tools` | return llama-server's 403 `feature_disabled`; server-executed tools are disabled and are distinct from OpenAI request tool calling |
 | `POST /embedding`, `/embeddings`, `/v1/embeddings` | recognized and return 501; the loaded causal text model does not expose a pooled embedding output |
-| `POST /rerank`, `/v1/rerank`, `/v1/reranking` | recognized and return 501; dedicated ranking models are not supported |
+| `POST /rerank`, `/reranking`, `/v1/rerank`, `/v1/reranking` | recognized and return 501; dedicated ranking models are not supported |
+| `POST /audio/transcriptions`, `/v1/audio/transcriptions` | recognized and return 501; boring-llm does not load audio-capable models |
+| `POST /tts`, `/infill`, `/v1/systemone` | recognized and return 501; text-to-speech, infill and decision-model execution are not supported |
 | `POST /v1/chat/completions/control` | recognized and returns 501; serialized requests cannot be controlled through a concurrent side channel |
 | `POST /v1/messages/count_tokens` | Anthropic text messages, system text blocks, tool definitions and `thinking`/`tool_use`/`tool_result` history (including tool error state) are adapted to the model chat template and counted without inference; the response uses Anthropic's native `{input_tokens}` shape, and media blocks are rejected explicitly |
 | `POST /v1/messages` | Anthropic Messages generation with text, signed thinking and tool-use blocks, buffered or streamed with native Anthropic SSE events (including `signature_delta` and terminal `error` events), non-overlapping cached/non-cached usage, and Anthropic-shaped validation, authentication and server errors carrying `request_id`; `thinking: {type: "enabled", budget_tokens: N}` enables model reasoning, assistant thinking history is preserved, matched `stop_sequences` are reported with `stop_reason: "stop_sequence"`, and `disable_parallel_tool_use` reaches compatible chat templates |
