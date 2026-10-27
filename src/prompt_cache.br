@@ -28,6 +28,7 @@ use gguf
 use gguf_file
 use io
 use math_gpu
+use float16_gpu
 use model
 use openai
 use std.fs.File
@@ -163,9 +164,17 @@ pub def save_snapshot_file(string path, int fp, int seq, QuantModel model, GenCa
     let plane = n * kv_dim * 4
     var int l = 0
     while l < n_layer:
-        let k_host = download_floats_gpu(folded.layers[l].k, n * kv_dim)
+        mut [float32] k_host = []
+        mut [float32] v_host = []
+        if folded.f16:
+            let k_resident = unpack_float16_gpu(folded.layers[l].hk)
+            k_host = download_floats_gpu(k_resident, n * kv_dim)
+            let v_resident = unpack_float16_gpu(folded.layers[l].hv)
+            v_host = download_floats_gpu(v_resident, n * kv_dim)
+        else:
+            k_host = download_floats_gpu(folded.layers[l].k, n * kv_dim)
+            v_host = download_floats_gpu(folded.layers[l].v, n * kv_dim)
         write_floats(f, k_host, n * kv_dim, data_off + 2 * l * plane)
-        let v_host = download_floats_gpu(folded.layers[l].v, n * kv_dim)
         write_floats(f, v_host, n * kv_dim, data_off + (2 * l + 1) * plane)
         l += 1
     mut [uint8] toks = [0 as uint8 for i in 0..<(4 * n)]
@@ -203,6 +212,9 @@ pub GenCache load_snapshot_file(string path, DiskSnap snap, QuantModel model, in
     while l < model.config.n_layer:
         let k_host = read_floats(f, data_off + 2 * l * plane, common * kv_dim)
         let v_host = read_floats(f, data_off + (2 * l + 1) * plane, common * kv_dim)
-        layers.push(LayerCache(upload_floats_gpu(k_host), upload_floats_gpu(v_host), [], []))
+        if uses_float16_kv_cache():
+            layers.push(LayerCache([], [], pack_float16_gpu(k_host), pack_float16_gpu(v_host), [], []))
+        else:
+            layers.push(LayerCache(upload_floats_gpu(k_host), upload_floats_gpu(v_host), [], [], [], []))
         l += 1
-    GenCache(layers, common, 0)
+    GenCache(layers, common, 0, uses_float16_kv_cache())

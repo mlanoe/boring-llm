@@ -20,6 +20,7 @@ use gguf_file
 use quant
 use math
 use math_gpu
+use float16_gpu
 use sampling
 
 pub struct Config:
@@ -640,6 +641,8 @@ pub [int] generate_f32(Model model, [int] prompt_tokens, int max_new_tokens, int
 pub struct LayerCache:
     [float32]'kernel'unified k     # main rows: the first `GenCache.pos - GenCache.tail` are valid
     [float32]'kernel'unified v
+    [float16]'kernel'unified hk    # same main rows when `GenCache.f16` is true
+    [float16]'kernel'unified hv
     [float32]'kernel'unified tk    # the newest `GenCache.tail` rows ([] when there are none)
     [float32]'kernel'unified tv
 
@@ -647,6 +650,7 @@ pub struct GenCache:
     [LayerCache] layers
     int pos        # absolute position of the NEXT token to be processed
     int tail       # how many of the newest positions live in the tail buffers
+    bool f16       # main K/V buffers use hk/hv rather than k/v
 
 let int TAIL_MAX = 64
 
@@ -655,9 +659,17 @@ let int TAIL_MAX = 64
 # deliberately no synchronization around the copy: the delta is measured in
 # the real pipelined command stream. See tools/profile_decode_marginal.py.
 static var int decode_profile_stage = 0
+static var bool kv_cache_f16 = false
 
 pub def set_decode_profile_stage(int stage):
     decode_profile_stage = stage
+
+pub def set_kv_cache_type(string cache_type) throws:
+    guard cache_type == "f32" or cache_type == "f16" else throw "KV cache type must be f32 or f16"
+    kv_cache_f16 = cache_type == "f16"
+
+pub bool uses_float16_kv_cache():
+    kv_cache_f16
 
 # Batched prefill: processes the WHOLE prompt in one pass per layer (same
 # structure as forward_gpu_quantized — same kernels, same dispatch count
@@ -670,6 +682,7 @@ pub def set_decode_profile_stage(int stage):
 # than one batched 26-token forward, purely from per-kernel-launch overhead
 # at this model's small scale (confirmed empirically before adding this).
 pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) throws:
+    guard not kv_cache_f16 or model.config.d_head == 64 or model.config.d_head == 128 else throw "float16 KV cache requires attention head size 64 or 128"
     let seq = tokens.length
     let d = model.config.d_model
     let qkv_dim = model.config.n_head * model.config.d_head
@@ -719,7 +732,10 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
         # `k_rope_raw`/`v` already ARE the whole prompt's post-RoPE cache for
         # this layer (seq positions, 0..seq-1) — nothing to grow, and they
         # stay on the device as the resident cache.
-        new_layers.push(LayerCache(k_rope_raw, v, [], []))
+        if kv_cache_f16:
+            new_layers.push(LayerCache([], [], pack_float16_gpu(k_rope_raw), pack_float16_gpu(v), [], []))
+        else:
+            new_layers.push(LayerCache(k_rope_raw, v, [], [], [], []))
         l += 1
 
     # Only the LAST position's logits are ever used (they pick the first
@@ -738,7 +754,7 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
     # doesn't trigger the GPU-result-to-array conversion automatically.
     let last_logits = passthrough(logits_raw)
 
-    (last_logits, GenCache(new_layers, seq, 0))
+    (last_logits, GenCache(new_layers, seq, 0, kv_cache_f16))
 
 # Batched cache-append: like prefill_gpu_quantized above, but appends
 # `tokens` (a batch of N new tokens, N >= 1) to an EXISTING, possibly
@@ -752,6 +768,7 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
 # split, rather than unifying them behind an "empty vs non-empty cache"
 # branch — same GPU-orchestration code, same reasoning.
 pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache cache0, [int] tokens) throws:
+    guard not cache0.f16 or model.config.d_head == 64 or model.config.d_head == 128 else throw "float16 KV cache requires attention head size 64 or 128"
     if cache0.pos == 0:
         return prefill_gpu_quantized(model, tokens)
     let cache = fold_cache(model, cache0)
@@ -795,12 +812,27 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
         # forward_step already uses for a single new token, just batched.
         q = rope_apply_at_gpu(q, n, model.config.n_head, model.config.d_head, model.config.rope_freq_base, base_pos, model.config.rope_neox)
         let k_rope_raw = rope_apply_at_gpu(k, n, model.config.n_kv_head, model.config.d_head, model.config.rope_freq_base, base_pos, model.config.rope_neox)
-        # Grow the resident cache on the device: old rows then the new ones.
-        let full_k = kv_append_gpu(lc.k, k_rope_raw, base_pos * kv_dim, n * kv_dim)
-        let full_v = kv_append_gpu(lc.v, v, base_pos * kv_dim, n * kv_dim)
-
         let seq_k = base_pos + n
-        let attn_out = attention_gqa_gpu(q, full_k, full_v, n, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head, true, base_pos)
+        mut [float32]'kernel'unified full_k = []
+        mut [float32]'kernel'unified full_v = []
+        mut [float16]'kernel'unified full_hk = []
+        mut [float16]'kernel'unified full_hv = []
+        mut [float32]'kernel'unified attn_out = []
+        if cache.f16:
+            # Batched prefill still uses the general float32 attention path.
+            # Widen the old main cache for this comparatively infrequent path,
+            # then repack the result. Single-token decode reads half directly.
+            let old_k = unpack_float16_gpu(lc.hk)
+            let old_v = unpack_float16_gpu(lc.hv)
+            full_k = kv_append_gpu(old_k, k_rope_raw, base_pos * kv_dim, n * kv_dim)
+            full_v = kv_append_gpu(old_v, v, base_pos * kv_dim, n * kv_dim)
+            attn_out = attention_gqa_gpu(q, full_k, full_v, n, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head, true, base_pos)
+            full_hk = pack_float16_gpu(full_k)
+            full_hv = pack_float16_gpu(full_v)
+        else:
+            full_k = kv_append_gpu(lc.k, k_rope_raw, base_pos * kv_dim, n * kv_dim)
+            full_v = kv_append_gpu(lc.v, v, base_pos * kv_dim, n * kv_dim)
+            attn_out = attention_gqa_gpu(q, full_k, full_v, n, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head, true, base_pos)
         let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, n, qkv_dim, d)
         x = add_gpu(x, attn_proj, n * d)
 
@@ -811,7 +843,10 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
         let ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, n, model.config.ffn_dim, d)
         x = add_gpu(x, ffn_out, n * d)
 
-        new_layers.push(LayerCache(full_k, full_v, [], []))
+        if cache.f16:
+            new_layers.push(LayerCache([], [], full_hk, full_hv, [], []))
+        else:
+            new_layers.push(LayerCache(full_k, full_v, [], [], [], []))
         l += 1
 
     # Last row only — see prefill_gpu_quantized's identical tail for why.
@@ -820,15 +855,15 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
     let logits_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
     let last_logits = passthrough(logits_raw)
 
-    (last_logits, GenCache(new_layers, base_pos + n, 0))
+    (last_logits, GenCache(new_layers, base_pos + n, 0, cache.f16))
 
 pub GenCache empty_cache(int n_layer):
     mut [LayerCache] layers = []
     var int l = 0
     while l < n_layer:
-        layers.push(LayerCache([], [], [], []))
+        layers.push(LayerCache([], [], [], [], [], []))
         l += 1
-    GenCache(layers, 0, 0)
+    GenCache(layers, 0, 0, kv_cache_f16)
 
 # The cache with its tail folded into the main buffers (nothing to do when the
 # tail is empty): what prefill and the disk snapshots need, one buffer per layer.
@@ -841,11 +876,16 @@ pub GenCache fold_cache(QuantModel model, GenCache cache) throws:
     var int l = 0
     while l < model.config.n_layer:
         let lc = cache.layers[l]
-        let fk = kv_append_gpu(lc.k, lc.tk, main_n * kv_dim, cache.tail * kv_dim)
-        let fv = kv_append_gpu(lc.v, lc.tv, main_n * kv_dim, cache.tail * kv_dim)
-        layers.push(LayerCache(fk, fv, [], []))
+        if cache.f16:
+            let fk = append_float16_gpu(lc.hk, lc.tk, main_n * kv_dim, cache.tail * kv_dim)
+            let fv = append_float16_gpu(lc.hv, lc.tv, main_n * kv_dim, cache.tail * kv_dim)
+            layers.push(LayerCache([], [], fk, fv, [], []))
+        else:
+            let fk = kv_append_gpu(lc.k, lc.tk, main_n * kv_dim, cache.tail * kv_dim)
+            let fv = kv_append_gpu(lc.v, lc.tv, main_n * kv_dim, cache.tail * kv_dim)
+            layers.push(LayerCache(fk, fv, [], [], [], []))
         l += 1
-    GenCache(layers, cache.pos, 0)
+    GenCache(layers, cache.pos, 0, cache.f16)
 
 # Processes exactly one new token against the existing cache. Returns the
 # new token's own logits row (vocab_size long — there's only ever one
@@ -903,9 +943,15 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
         # No causal mask: the single new query is always the most recent
         # position, so every key already in the cache (including the one
         # just appended) is a legitimate position to attend to.
-        let attn_out = attention_gqa_tail_gpu(q, lc.k, lc.v, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
+        let attn_out = if cache.f16:
+            attention_gqa_tail_f16_gpu(q, lc.hk, lc.hv, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
+        else:
+            attention_gqa_tail_gpu(q, lc.k, lc.v, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
         if decode_profile_stage == 2:
-            let _ = attention_gqa_tail_gpu(q, lc.k, lc.v, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
+            if cache.f16:
+                let _ = attention_gqa_tail_f16_gpu(q, lc.hk, lc.hv, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
+            else:
+                let _ = attention_gqa_tail_gpu(q, lc.k, lc.v, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
         let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, 1, qkv_dim, d)
         if decode_profile_stage == 3:
             let _ = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, 1, qkv_dim, d)
@@ -943,11 +989,16 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
             normed = normed_final
 
         if tail_len + 1 >= TAIL_MAX:
-            let full_k = kv_append_gpu(lc.k, tk_new, main_len * kv_dim, (tail_len + 1) * kv_dim)
-            let full_v = kv_append_gpu(lc.v, tv_new, main_len * kv_dim, (tail_len + 1) * kv_dim)
-            new_layers.push(LayerCache(full_k, full_v, [], []))
+            if cache.f16:
+                let full_k = append_float16_gpu(lc.hk, tk_new, main_len * kv_dim, (tail_len + 1) * kv_dim)
+                let full_v = append_float16_gpu(lc.hv, tv_new, main_len * kv_dim, (tail_len + 1) * kv_dim)
+                new_layers.push(LayerCache([], [], full_k, full_v, [], []))
+            else:
+                let full_k = kv_append_gpu(lc.k, tk_new, main_len * kv_dim, (tail_len + 1) * kv_dim)
+                let full_v = kv_append_gpu(lc.v, tv_new, main_len * kv_dim, (tail_len + 1) * kv_dim)
+                new_layers.push(LayerCache(full_k, full_v, [], [], [], []))
         else:
-            new_layers.push(LayerCache(lc.k, lc.v, tk_new, tv_new))
+            new_layers.push(LayerCache(lc.k, lc.v, lc.hk, lc.hv, tk_new, tv_new))
         l += 1
 
     let new_tail = if cache.tail + 1 >= TAIL_MAX: 0 else: cache.tail + 1
@@ -959,7 +1010,7 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
     # doesn't trigger the GPU-result-to-array conversion automatically.
     let logits = passthrough(logits_raw)
 
-    (logits, GenCache(new_layers, pos + 1, new_tail))
+    (logits, GenCache(new_layers, pos + 1, new_tail, cache.f16))
 
 # Prefill in fixed-size chunks. One big prefill builds, per layer, a
 # (n_head x seq_q x seq_k) score matrix — 14 x 8000 x 8000 x 4 B = 3.5 GB for a
@@ -1048,16 +1099,21 @@ pub GenCache resume_cache(QuantModel model, GenCache cache, int reuse, int n_pro
         # inside the main buffers: the tail is dropped, the rows past `reuse` ignored
         mut [LayerCache] cut = []
         for lc in cache.layers:
-            cut.push(LayerCache(lc.k, lc.v, [], []))
-        return GenCache(cut, reuse, 0)
+            cut.push(LayerCache(lc.k, lc.v, lc.hk, lc.hv, [], []))
+        return GenCache(cut, reuse, 0, cache.f16)
     # inside the tail: the first `reuse - main_n` tail rows join the main ones
     let kv_dim = model.config.n_kv_head * model.config.d_head
     mut [LayerCache] joined = []
     for lc in cache.layers:
-        let jk = kv_append_gpu(lc.k, lc.tk, main_n * kv_dim, (reuse - main_n) * kv_dim)
-        let jv = kv_append_gpu(lc.v, lc.tv, main_n * kv_dim, (reuse - main_n) * kv_dim)
-        joined.push(LayerCache(jk, jv, [], []))
-    GenCache(joined, reuse, 0)
+        if cache.f16:
+            let jk = append_float16_gpu(lc.hk, lc.tk, main_n * kv_dim, (reuse - main_n) * kv_dim)
+            let jv = append_float16_gpu(lc.hv, lc.tv, main_n * kv_dim, (reuse - main_n) * kv_dim)
+            joined.push(LayerCache([], [], jk, jv, [], []))
+        else:
+            let jk = kv_append_gpu(lc.k, lc.tk, main_n * kv_dim, (reuse - main_n) * kv_dim)
+            let jv = kv_append_gpu(lc.v, lc.tv, main_n * kv_dim, (reuse - main_n) * kv_dim)
+            joined.push(LayerCache(jk, jv, [], [], [], []))
+    GenCache(joined, reuse, 0, cache.f16)
 
 # Tokens per `prefill_step_gpu_quantized` call in `prefill_chunked`, for a
 # caller that drives the chunks itself (the server, to show progress).

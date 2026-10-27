@@ -3,6 +3,11 @@ use model
 
 def main() throws:
     assert_eq(parse_cache_type_arg("cache", " F32 "), "f32" as string)
+    assert_eq(parse_cache_type_arg("cache", " F16 "), "f16" as string)
+    set_kv_cache_type("f16")
+    assert(uses_float16_kv_cache(), "f16 cache mode")
+    set_kv_cache_type("f32")
+    assert(not uses_float16_kv_cache(), "f32 cache mode")
     assert_eq(parse_flash_attention_arg("flash", "ON"), "on" as string)
     assert_eq(parse_flash_attention_arg("flash", " auto "), "auto" as string)
     assert_eq(parse_gpu_layers_arg("layers", "auto"), -1 as int)

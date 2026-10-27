@@ -3,7 +3,7 @@
 
 pub string parse_cache_type_arg(string name, string s) throws:
     let value = s.trim().lower()
-    guard value == "f32" else throw "{name} currently supports only f32 in the portable server; f16 Metal kernels are ready but require Boring wgpu shader-f16 support before they can be enabled"
+    guard value == "f32" or value == "f16" else throw "{name} supports f32 or f16"
     value
 
 pub string parse_flash_attention_arg(string name, string s) throws:

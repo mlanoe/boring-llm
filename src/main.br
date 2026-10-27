@@ -493,7 +493,7 @@ string full_usage_text():
     let auth = usage_text().replace("require a Bearer key; comma separates keys", "require Bearer or x-api-key; comma separates keys").replace("read one Bearer key per line", "read one accepted key per line")
     let cors = auth.replace("  --api-key KEY", "  --cors-origins ORIGINS          allowed browser origins (default: *)\n  --cors-methods METHODS          allowed CORS methods\n  --cors-headers HEADERS          allowed CORS headers\n  --cors-credentials, --no-cors-credentials\n                                  allow or deny browser credentials\n  --api-key KEY")
     let parallel = cors.replace("  --cache-prompt, --no-cache-prompt", "  -np, --parallel N               concurrent request slots (only 1 supported)\n  -t, --threads N                 accepted CPU-thread compatibility setting\n  -tb, --threads-batch N          accepted batch-thread compatibility setting\n  -C, --cpu-mask M                accepted hexadecimal CPU affinity mask\n  -Cr, --cpu-range lo-hi          accepted CPU affinity range\n  -Cb, --cpu-mask-batch M         accepted batch CPU affinity mask\n  -Crb, --cpu-range-batch lo-hi   accepted batch CPU affinity range\n  --cpu-strict N, --cpu-strict-batch N\n                                  accepted 0/1 affinity settings\n  --prio N, --prio-batch N        accepted CPU-priority settings\n  --poll N, --poll-batch N        accepted CPU-polling settings\n  --threads-http N                HTTP worker count (only 1 supported)\n  -b, --batch-size N              logical prefill batch limit (default: 2048)\n  -ub, --ubatch-size N            physical prefill chunk size (default: 512)\n  -ngl, --gpu-layers N            all-GPU layer limit (auto/all or enough layers)\n  -sm, --split-mode none          single-GPU execution mode\n  -mg, --main-gpu 0              primary GPU index (only 0 supported)\n  -kvo, --kv-offload              keep the KV cache on the GPU (required)\n  --op-offload                    execute model operations on the GPU (required)\n  -fa, --flash-attn [on|auto]     fused attention (always enabled)\n  -ctk, --cache-type-k TYPE       K cache type (only f32 supported)\n  -ctv, --cache-type-v TYPE       V cache type (only f32 supported)\n  --jinja                         Jinja chat templates (always enabled)\n  --no-warmup                    skip startup warmup (current behavior)\n  -nocb, --no-cont-batching      serialized serving (current behavior)\n  --context-shift, --no-context-shift\n                                  rebuild a retained context, or stop when full\n  --no-webui, --no-ui            API-only server (current behavior)\n  --no-mmproj                    text-only mode (current behavior)\n  --cache-prompt, --no-cache-prompt")
-    let memory = parallel.replace("  -c, --ctx-size N", "  --no-mmap                      streamed GGUF reads (current behavior)\n  -c, --ctx-size N")
+    let memory = parallel.replace("K cache type (only f32 supported)", "K cache type: f32 or f16").replace("V cache type (only f32 supported)", "V cache type: f32 or f16").replace("  -c, --ctx-size N", "  --no-mmap                      streamed GGUF reads (current behavior)\n  -c, --ctx-size N")
     memory.replace("  -s, --seed S", "  --dry-multiplier N --dry-base N --dry-allowed-length N\n  --dry-penalty-last-n N\n  --presence-penalty N --frequency-penalty N\n  --mirostat N --mirostat-ent N --mirostat-lr N (server)\n  --adaptive-target N --adaptive-decay N (server)\n  --samplers LIST --sampler-seq SEQUENCE\n  --ignore-eos                    suppress the EOS token (server)\n  -s, --seed S")
 
 def main() throws:
@@ -608,9 +608,9 @@ def main() throws:
     let threads_batch_env = environment_default(argv, ["--threads-batch", "-tb"], "LLAMA_ARG_THREADS_BATCH", "-1")
     let threads_batch_default = parse_thread_count_arg("LLAMA_ARG_THREADS_BATCH", threads_batch_env)
     let cache_type_k_env = environment_default(argv, ["--cache-type-k", "-ctk"], "LLAMA_ARG_CACHE_TYPE_K", "f32")
-    let cache_type_k = parse_cache_type_arg("LLAMA_ARG_CACHE_TYPE_K", cache_type_k_env)
+    var string cache_type_k = parse_cache_type_arg("LLAMA_ARG_CACHE_TYPE_K", cache_type_k_env)
     let cache_type_v_env = environment_default(argv, ["--cache-type-v", "-ctv"], "LLAMA_ARG_CACHE_TYPE_V", "f32")
-    let cache_type_v = parse_cache_type_arg("LLAMA_ARG_CACHE_TYPE_V", cache_type_v_env)
+    var string cache_type_v = parse_cache_type_arg("LLAMA_ARG_CACHE_TYPE_V", cache_type_v_env)
     let flash_attention_env = environment_default(argv, ["--flash-attn", "-fa"], "LLAMA_ARG_FLASH_ATTN", "auto")
     let flash_attention = parse_flash_attention_arg("LLAMA_ARG_FLASH_ATTN", flash_attention_env)
     let gpu_layers_env = environment_default(argv, ["--gpu-layers", "--n-gpu-layers", "-ngl"], "LLAMA_ARG_N_GPU_LAYERS", "auto")
@@ -870,10 +870,10 @@ def main() throws:
             let requested_batch_cpu_strict = parse_bounded_int_arg("--cpu-strict-batch", argv[i + 1], 0, 1)
             i += 2
         elif (a == "--cache-type-k" or a == "-ctk") and i + 1 < argv.length:
-            let requested_cache_type_k = parse_cache_type_arg("--cache-type-k", argv[i + 1])
+            cache_type_k = parse_cache_type_arg("--cache-type-k", argv[i + 1])
             i += 2
         elif (a == "--cache-type-v" or a == "-ctv") and i + 1 < argv.length:
-            let requested_cache_type_v = parse_cache_type_arg("--cache-type-v", argv[i + 1])
+            cache_type_v = parse_cache_type_arg("--cache-type-v", argv[i + 1])
             i += 2
         elif a == "--flash-attn" or a == "-fa":
             if i + 1 < argv.length and !argv[i + 1].startsWith("-"):
@@ -1100,6 +1100,7 @@ def main() throws:
 
     guard gguf_path != "" else throw full_usage_text()
     guard repeat_last_n >= -1 else throw "--repeat-last-n must be -1 or greater"
+    guard cache_type_k == cache_type_v else throw "--cache-type-k and --cache-type-v must currently use the same type"
     guard mirostat == 0 or adaptive_target < 0.0 as float32 else throw "--mirostat and --adaptive-target cannot be enabled together"
     guard serve_mode or (presence_penalty == 0.0 as float32 and frequency_penalty == 0.0 as float32 and mirostat == 0 and adaptive_target < 0.0 as float32 and not ignore_eos) else throw "presence/frequency penalties, stateful sampling, and --ignore-eos currently require --serve"
     if reasoning_default == "on" or reasoning_default == "off":
@@ -1108,6 +1109,7 @@ def main() throws:
         chat_template_kwargs_default = jv_set(chat_template_kwargs_default, "preserve_reasoning", JValue.JBool(reasoning_preserve_default == "on"))
 
     set_decode_profile_stage(requested_profile_stage)
+    set_kv_cache_type(cache_type_k)
     set_prefill_chunk_len(effective_prefill_chunk(batch_size, ubatch_size))
 
     if serve_mode:

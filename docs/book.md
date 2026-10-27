@@ -193,6 +193,7 @@ For `--serve`, the sampling flags set server defaults. Alongside `temperature`, 
 | `--prio N`, `--prio-batch N`; `--poll N`, `--poll-batch N` | llama-server defaults | accept and validate CPU priority (`-1..3`/`0..3`) and polling (`0..100`/`0..1`) settings; they remain inert for GPU-resident inference |
 | `-C`, `--cpu-mask`; `-Cr`, `--cpu-range`; `-Cb`, `--cpu-mask-batch`; `-Crb`, `--cpu-range-batch`; `--cpu-strict`, `--cpu-strict-batch` | unset/non-strict | accept hexadecimal masks, inclusive `lo-hi` ranges and strictness values `0`/`1`; these CPU-affinity settings remain inert for GPU-resident inference |
 | `--no-mmap` | current behavior | accepted because the loader reads only the GGUF header and one tensor range at a time; `--mlock` is rejected because weights move to GPU memory instead of remaining resident in host RAM |
+| `-ctk`, `--cache-type-k TYPE`; `-ctv`, `--cache-type-v TYPE` | `f32` | select `f32` or a half-sized `f16` main KV cache; K and V must match, and f16 currently supports attention head widths 64 and 128 |
 | `--no-webui`, `--no-ui` | current behavior | accepted because boring-llm is API-only; `--webui`/`--ui` is rejected |
 | `--no-mmproj`, `--no-mmproj-auto` | current behavior | accepted because boring-llm is text-only; `--mmproj`, `--mmproj-url`, embeddings and reranking modes are rejected before model loading |
 | `LLAMA_ARG_MODEL`, `LLAMA_ARG_ALIAS`, `LLAMA_ARG_TAGS`, `LLAMA_ARG_HOST`, `LLAMA_ARG_PORT`, `LLAMA_ARG_CTX_SIZE`, `LLAMA_ARG_N_PREDICT`, `LLAMA_API_KEY` | unset | core llama-server environment defaults; an explicit command-line option takes precedence |
@@ -857,14 +858,13 @@ This writes `docs/book.html`, `README.html` at the repository root, and one HTML
 ## 13. Limits and Known Issues
 
 - **One request at a time.** There is no batching and no concurrent decoding.
-- **Context** is limited by `--ctx-size` and memory. The KV cache is float32, twice the size llama.cpp's float16 cache needs.
-- **Float16 cache activation is deferred, not unimplemented.** Native half-storage, append and mixed-cache decode kernels pass on Metal, but importing them into the server also places f16 declarations in its monolithic wgpu shader. Portable activation waits for Boring's wgpu shader-f16 support so the default f32 wgpu server is not regressed.
+- **Context** is limited by `--ctx-size` and memory. The default KV cache is float32; select matching `-ctk f16 -ctv f16` for a half-sized main cache on models with 64- or 128-wide attention heads.
 - **Architectures**: Llama-style GGUF layouts only (`qwen2` and `llama` are the tested ones); no mixture-of-experts, no vision.
 - **Chat templates** use a Jinja2 subset; an unsupported construct is reported.
 - **Standard split GGUF naming required.** Multi-file models are discovered from any `model-00001-of-000NN.gguf` shard using their `split.no`, `split.count`, and `split.tensors.count` metadata. Arbitrary shard filenames are not guessed.
 - **Unix only for the disk features**: the streaming loader and snapshots use Unix file APIs.
 - **wgpu, CUDA, ROCm**: K-quant prefill through the portable schedule is about three times slower than the hand-written kernels; CUDA and ROCm have never been run.
-- **Speed** is about half to two thirds of llama.cpp's on the 7B model (see [chapter 8](#8-performance)); the remaining gap is in the Metal kernels and the float32 KV cache.
+- **Speed** is about half to two thirds of llama.cpp's on the 7B model (see [chapter 8](#8-performance)); the remaining gap is primarily in the GPU kernels.
 - **Loopback only, no authentication.**
 
 ---
