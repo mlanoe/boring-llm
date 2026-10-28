@@ -50,6 +50,9 @@ pub struct Config:
     int n_expert           # mixture of experts: experts per MoE layer (0 = dense model)
     int n_expert_used      # experts each token is routed to
     int expert_ffn         # width of one expert's FFN
+    float32 residual_scale # branch outputs (attention, FFN) are multiplied by this before the residual add (Granite)
+    float32 logit_mul      # the output logits are multiplied by this (Granite: 1 / logit_scale)
+    int nope_step          # SmolLM3: every nope_step-th layer has no rotary embedding (0 = all layers have one)
     bool qk_norm    # Qwen3: an RMS norm over each head's Q and K (weights of d_head floats) before RoPE
 
 pub struct Layer:
@@ -246,10 +249,10 @@ pub [float32] load_tensor_f32(GgufFile file, string name) throws:
 int rope_style_for_arch(string arch) throws:
     if arch == "qwen2" or arch == "qwen3" or arch == "phi3" or arch == "gemma" or arch == "gemma2" or arch == "gemma3" or arch == "qwen3moe":
         1
-    elif arch == "llama":
+    elif arch == "llama" or arch == "granite" or arch == "smollm3":
         0
     else:
-        throw "config_from_gguf: unsupported architecture '{arch}' (supported: 'llama' (also Mistral and Mixtral), 'qwen2', 'qwen3', 'qwen3moe', 'phi3', 'gemma', 'gemma2', 'gemma3'; check llama.cpp's llama_model_rope_type() and build_* graph before adding one)"
+        throw "config_from_gguf: unsupported architecture '{arch}' (supported: 'llama' (also Mistral and Mixtral), 'qwen2', 'qwen3', 'qwen3moe', 'granite', 'smollm3', 'phi3', 'gemma', 'gemma2', 'gemma3'; check llama.cpp's llama_model_rope_type() and build_* graph before adding one)"
 
 # The context size the engine runs with (`--ctx-size`), set before the model is loaded:
 # Phi-3's LongRoPE picks its factor set from it.
@@ -331,8 +334,14 @@ pub Config config_from_gguf(GgufFile file) throws:
     # (its converter already stores the RMSNorm weights as w + 1).
     let is_gemma = arch == "gemma" or arch == "gemma2" or arch == "gemma3"
     let is_gemma_ext = arch == "gemma2" or arch == "gemma3"
+    # Granite: explicit scales instead of sqrt(d) / 1 / sqrt(d_head) / 1
+    let granite_embd = gguf_get_f32(file.metadata, "{arch}.embedding_scale") else (0.0 as float32)
+    let granite_attn = gguf_get_f32(file.metadata, "{arch}.attention.scale") else (0.0 as float32)
+    let granite_resid = gguf_get_f32(file.metadata, "{arch}.residual_scale") else (0.0 as float32)
+    let granite_logit = gguf_get_f32(file.metadata, "{arch}.logit_scale") else (0.0 as float32)
+    let nope_step = if arch == "smollm3": 4 else: 0
     let act = if is_gemma: 1 else: 0
-    let embd_scale = if is_gemma: (d_model as float32).sqrt() else: (1.0 as float32)
+    let embd_scale = if is_gemma: (d_model as float32).sqrt() elif granite_embd > 0.0: granite_embd else: (1.0 as float32)
 
     # Gemma 2/3 (mirrors llama.cpp's load_hparams / build_gemma2 / build_gemma3):
     # post-attention and post-FFN norms, a score scale of 1/sqrt(d_head) (the
@@ -341,7 +350,7 @@ pub Config config_from_gguf(GgufFile file) throws:
     # soft-capping of attention scores and output logits. Gemma 3's sliding
     # layers use their own unscaled RoPE base.
     let big = (arch == "gemma2" and n_layer == 46) or (arch == "gemma3" and n_layer == 62)
-    let attn_scale = if big: 1.0 / ((d_model / n_head) as float32).sqrt() else: 1.0 / (d_head as float32).sqrt()
+    let attn_scale = if granite_attn > 0.0: granite_attn elif big: 1.0 / ((d_model / n_head) as float32).sqrt() else: 1.0 / (d_head as float32).sqrt()
     let attn_softcap = if arch == "gemma2": (gguf_get_f32(file.metadata, "{arch}.attn_logit_softcapping") else (0.0 as float32)) else: (0.0 as float32)
     let final_softcap = if arch == "gemma2": (gguf_get_f32(file.metadata, "{arch}.final_logit_softcapping") else (0.0 as float32)) else: (0.0 as float32)
     let swa_window = if is_gemma_ext: (gguf_get_int(file.metadata, "{arch}.attention.sliding_window") else 0) else: 0
@@ -351,8 +360,10 @@ pub Config config_from_gguf(GgufFile file) throws:
 
     Config(vocab_size, d_model, n_layer, n_head, n_kv_head, d_head,
            ffn_dim, rope_freq_base, rope_freqs, rms_eps, not has_output, rope_neox, act, embd_scale,
-           is_gemma_ext, attn_scale, attn_softcap, final_softcap, swa_window, swa_pattern, rope_freqs_local,
-           is_gemma_ext, n_expert, n_expert_used, expert_ffn, qk_norm)
+           is_gemma_ext or granite_attn > 0.0, attn_scale, attn_softcap, final_softcap, swa_window, swa_pattern, rope_freqs_local,
+           is_gemma_ext, n_expert, n_expert_used, expert_ffn,
+           if granite_resid > 0.0: granite_resid else: (1.0 as float32),
+           if granite_logit > 0.0: (1.0 as float32) / granite_logit else: (1.0 as float32), nope_step, qk_norm)
 
 # Phi-3 stores the attention projections as one `attn_qkv.weight` (rows: Q, then
 # K, then V) and the FFN as one `ffn_up.weight` holding gate then up (ggml's
@@ -589,11 +600,21 @@ int layer_window(Config c, int l):
     else:
         0
 
+# SmolLM3's NoPE layers rotate by nothing: all angular frequencies zero, magnitude 1.
 [float32] layer_rope_freqs(Config c, int l):
+    if c.nope_step > 0 and (l + 1) % c.nope_step == 0:
+        return [if i == c.rope_freqs.length - 1: (1.0 as float32) else: (0.0 as float32) for i in 0..<c.rope_freqs.length]
     if layer_is_swa(c, l):
         c.rope_freqs_local
     else:
         c.rope_freqs
+
+# The output logits as the model defines them: scaled (Granite), then soft-capped (Gemma 2).
+[float32] finish_logits([float32] logits, Config c):
+    if c.logit_mul != 1.0:
+        softcap_logits([logits[i] * c.logit_mul for i in 0..<logits.length], c.final_softcap)
+    else:
+        softcap_logits(logits, c.final_softcap)
 
 # Soft-caps every logit: cap * tanh(logit / cap) (Gemma 2's final_logit_softcapping).
 [float32] softcap_logits([float32] logits, float32 cap):
@@ -747,18 +768,22 @@ pub [float32] forward(Model model, [int] tokens) throws:
         var attn_proj = linear(attn_out, layer.o_w, seq, qkv_dim, d)
         if model.config.post_norms:
             attn_proj = rms_norm(attn_proj, layer.attn_post_norm_w, seq, d, model.config.rms_eps)
+        if model.config.residual_scale != 1.0:
+            attn_proj = [attn_proj[i] * model.config.residual_scale for i in 0..<attn_proj.length]
         x = vec_add(x, attn_proj)
 
         let normed2 = rms_norm(x, layer.ffn_norm_w, seq, d, model.config.rms_eps)
         var ffn_out = if layer.is_moe: moe_ffn_cpu(model.config, layer, normed2, seq) else: swiglu_ffn(normed2, layer.gate_w, layer.up_w, layer.down_w, seq, d, model.config.ffn_dim, model.config.act)
         if model.config.post_norms:
             ffn_out = rms_norm(ffn_out, layer.ffn_post_norm_w, seq, d, model.config.rms_eps)
+        if model.config.residual_scale != 1.0:
+            ffn_out = [ffn_out[i] * model.config.residual_scale for i in 0..<ffn_out.length]
         x = vec_add(x, ffn_out)
 
         l += 1
 
     let final_normed = rms_norm(x, model.output_norm_w, seq, d, model.config.rms_eps)
-    softcap_logits(linear(final_normed, model.output_w, seq, d, model.config.vocab_size), model.config.final_softcap)
+    finish_logits(linear(final_normed, model.output_w, seq, d, model.config.vocab_size), model.config)
 
 # Phase 2a: same forward pass, but every matmul/norm/RoPE/attention op runs
 # as a real GPU kernel (math_gpu.br) instead of a CPU loop. Still no
@@ -862,6 +887,8 @@ pub [float32] forward_gpu_quantized(QuantModel model, [int] tokens) throws:
         mut [float32]'kernel'unified attn_res = attn_proj
         if model.config.post_norms:
             attn_res = rms_norm_gpu(attn_proj, layer.attn_post_norm_w, seq, d, model.config.rms_eps)
+        if model.config.residual_scale != 1.0:
+            attn_res = scale_gpu(attn_res, model.config.residual_scale, seq * d)
         x = vec_add(x, attn_res)
 
         let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, seq, d, model.config.rms_eps)
@@ -879,13 +906,15 @@ pub [float32] forward_gpu_quantized(QuantModel model, [int] tokens) throws:
             ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, seq, d, model.config.rms_eps)
         else:
             ffn_res = ffn_out
+        if model.config.residual_scale != 1.0:
+            ffn_res = scale_gpu(ffn_res, model.config.residual_scale, seq * d)
         x = vec_add(x, ffn_res)
 
         l += 1
 
     let final_normed = rms_norm_gpu(x, model.output_norm_w, seq, d, model.config.rms_eps)
     let logits_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, seq, d, model.config.vocab_size)
-    softcap_logits(passthrough(logits_raw), model.config.final_softcap)
+    finish_logits(passthrough(logits_raw), model.config)
 
 
 # The embedding forward pass: the same layers as forward_gpu_quantized, but it returns the
@@ -931,6 +960,8 @@ pub [float32] hidden_states_gpu_quantized(QuantModel model, [int] tokens) throws
         mut [float32]'kernel'unified attn_res = attn_proj
         if model.config.post_norms:
             attn_res = rms_norm_gpu(attn_proj, layer.attn_post_norm_w, seq, d, model.config.rms_eps)
+        if model.config.residual_scale != 1.0:
+            attn_res = scale_gpu(attn_res, model.config.residual_scale, seq * d)
         x = vec_add(x, attn_res)
 
         let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, seq, d, model.config.rms_eps)
@@ -948,6 +979,8 @@ pub [float32] hidden_states_gpu_quantized(QuantModel model, [int] tokens) throws
             ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, seq, d, model.config.rms_eps)
         else:
             ffn_res = ffn_out
+        if model.config.residual_scale != 1.0:
+            ffn_res = scale_gpu(ffn_res, model.config.residual_scale, seq * d)
         x = vec_add(x, ffn_res)
 
         l += 1
@@ -1168,6 +1201,8 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
         mut [float32]'kernel'unified attn_res = attn_proj
         if model.config.post_norms:
             attn_res = rms_norm_gpu(attn_proj, layer.attn_post_norm_w, seq, d, model.config.rms_eps)
+        if model.config.residual_scale != 1.0:
+            attn_res = scale_gpu(attn_res, model.config.residual_scale, seq * d)
         x = add_gpu(x, attn_res, seq * d)
 
         let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, seq, d, model.config.rms_eps)
@@ -1185,6 +1220,8 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
             ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, seq, d, model.config.rms_eps)
         else:
             ffn_res = ffn_out
+        if model.config.residual_scale != 1.0:
+            ffn_res = scale_gpu(ffn_res, model.config.residual_scale, seq * d)
         x = add_gpu(x, ffn_res, seq * d)
 
         # `k_rope_raw`/`v` already ARE the whole prompt's post-RoPE cache for
@@ -1210,7 +1247,7 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
     let logits_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
     # returned inside a tuple below, which — like a struct constructor —
     # doesn't trigger the GPU-result-to-array conversion automatically.
-    let last_logits = softcap_logits(passthrough(logits_raw), model.config.final_softcap)
+    let last_logits = finish_logits(passthrough(logits_raw), model.config)
 
     (last_logits, GenCache(new_layers, seq, 0, kv_cache_f16))
 
@@ -1298,6 +1335,8 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
         mut [float32]'kernel'unified attn_res = attn_proj
         if model.config.post_norms:
             attn_res = rms_norm_gpu(attn_proj, layer.attn_post_norm_w, n, d, model.config.rms_eps)
+        if model.config.residual_scale != 1.0:
+            attn_res = scale_gpu(attn_res, model.config.residual_scale, n * d)
         x = add_gpu(x, attn_res, n * d)
 
         let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, n, d, model.config.rms_eps)
@@ -1315,6 +1354,8 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
             ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, n, d, model.config.rms_eps)
         else:
             ffn_res = ffn_out
+        if model.config.residual_scale != 1.0:
+            ffn_res = scale_gpu(ffn_res, model.config.residual_scale, n * d)
         x = add_gpu(x, ffn_res, n * d)
 
         if cache.f16:
@@ -1327,7 +1368,7 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
     let x_last = extract_row(x, n - 1, d)
     let final_normed = rms_norm_gpu(x_last, model.output_norm_w, 1, d, model.config.rms_eps)
     let logits_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
-    let last_logits = softcap_logits(passthrough(logits_raw), model.config.final_softcap)
+    let last_logits = finish_logits(passthrough(logits_raw), model.config)
 
     (last_logits, GenCache(new_layers, base_pos + n, 0, cache.f16))
 
@@ -1405,6 +1446,8 @@ pub ([float32], GenCache) forward_batch_gpu_quantized(QuantModel model, GenCache
         mut [float32]'kernel'unified attn_res = attn_proj
         if model.config.post_norms:
             attn_res = rms_norm_gpu(attn_proj, layer.attn_post_norm_w, n, d, model.config.rms_eps)
+        if model.config.residual_scale != 1.0:
+            attn_res = scale_gpu(attn_res, model.config.residual_scale, n * d)
         x = add_gpu(x, attn_res, n * d)
 
         let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, n, d, model.config.rms_eps)
@@ -1422,6 +1465,8 @@ pub ([float32], GenCache) forward_batch_gpu_quantized(QuantModel model, GenCache
             ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, n, d, model.config.rms_eps)
         else:
             ffn_res = ffn_out
+        if model.config.residual_scale != 1.0:
+            ffn_res = scale_gpu(ffn_res, model.config.residual_scale, n * d)
         x = add_gpu(x, ffn_res, n * d)
 
         if cache.f16:
@@ -1433,7 +1478,7 @@ pub ([float32], GenCache) forward_batch_gpu_quantized(QuantModel model, GenCache
     # Every row's logits (n * vocab_size floats): row j is the distribution after tokens[j].
     let final_normed = rms_norm_gpu(x, model.output_norm_w, n, d, model.config.rms_eps)
     let logits_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, n, d, model.config.vocab_size)
-    let rows = softcap_logits(passthrough(logits_raw), model.config.final_softcap)
+    let rows = finish_logits(passthrough(logits_raw), model.config)
 
     (rows, GenCache(new_layers, base_pos + n, 0, cache.f16))
 
@@ -1542,6 +1587,8 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
         mut [float32]'kernel'unified attn_res = attn_proj
         if model.config.post_norms:
             attn_res = rms_norm_gpu(attn_proj, layer.attn_post_norm_w, 1, d, model.config.rms_eps)
+        if model.config.residual_scale != 1.0:
+            attn_res = scale_gpu(attn_res, model.config.residual_scale, 1 * d)
         let ([float32]'kernel'unified x_after_attn, [float32]'kernel'unified normed2) = add_rms_norm_decode_gpu(
             x, attn_res, layer.ffn_norm_w, d, model.config.rms_eps)
         if decode_profile_stage == 4:
@@ -1574,6 +1621,8 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
             ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, 1, d, model.config.rms_eps)
         else:
             ffn_res = ffn_out
+        if model.config.residual_scale != 1.0:
+            ffn_res = scale_gpu(ffn_res, model.config.residual_scale, 1 * d)
         if l + 1 < model.config.n_layer:
             let ([float32]'kernel'unified x_next, [float32]'kernel'unified normed_next) = add_rms_norm_decode_gpu(
                 x, ffn_res, model.layers[l + 1].attn_norm_w, d, model.config.rms_eps)
@@ -1605,7 +1654,7 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
     set_gpu_batch_limit(1)
     # returned inside a tuple below, which — like a struct constructor —
     # doesn't trigger the GPU-result-to-array conversion automatically.
-    let logits = softcap_logits(passthrough(logits_raw), model.config.final_softcap)
+    let logits = finish_logits(passthrough(logits_raw), model.config)
 
     (logits, GenCache(new_layers, pos + 1, new_tail, cache.f16))
 

@@ -95,11 +95,12 @@ def reference(W, c):
         win = c.get("window", 0)
         swa = win > 0 and (c.get("all_swa") or (l % c["pattern"]) < c["pattern"] - 1)
         tab = c["rope_local"] if swa and "rope_local" in c else c["rope"]
-        q, k = rope(q, pos, *tab, c["neox"]), rope(k, pos, *tab, c["neox"])
+        if not (c.get("nope") and (l + 1) % 4 == 0):
+            q, k = rope(q, pos, *tab, c["neox"]), rope(k, pos, *tab, c["neox"])
         out = np.zeros((seq, NH, dh))
         for hd in range(NH):
             kv = hd // (NH // NKV)
-            sc = q[:, hd] @ k[:, kv].T / math.sqrt(dh)
+            sc = q[:, hd] @ k[:, kv].T * c.get("attn_scale", 1 / math.sqrt(dh))
             if c.get("attn_softcap"):
                 sc = c["attn_softcap"] * np.tanh(sc / c["attn_softcap"])
             idx = np.arange(seq)
@@ -110,7 +111,7 @@ def reference(W, c):
             p = np.exp(sc - sc.max(-1, keepdims=True))
             p /= p.sum(-1, keepdims=True)
             out[:, hd] = p @ v[:, kv]
-        proj = out.reshape(seq, NH * dh) @ L["o"].T
+        proj = out.reshape(seq, NH * dh) @ L["o"].T * c.get("residual_scale", 1.0)
         x = x + (rms(proj, L["post_attn"]) if c.get("post_norms") else proj)
         h = rms(x, L["ffn_norm"])
         act = gelu if c["act"] == "gelu" else silu
@@ -125,9 +126,10 @@ def reference(W, c):
                     ffn[t] += wt * ((act(h[t] @ L["eg"][e].T) * (h[t] @ L["eu"][e].T)) @ L["ed"][e].T)
         else:
             ffn = (act(h @ L["gate"].T) * (h @ L["up"].T)) @ L["down"].T
+        ffn = ffn * c.get("residual_scale", 1.0)
         x = x + (rms(ffn, L["post_ffn"]) if c.get("post_norms") else ffn)
     x = rms(x, W["out_norm"])
-    logits = x @ W["out"].T
+    logits = x @ W["out"].T * c.get("logit_mul", 1.0)
     if c.get("final_softcap"):
         logits = c["final_softcap"] * np.tanh(logits / c["final_softcap"])
     return logits
@@ -295,6 +297,17 @@ def run():
     add_moe(rng, Wq, 6, FFN // 2)
     write("qwen3moe", "qwen3moe", Wq, {**base, "qk_norm": True, "rope": rope_table(dh, 10000.0), "n_used": 3},
           meta={"expert_count": 6, "expert_used_count": 3, "expert_feed_forward_length": FFN // 2})
+
+    # Granite: explicit embedding / attention / residual / logit scales (NORM rope, llama-like tensors)
+    write("granite", "granite", W, {**base, "neox": False, "rope": rope_table(dh, 10000.0), "embd_scale": 2.0,
+                                    "attn_scale": 0.31, "residual_scale": 0.6, "logit_mul": 1 / 4.0},
+          meta={"embedding_scale": 2.0, "attention.scale": 0.31, "residual_scale": 0.6, "logit_scale": 4.0})
+    # SmolLM3: every 4th layer has no rotary embedding (needs 4 layers)
+    NL_s = NL
+    NL = 4
+    Wn = make_weights(rng, dh, False)
+    write("smollm3", "smollm3", Wn, {**base, "neox": False, "rope": rope_table(dh, 10000.0), "nope": True})
+    NL = NL_s
 
     # Phi-3 with both factor sets and an original context of 32: which set does llama.cpp pick at n_ctx 16 / 64?
     f_long = rng.uniform(2.0, 4.0, dh // 2)

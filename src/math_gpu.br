@@ -3577,6 +3577,16 @@ pub req [float32]'kernel'unified glu_combine_gpu([float32]'kernel'global gate, [
             out[i] = activated * up[i]
         out
 
+# x * factor, elementwise (Granite's residual scale).
+pub req [float32]'kernel'unified scale_gpu([float32]'kernel'global x, float32 factor, int n) throws:
+    let int blocks = (n + 255) / 256
+    kernel(block = 256, grid = blocks):
+        mut [float32]'unified out = [0.0 for ..<n]
+        let i = .thread.x + .block.x * .block_dim.x
+        if i < n:
+            out[i] = x[i] * factor
+        out
+
 # ── Mixture-of-experts helpers ─────────────────────────────────────────────
 # Rows of `x` (d floats each) picked by `idx` (row numbers stored as floats, exact up to 2^24).
 pub req [float32]'kernel'unified gather_rows_gpu([float32]'kernel'global x, [float32]'kernel'global idx, int m, int d) throws:

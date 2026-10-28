@@ -44,6 +44,8 @@ def main() throws:
     check_case("gemma3")
     check_case("mixtral")
     check_case("qwen3moe")
+    check_case("granite")
+    check_case("smollm3")
     # Phi-3 with both factor sets (original context 1024): short up to a 1024 context, long beyond
     check_case_ctx("phi3-short", "phi3-short", 64)
     check_case_ctx("phi3-long", "phi3-short", 2048)

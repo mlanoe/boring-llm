@@ -45,6 +45,8 @@ CATALOG = {
     "qwen2.5-0.5b-instruct-iq4_xs": ("bartowski/Qwen2.5-0.5B-Instruct-GGUF", "Qwen2.5-0.5B-Instruct-IQ4_XS.gguf", "qwen2.5-0.5b-instruct-iq4_xs.gguf", "IQ4_XS tensors"),
     "tinymixtral-4x248m-q8_0": ("mradermacher/TinyMixtral-4x248M-MoE-GGUF", "TinyMixtral-4x248M-MoE.Q8_0.gguf", "tinymixtral-4x248m-q8_0.gguf", "mixtral architecture (4 experts, 2 used), Q8_0"),
     "tinymixtral-4x248m-q4_k_m": ("mradermacher/TinyMixtral-4x248M-MoE-GGUF", "TinyMixtral-4x248M-MoE.Q4_K_M.gguf", "tinymixtral-4x248m-q4_k_m.gguf", "mixtral architecture, K-quant experts"),
+    "granite-3.3-2b-instruct-q4_k_m": ("ibm-granite/granite-3.3-2b-instruct-GGUF", "granite-3.3-2b-instruct-Q4_K_M.gguf", "granite-3.3-2b-instruct-q4_k_m.gguf", "granite architecture (embedding / attention / residual / logit scales)"),
+    "smollm3-3b-q4_k_m": ("ggml-org/SmolLM3-3B-GGUF", "SmolLM3-Q4_K_M.gguf", "smollm3-3b-q4_k_m.gguf", "smollm3 architecture (NoPE layers), reasoning template"),
     "qwen2.5-0.5b-instruct-q4_0": ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q4_0.gguf", "qwen2.5-0.5b-instruct-q4_0.gguf", "test_quant_kernels_real"),
     "qwen2.5-0.5b-instruct-q2_k": ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q2_k.gguf", "qwen2.5-0.5b-instruct-q2_k.gguf", "test_quant_kernels_real"),
     "qwen2.5-0.5b-instruct-fp16": ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-fp16.gguf", "qwen2.5-0.5b-instruct-fp16.gguf", "float reference"),
