@@ -6,7 +6,7 @@ A local LLM inference engine written entirely in [Boring](https://github.com/mla
 main --gguf qwen2.5-3b-instruct-q4_k_m.gguf --serve --port 8080 --ctx-size 16384 --prompt-cache ~/.cache/boring-llm
 ```
 
-Full documentation: [the book](docs/book.md) ([HTML](docs/book.html)): command line, HTTP API, caches, architecture, verification and a development guide. This README is the short version.
+Full documentation: [the book](docs/book.md) ([HTML](docs/book.html)): installation, command line, HTTP API, supported models, caches, performance, architecture, verification and troubleshooting. This README is the short version.
 
 ## What it does
 
@@ -22,7 +22,13 @@ JSON Schema string `pattern` constraints support the regular subset commonly use
 
 ## Quick start
 
-Requirements: the [Rust toolchain](https://rustup.rs/), [Boring](https://github.com/mlanoe/boring) (`cargo install --git https://github.com/mlanoe/boring`), and a GPU supported by Metal or wgpu. Use a `boring` built from `dfa2a4b6` or later (it adds the native `kernel.tensors.linear` schedules for Q4_0, Q5_0, Q4_1, Q5_1, Q5_K, F16 and BF16 that `math_gpu.br` now uses; the installed 0.9.11 stops with "unsupported quantized tensor linear format") and in any case from `9b6ac41c` or later; this version adds the process-environment primitive used for `LLAMA_ARG_*` compatibility. Earlier builds cannot select launch batching only during decode (before `51d7260e`), leave about 1.8 ms/token on the table for the large Q8_0 decode projections (before `a08df631`), decode Q8_0 weights ~2x slower on Metal (before `1faf71e2`), do not compile the disk prompt cache or the native Metal K-quant kernels on macOS 27 (before `a057dd8c`), decode Q4_K weights ~2x slower (before `6fb92947`), prefill ~3x slower on Metal, stage the prefill tiles in half precision (`6acc7d44` to `316c7695`: logits of the 7B drift) or, between `316c7695` and `ff79f091`, return wrong values for the biased Q8_0 projections of small Qwen models, or, between `8bdac11d` and `d38813c8`, return wrong values for every odd output column of Q6_K matrices (Q4_K_M models then produce garbage), or, before `46c2473f`, fail to transpile a `.split()` used as a call argument.
+Requirements: the [Rust toolchain](https://rustup.rs/), a current build of [Boring](https://github.com/mlanoe/boring), and a GPU supported by Metal or wgpu. Install Boring from its current main branch so the compiler and GPU tensor formats match this project:
+
+```sh
+cargo install --git https://github.com/mlanoe/boring --force
+```
+
+If compilation reports an unsupported tensor format or a missing runtime primitive, update Boring and regenerate the target project before rebuilding.
 
 ```sh
 # 1. build (Metal; use --target wgpu on other platforms)
@@ -167,7 +173,7 @@ Server-executed tools and the Web UI's MCP CORS proxy remain disabled: `GET`/`PO
 
 ## Performance
 
-Measured on one 16 GB Apple-silicon machine (Apple M3, Metal). The 0.5B rows use the current Q8_0 split-K decode schedule; the other models are older clean runs. Timings still move by tens of percent from one repetition to the next (min-max is in `docs/development-log.md`), so read the ratios as indications, not as constants.
+Measured on one 16 GB Apple-silicon machine (Apple M3, Metal). The 0.5B rows use the current Q8_0 split-K decode schedule; the other models are earlier clean runs. Timings can move by tens of percent between repetitions, so read the ratios as indications rather than constants and reproduce them with `tools/bench_vs_llamacpp.py` on your hardware.
 
 Against llama.cpp (llama-cpp-python, Metal, same GGUF, same machine, 3 alternating runs, medians, `tools/bench_vs_llamacpp.py`), tokens per second:
 
@@ -184,7 +190,7 @@ Against llama.cpp (llama-cpp-python, Metal, same GGUF, same machine, 3 alternati
 
 The server needs 3.1 GB (peak 3.3 GB) for the 3B model and 6.4 GB (peak 6.8 GB) for the 7B, and is ready in about 4 s on the 7B (disk-streaming loader). Through OpenCode, the 7B model's first request (7,539 tokens, ten tools) spent 115 s in prefill cold and 2.5 s on the follow-up that reused 7,559 of 7,638 tokens; a cold start used to take 321-453 s.
 
-Where the gap to llama.cpp is: prefill is close on short prompts on the 7B and remains more variable at long context; a newer run no longer reproduced the earlier 0.91x-to-0.71x fall, and making llama.cpp's KV cache float32 did not explain the remaining gap. Decode is about 0.6x on the 7B. On the 0.5B, the Q8_0 Metal decoder now mirrors llama.cpp's cooperative structure: four SIMD groups split `k` for two output rows and reduce their partial sums in threadgroup memory. With eight launches per command buffer, this schedule beats the former four-row activation-reuse path on all six resident model shapes. Together with joined QKV, fused RoPE/KV preparation and residual/RMSNorm work, decode reaches 0.87x llama.cpp near 570 tokens, 0.89x near 4,150 and 0.87x near 7,650. The detail, including run-to-run spread, is in `docs/development-log.md`. Earlier gains came from `boring`'s Q4_K single-token decode, the fragment-blocked quantized prefill schedule and float32 staging, plus this project's fused attention and two-buffer KV cache.
+Where the gap to llama.cpp is: prefill is close on short prompts on the 7B and remains more variable at long context; decode is about 0.6x on the 7B. On the 0.5B, the Q8_0 Metal decoder uses a cooperative split-K schedule, and joined QKV, fused RoPE/KV preparation, residual/RMSNorm work, and launch batching bring decode close to llama.cpp on the measured contexts.
 
 The former structural Q8_0 decode difference with llama.cpp is therefore closed. The remaining short-context 0.5B gap is 1.33 ms/token at the latest medians and now needs a fresh marginal-cost profile rather than another wholesale matvec schedule change. From about 570 to 7,650 prompt tokens, decode grows by 11.37 ms/token in boring-llm and 9.98 ms/token in llama.cpp: attention/float32 KV work leaves only another 1.39 ms/token of gap across that interval.
 
@@ -221,7 +227,6 @@ tools/                    oracles, accuracy and speed comparisons with llama.cpp
 test/                     interpreter tests (test_*.br) and compiled real-model tests (*_real.br)
 docs/book.md              the book: using, operating, understanding and extending the engine
 docs/build.py             generates the HTML versions of the documentation (python3 docs/build.py)
-docs/development-log.md   how it was built, with the measurements and the bugs found on the way
 boring.toml               kernel scheduling policy (native Metal paths for Q8_0, Q4_K, Q6_K)
 ```
 
@@ -236,7 +241,7 @@ boring.toml               kernel scheduling policy (native Metal paths for Q8_0,
 
 ## Boring
 
-Boring is a language that transpiles to Rust, with Python-like indentation and Swift-like optionals. This project is also its real-world test: every bug found in the compiler while building it was reported and fixed upstream (see `docs/development-log.md`). See the [Boring repository](https://github.com/mlanoe/boring) for the language reference.
+Boring is a language that transpiles to Rust, with Python-like indentation and Swift-like optionals. boring-llm uses its GPU kernel language, labeled arrays and ownership qualifiers to keep the complete inference stack in readable Boring source. See the [Boring repository](https://github.com/mlanoe/boring) for the language reference and compiler installation instructions.
 
 ## Contributing
 

@@ -1,5 +1,12 @@
 # Development log
 
+> **Development archive, not user documentation.** This chronological log
+> preserves experiments, rejected approaches, measurements, compiler issues,
+> task identifiers and historical revisions so development can be resumed with
+> its original context. None of those revisions defines the supported Boring
+> version or the current application contract. Use [the book](book.md) and the
+> [README](../README.md) for installation, features, compatibility and limits.
+
 This is the phase-by-phase build history of `boring-llm`: what was implemented, how it was verified, and every real [Boring](https://github.com/mlanoe/boring) compiler bug/gap found and fixed along the way. It used to live in the main `README.md`; moved here so the README can focus on presenting the project rather than its construction. See `README.md` for what the project is and how to run it.
 
 ---

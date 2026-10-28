@@ -229,9 +229,8 @@ def main() throws:
     # `w_packed` field is `[uint8]'global`, and WGSL has no 8-bit
     # storage-buffer element type, but `boring`'s wgpu backend now packs
     # 4 bytes per `uint32` storage slot transparently and unpacks via
-    # bit-shifts under the hood (this used to be a real, documented
-    # Metal-only gap — task_0bd1e42a's own follow-up fix closed it; see
-    # `docs/development-log.md`'s wgpu Phase 4 entries for the history).
+    # bit-shifts under the hood. Keep this case on both targets because it
+    # verifies that packed byte weights have the same semantics.
     mut [uint8] w_packed = []
     # row0: scale=1.0 (f16 bits 0x3C00), all 32 quantized values = 1
     w_packed.push(0x00 as uint8)

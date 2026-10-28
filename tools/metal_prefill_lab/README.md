@@ -27,5 +27,5 @@ swiftc -O harness.swift -o harness
 ```
 
 Arguments: file, kernel, threads per group, tile rows (m), tile columns (n); then
-`--D NAME=VALUE` macros and `--m/--n/--k/--iters/--reps`. Results are in
-`docs/development-log.md` (2026-10-10).
+`--D NAME=VALUE` macros and `--m/--n/--k/--iters/--reps`. Results are printed by
+the harness so alternative schedules can be compared on the current machine.

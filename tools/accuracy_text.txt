@@ -17,7 +17,7 @@ main --gguf qwen2.5-3b-instruct-q4_k_m.gguf --serve --port 8080 --ctx-size 16384
 
 ## Quick start
 
-Requirements: the [Rust toolchain](https://rustup.rs/), [Boring](https://github.com/mlanoe/boring) (`cargo install --git https://github.com/mlanoe/boring`), and a GPU supported by Metal or wgpu. Use a `boring` built from `aada545d` or later. Earlier builds either do not compile the disk prompt cache or the native Metal K-quant kernels on macOS 27 (before `a057dd8c`), decode Q4_K weights ~2x slower (before `6fb92947`), prefill ~3x slower on Metal, stage the prefill tiles in half precision (`6acc7d44` to `316c7695`: logits of the 7B drift) or, between `316c7695` and `ff79f091`, return wrong values for the biased Q8_0 projections of small Qwen models.
+Requirements: the [Rust toolchain](https://rustup.rs/), a current build of [Boring](https://github.com/mlanoe/boring), and a GPU supported by Metal or wgpu.
 
 ```sh
 # 1. build (Metal; use --target wgpu on other platforms)
@@ -144,7 +144,6 @@ src/
   main.br                 command line
 tools/                    oracles, accuracy and speed comparisons with llama.cpp, smoke test, OpenCode trial script, Metal prefill lab
 test/                     interpreter tests (test_*.br) and compiled real-model tests (*_real.br)
-docs/development-log.md   how it was built, with the measurements and the bugs found on the way
 boring.toml               kernel scheduling policy (native Metal paths for Q8_0, Q4_K, Q6_K)
 ```
 
@@ -159,7 +158,7 @@ boring.toml               kernel scheduling policy (native Metal paths for Q8_0,
 
 ## Boring
 
-Boring is a language that transpiles to Rust, with Python-like indentation and Swift-like optionals. This project is also its real-world test: every bug found in the compiler while building it was reported and fixed upstream (see `docs/development-log.md`). See the [Boring repository](https://github.com/mlanoe/boring) for the language reference.
+Boring is a language that transpiles to Rust, with Python-like indentation and Swift-like optionals. See the [Boring repository](https://github.com/mlanoe/boring) for the language reference.
 
 ## Contributing
 

@@ -2,7 +2,7 @@
 
 boring-llm is a local LLM inference engine written entirely in [Boring](https://github.com/mlanoe/boring), a language that transpiles to Rust. It reads quantized [GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) model files (the llama.cpp format, with no conversion step), runs them on the GPU through Boring's own kernel language, and serves them over an OpenAI-compatible HTTP API that coding agents such as [OpenCode](https://opencode.ai) can use.
 
-This book is the reference for using, operating, understanding and extending it. The [README](../README.md) is the short version; the [development log](development-log.md) is the history, with every measurement and every bug found along the way. Where this book gives a number, the development log says how it was measured.
+This book is the reference for installing, using, operating, understanding and extending the application. The [README](../README.md) is the short version. Performance figures include the command needed to reproduce them and should be treated as measurements of one machine, not as release guarantees.
 
 ---
 
@@ -32,7 +32,7 @@ This book is the reference for using, operating, understanding and extending it.
 
 - A **GGUF loader and inference engine**: tokenizer, chat-template renderer, transformer forward pass, KV caches, sampling. All of it is Boring source (about 9,000 lines under `src/`), including the GPU kernels.
 - An **OpenAI-compatible server** (`--serve`) with streaming, stop strings and tool calling, tuned for agent clients that resend a long, mostly identical prompt every turn.
-- A **real-world test of the Boring language and its GPU targets**: every compiler bug found while building it was reduced to a minimal case and reported upstream.
+- A **readable inference implementation**: model loading, tokenization, templates, sampling, caching, server logic and GPU kernels are Boring source in this repository.
 
 ### What it is not
 
@@ -52,8 +52,12 @@ This book is the reference for using, operating, understanding and extending it.
 | `qwen2` | Qwen2.5 0.5B, 3B, 7B Instruct |
 | `qwen3` | Qwen3 4B (thinking and non-thinking) |
 | `llama` | TinyLlama 1.1B Chat |
+| `phi3` | synthetic short/long-context fixtures |
+| `gemma`, `gemma2`, `gemma3` | synthetic fixtures; Gemma 3 270M on real weights |
+| `granite`, `smollm3` | synthetic fixtures |
+| Mixtral-layout `llama`, `qwen3moe` | synthetic fixtures; a small Mixtral-layout model on real weights |
 
-Any GGUF of those two architectures should load. Other architectures are rejected with an explicit error rather than guessed (see [section 6.2](#62-architectures)).
+Support is limited to the layouts and features described in [section 6.2](#62-architectures); a familiar architecture name does not imply support for every variant. Unknown layouts and missing required tensors are rejected explicitly rather than guessed.
 
 ### How the book is organized
 
@@ -66,7 +70,7 @@ Chapters 2 to 5 are for people who want to run it. Chapters 6 to 8 explain model
 ### Requirements
 
 - The [Rust toolchain](https://rustup.rs/).
-- The `boring` compiler: `cargo install --git https://github.com/mlanoe/boring`. The README states the minimum commit; older builds miss kernel fixes or have known accuracy problems (see [section 10.4](#104-compiler-versions)).
+- A current build of the `boring` compiler: `cargo install --git https://github.com/mlanoe/boring --force`. Regenerate the target project after updating it (see [section 10.4](#104-compiler-compatibility)).
 - A GPU supported by Metal (macOS) or wgpu (Vulkan, DirectX 12, Metal).
 - A GGUF model file, for example from Hugging Face.
 
@@ -582,7 +586,7 @@ The file layout is in [the appendix](#152-prompt-cache-file-layout).
 
 ### 8.1 Measured numbers
 
-Measured on one 16 GB Apple-silicon machine (M3, Metal) with `boring` 46c2473f, with nothing else running but the benchmark. Timings still move by tens of percent between repetitions, so read the ratios as indications; the per-run minimum and maximum are in the development log.
+Measured on one 16 GB Apple-silicon machine (M3, Metal), with nothing else running but the benchmark. Timings still move by tens of percent between repetitions, so read the ratios as indications and reproduce them with the benchmark tool on your hardware.
 
 | Model | Prompt | Prefill tok/s | Decode tok/s | Decode ms/token |
 |---|---|---|---|---|
@@ -624,7 +628,7 @@ A stage-by-stage profile of the prefill matrix multiply lives in `tools/metal_pr
 - Use `--prompt-cache` for agent workloads. It is the largest single saving.
 - On wgpu, CUDA and ROCm try `--kquant-prefill handwritten`, which is faster there today.
 - Close other GPU users before measuring. A load average above 3 distorts timings.
-- `BORING_METAL_BATCH=N` (a `boring` environment variable for Metal builds, `boring` ecc15864 or later) batches kernel launches into shared command buffers. It cut the CPU cost of a launch from 22 to 1.5 us but gave no measurable decode speed-up here (the GPU is the bottleneck) and made prefill 7 to 13 percent slower, so leave it unset.
+- `BORING_METAL_BATCH=N` batches Metal kernel launches into shared command buffers. It is a diagnostic tuning control; the engine already selects its decode batching policy, so leave it unset for normal use.
 
 ---
 
@@ -694,7 +698,7 @@ Kernels are Boring `kernel` structs with `'global`, `'unified` and `'actor` qual
 
 ### 9.5 State as values
 
-A `mut` kernel field built from a resident argument is a copy of it (the generated wrapper copies the buffer), so a kernel cannot update the caller's buffer in place, and writing to such a field is not an error: the write goes to the copy and is lost without any message. The engine therefore passes state as values: `forward_step` takes a cache and returns `(logits, new_cache)`, the sampler takes an RNG and returns `(token, new_rng)`, and the Jinja evaluator threads its environment through return values. This is a deliberate idiom, not a workaround, and it is why a cache can be shared between slots, truncated or snapshotted without copying. The silence is the dangerous part: a fused residual-add + RMSNorm kernel written as an in-place update compiled, passed its unit test and made every model print random text (see [section 11.5](#115-the-decode-check)); `tools/decode_vs_llamacpp.py` is what catches this class of bug today, and a compile-time warning is requested from `boring` (`task_e0c5ff89`).
+A `mut` kernel field built from a resident argument is a copy of it (the generated wrapper copies the buffer), so a kernel cannot update the caller's buffer in place. The engine therefore passes state as values: `forward_step` takes a cache and returns `(logits, new_cache)`, the sampler takes an RNG and returns `(token, new_rng)`, and the Jinja evaluator threads its environment through return values. This is why a cache can be shared between slots, truncated or snapshotted without copying. `tools/decode_vs_llamacpp.py` verifies the resulting decode path after kernel changes.
 
 ---
 
@@ -734,18 +738,18 @@ A prefill schedule has a staging precision: `float` (the default, exact against 
 
 On wgpu, CUDA and ROCm the portable tensor schedule for K-quant prefill is about three times slower than the hand-written Q4_K and Q6_K kernels in `math_gpu.br`. `--kquant-prefill handwritten` selects the hand-written ones. On Metal the native schedules are faster than both, so the default is `tensor`.
 
-### 10.4 Compiler versions
+### 10.4 Compiler compatibility
 
-The project is also a regression suite for `boring`. Several compiler versions are known bad for it:
+boring-llm follows the current Boring compiler and uses recent tensor formats,
+GPU schedules, environment access and resident-buffer behavior. Install Boring
+from its current main branch, then regenerate the Metal or wgpu Cargo project
+before rebuilding. A stale generated project can continue to contain code from
+the previous compiler even after the executable has been updated.
 
-- before `a057dd8c`: the disk prompt cache and the native Metal K-quant kernels do not compile on macOS 27;
-- before `6fb92947`: Q4_K decode is about twice as slow;
-- `6acc7d44` to `316c7695`: prefill tiles are staged in half precision, so the 7B's logits drift;
-- `316c7695` to `ff79f091`: biased Q8_0 projections return wrong values on small Qwen models.
-- `8bdac11d` to before `d38813c8`: Q6_K prefill returns wrong values for every odd output column (the 8-byte loads of 210-byte blocks were misaligned), so Q4_K_M models produce garbage.
-- before `46c2473f`: a `.split(...)` written directly as a call argument stopped a later `.split(...)` of the same function from transpiling (this project's `think_parts` in `openai.br` relies on the fix).
-
-The README states the minimum commit to use. After any compiler update that touches the GPU kernels, run the accuracy check in [section 11.4](#114-the-accuracy-check).
+If the build reports an unsupported tensor format or a missing runtime
+primitive, update Boring first. After any compiler update that touches GPU
+kernels, run both the accuracy check in [section 11.4](#114-the-accuracy-check)
+and the decode check in [section 11.5](#115-the-decode-check).
 
 ---
 
@@ -802,7 +806,7 @@ It exists because kernel unit tests passed while the models regressed three time
 
 ### 11.5 The decode check
 
-`tools/decode_vs_llamacpp.py` covers what the accuracy check cannot: the generation path. Generation prefills in chunks and then runs one `forward_step` per token with the KV cache and the single-row kernels, while `--tokens` runs one batched forward pass. A commit once fused the attention residual add into the following RMSNorm with a kernel that updated a copy of the residual stream: every layer lost its attention output and the model printed random text, yet the unit tests, the logits check and the benchmarks all passed.
+`tools/decode_vs_llamacpp.py` covers what the accuracy check cannot: the generation path. Generation prefills in chunks and then runs one `forward_step` per token with the KV cache and the single-row kernels, while `--tokens` runs one batched forward pass. This catches state-passing errors that unit tests, a batched logits check, and throughput benchmarks do not exercise.
 
 ```sh
 .venv/bin/python tools/decode_vs_llamacpp.py --gguf weights/qwen2.5-0.5b-instruct-q8_0.gguf \
@@ -855,7 +859,7 @@ Qwen3 is the worked example: three small changes in `model.br` (the head size fr
 
 ### 12.5 Compiler bugs
 
-Boring is developed alongside this project. When a real compiler bug or gap turns up, reduce it to a minimal program, report it with the program and the expected behavior, and keep the workaround out of shared code once it is fixed. The development log records each one: what was seen, the reduction, and which commit fixed it.
+When a compiler bug or gap turns up, reduce it to a minimal Boring program and report the program, generated target and expected behavior upstream. Keep temporary compiler workarounds isolated and remove them once the application works with the current compiler.
 
 ### 12.6 Documentation
 
@@ -889,7 +893,7 @@ This writes `docs/book.html`, `README.html` at the repository root, and one HTML
 |---|---|
 | `context_length_exceeded` | the prompt is longer than `--ctx-size`; raise it (OpenCode needs at least 16384) |
 | a client times out on the first request | it gave up on a silent response; check that it reads SSE comment lines, or use `--prompt-cache` so only the first request ever is slow |
-| the build fails on macOS 27 with Metal K-quant kernels | the `boring` compiler is older than the README's minimum commit |
+| the build fails in generated Metal tensor code | update Boring, regenerate `src/main_metal/`, then rebuild it from scratch |
 | `quantized tensor dimension k must be a multiple of 256` | a K-quant tensor whose row length is not a multiple of 256 |
 | random text from a model whose logits check passes | a decode-path bug (`forward_step`, the KV cache, a single-row kernel, a residual update on a copy); run `tools/decode_vs_llamacpp.py` |
 | garbage output on a Q4_K_M model after a compiler update | a kernel regression; run `tools/accuracy_vs_llamacpp.py` and compare the mean logit difference with the healthy values in [section 11.4](#114-the-accuracy-check) |

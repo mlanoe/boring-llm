@@ -11,8 +11,8 @@
 # no metadata key for it), and attention Q/K/V bias tensors (present for
 # Qwen2, absent for Llama/Mistral) fall back to an all-zero vector via
 # `load_tensor_f32_or_zero` when the GGUF file doesn't have them. Verified
-# against a real Qwen2 GGUF and a real Llama GGUF — see
-# docs/development-log.md.
+# against real Qwen2 and Llama GGUF files; the reproducible comparison tools
+# live under tools/.
 
 use io
 use gguf
@@ -242,8 +242,8 @@ pub [float32] load_tensor_f32(GgufFile file, string name) throws:
 # (architecture "llama" — also covers plain Mistral, which reuses the same
 # GGUF architecture string) needs NORM — a 4-decimal-place logit match on
 # the interleaved formula against NEOX's complete divergence beyond
-# position 0 (see docs/development-log.md) leaves no ambiguity about which
-# is which. Scoped to exactly this project's target family for now; throws
+# position 0 leaves no ambiguity about which is which. Scoped to exactly
+# this project's target family for now; throws
 # on anything else rather than silently guessing (same "fail loud on an
 # unhandled case" convention as quant.br's unsupported-ggml-type error).
 int rope_style_for_arch(string arch) throws:
