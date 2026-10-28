@@ -1138,6 +1138,105 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
 
     (last_logits, GenCache(new_layers, base_pos + n, 0, cache.f16))
 
+# Speculative decoding's verification pass: feeds `tokens` (n >= 1) after an existing cache like
+# prefill_step_gpu_quantized, but returns the logits of every row, not just the last.
+pub ([float32], GenCache) forward_batch_gpu_quantized(QuantModel model, GenCache cache0, [int] tokens) throws:
+    guard not cache0.f16 or model.config.d_head == 64 or model.config.d_head == 128 else throw "float16 KV cache requires attention head size 64 or 128"
+    guard cache0.pos > 0 else throw "forward_batch needs a prefilled cache"
+    let cache = fold_cache(model, cache0)
+    let n = tokens.length
+    let base_pos = cache.pos
+    let d = model.config.d_model
+    let qkv_dim = model.config.n_head * model.config.d_head
+    let kv_dim = model.config.n_kv_head * model.config.d_head
+    let tok_embd_row_bytes = quantized_row_bytes(model.tok_embd_type, d)
+
+    mut [float32] x_host = [0.0 for i in 0..<(n * d)]
+    var int p = 0
+    while p < n:
+        let tok = tokens[p]
+        let row_byte_offset = tok * tok_embd_row_bytes
+        let row = dequantize_row(model.tok_embd_type, model.tok_embd_q8, row_byte_offset, d)
+        var int i = 0
+        while i < d:
+            x_host[p * d + i] = row[i] * model.config.embd_scale
+            i += 1
+        p += 1
+
+    # Residual stream: uploaded once, then kept on the device across layers.
+    var x = upload_floats_gpu(x_host)
+
+    mut [LayerCache] new_layers = []
+    var int l = 0
+    while l < model.config.n_layer:
+        let layer = model.layers[l]
+        let lc = cache.layers[l]
+
+        let normed = rms_norm_gpu(x, layer.attn_norm_w, n, d, model.config.rms_eps)
+        var q = tensor_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, n, d, qkv_dim)
+        var k = tensor_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, n, d, kv_dim)
+        let v = tensor_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, n, d, kv_dim)
+        if model.config.qk_norm:
+            q = rms_norm_gpu(q, layer.q_norm_w, n * model.config.n_head, model.config.d_head, model.config.rms_eps)
+            k = rms_norm_gpu(k, layer.k_norm_w, n * model.config.n_kv_head, model.config.d_head, model.config.rms_eps)
+        # RoPE positions for this batch start at `base_pos` (the number of
+        # positions already in the cache), not 0 — same rope_apply_at_gpu
+        # forward_step already uses for a single new token, just batched.
+        let rope_t = layer_rope_freqs(model.config, l)
+        q = rope_apply_at_gpu(q, n, model.config.n_head, model.config.d_head, rope_t, base_pos, model.config.rope_neox)
+        let k_rope_raw = rope_apply_at_gpu(k, n, model.config.n_kv_head, model.config.d_head, rope_t, base_pos, model.config.rope_neox)
+        let seq_k = base_pos + n
+        mut [float32]'kernel'unified full_k = []
+        mut [float32]'kernel'unified full_v = []
+        mut [float16]'kernel'unified full_hk = []
+        mut [float16]'kernel'unified full_hv = []
+        mut [float32]'kernel'unified attn_out = []
+        if cache.f16:
+            # Batched prefill still uses the general float32 attention path.
+            # Widen the old main cache for this comparatively infrequent path,
+            # then repack the result. Single-token decode reads half directly.
+            let old_k = unpack_float16_gpu(lc.hk)
+            let old_v = unpack_float16_gpu(lc.hv)
+            full_k = kv_append_gpu(old_k, k_rope_raw, base_pos * kv_dim, n * kv_dim)
+            full_v = kv_append_gpu(old_v, v, base_pos * kv_dim, n * kv_dim)
+            attn_out = attention_layer_gpu(q, full_k, full_v, n, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head, base_pos,
+                model.config.attn_ext, model.config.attn_scale, model.config.attn_softcap, layer_window(model.config, l))
+            full_hk = pack_float16_gpu(full_k)
+            full_hv = pack_float16_gpu(full_v)
+        else:
+            full_k = kv_append_gpu(lc.k, k_rope_raw, base_pos * kv_dim, n * kv_dim)
+            full_v = kv_append_gpu(lc.v, v, base_pos * kv_dim, n * kv_dim)
+            attn_out = attention_layer_gpu(q, full_k, full_v, n, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head, base_pos,
+                model.config.attn_ext, model.config.attn_scale, model.config.attn_softcap, layer_window(model.config, l))
+        let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, n, qkv_dim, d)
+        mut [float32]'kernel'unified attn_res = attn_proj
+        if model.config.post_norms:
+            attn_res = rms_norm_gpu(attn_proj, layer.attn_post_norm_w, n, d, model.config.rms_eps)
+        x = add_gpu(x, attn_res, n * d)
+
+        let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, n, d, model.config.rms_eps)
+        let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, n, d, model.config.ffn_dim)
+        let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, n, d, model.config.ffn_dim)
+        let hidden = glu_combine_gpu(gate, up, model.config.act)
+        let ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, n, model.config.ffn_dim, d)
+        mut [float32]'kernel'unified ffn_res = ffn_out
+        if model.config.post_norms:
+            ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, n, d, model.config.rms_eps)
+        x = add_gpu(x, ffn_res, n * d)
+
+        if cache.f16:
+            new_layers.push(LayerCache([], [], full_hk, full_hv, [], []))
+        else:
+            new_layers.push(LayerCache(full_k, full_v, [], [], [], []))
+        l += 1
+
+    # Every row's logits (n * vocab_size floats): row j is the distribution after tokens[j].
+    let final_normed = rms_norm_gpu(x, model.output_norm_w, n, d, model.config.rms_eps)
+    let logits_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, n, d, model.config.vocab_size)
+    let rows = softcap_logits(passthrough(logits_raw), model.config.final_softcap)
+
+    (rows, GenCache(new_layers, base_pos + n, 0, cache.f16))
+
 pub GenCache empty_cache(int n_layer):
     mut [LayerCache] layers = []
     var int l = 0

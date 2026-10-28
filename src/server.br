@@ -25,6 +25,7 @@ use sampling
 use embedding
 use grammar
 use schema_grammar
+use speculative
 use std.net.TcpListener, TcpStream
 use std.io.Read, Write
 use std.time.Instant
@@ -73,6 +74,10 @@ pub struct ServerCtx:
     string cors_methods
     string cors_headers
     bool cors_credentials
+    bool spec_enabled       # `--spec-type ngram-simple`: draft by prompt lookup, verify in one batched pass
+    int spec_draft_max      # tokens drafted at most
+    int spec_draft_min      # a draft shorter than this is not worth a batched pass
+    int spec_ngram          # n-gram length looked up (shorter ones are tried when it does not match)
     string default_grammar  # `--grammar` / `--grammar-file`: GBNF used when a request sets none; "" = none
     bool embeddings_enabled # `--embeddings`: serve /embedding, /embeddings and /v1/embeddings
     int pooling             # 0 none, 1 mean, 2 cls, 3 last (see embedding.br)
@@ -906,6 +911,21 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     var bool context_was_shifted = false
     var int generated = 0
     var int first_token_ms = -1
+    # Speculative decoding state: a batched pass fed [next_tok, d1..dk] and keeps every row's logits; while
+    # `spec_pending`, `cur` is the cache after all k + 1 tokens and the logits come from `spec_rows`.
+    var bool spec_pending = false
+    var [int] spec_expected = []
+    var int spec_idx = 0
+    var [float32] spec_rows = []
+    var GenCache spec_cache = empty_cache(ctx.model.config.n_layer)
+    var int spec_base = 0
+    var int spec_drafted = 0
+    var int spec_accepted = 0
+    # A batched pass costs about as much as a few decode steps, so a draft that is mostly rejected loses:
+    # after a pass that gains less than two tokens, drafting pauses for 2, 4, ... 16 steps.
+    var int spec_fails = 0
+    var int spec_skip = 0
+    let spec_active = ctx.spec_enabled and not context_shift
     var float32 mirostat_mu = 2.0 as float32 * mirostat_tau
     var float32 adaptive_weighted_sum = if adaptive_target >= 0.0 as float32: adaptive_target / (1.0 as float32 - adaptive_decay) else: 0.0 as float32
     var float32 adaptive_total_weight = if adaptive_target >= 0.0 as float32: 1.0 as float32 / (1.0 as float32 - adaptive_decay) else: 0.0 as float32
@@ -1143,15 +1163,65 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                     shifted_tokens.push(next_tok)
                     tokens = shifted_tokens
                     print "[serve] context shift: kept {shift.keep}, discarded {shift.discard}, retained {retained.length} tokens"
-                let (step_logits, step_cache) = forward_step(ctx.model, cur, next_tok)
-                if ctx.metrics_enabled:
-                    metrics.n_decode += 1
-                logits = step_logits
-                cur = step_cache
+                if spec_pending and next_tok == spec_expected[spec_idx]:
+                    # the sampler chose the drafted token: its row of logits is already computed
+                    spec_idx += 1
+                    spec_accepted += 1
+                    logits = extract_row(spec_rows, spec_idx, vocab)
+                    if spec_idx == spec_expected.length:
+                        spec_pending = false
+                        spec_fails = 0
+                else:
+                    if spec_pending:
+                        # first mismatch: keep the cache up to the last accepted draft, then decode normally
+                        cur = resume_cache(ctx.model, spec_cache, spec_base + 1 + spec_idx, spec_base + 2 + spec_idx)
+                        spec_pending = false
+                        if spec_idx >= 2:
+                            spec_fails = 0
+                        else:
+                            if spec_fails < 4:
+                                spec_fails += 1
+                            spec_skip = 1
+                            var int pause = 0
+                            while pause < spec_fails:
+                                spec_skip = spec_skip * 2
+                                pause += 1
+                    var [int] draft = []
+                    if spec_skip > 0:
+                        spec_skip -= 1
+                    elif spec_active and cur.pos + ctx.spec_draft_max + 2 < ctx.max_ctx:
+                        draft = ngram_draft(tokens, ctx.spec_draft_max, ctx.spec_ngram, 2)
+                    if draft.length >= ctx.spec_draft_min and draft.length > 0:
+                        mut [int] feed = [next_tok]
+                        for dt in draft:
+                            feed.push(dt)
+                        let (batch_rows, batch_cache) = forward_batch_gpu_quantized(ctx.model, cur, feed)
+                        if ctx.metrics_enabled:
+                            metrics.n_decode += 1
+                        spec_base = cur.pos
+                        spec_cache = batch_cache
+                        spec_rows = batch_rows
+                        spec_expected = draft
+                        spec_idx = 0
+                        spec_pending = true
+                        spec_drafted += draft.length
+                        logits = extract_row(batch_rows, 0, vocab)
+                        cur = batch_cache
+                    else:
+                        let (step_logits, step_cache) = forward_step(ctx.model, cur, next_tok)
+                        if ctx.metrics_enabled:
+                            metrics.n_decode += 1
+                        logits = step_logits
+                        cur = step_cache
             if t_max_predict_ms > 0 and first_token_ms >= 0 and text.contains("\n"):
                 let since_first_token = started.elapsed().asMillis() as int - first_token_ms
                 if since_first_token > t_max_predict_ms:
                     prediction_timed_out = true
+    if spec_pending:
+        # the loop ended inside a draft: drop the rows of the tokens that were never consumed
+        cur = resume_cache(ctx.model, spec_cache, spec_base + 1 + spec_idx, spec_base + 2 + spec_idx)
+    if spec_drafted > 0:
+        print "[serve] speculative decoding: {spec_accepted} of {spec_drafted} drafted tokens accepted"
     let gen_ms = started.elapsed().asMillis() as int
     let completed = unix_timestamp()
 

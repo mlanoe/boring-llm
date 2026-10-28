@@ -1,0 +1,34 @@
+# boring-llm — draft tokens for speculative decoding (pure)
+#
+# "Prompt lookup" drafting, as in llama.cpp's ngram-simple: when the last few tokens of the text so far
+# already occurred earlier (in the prompt or in the reply), the tokens that followed that earlier
+# occurrence are a good guess for what comes next (code edits, quotations, repeated structure). The
+# server verifies the guess with one batched forward pass; every guess that matches what the sampler
+# would have chosen anyway saves a decode step.
+
+# The most recent earlier occurrence of the last `size` tokens, for `size` from `ngram_max` down to
+# `ngram_min`; its continuation (at most `max_draft` tokens) is the draft. Empty when nothing matches.
+pub [int] ngram_draft([int] tokens, int max_draft, int ngram_max, int ngram_min):
+    let n = tokens.length
+    var int size = ngram_max
+    while size >= ngram_min and size >= 1:
+        if n > size:
+            var int start = n - size - 1
+            while start >= 0:
+                var bool same = true
+                var int j = 0
+                while same and j < size:
+                    if tokens[start + j] != tokens[n - size + j]:
+                        same = false
+                    j += 1
+                if same:
+                    mut [int] draft = []
+                    var int k = start + size
+                    while k < n and draft.length < max_draft:
+                        draft.push(tokens[k])
+                        k += 1
+                    if draft.length > 0:
+                        return draft
+                start -= 1
+        size -= 1
+    []
