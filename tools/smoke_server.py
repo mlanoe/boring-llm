@@ -96,7 +96,7 @@ check("GET /props exposes llama-server diagnostics", s == 200 and props.get("mod
       and props_defaults.get("next_token", {}).get("n_remain")
       == props_defaults.get("params", {}).get("max_tokens")
       and props_defaults.get("params", {}).get("samplers")
-      == ["dry", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"], b)
+      == ["penalties", "dry", "top_n_sigma", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"], b)
 
 count_body = {"model": model_id, "messages": [{"role": "user", "content": "Say hi."}], "chat_template_kwargs": NO_THINK}
 s, h, b = call("/v1/chat/completions/input_tokens", count_body)
