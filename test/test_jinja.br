@@ -48,7 +48,7 @@ def main() throws:
     messages.push(JValue.JDict(msg, ["role", "content"]))
     mut {string=JValue} env5 = {=}
     env5["messages"] = JValue.JList(messages)
-    let tmpl5 = "{ob}%- if messages[0]['role'] == \"user\" and not (messages[0].role == \"system\") -%{cb}{ob}{ob} messages[0].role {cb}{cb}:{ob}{ob} messages[0]['content'] {cb}{cb}{ob}%- endif -%{cb}"
+    let tmpl5 = $"""$ob%- if messages[0]['role'] == "user" and not (messages[0].role == "system") -%${cb}${ob}$ob messages[0].role ${cb}$cb:${ob}$ob messages[0]['content'] ${cb}${cb}$ob%- endif -%$cb"""
     let out5 = render_jinja(tmpl5, env5)
     assert_eq(out5, "user:hi" as string)
 
@@ -79,7 +79,7 @@ def main() throws:
     mut {string=JValue} env7 = {=}
     env7["x"] = JValue.JStr("a\"b")
     let out7 = render_jinja("{ob}{ob} x | tojson {cb}{cb}", env7)
-    assert_eq(out7, "\"a\\\"b\"" as string)
+    assert_eq(out7, '''"a\"b"''' as string)
 
     # a real Jinja quirk: exactly one trailing newline in the raw template
     # source is always dropped (keep_trailing_newline=False, real Jinja2's

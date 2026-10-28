@@ -18,7 +18,7 @@ struct SchemaGrammar:
     var {string=string} ref_rules   # $ref -> rule name
 
 # One whitespace rule, as in json.gbnf (newlines and indentation are bounded).
-let string SPACE_RULE = "| \" \" | \"\\n\"{{1,2}} [ \\t]{{0,20}}"
+let string SPACE_RULE = '''| " " | "\n"{1,2} [ \t]{0,20}'''
 
 string sanitize_name(string raw):
     var string out = ""
@@ -163,7 +163,7 @@ string object_rule(mut SchemaGrammar& g, JValue schema, string name) throws:
     if extra:
         let extra_child = extra_value_rule(g, schema, name)
         extra_kv = add_rule(g, "{name}-additional-kv", "string \":\" space {extra_child}")
-    var string body = "\"{{\" space "
+    var string body = '''"{" space '''
     if req_kv.length > 0:
         var string inner = req_kv[0]
         var int i = 1
@@ -200,7 +200,7 @@ string array_rule(mut SchemaGrammar& g, JValue schema, string name) throws:
     let max = int_or(json_get(schema, "maxItems"), -1)
     guard max < 0 or max >= min else throw "maxItems is smaller than minItems"
     if max == 0:
-        return "\"[\" space \"]\" space"
+        return '''"[" space "]" space'''
     var string inner = item
     if min > 1 or max > 1 or max < 0:
         let more_min = if min > 1: min - 1 else: 0

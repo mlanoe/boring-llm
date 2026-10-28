@@ -153,11 +153,11 @@ bool json_has_literal([string] cs, int pos, string lit):
     let p = json_skip_ws(cs, pos)
     guard p < cs.length else throw "json: unexpected end of input"
     let ch = cs[p]
-    if ch == "{{":
+    if ch == '''{''':
         var {string=JValue} fields = {=}
         var [string] keys = []
         var int q = json_skip_ws(cs, p + 1)
-        if q < cs.length and cs[q] == "}}":
+        if q < cs.length and cs[q] == '''}''':
             return (JValue.JDict(fields, keys), q + 1)
         while true:
             q = json_skip_ws(cs, q)
@@ -173,7 +173,7 @@ bool json_has_literal([string] cs, int pos, string lit):
             guard q < cs.length else throw "json: unterminated object"
             if cs[q] == ",":
                 q += 1
-            elif cs[q] == "}}":
+            elif cs[q] == '''}''':
                 return (JValue.JDict(fields, keys), q + 1)
             else:
                 throw "json: expected ',' or '}}' at {q}"
@@ -241,7 +241,7 @@ pub int json_prefix_state(string src):
                 let top = states.length - 1
                 states[top] = 1
                 p += 1
-            elif ch == "}}":
+            elif ch == '''}''':
                 states.pop()
                 p += 1
             else:
@@ -257,7 +257,7 @@ pub int json_prefix_state(string src):
             else:
                 return -1
         elif state == 1:
-            if ch == "}}":
+            if ch == '''}''':
                 states.pop()
                 p += 1
             elif ch != "\"":
@@ -306,7 +306,7 @@ pub int json_prefix_state(string src):
                 let after = if state == 0: 7 elif state == 3: 4 else: 6
                 let top = states.length - 1
                 states[top] = after
-                if ch == "{{":
+                if ch == '''{''':
                     states.push(1)
                     p += 1
                 elif ch == "[":
@@ -392,7 +392,7 @@ pub int json_object_prefix_state(string src):
         p += 1
     if p == cs.length:
         return 0
-    if cs[p] != "{{":
+    if cs[p] != '''{''':
         return -1
     json_prefix_state(src)
 

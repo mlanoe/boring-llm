@@ -249,7 +249,7 @@ string tokens_with_pieces_json(Tokenizer tok, [int] ids):
                 piece = "{piece}{int(bytes[j])}"
                 j += 1
             piece = "{piece}]"
-        out = "{out}{{\"id\": {ids[i]}, \"piece\": {piece}}}"
+        out = $"""$out{"id": ${ids[i]}, "piece": $piece}"""
         i += 1
     "{{\"tokens\": {out}]}}"
 
@@ -788,8 +788,8 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         stops, ignore_eos, streaming,
         requested_native_logprobs, timings_per_token, n_indent, sse_ping_interval, requested_post_sampling_probs,
         ctx.model_name, ctx.max_ctx, cache_prompt, return_tokens, return_progress, t_max_predict_ms)
-    let keep_generation_settings = base_generation_settings.replace("\"n_keep\": 0", "\"n_keep\": {n_keep}")
-    let native_generation_settings = keep_generation_settings.replace("\"n_discard\": 0", "\"n_discard\": {n_discard}")
+    let keep_generation_settings = base_generation_settings.replace('''"n_keep": 0''', "\"n_keep\": {n_keep}")
+    let native_generation_settings = keep_generation_settings.replace('''"n_discard": 0''', "\"n_discard\": {n_discard}")
     let processed_prompt = if is_native: ctx.tok.decode(prompt_tokens) else: ""
     let id = "{counter}"
     var bool responses_text_started = false
@@ -1774,7 +1774,7 @@ string grammar_error(string text):
     elif unsupported_router != "":
         respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json(unsupported_router))
     elif (r.method == "GET" or r.method == "HEAD") and (path == "/health" or path == "/v1/health" or path == "/"):
-        respond_json(response, sock, 200, "OK", "{{\"status\": \"ok\"}}")
+        respond_json(response, sock, 200, "OK", '''{"status": "ok"}''')
     elif (r.method == "GET" or r.method == "HEAD") and path == "/props":
         let template = gguf_get_string(ctx.file.metadata, "tokenizer.chat_template") else ""
         respond_json(response, sock, 200, "OK", props_json(ctx.model_path, template, ctx.max_ctx, ctx.cache_slots, ctx.default_max_tokens,
@@ -1896,7 +1896,7 @@ string grammar_error(string text):
     elif ctx.embeddings_enabled and r.method == "POST" and (path == "/embedding" or path == "/embeddings" or path == "/v1/embeddings"):
         return handle_embeddings(ctx, response, sock, r.body, path == "/v1/embeddings", slots)
     elif unsupported_endpoint == "embeddings":
-        respond_json(response, sock, 501, "Not Implemented", "{{\"error\": {{\"code\": 501, \"message\": \"This server does not support embeddings. Start it with `--embeddings`\", \"type\": \"not_supported_error\"}}}}")
+        respond_json(response, sock, 501, "Not Implemented", '''{"error": {"code": 501, "message": "This server does not support embeddings. Start it with `--embeddings`", "type": "not_supported_error"}}''')
     elif unsupported_endpoint != "":
         respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json(unsupported_endpoint))
     elif r.method == "POST" and path == "/v1/messages/count_tokens":

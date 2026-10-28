@@ -11,5 +11,5 @@ def main():
     assert(json_pattern_matches("^\\w+\\s+ok$", "name  ok"), "word and whitespace classes")
     assert(json_pattern_validation_error("(a|b)") != "", "groups and alternation are rejected")
     assert(json_pattern_validation_error("[abc") != "", "unterminated class")
-    assert(json_pattern_validation_error("a{{2}}") != "", "brace quantifiers are rejected")
+    assert(json_pattern_validation_error('''a{2}''') != "", "brace quantifiers are rejected")
     print "test_json_pattern: all assertions passed"

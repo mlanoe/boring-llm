@@ -41,8 +41,8 @@ def main() throws:
 
     assert_eq(floats_json([1.5, 2.0]), "[1.5, 2]")
     let body = openai_embeddings_json([[0.5, 1.0]], "m", 3, false)
-    assert(body.contains("\"embedding\": [0.5, 1]") and body.contains("\"prompt_tokens\": 3") and body.contains("\"index\": 0"), body)
+    assert(body.contains('''"embedding": [0.5, 1]''') and body.contains('''"prompt_tokens": 3''') and body.contains('''"index": 0'''), body)
     let ob = chr(123)
     let cb = chr(125)
-    assert_eq(native_embeddings_json([[[0.5, 1.0]]]), "[{ob}\"index\": 0, \"embedding\": [[0.5, 1]]{cb}]")
+    assert_eq(native_embeddings_json([[[0.5, 1.0]]]), $"""[$ob"index": 0, "embedding": [[0.5, 1]]$cb]""")
     print "test_embedding: all assertions passed"

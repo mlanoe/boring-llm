@@ -8,16 +8,16 @@ use json
 def main() throws:
     # Round trip: key order, nesting, null/bool/float/escapes all survive
     # parse -> jv_to_json byte-for-byte (Python json.dumps-style spacing).
-    let src1 = "{{\"b\": 1, \"a\": [true, null, \"x\\ny\"], \"c\": 1.5, \"d\": {{\"z\": -2, \"y\": \"q\"}}}}"
+    let src1 = '''{"b": 1, "a": [true, null, "x\ny"], "c": 1.5, "d": {"z": -2, "y": "q"}}'''
     let v1 = json_parse(src1)
     assert_eq(jv_to_json(v1), src1 as string)
 
     # Whitespace-insensitive on input, normalized on output.
-    let v2 = json_parse("  {{ \"k\" :  [ 1 ,2 , 3 ] , \"e\" : {{ }} , \"l\": [ ] }}  ")
-    assert_eq(jv_to_json(v2), "{{\"k\": [1, 2, 3], \"e\": {{}}, \"l\": []}}" as string)
+    let v2 = json_parse('''  { "k" :  [ 1 ,2 , 3 ] , "e" : { } , "l": [ ] }  ''')
+    assert_eq(jv_to_json(v2), '''{"k": [1, 2, 3], "e": {}, "l": []}''' as string)
 
     # Typed accessors.
-    let body = json_parse("{{\"model\": \"qwen\", \"max_tokens\": 64, \"temperature\": 0.7, \"stream\": true, \"messages\": [{{\"role\": \"user\", \"content\": \"hi\"}}]}}")
+    let body = json_parse('''{"model": "qwen", "max_tokens": 64, "temperature": 0.7, "stream": true, "messages": [{"role": "user", "content": "hi"}]}''')
     assert_eq(json_get_str(body, "model", "?"), "qwen" as string)
     assert_eq(json_get_int(body, "max_tokens", -1), 64 as int)
     assert_eq(json_get_int(body, "missing", -1), -1 as int)
@@ -27,7 +27,7 @@ def main() throws:
     assert_eq(json_get_list(body, "messages").length, 1 as int)
 
     # \u escapes: BMP char, ASCII, and a surrogate pair (U+1F600 grinning face).
-    let v3 = json_parse("\"caf\\u00e9 \\u0041 \\ud83d\\ude00 \\\"q\\\" \\\\ \\/\"")
+    let v3 = json_parse('''"caf\u00e9 \u0041 \ud83d\ude00 \"q\" \\ \/"''')
     match v3:
         JStr(s):
             assert_eq(s, "café A {chr(0x1F600)} \"q\" \\ /" as string)
@@ -36,9 +36,9 @@ def main() throws:
 
     # Raw (unescaped) non-ASCII input passes straight through, and
     # control characters re-escape on output.
-    let v4 = json_parse("\"héllo wörld\"")
-    assert_eq(jv_to_json(v4), "\"héllo wörld\"" as string)
-    assert_eq(jv_to_json(JValue.JStr("a{chr(1)}b")), "\"a\\u0001b\"" as string)
+    let v4 = json_parse('''"héllo wörld"''')
+    assert_eq(jv_to_json(v4), '''"héllo wörld"''' as string)
+    assert_eq(jv_to_json(JValue.JStr("a{chr(1)}b")), '''"a\u0001b"''' as string)
 
     # Big integer falls back to float rather than failing.
     let v5 = json_parse("123456789012345678901234567890")
@@ -48,8 +48,8 @@ def main() throws:
 
     # Malformed input is a clean error, never a crash.
     var int errors = 0
-    for bad in ["", "{{", "[1, 2", "{{\"a\" 1}}", "{{\"a\": }}", "\"abc", "[1] x", "tru", "{{'a': 1}}", "\"\\u12\"",
-                "\"bad\\q\"", "\"raw{chr(10)}newline\"", "+1", "01", "-01", "1.", "1e", "1e+", "--1"]:
+    for bad in ["", '''{''', "[1, 2", '''{"a" 1}''', '''{"a": }''', "\"abc", "[1] x", "tru", '''{'a': 1}''', '''"\u12"''',
+                '''"bad\q"''', "\"raw{chr(10)}newline\"", "+1", "01", "-01", "1.", "1e", "1e+", "--1"]:
         try:
             let _ = json_parse(bad)
         catch:
@@ -57,7 +57,7 @@ def main() throws:
     assert_eq(errors, 19 as int)
 
     var int surrogate_errors = 0
-    for bad_surrogate in ["\"\\ud800\"", "\"\\ud800\\u0041\"", "\"\\udc00\""]:
+    for bad_surrogate in ['''"\ud800"''', '''"\ud800\u0041"''', '''"\udc00"''']:
         try:
             let _ = json_parse(bad_surrogate)
         catch:
@@ -67,7 +67,7 @@ def main() throws:
     # Incremental classifier used by constrained decoding: every proper prefix
     # stays viable, a full document is complete, and impossible continuations
     # are rejected immediately.
-    let constrained = "{{\"name\": \"café\", \"args\": [1, -2.5e+3, true, null]}}"
+    let constrained = '''{"name": "café", "args": [1, -2.5e+3, true, null]}'''
     let constrained_chars = constrained.chars()
     var int prefix_len = 0
     while prefix_len < constrained_chars.length:
@@ -80,21 +80,21 @@ def main() throws:
         prefix_len += 1
     assert_eq(json_prefix_state(constrained), 1 as int)
     assert_eq(json_prefix_state("  {constrained} \n\t"), 1 as int)
-    for impossible in ["{{]", "[}}", "{{\"a\",", "{{\"a\": truX", "{{\"a\": 01", "{{\"a\": \"bad\\q"]:
+    for impossible in ['''{]''', '''[}''', '''{"a",''', '''{"a": truX''', '''{"a": 01''', '''{"a": "bad\q''']:
         assert_eq(json_prefix_state(impossible), -1 as int)
-    for possible in ["", "  ", "{{", "{{\"a", "{{\"a\":", "{{\"a\": [1,", "{{\"a\": 1e+"]:
+    for possible in ["", "  ", '''{''', '''{"a''', '''{"a":''', '''{"a": [1,''', '''{"a": 1e+''']:
         assert_eq(json_prefix_state(possible), 0 as int)
 
-    assert_eq(json_object_prefix_state("  {{\"ok\": true}}"), 1 as int)
+    assert_eq(json_object_prefix_state('''  {"ok": true}'''), 1 as int)
     assert_eq(json_object_prefix_state("[1, 2]"), -1 as int)
-    assert_eq(json_object_prefix_state("\"scalar\""), -1 as int)
-    assert_eq(json_object_candidate_allowed("", "  {{", false), true)
-    assert_eq(json_object_candidate_allowed("{{\"a\":", " 1", false), true)
-    assert_eq(json_object_candidate_allowed("{{\"a\":", " nope", false), false)
-    assert_eq(json_object_candidate_allowed("{{\"a\": 1}}", "", true), true)
-    assert_eq(json_object_candidate_allowed("{{\"a\": 1", "", true), false)
-    assert_eq(json_object_candidate_allowed("{{\"a\": 1}}", " trailing", false), false)
-    assert_eq(json_object_decoded_candidate_allowed("{{\"x\": \"caf�", "{{\"x\": \"café", false), true)
-    assert_eq(json_object_decoded_candidate_allowed("{{\"x\": 1}}", "", true), true)
-    assert_eq(json_object_decoded_candidate_allowed("{{\"x\": 1", "", true), false)
+    assert_eq(json_object_prefix_state('''"scalar"'''), -1 as int)
+    assert_eq(json_object_candidate_allowed("", '''  {''', false), true)
+    assert_eq(json_object_candidate_allowed('''{"a":''', " 1", false), true)
+    assert_eq(json_object_candidate_allowed('''{"a":''', " nope", false), false)
+    assert_eq(json_object_candidate_allowed('''{"a": 1}''', "", true), true)
+    assert_eq(json_object_candidate_allowed('''{"a": 1''', "", true), false)
+    assert_eq(json_object_candidate_allowed('''{"a": 1}''', " trailing", false), false)
+    assert_eq(json_object_decoded_candidate_allowed('''{"x": "caf�''', '''{"x": "café''', false), true)
+    assert_eq(json_object_decoded_candidate_allowed('''{"x": 1}''', "", true), true)
+    assert_eq(json_object_decoded_candidate_allowed('''{"x": 1''', "", true), false)
     print "test_json: ok"

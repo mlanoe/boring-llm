@@ -7,7 +7,7 @@
 # the greedy quantifiers *, + and ?.
 
 int pattern_ascii_rank(string ch):
-    let ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{{|}}~".chars()
+    let ascii = ''' !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~'''.chars()
     var int i = 0
     while i < ascii.length:
         if ascii[i] == ch: return i
@@ -43,7 +43,7 @@ int pattern_atom_end([string] pattern, int start):
             i += 1
         if i >= pattern.length or i == first: return -1
         return i + 1
-    if ch == "(" or ch == ")" or ch == "|" or ch == "{{" or ch == "}}" or ch == "*" or ch == "+" or ch == "?" or ch == "^" or ch == "$":
+    if ch == "(" or ch == ")" or ch == "|" or ch == '''{''' or ch == '''}''' or ch == "*" or ch == "+" or ch == "?" or ch == "^" or ch == "$":
         return -1
     start + 1
 

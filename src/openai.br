@@ -1045,9 +1045,9 @@ string balanced_object([string] cs, int start):
         else:
             if ch == "\"":
                 in_str = true
-            elif ch == "{{":
+            elif ch == '''{''':
                 depth += 1
-            elif ch == "}}":
+            elif ch == '''}''':
                 depth -= 1
                 if depth == 0:
                     var out = ""
@@ -1077,7 +1077,7 @@ JValue? parse_tool_body(string body):
     var int tried = 0
     var int i = 0
     while i < cs.length and tried < 3:
-        if cs[i] == "{{":
+        if cs[i] == '''{''':
             tried += 1
             let candidate = balanced_object(cs, i)
             if candidate != "":
@@ -1527,7 +1527,7 @@ pub bool json_schema_should_stop(JValue schema, string decoded):
 pub JValue response_json_schema(JValue body):
     let native_schema = json_get(body, "json_schema")
     if not request_value_is_undefined(native_schema):
-        if jv_is_dict(native_schema) and jv_to_json(native_schema) == "{{}}":
+        if jv_is_dict(native_schema) and jv_to_json(native_schema) == '''{}''':
             var JValue object_schema = JValue.JDict({=}, [])
             object_schema = jv_set(object_schema, "type", JValue.JStr("object"))
             return object_schema
@@ -2386,18 +2386,18 @@ string tool_calls_json(string id, [ParsedToolCall] calls, bool with_index):
         if i > 0:
             out = "{out}, "
         let idx = if with_index: "\"index\": {i}, " else: ""
-        out = "{out}{{{idx}\"id\": \"call_{id}_{i}\", \"type\": \"function\", \"function\": {{\"name\": \"{json_escape(calls[i].name)}\", \"arguments\": \"{json_escape(calls[i].arguments)}\"}}}}"
+        out = $"""$out{$idx"id": "call_${id}_$i", "type": "function", "function": {"name": "${json_escape(calls[i].name)}", "arguments": "${json_escape(calls[i].arguments)}"}}"""
         i += 1
     "{out}]"
 
 string usage_json(int prompt_tokens, int completion_tokens, int cached_tokens):
-    "{{\"prompt_tokens\": {prompt_tokens}, \"completion_tokens\": {completion_tokens}, \"total_tokens\": {prompt_tokens + completion_tokens}, \"prompt_tokens_details\": {{\"cached_tokens\": {cached_tokens}}}}}"
+    $"""{"prompt_tokens": $prompt_tokens, "completion_tokens": $completion_tokens, "total_tokens": ${prompt_tokens + completion_tokens}, "prompt_tokens_details": {"cached_tokens": $cached_tokens}}"""
 
 pub string error_json(string message, string kind, string code):
-    "{{\"error\": {{\"message\": \"{json_escape(message)}\", \"type\": \"{kind}\", \"code\": \"{code}\"}}}}"
+    $"""{"error": {"message": "${json_escape(message)}", "type": "$kind", "code": "$code"}}"""
 
 pub string anthropic_error_json(string request_id, string message, string kind):
-    "{{\"type\":\"error\",\"error\":{{\"type\":\"{json_escape(kind)}\",\"message\":\"{json_escape(message)}\"}},\"request_id\":\"req_{json_escape(request_id)}\"}}"
+    $"""{"type":"error","error":{"type":"${json_escape(kind)}","message":"${json_escape(message)}"},"request_id":"req_${json_escape(request_id)}"}"""
 
 pub string provider_error_json(bool is_anthropic, string request_id, string message, string kind, string code):
     if is_anthropic: anthropic_error_json(request_id, message, kind) else: error_json(message, kind, code)
@@ -2406,16 +2406,16 @@ pub string provider_error_json(bool is_anthropic, string request_id, string mess
 # in but disabled. Keep this separate from OpenAI request errors, whose codes
 # are stable strings consumed by SDKs.
 pub string endpoint_not_supported_json(string endpoint):
-    "{{\"error\": {{\"code\": 501, \"message\": \"This server does not support {json_escape(endpoint)} endpoint.\", \"type\": \"not_supported_error\"}}}}"
+    $"""{"error": {"code": 501, "message": "This server does not support ${json_escape(endpoint)} endpoint.", "type": "not_supported_error"}}"""
 
 pub string feature_disabled_json():
-    "{{\"error\": {{\"message\": \"this feature is disabled\", \"type\": \"feature_disabled\"}}}}"
+    '''{"error": {"message": "this feature is disabled", "type": "feature_disabled"}}'''
 
 pub string lora_adapters_json():
     "[]"
 
 pub string slot_erased_json(int id_slot, int n_erased):
-    "{{\"id_slot\": {id_slot}, \"n_erased\": {n_erased}}}"
+    $"""{"id_slot": $id_slot, "n_erased": $n_erased}"""
 
 pub string slot_filename_validation_error(string filename):
     if filename == "": return "`filename` is required and must be a non-empty string"
@@ -2424,10 +2424,10 @@ pub string slot_filename_validation_error(string filename):
     ""
 
 pub string slot_saved_json(int id_slot, string filename, int n_saved, int n_written, int elapsed_ms):
-    "{{\"id_slot\": {id_slot}, \"filename\": \"{json_escape(filename)}\", \"n_saved\": {n_saved}, \"n_written\": {n_written}, \"timings\": {{\"save_ms\": {elapsed_ms}}}}}"
+    $"""{"id_slot": $id_slot, "filename": "${json_escape(filename)}", "n_saved": $n_saved, "n_written": $n_written, "timings": {"save_ms": $elapsed_ms}}"""
 
 pub string slot_restored_json(int id_slot, string filename, int n_restored, int n_read, int elapsed_ms):
-    "{{\"id_slot\": {id_slot}, \"filename\": \"{json_escape(filename)}\", \"n_restored\": {n_restored}, \"n_read\": {n_read}, \"timings\": {{\"restore_ms\": {elapsed_ms}}}}}"
+    $"""{"id_slot": $id_slot, "filename": "${json_escape(filename)}", "n_restored": $n_restored, "n_read": $n_read, "timings": {"restore_ms": $elapsed_ms}}"""
 
 pub string metrics_text(int prompt_tokens, int prompt_ms, int predicted_tokens,
                          int predicted_ms, int n_tokens_max, int n_decode):
@@ -2445,7 +2445,7 @@ pub string metrics_text(int prompt_tokens, int prompt_ms, int predicted_tokens,
 # counts are also given as fields (like llama.cpp's `n_prompt_tokens`, `n_ctx`).
 pub string context_exceeded_json(int n_prompt, int n_ctx):
     let message = "This model's maximum context length is {n_ctx} tokens. The request exceeds the available context size: your messages resulted in {n_prompt} tokens (the reply needs room too). Shorten the conversation or start the server with a larger --ctx-size."
-    "{{\"error\": {{\"message\": \"{json_escape(message)}\", \"type\": \"invalid_request_error\", \"code\": \"context_length_exceeded\", \"param\": \"messages\", \"n_prompt_tokens\": {n_prompt}, \"n_ctx\": {n_ctx}}}}}"
+    $"""{"error": {"message": "${json_escape(message)}", "type": "invalid_request_error", "code": "context_length_exceeded", "param": "messages", "n_prompt_tokens": $n_prompt, "n_ctx": $n_ctx}}"""
 
 pub string provider_context_exceeded_json(bool is_anthropic, string request_id, int n_prompt, int n_ctx):
     if is_anthropic:
@@ -2458,7 +2458,7 @@ pub uint64 unix_timestamp() throws:
     SystemTime.now().durationSince(UNIX_EPOCH).asSecs()
 
 pub string models_json(string model_id, uint64 created):
-    "{{\"object\": \"list\", \"data\": [{{\"id\": \"{json_escape(model_id)}\", \"object\": \"model\", \"created\": {created}, \"owned_by\": \"boring-llm\"}}]}}"
+    $"""{"object": "list", "data": [{"id": "${json_escape(model_id)}", "object": "model", "created": $created, "owned_by": "boring-llm"}]}"""
 
 pub string model_json_meta(string model_id, int vocab_type, int n_vocab, int n_ctx,
                            int n_ctx_train, int n_embd, int n_params, int size, uint64 created):
@@ -2466,25 +2466,25 @@ pub string model_json_meta(string model_id, int vocab_type, int n_vocab, int n_c
 
 pub string model_json_meta_aliases(string model_id, [string] aliases, [string] tags, int vocab_type, int n_vocab, int n_ctx,
                                    int n_ctx_train, int n_embd, int n_params, int size, uint64 created):
-    "{{\"id\": \"{json_escape(model_id)}\", \"aliases\": {model_aliases_json(aliases)}, \"tags\": {model_aliases_json(tags)}, \"object\": \"model\", \"created\": {created}, \"owned_by\": \"boring-llm\", \"architecture\": {{\"input_modalities\": [\"text\"], \"output_modalities\": [\"text\"]}}, \"meta\": {{\"vocab_type\": {vocab_type}, \"n_vocab\": {n_vocab}, \"n_ctx\": {n_ctx}, \"n_ctx_train\": {n_ctx_train}, \"n_embd\": {n_embd}, \"n_params\": {n_params}, \"size\": {size}}}}}"
+    $"""{"id": "${json_escape(model_id)}", "aliases": ${model_aliases_json(aliases)}, "tags": ${model_aliases_json(tags)}, "object": "model", "created": $created, "owned_by": "boring-llm", "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]}, "meta": {"vocab_type": $vocab_type, "n_vocab": $n_vocab, "n_ctx": $n_ctx, "n_ctx_train": $n_ctx_train, "n_embd": $n_embd, "n_params": $n_params, "size": $size}}"""
 
 # llama-server exposes these GGUF/model facts in a non-standard `meta` object.
 # They are useful to clients which choose a context window or sanity-check the
 # loaded model, while the surrounding response remains OpenAI-compatible.
 pub string models_json_meta(string model_id, int vocab_type, int n_vocab, int n_ctx,
                             int n_ctx_train, int n_embd, int n_params, int size, uint64 created):
-    "{{\"object\": \"list\", \"data\": [{model_json_meta(model_id, vocab_type, n_vocab, n_ctx, n_ctx_train, n_embd, n_params, size, created)}]}}"
+    $"""{"object": "list", "data": [${model_json_meta(model_id, vocab_type, n_vocab, n_ctx, n_ctx_train, n_embd, n_params, size, created)}]}"""
 
 pub string models_json_meta_aliases(string model_id, [string] aliases, int vocab_type, int n_vocab, int n_ctx,
                                     int n_ctx_train, int n_embd, int n_params, int size, uint64 created):
-    "{{\"object\": \"list\", \"data\": [{model_json_meta_aliases(model_id, aliases, [], vocab_type, n_vocab, n_ctx, n_ctx_train, n_embd, n_params, size, created)}]}}"
+    $"""{"object": "list", "data": [${model_json_meta_aliases(model_id, aliases, [], vocab_type, n_vocab, n_ctx, n_ctx_train, n_embd, n_params, size, created)}]}"""
 
 pub string models_json_meta_aliases_tags(string model_id, [string] aliases, [string] tags, int vocab_type, int n_vocab, int n_ctx,
                                          int n_ctx_train, int n_embd, int n_params, int size, uint64 created):
-    "{{\"object\": \"list\", \"data\": [{model_json_meta_aliases(model_id, aliases, tags, vocab_type, n_vocab, n_ctx, n_ctx_train, n_embd, n_params, size, created)}]}}"
+    $"""{"object": "list", "data": [${model_json_meta_aliases(model_id, aliases, tags, vocab_type, n_vocab, n_ctx, n_ctx_train, n_embd, n_params, size, created)}]}"""
 
 pub string input_tokens_json(int input_tokens):
-    "{{\"object\": \"response.input_tokens\", \"input_tokens\": {input_tokens}}}"
+    $"""{"object": "response.input_tokens", "input_tokens": $input_tokens}"""
 
 pub string anthropic_input_tokens_json(int input_tokens):
     "{{\"input_tokens\":{input_tokens}}}"
@@ -2502,76 +2502,76 @@ pub string anthropic_message_json(string id, string model, ParsedReply reply, st
     var string content = "["
     var bool wrote = false
     if reasoning != "":
-        content = "{content}{{\"type\":\"thinking\",\"thinking\":\"{json_escape(reasoning)}\",\"signature\":\"{json_escape(anthropic_thinking_signature(id))}\"}}"
+        content = $"""$content{"type":"thinking","thinking":"${json_escape(reasoning)}","signature":"${json_escape(anthropic_thinking_signature(id))}"}"""
         wrote = true
     if reply.content != "" or reply.calls.length == 0:
         if wrote: content = "{content},"
-        content = "{content}{{\"type\":\"text\",\"text\":\"{json_escape(reply.content)}\"}}"
+        content = $"""$content{"type":"text","text":"${json_escape(reply.content)}"}"""
         wrote = true
     var int i = 0
     while i < reply.calls.length:
         if wrote: content = "{content},"
         let parsed_input = try? json_parse(reply.calls[i].arguments)
-        var string input = "{{}}"
+        var string input = '''{}'''
         if let value = parsed_input: input = jv_to_json(value)
-        content = "{content}{{\"type\":\"tool_use\",\"id\":\"toolu_{id}_{i}\",\"name\":\"{json_escape(reply.calls[i].name)}\",\"input\":{input}}}"
+        content = $"""$content{"type":"tool_use","id":"toolu_${id}_$i","name":"${json_escape(reply.calls[i].name)}","input":$input}"""
         wrote = true
         i += 1
     let stop_reason = if reply.calls.length > 0: "tool_use" elif finish_reason == "length": "max_tokens" elif stop_sequence != "": "stop_sequence" else: "end_turn"
     let stop_sequence_json = if stop_sequence == "": "null" else: "\"{json_escape(stop_sequence)}\""
     let uncached_tokens = anthropic_uncached_input_tokens(input_tokens, cached_tokens)
-    "{{\"id\":\"msg_{id}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":{content}],\"model\":\"{json_escape(model)}\",\"stop_reason\":\"{stop_reason}\",\"stop_sequence\":{stop_sequence_json},\"usage\":{{\"input_tokens\":{uncached_tokens},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":{cached_tokens},\"output_tokens\":{output_tokens}}}}}"
+    $"""{"id":"msg_$id","type":"message","role":"assistant","content":$content],"model":"${json_escape(model)}","stop_reason":"$stop_reason","stop_sequence":$stop_sequence_json,"usage":{"input_tokens":$uncached_tokens,"cache_creation_input_tokens":0,"cache_read_input_tokens":$cached_tokens,"output_tokens":$output_tokens}}"""
 
 string anthropic_sse(string event_type, string data):
     "event: {event_type}\ndata: {data}\n\n"
 
 pub string anthropic_message_start_sse(string id, string model, int input_tokens, int cached_tokens):
     let uncached_tokens = anthropic_uncached_input_tokens(input_tokens, cached_tokens)
-    anthropic_sse("message_start", "{{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_{id}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"{json_escape(model)}\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":{uncached_tokens},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":{cached_tokens},\"output_tokens\":0}}}}}}")
+    anthropic_sse("message_start", $"""{"type":"message_start","message":{"id":"msg_$id","type":"message","role":"assistant","content":[],"model":"${json_escape(model)}","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":$uncached_tokens,"cache_creation_input_tokens":0,"cache_read_input_tokens":$cached_tokens,"output_tokens":0}}}""")
 
 pub string anthropic_text_start_sse(int index):
-    anthropic_sse("content_block_start", "{{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}")
+    anthropic_sse("content_block_start", $"""{"type":"content_block_start","index":$index,"content_block":{"type":"text","text":""}}""")
 
 pub string anthropic_text_delta_sse(int index, string text):
-    anthropic_sse("content_block_delta", "{{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"text_delta\",\"text\":\"{json_escape(text)}\"}}}}")
+    anthropic_sse("content_block_delta", $"""{"type":"content_block_delta","index":$index,"delta":{"type":"text_delta","text":"${json_escape(text)}"}}""")
 
 pub string anthropic_thinking_start_sse(int index):
-    anthropic_sse("content_block_start", "{{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}}}")
+    anthropic_sse("content_block_start", $"""{"type":"content_block_start","index":$index,"content_block":{"type":"thinking","thinking":"","signature":""}}""")
 
 pub string anthropic_thinking_delta_sse(int index, string text):
-    anthropic_sse("content_block_delta", "{{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"{json_escape(text)}\"}}}}")
+    anthropic_sse("content_block_delta", $"""{"type":"content_block_delta","index":$index,"delta":{"type":"thinking_delta","thinking":"${json_escape(text)}"}}""")
 
 pub string anthropic_signature_delta_sse(int index, string signature):
-    anthropic_sse("content_block_delta", "{{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"signature_delta\",\"signature\":\"{json_escape(signature)}\"}}}}")
+    anthropic_sse("content_block_delta", $"""{"type":"content_block_delta","index":$index,"delta":{"type":"signature_delta","signature":"${json_escape(signature)}"}}""")
 
 pub string anthropic_tool_start_sse(string id, int call_index, int content_index, ParsedToolCall call):
-    anthropic_sse("content_block_start", "{{\"type\":\"content_block_start\",\"index\":{content_index},\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_{id}_{call_index}\",\"name\":\"{json_escape(call.name)}\",\"input\":{{}}}}}}")
+    anthropic_sse("content_block_start", $"""{"type":"content_block_start","index":$content_index,"content_block":{"type":"tool_use","id":"toolu_${id}_$call_index","name":"${json_escape(call.name)}","input":{}}}""")
 
 pub string anthropic_tool_delta_sse(int index, string arguments):
-    anthropic_sse("content_block_delta", "{{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{json_escape(arguments)}\"}}}}")
+    anthropic_sse("content_block_delta", $"""{"type":"content_block_delta","index":$index,"delta":{"type":"input_json_delta","partial_json":"${json_escape(arguments)}"}}""")
 
 pub string anthropic_content_stop_sse(int index):
-    anthropic_sse("content_block_stop", "{{\"type\":\"content_block_stop\",\"index\":{index}}}")
+    anthropic_sse("content_block_stop", $"""{"type":"content_block_stop","index":$index}""")
 
 pub string anthropic_message_delta_sse(string finish_reason, string stop_sequence, int output_tokens):
     let stop_reason = if finish_reason == "tool_calls": "tool_use" elif finish_reason == "length": "max_tokens" elif stop_sequence != "": "stop_sequence" else: "end_turn"
     let stop_sequence_json = if stop_sequence == "": "null" else: "\"{json_escape(stop_sequence)}\""
-    anthropic_sse("message_delta", "{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop_reason}\",\"stop_sequence\":{stop_sequence_json}}},\"usage\":{{\"output_tokens\":{output_tokens}}}}}")
+    anthropic_sse("message_delta", $"""{"type":"message_delta","delta":{"stop_reason":"$stop_reason","stop_sequence":$stop_sequence_json},"usage":{"output_tokens":$output_tokens}}""")
 
 pub string anthropic_message_stop_sse():
-    anthropic_sse("message_stop", "{{\"type\":\"message_stop\"}}")
+    anthropic_sse("message_stop", '''{"type":"message_stop"}''')
 
 pub string anthropic_ping_sse():
-    anthropic_sse("ping", "{{\"type\":\"ping\"}}")
+    anthropic_sse("ping", '''{"type":"ping"}''')
 
 pub string anthropic_error_sse(string message):
-    anthropic_sse("error", "{{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":\"{json_escape(message)}\"}}}}")
+    anthropic_sse("error", $"""{"type":"error","error":{"type":"api_error","message":"${json_escape(message)}"}}""")
 
 pub string anthropic_stream_failure_sse(string message):
     anthropic_error_sse(message)
 
 string responses_usage_json(int input_tokens, int output_tokens, int cached_tokens):
-    "{{\"input_tokens\": {input_tokens}, \"input_tokens_details\": {{\"cached_tokens\": {cached_tokens}}}, \"output_tokens\": {output_tokens}, \"output_tokens_details\": {{\"reasoning_tokens\": 0}}, \"total_tokens\": {input_tokens + output_tokens}}}"
+    $"""{"input_tokens": $input_tokens, "input_tokens_details": {"cached_tokens": $cached_tokens}, "output_tokens": $output_tokens, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": ${input_tokens + output_tokens}}"""
 
 string responses_optional_json(JValue value):
     if request_value_is_undefined(value): "null" else: jv_to_json(value)
@@ -2581,13 +2581,13 @@ pub string responses_settings_json(JValue body, float temperature, float top_p):
     let metadata = json_get(body, "metadata")
     let metadata_json = if jv_is_dict(metadata): jv_to_json(metadata) else: "{}"
     let reasoning = json_get(body, "reasoning")
-    let reasoning_json = if jv_is_dict(reasoning): jv_to_json(reasoning) else: "{{\"effort\": null, \"summary\": null}}"
+    let reasoning_json = if jv_is_dict(reasoning): jv_to_json(reasoning) else: '''{"effort": null, "summary": null}'''
     let text = json_get(body, "text")
-    let text_json = if jv_is_dict(text): jv_to_json(text) else: "{{\"format\": {{\"type\": \"text\"}}}}"
+    let text_json = if jv_is_dict(text): jv_to_json(text) else: '''{"format": {"type": "text"}}'''
     let tools = json_get(body, "responses_tools")
     let tools_json = if jv_is_list(tools): jv_to_json(tools) else: "[]"
     let tool_choice = json_get(body, "responses_tool_choice")
-    let tool_choice_json = if request_value_is_undefined(tool_choice): "\"auto\"" else: jv_to_json(tool_choice)
+    let tool_choice_json = if request_value_is_undefined(tool_choice): '''"auto"''' else: jv_to_json(tool_choice)
     let parallel_tool_calls = json_get_bool(body, "parallel_tool_calls", true)
     "\"input\": {input_json}, \"instructions\": {responses_optional_json(json_get(body, "instructions"))}, \"max_output_tokens\": {responses_optional_json(json_get(body, "max_output_tokens"))}, \"parallel_tool_calls\": {parallel_tool_calls}, \"previous_response_id\": null, \"reasoning\": {reasoning_json}, \"store\": false, \"temperature\": {temperature}, \"text\": {text_json}, \"tool_choice\": {tool_choice_json}, \"tools\": {tools_json}, \"top_p\": {top_p}, \"truncation\": \"disabled\", \"metadata\": {metadata_json}"
 
@@ -2595,17 +2595,17 @@ string responses_output_json_reasoning(string id, ParsedReply reply, string reas
     var string out = "["
     var bool has_item = false
     if reasoning != "":
-        out = "{out}{{\"id\": \"rs_{id}\", \"type\": \"reasoning\", \"status\": \"completed\", \"summary\": [{{\"type\": \"summary_text\", \"text\": \"{json_escape(reasoning)}\"}}], \"encrypted_content\": null}}"
+        out = $"""$out{"id": "rs_$id", "type": "reasoning", "status": "completed", "summary": [{"type": "summary_text", "text": "${json_escape(reasoning)}"}], "encrypted_content": null}"""
         has_item = true
     if reply.content != "" or reply.calls.length == 0:
         if has_item: out = "{out}, "
-        out = "{out}{{\"id\": \"msg_{id}\", \"type\": \"message\", \"status\": \"completed\", \"role\": \"assistant\", \"content\": [{{\"type\": \"output_text\", \"text\": \"{json_escape(reply.content)}\", \"annotations\": [], \"logprobs\": []}}]}}"
+        out = $"""$out{"id": "msg_$id", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "${json_escape(reply.content)}", "annotations": [], "logprobs": []}]}"""
         has_item = true
     var int i = 0
     while i < reply.calls.length:
         if has_item: out = "{out}, "
         let call = reply.calls[i]
-        out = "{out}{{\"id\": \"fc_{id}_{i}\", \"type\": \"function_call\", \"status\": \"completed\", \"call_id\": \"call_{id}_{i}\", \"name\": \"{json_escape(call.name)}\", \"arguments\": \"{json_escape(call.arguments)}\"}}"
+        out = $"""$out{"id": "fc_${id}_$i", "type": "function_call", "status": "completed", "call_id": "call_${id}_$i", "name": "${json_escape(call.name)}", "arguments": "${json_escape(call.arguments)}"}"""
         has_item = true
         i += 1
     "{out}]"
@@ -2617,83 +2617,83 @@ pub string responses_json_timed(string id, string model, ParsedReply reply, stri
                                  int input_tokens, int output_tokens, int cached_tokens, uint64 created,
                                  uint64 completed, int prompt_ms, int predicted_ms, string settings):
     let status = if finish_reason == "length": "incomplete" else: "completed"
-    let incomplete = if finish_reason == "length": "{{\"reason\": \"max_output_tokens\"}}" else: "null"
-    "{{\"id\": \"resp_{id}\", \"object\": \"response\", \"created_at\": {created}, \"completed_at\": {completed}, \"status\": \"{status}\", \"error\": null, \"incomplete_details\": {incomplete}, \"model\": \"{json_escape(model)}\", {settings}, \"output\": {responses_output_json(id, reply)}, \"usage\": {responses_usage_json(input_tokens, output_tokens, cached_tokens)}, \"timings\": {server_timings_json(cached_tokens, input_tokens - cached_tokens, prompt_ms, output_tokens, predicted_ms)}}}"
+    let incomplete = if finish_reason == "length": '''{"reason": "max_output_tokens"}''' else: "null"
+    $"""{"id": "resp_$id", "object": "response", "created_at": $created, "completed_at": $completed, "status": "$status", "error": null, "incomplete_details": $incomplete, "model": "${json_escape(model)}", $settings, "output": ${responses_output_json(id, reply)}, "usage": ${responses_usage_json(input_tokens, output_tokens, cached_tokens)}, "timings": ${server_timings_json(cached_tokens, input_tokens - cached_tokens, prompt_ms, output_tokens, predicted_ms)}}"""
 
 pub string responses_json_reasoning_timed(string id, string model, ParsedReply reply, string reasoning,
                                            string finish_reason, int input_tokens, int output_tokens,
                                            int cached_tokens, uint64 created, uint64 completed, int prompt_ms,
                                            int predicted_ms, string settings):
     let status = if finish_reason == "length": "incomplete" else: "completed"
-    let incomplete = if finish_reason == "length": "{{\"reason\": \"max_output_tokens\"}}" else: "null"
-    "{{\"id\": \"resp_{id}\", \"object\": \"response\", \"created_at\": {created}, \"completed_at\": {completed}, \"status\": \"{status}\", \"error\": null, \"incomplete_details\": {incomplete}, \"model\": \"{json_escape(model)}\", {settings}, \"output\": {responses_output_json_reasoning(id, reply, reasoning)}, \"usage\": {responses_usage_json(input_tokens, output_tokens, cached_tokens)}, \"timings\": {server_timings_json(cached_tokens, input_tokens - cached_tokens, prompt_ms, output_tokens, predicted_ms)}}}"
+    let incomplete = if finish_reason == "length": '''{"reason": "max_output_tokens"}''' else: "null"
+    $"""{"id": "resp_$id", "object": "response", "created_at": $created, "completed_at": $completed, "status": "$status", "error": null, "incomplete_details": $incomplete, "model": "${json_escape(model)}", $settings, "output": ${responses_output_json_reasoning(id, reply, reasoning)}, "usage": ${responses_usage_json(input_tokens, output_tokens, cached_tokens)}, "timings": ${server_timings_json(cached_tokens, input_tokens - cached_tokens, prompt_ms, output_tokens, predicted_ms)}}"""
 
 string responses_sse(string event_type, string data):
     "event: {event_type}\ndata: {data}\n\n"
 
 pub string responses_created_sse(string id, string model, uint64 created, int sequence, string event_type,
                                  string settings):
-    responses_sse(event_type, "{{\"type\": \"{event_type}\", \"response\": {{\"id\": \"resp_{id}\", \"object\": \"response\", \"created_at\": {created}, \"completed_at\": null, \"status\": \"in_progress\", \"error\": null, \"incomplete_details\": null, \"model\": \"{json_escape(model)}\", {settings}, \"output\": [], \"usage\": null}}, \"sequence_number\": {sequence}}}")
+    responses_sse(event_type, $"""{"type": "$event_type", "response": {"id": "resp_$id", "object": "response", "created_at": $created, "completed_at": null, "status": "in_progress", "error": null, "incomplete_details": null, "model": "${json_escape(model)}", $settings, "output": [], "usage": null}, "sequence_number": $sequence}""")
 
 pub string responses_message_added_sse(string id, int output_index, int sequence):
-    responses_sse("response.output_item.added", "{{\"type\": \"response.output_item.added\", \"output_index\": {output_index}, \"item\": {{\"id\": \"msg_{id}\", \"type\": \"message\", \"status\": \"in_progress\", \"role\": \"assistant\", \"content\": []}}, \"sequence_number\": {sequence}}}")
+    responses_sse("response.output_item.added", $"""{"type": "response.output_item.added", "output_index": $output_index, "item": {"id": "msg_$id", "type": "message", "status": "in_progress", "role": "assistant", "content": []}, "sequence_number": $sequence}""")
 
 pub string responses_content_added_sse(string id, int output_index, int sequence):
-    responses_sse("response.content_part.added", "{{\"type\": \"response.content_part.added\", \"item_id\": \"msg_{id}\", \"output_index\": {output_index}, \"content_index\": 0, \"part\": {{\"type\": \"output_text\", \"text\": \"\", \"annotations\": [], \"logprobs\": []}}, \"sequence_number\": {sequence}}}")
+    responses_sse("response.content_part.added", $"""{"type": "response.content_part.added", "item_id": "msg_$id", "output_index": $output_index, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": [], "logprobs": []}, "sequence_number": $sequence}""")
 
 pub string responses_reasoning_added_sse(string id, int sequence):
-    responses_sse("response.output_item.added", "{{\"type\": \"response.output_item.added\", \"output_index\": 0, \"item\": {{\"id\": \"rs_{id}\", \"type\": \"reasoning\", \"status\": \"in_progress\", \"summary\": [], \"encrypted_content\": null}}, \"sequence_number\": {sequence}}}")
+    responses_sse("response.output_item.added", $"""{"type": "response.output_item.added", "output_index": 0, "item": {"id": "rs_$id", "type": "reasoning", "status": "in_progress", "summary": [], "encrypted_content": null}, "sequence_number": $sequence}""")
 
 pub string responses_reasoning_part_sse(string id, string text, int sequence, bool done):
     let event_type = if done: "response.reasoning_summary_part.done" else: "response.reasoning_summary_part.added"
-    responses_sse(event_type, "{{\"type\": \"{event_type}\", \"item_id\": \"rs_{id}\", \"output_index\": 0, \"summary_index\": 0, \"part\": {{\"type\": \"summary_text\", \"text\": \"{json_escape(text)}\"}}, \"sequence_number\": {sequence}}}")
+    responses_sse(event_type, $"""{"type": "$event_type", "item_id": "rs_$id", "output_index": 0, "summary_index": 0, "part": {"type": "summary_text", "text": "${json_escape(text)}"}, "sequence_number": $sequence}""")
 
 pub string responses_reasoning_delta_sse(string id, string delta, int sequence):
-    responses_sse("response.reasoning_summary_text.delta", "{{\"type\": \"response.reasoning_summary_text.delta\", \"item_id\": \"rs_{id}\", \"output_index\": 0, \"summary_index\": 0, \"delta\": \"{json_escape(delta)}\", \"sequence_number\": {sequence}}}")
+    responses_sse("response.reasoning_summary_text.delta", $"""{"type": "response.reasoning_summary_text.delta", "item_id": "rs_$id", "output_index": 0, "summary_index": 0, "delta": "${json_escape(delta)}", "sequence_number": $sequence}""")
 
 pub string responses_reasoning_text_done_sse(string id, string reasoning, int sequence):
-    responses_sse("response.reasoning_summary_text.done", "{{\"type\": \"response.reasoning_summary_text.done\", \"item_id\": \"rs_{id}\", \"output_index\": 0, \"summary_index\": 0, \"text\": \"{json_escape(reasoning)}\", \"sequence_number\": {sequence}}}")
+    responses_sse("response.reasoning_summary_text.done", $"""{"type": "response.reasoning_summary_text.done", "item_id": "rs_$id", "output_index": 0, "summary_index": 0, "text": "${json_escape(reasoning)}", "sequence_number": $sequence}""")
 
 pub string responses_reasoning_done_sse(string id, string reasoning, int sequence):
-    responses_sse("response.output_item.done", "{{\"type\": \"response.output_item.done\", \"output_index\": 0, \"item\": {{\"id\": \"rs_{id}\", \"type\": \"reasoning\", \"status\": \"completed\", \"summary\": [{{\"type\": \"summary_text\", \"text\": \"{json_escape(reasoning)}\"}}], \"encrypted_content\": null}}, \"sequence_number\": {sequence}}}")
+    responses_sse("response.output_item.done", $"""{"type": "response.output_item.done", "output_index": 0, "item": {"id": "rs_$id", "type": "reasoning", "status": "completed", "summary": [{"type": "summary_text", "text": "${json_escape(reasoning)}"}], "encrypted_content": null}, "sequence_number": $sequence}""")
 
 pub string responses_text_delta_sse(string id, string delta, int output_index, int sequence):
-    responses_sse("response.output_text.delta", "{{\"type\": \"response.output_text.delta\", \"item_id\": \"msg_{id}\", \"output_index\": {output_index}, \"content_index\": 0, \"delta\": \"{json_escape(delta)}\", \"logprobs\": [], \"sequence_number\": {sequence}}}")
+    responses_sse("response.output_text.delta", $"""{"type": "response.output_text.delta", "item_id": "msg_$id", "output_index": $output_index, "content_index": 0, "delta": "${json_escape(delta)}", "logprobs": [], "sequence_number": $sequence}""")
 
 pub string responses_text_done_sse(string id, string text, int output_index, int sequence):
-    responses_sse("response.output_text.done", "{{\"type\": \"response.output_text.done\", \"item_id\": \"msg_{id}\", \"output_index\": {output_index}, \"content_index\": 0, \"text\": \"{json_escape(text)}\", \"logprobs\": [], \"sequence_number\": {sequence}}}")
+    responses_sse("response.output_text.done", $"""{"type": "response.output_text.done", "item_id": "msg_$id", "output_index": $output_index, "content_index": 0, "text": "${json_escape(text)}", "logprobs": [], "sequence_number": $sequence}""")
 
 pub string responses_content_done_sse(string id, string text, int output_index, int sequence):
-    responses_sse("response.content_part.done", "{{\"type\": \"response.content_part.done\", \"item_id\": \"msg_{id}\", \"output_index\": {output_index}, \"content_index\": 0, \"part\": {{\"type\": \"output_text\", \"text\": \"{json_escape(text)}\", \"annotations\": [], \"logprobs\": []}}, \"sequence_number\": {sequence}}}")
+    responses_sse("response.content_part.done", $"""{"type": "response.content_part.done", "item_id": "msg_$id", "output_index": $output_index, "content_index": 0, "part": {"type": "output_text", "text": "${json_escape(text)}", "annotations": [], "logprobs": []}, "sequence_number": $sequence}""")
 
 pub string responses_message_done_sse(string id, string text, int output_index, int sequence):
-    responses_sse("response.output_item.done", "{{\"type\": \"response.output_item.done\", \"output_index\": {output_index}, \"item\": {{\"id\": \"msg_{id}\", \"type\": \"message\", \"status\": \"completed\", \"role\": \"assistant\", \"content\": [{{\"type\": \"output_text\", \"text\": \"{json_escape(text)}\", \"annotations\": [], \"logprobs\": []}}]}}, \"sequence_number\": {sequence}}}")
+    responses_sse("response.output_item.done", $"""{"type": "response.output_item.done", "output_index": $output_index, "item": {"id": "msg_$id", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "${json_escape(text)}", "annotations": [], "logprobs": []}]}, "sequence_number": $sequence}""")
 
 pub string responses_function_sse(string id, ParsedToolCall call, int call_index, int output_index,
                                    int sequence, bool done):
     let event_type = if done: "response.output_item.done" else: "response.output_item.added"
     let status = if done: "completed" else: "in_progress"
     let arguments = if done: call.arguments else: ""
-    responses_sse(event_type, "{{\"type\": \"{event_type}\", \"output_index\": {output_index}, \"item\": {{\"id\": \"fc_{id}_{call_index}\", \"type\": \"function_call\", \"status\": \"{status}\", \"call_id\": \"call_{id}_{call_index}\", \"name\": \"{json_escape(call.name)}\", \"arguments\": \"{json_escape(arguments)}\"}}, \"sequence_number\": {sequence}}}")
+    responses_sse(event_type, $"""{"type": "$event_type", "output_index": $output_index, "item": {"id": "fc_${id}_$call_index", "type": "function_call", "status": "$status", "call_id": "call_${id}_$call_index", "name": "${json_escape(call.name)}", "arguments": "${json_escape(arguments)}"}, "sequence_number": $sequence}""")
 
 pub string responses_function_arguments_done_sse(string id, ParsedToolCall call, int call_index,
                                                    int output_index, int sequence):
-    responses_sse("response.function_call_arguments.done", "{{\"type\": \"response.function_call_arguments.done\", \"item_id\": \"fc_{id}_{call_index}\", \"output_index\": {output_index}, \"arguments\": \"{json_escape(call.arguments)}\", \"sequence_number\": {sequence}}}")
+    responses_sse("response.function_call_arguments.done", $"""{"type": "response.function_call_arguments.done", "item_id": "fc_${id}_$call_index", "output_index": $output_index, "arguments": "${json_escape(call.arguments)}", "sequence_number": $sequence}""")
 
 pub string responses_function_arguments_delta_sse(string id, string delta, int call_index,
                                                     int output_index, int sequence):
-    responses_sse("response.function_call_arguments.delta", "{{\"type\": \"response.function_call_arguments.delta\", \"item_id\": \"fc_{id}_{call_index}\", \"output_index\": {output_index}, \"delta\": \"{json_escape(delta)}\", \"sequence_number\": {sequence}}}")
+    responses_sse("response.function_call_arguments.delta", $"""{"type": "response.function_call_arguments.delta", "item_id": "fc_${id}_$call_index", "output_index": $output_index, "delta": "${json_escape(delta)}", "sequence_number": $sequence}""")
 
 pub string responses_terminal_sse(string response_json, int sequence, bool incomplete):
     let event_type = if incomplete: "response.incomplete" else: "response.completed"
-    responses_sse(event_type, "{{\"type\": \"{event_type}\", \"response\": {response_json}, \"sequence_number\": {sequence}}}")
+    responses_sse(event_type, $"""{"type": "$event_type", "response": $response_json, "sequence_number": $sequence}""")
 
 pub string responses_error_sse(string message, int sequence):
-    responses_sse("error", "{{\"type\": \"error\", \"code\": \"internal_error\", \"message\": \"{json_escape(message)}\", \"param\": null, \"sequence_number\": {sequence}}}")
+    responses_sse("error", $"""{"type": "error", "code": "internal_error", "message": "${json_escape(message)}", "param": null, "sequence_number": $sequence}""")
 
 pub string responses_failed_sse(string id, string model, string message, int sequence,
                                 uint64 created, uint64 completed, string settings):
-    responses_sse("response.failed", "{{\"type\": \"response.failed\", \"response\": {{\"id\": \"resp_{id}\", \"object\": \"response\", \"created_at\": {created}, \"completed_at\": {completed}, \"status\": \"failed\", \"error\": {{\"code\": \"internal_error\", \"message\": \"{json_escape(message)}\"}}, \"incomplete_details\": null, \"model\": \"{json_escape(model)}\", {settings}, \"output\": [], \"usage\": null}}, \"sequence_number\": {sequence}}}")
+    responses_sse("response.failed", $"""{"type": "response.failed", "response": {"id": "resp_$id", "object": "response", "created_at": $created, "completed_at": $completed, "status": "failed", "error": {"code": "internal_error", "message": "${json_escape(message)}"}, "incomplete_details": null, "model": "${json_escape(model)}", $settings, "output": [], "usage": null}, "sequence_number": $sequence}""")
 
 pub string tokens_json([int] tokens):
     var string out = "["
@@ -2706,10 +2706,10 @@ pub string tokens_json([int] tokens):
     "{{\"tokens\": {out}]}}"
 
 pub string content_json(string content):
-    "{{\"content\": \"{json_escape(content)}\"}}"
+    $"""{"content": "${json_escape(content)}"}"""
 
 pub string prompt_json(string prompt):
-    "{{\"prompt\": \"{json_escape(prompt)}\"}}"
+    $"""{"prompt": "${json_escape(prompt)}"}"""
 
 pub string tokenize_request_validation_error(JValue body):
     let content = json_get(body, "content")
@@ -2773,10 +2773,10 @@ pub string llama_sampling_params_json(int max_tokens, float32 temperature, float
                                       int sse_ping_interval, bool post_sampling_probs,
                                       string model, int n_ctx, bool cache_prompt,
                                       bool return_tokens, bool return_progress, int t_max_predict_ms):
-    "{{\"n_predict\": {max_tokens}, \"n_ctx\": {n_ctx}, \"model\": \"{json_escape(model)}\", \"n_indent\": {n_indent}, \"sse_ping_interval\": {sse_ping_interval}, \"seed\": {seed}, \"temperature\": {temperature}, \"dynatemp_range\": {dynatemp_range}, \"dynatemp_exponent\": {dynatemp_exponent}, \"top_k\": {top_k}, \"top_p\": {top_p}, \"min_p\": {min_p}, \"top_n_sigma\": {top_n_sigma}, \"xtc_probability\": {xtc_probability}, \"xtc_threshold\": {xtc_threshold}, \"typical_p\": {typical_p}, \"repeat_last_n\": {repeat_last_n}, \"repeat_penalty\": {repeat_penalty}, \"presence_penalty\": {presence_penalty}, \"frequency_penalty\": {frequency_penalty}, \"dry_multiplier\": {dry_multiplier}, \"dry_base\": {dry_base}, \"dry_allowed_length\": {dry_allowed_length}, \"dry_penalty_last_n\": {dry_penalty_last_n}, \"dry_sequence_breakers\": {string_list_json(dry_sequence_breakers)}, \"mirostat\": {mirostat}, \"mirostat_tau\": {mirostat_tau}, \"mirostat_eta\": {mirostat_eta}, \"adaptive_target\": {adaptive_target}, \"adaptive_decay\": {adaptive_decay}, \"stop\": {string_list_json(stops)}, \"max_tokens\": {max_tokens}, \"n_keep\": 0, \"n_discard\": 0, \"ignore_eos\": {ignore_eos}, \"stream\": {streaming}, \"cache_prompt\": {cache_prompt}, \"return_tokens\": {return_tokens}, \"return_progress\": {return_progress}, \"t_max_predict_ms\": {t_max_predict_ms}, \"n_probs\": {n_probs}, \"post_sampling_probs\": {post_sampling_probs}, \"min_keep\": {min_keep}, \"grammar\": \"\", \"reasoning_format\": \"none\", \"reasoning_in_content\": false, \"generation_prompt\": \"\", \"samplers\": {string_list_json(samplers)}, \"speculative.n_max\": 0, \"speculative.n_min\": 0, \"speculative.p_min\": 0.0, \"timings_per_token\": {timings_per_token}, \"lora\": []}}"
+    $"""{"n_predict": $max_tokens, "n_ctx": $n_ctx, "model": "${json_escape(model)}", "n_indent": $n_indent, "sse_ping_interval": $sse_ping_interval, "seed": $seed, "temperature": $temperature, "dynatemp_range": $dynatemp_range, "dynatemp_exponent": $dynatemp_exponent, "top_k": $top_k, "top_p": $top_p, "min_p": $min_p, "top_n_sigma": $top_n_sigma, "xtc_probability": $xtc_probability, "xtc_threshold": $xtc_threshold, "typical_p": $typical_p, "repeat_last_n": $repeat_last_n, "repeat_penalty": $repeat_penalty, "presence_penalty": $presence_penalty, "frequency_penalty": $frequency_penalty, "dry_multiplier": $dry_multiplier, "dry_base": $dry_base, "dry_allowed_length": $dry_allowed_length, "dry_penalty_last_n": $dry_penalty_last_n, "dry_sequence_breakers": ${string_list_json(dry_sequence_breakers)}, "mirostat": $mirostat, "mirostat_tau": $mirostat_tau, "mirostat_eta": $mirostat_eta, "adaptive_target": $adaptive_target, "adaptive_decay": $adaptive_decay, "stop": ${string_list_json(stops)}, "max_tokens": $max_tokens, "n_keep": 0, "n_discard": 0, "ignore_eos": $ignore_eos, "stream": $streaming, "cache_prompt": $cache_prompt, "return_tokens": $return_tokens, "return_progress": $return_progress, "t_max_predict_ms": $t_max_predict_ms, "n_probs": $n_probs, "post_sampling_probs": $post_sampling_probs, "min_keep": $min_keep, "grammar": "", "reasoning_format": "none", "reasoning_in_content": false, "generation_prompt": "", "samplers": ${string_list_json(samplers)}, "speculative.n_max": 0, "speculative.n_min": 0, "speculative.p_min": 0.0, "timings_per_token": $timings_per_token, "lora": []}"""
 
 string llama_next_token_json(int remaining):
-    "{{\"has_next_token\": true, \"has_new_line\": false, \"n_remain\": {remaining}, \"n_decoded\": 0, \"stopping_word\": \"\"}}"
+    $"""{"has_next_token": true, "has_new_line": false, "n_remain": $remaining, "n_decoded": 0, "stopping_word": ""}"""
 
 # llama.cpp derives these capabilities from the parsed Jinja program.  The
 # Boring renderer does not retain an AST after startup, so report the template
@@ -2788,7 +2788,7 @@ string chat_template_caps_json(string chat_template):
     let supports_parallel_tool_calls = chat_template.contains("parallel_tool_calls")
     let supports_preserve_reasoning = chat_template.contains("reasoning_content")
     let supports_reasoning_effort = chat_template.contains("reasoning_effort")
-    "{{\"supports_tools\": {supports_tools}, \"supports_tool_calls\": {supports_tool_calls}, \"supports_system_role\": {supports_system_role}, \"supports_parallel_tool_calls\": {supports_parallel_tool_calls}, \"supports_preserve_reasoning\": {supports_preserve_reasoning}, \"supports_reasoning_effort\": {supports_reasoning_effort}, \"supports_string_content\": true, \"supports_typed_content\": false, \"supports_object_arguments\": {supports_tool_calls}}}"
+    $"""{"supports_tools": $supports_tools, "supports_tool_calls": $supports_tool_calls, "supports_system_role": $supports_system_role, "supports_parallel_tool_calls": $supports_parallel_tool_calls, "supports_preserve_reasoning": $supports_preserve_reasoning, "supports_reasoning_effort": $supports_reasoning_effort, "supports_string_content": true, "supports_typed_content": false, "supports_object_arguments": $supports_tool_calls}"""
 
 pub string props_json(string model_path, string chat_template, int n_ctx, int total_slots, int max_tokens,
                          float32 temperature, float32 dynatemp_range, float32 dynatemp_exponent,
@@ -2803,7 +2803,7 @@ pub string props_json(string model_path, string chat_template, int n_ctx, int to
     let params = llama_sampling_params_json(max_tokens, temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, ["\n", ":", "\"", "*"], mirostat, mirostat_tau, mirostat_eta, adaptive_target, adaptive_decay, samplers, presence_penalty, frequency_penalty, [], ignore_eos, true, 0, false, 0, 30, false, model_path, n_ctx, true, false, false, 0)
     let next_token = llama_next_token_json(max_tokens)
     let caps = chat_template_caps_json(chat_template)
-    "{{\"default_generation_settings\": {{\"id\": 0, \"id_task\": -1, \"n_ctx\": {n_ctx}, \"speculative\": false, \"is_processing\": false, \"params\": {params}, \"prompt\": \"\", \"next_token\": {next_token}}}, \"total_slots\": {total_slots}, \"model_path\": \"{json_escape(model_path)}\", \"chat_template\": \"{json_escape(chat_template)}\", \"chat_template_caps\": {caps}, \"modalities\": {{\"vision\": false}}, \"media_marker\": \"\", \"build_info\": \"boring-llm\", \"is_sleeping\": false}}"
+    $"""{"default_generation_settings": {"id": 0, "id_task": -1, "n_ctx": $n_ctx, "speculative": false, "is_processing": false, "params": $params, "prompt": "", "next_token": $next_token}, "total_slots": $total_slots, "model_path": "${json_escape(model_path)}", "chat_template": "${json_escape(chat_template)}", "chat_template_caps": $caps, "modalities": {"vision": false}, "media_marker": "", "build_info": "boring-llm", "is_sleeping": false}"""
 
 # llama-server's `/slots` monitor reports one item per configured KV-cache
 # slot. This server handles one request at a time, so a monitoring request can
@@ -2827,7 +2827,7 @@ pub string slots_json(int n_slots, [int] cached_tokens, string model, int n_ctx,
         let n_past = if slot < cached_tokens.length: cached_tokens[slot] else: 0
         let params = llama_sampling_params_json(max_tokens, temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, ["\n", ":", "\"", "*"], mirostat, mirostat_tau, mirostat_eta, adaptive_target, adaptive_decay, samplers, presence_penalty, frequency_penalty, [], ignore_eos, true, 0, false, 0, 30, false, model, n_ctx, true, false, false, 0)
         let next_token = llama_next_token_json(max_tokens)
-        out = "{out}{{\"id\": {slot}, \"id_task\": -1, \"n_ctx\": {n_ctx}, \"speculative\": false, \"is_processing\": false, \"params\": {params}, \"prompt\": \"\", \"generated\": \"\", \"next_token\": {next_token}, \"n_past\": {n_past}, \"n_prompt_tokens\": 0, \"n_predicted\": 0, \"stopped_eos\": false, \"stopped_word\": false, \"stopped_limit\": false}}"
+        out = $"""$out{"id": $slot, "id_task": -1, "n_ctx": $n_ctx, "speculative": false, "is_processing": false, "params": $params, "prompt": "", "generated": "", "next_token": $next_token, "n_past": $n_past, "n_prompt_tokens": 0, "n_predicted": 0, "stopped_eos": false, "stopped_word": false, "stopped_limit": false}"""
         slot += 1
     "{out}]"
 
@@ -2843,7 +2843,7 @@ pub string completion_json_r(string id, string model, ParsedReply reply, string 
     let content = if reply.content == "" and reply.calls.length > 0: "null" else: "\"{json_escape(reply.content)}\""
     let thinking = if reasoning != "": ", \"reasoning_content\": \"{json_escape(reasoning)}\"" else: ""
     let calls = if reply.calls.length > 0: ", \"tool_calls\": {tool_calls_json(id, reply.calls, false)}" else: ""
-    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{thinking}{calls}}}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}}}"
+    $"""{"id": "chatcmpl-$id", "object": "chat.completion", "created": $created, "model": "${json_escape(model)}", "choices": [{"index": 0, "message": {"role": "assistant", "content": ${content}${thinking}$calls}, "finish_reason": "$finish_reason"}], "usage": ${usage_json(prompt_tokens, completion_tokens, cached_tokens)}}"""
 
 pub string completion_json_r_timed(string id, string model, ParsedReply reply, string reasoning, string finish_reason,
                                     int prompt_tokens, int completion_tokens, int cached_tokens, uint64 created,
@@ -2851,7 +2851,7 @@ pub string completion_json_r_timed(string id, string model, ParsedReply reply, s
     let content = if reply.content == "" and reply.calls.length > 0: "null" else: "\"{json_escape(reply.content)}\""
     let thinking = if reasoning != "": ", \"reasoning_content\": \"{json_escape(reasoning)}\"" else: ""
     let calls = if reply.calls.length > 0: ", \"tool_calls\": {tool_calls_json(id, reply.calls, false)}" else: ""
-    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{thinking}{calls}}}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}, \"timings\": {server_timings_json(cached_tokens, prompt_tokens - cached_tokens, prompt_ms, completion_tokens, predicted_ms)}}}"
+    $"""{"id": "chatcmpl-$id", "object": "chat.completion", "created": $created, "model": "${json_escape(model)}", "choices": [{"index": 0, "message": {"role": "assistant", "content": ${content}${thinking}$calls}, "finish_reason": "$finish_reason"}], "usage": ${usage_json(prompt_tokens, completion_tokens, cached_tokens)}, "timings": ${server_timings_json(cached_tokens, prompt_tokens - cached_tokens, prompt_ms, completion_tokens, predicted_ms)}}"""
 
 pub struct TokenLogprobAlternative:
     int id
@@ -2871,7 +2871,7 @@ string logprob_bytes_json([uint8] bytes):
 
 pub string chat_logprobs_json([string] tokens, [[uint8]] token_bytes, [float32] values,
                                [[TokenLogprobAlternative]] alternatives):
-    var string out = "{{\"content\": ["
+    var string out = '''{"content": ['''
     var int i = 0
     while i < tokens.length:
         if i > 0:
@@ -2882,9 +2882,9 @@ pub string chat_logprobs_json([string] tokens, [[uint8]] token_bytes, [float32] 
             if j > 0:
                 tops = "{tops}, "
             let alternative = alternatives[i][j]
-            tops = "{tops}{{\"token\": \"{json_escape(alternative.token)}\", \"logprob\": {alternative.logprob}, \"bytes\": {logprob_bytes_json(alternative.bytes)}}}"
+            tops = $"""$tops{"token": "${json_escape(alternative.token)}", "logprob": ${alternative.logprob}, "bytes": ${logprob_bytes_json(alternative.bytes)}}"""
             j += 1
-        out = "{out}{{\"token\": \"{json_escape(tokens[i])}\", \"logprob\": {values[i]}, \"bytes\": {logprob_bytes_json(token_bytes[i])}, \"top_logprobs\": {tops}]}}"
+        out = $"""$out{"token": "${json_escape(tokens[i])}", "logprob": ${values[i]}, "bytes": ${logprob_bytes_json(token_bytes[i])}, "top_logprobs": $tops]}"""
         i += 1
     "{out}]}}"
 
@@ -2895,7 +2895,7 @@ pub string completion_json_r_logprobs(string id, string model, ParsedReply reply
     let content = if reply.content == "" and reply.calls.length > 0: "null" else: "\"{json_escape(reply.content)}\""
     let thinking = if reasoning != "": ", \"reasoning_content\": \"{json_escape(reasoning)}\"" else: ""
     let calls = if reply.calls.length > 0: ", \"tool_calls\": {tool_calls_json(id, reply.calls, false)}" else: ""
-    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{thinking}{calls}}}, \"logprobs\": {chat_logprobs_json(tokens, token_bytes, values, alternatives)}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}}}"
+    $"""{"id": "chatcmpl-$id", "object": "chat.completion", "created": $created, "model": "${json_escape(model)}", "choices": [{"index": 0, "message": {"role": "assistant", "content": ${content}${thinking}$calls}, "logprobs": ${chat_logprobs_json(tokens, token_bytes, values, alternatives)}, "finish_reason": "$finish_reason"}], "usage": ${usage_json(prompt_tokens, completion_tokens, cached_tokens)}}"""
 
 pub string completion_json_r_logprobs_timed(string id, string model, ParsedReply reply, string reasoning,
                                              string finish_reason, int prompt_tokens, int completion_tokens,
@@ -2905,16 +2905,16 @@ pub string completion_json_r_logprobs_timed(string id, string model, ParsedReply
     let content = if reply.content == "" and reply.calls.length > 0: "null" else: "\"{json_escape(reply.content)}\""
     let thinking = if reasoning != "": ", \"reasoning_content\": \"{json_escape(reasoning)}\"" else: ""
     let calls = if reply.calls.length > 0: ", \"tool_calls\": {tool_calls_json(id, reply.calls, false)}" else: ""
-    "{{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"message\": {{\"role\": \"assistant\", \"content\": {content}{thinking}{calls}}}, \"logprobs\": {chat_logprobs_json(tokens, token_bytes, values, alternatives)}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}, \"timings\": {server_timings_json(cached_tokens, prompt_tokens - cached_tokens, prompt_ms, completion_tokens, predicted_ms)}}}"
+    $"""{"id": "chatcmpl-$id", "object": "chat.completion", "created": $created, "model": "${json_escape(model)}", "choices": [{"index": 0, "message": {"role": "assistant", "content": ${content}${thinking}$calls}, "logprobs": ${chat_logprobs_json(tokens, token_bytes, values, alternatives)}, "finish_reason": "$finish_reason"}], "usage": ${usage_json(prompt_tokens, completion_tokens, cached_tokens)}, "timings": ${server_timings_json(cached_tokens, prompt_tokens - cached_tokens, prompt_ms, completion_tokens, predicted_ms)}}"""
 
 pub string text_completion_json(string id, string model, string content, string finish_reason,
                                 int prompt_tokens, int completion_tokens, int cached_tokens, uint64 created):
-    "{{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(content)}\", \"index\": 0, \"logprobs\": null, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}}}"
+    $"""{"id": "cmpl-$id", "object": "text_completion", "created": $created, "model": "${json_escape(model)}", "choices": [{"text": "${json_escape(content)}", "index": 0, "logprobs": null, "finish_reason": "$finish_reason"}], "usage": ${usage_json(prompt_tokens, completion_tokens, cached_tokens)}}"""
 
 pub string text_completion_json_timed(string id, string model, string content, string finish_reason,
                                       int prompt_tokens, int completion_tokens, int cached_tokens, uint64 created,
                                       int prompt_ms, int predicted_ms):
-    "{{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(content)}\", \"index\": 0, \"logprobs\": null, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}, \"timings\": {server_timings_json(cached_tokens, prompt_tokens - cached_tokens, prompt_ms, completion_tokens, predicted_ms)}}}"
+    $"""{"id": "cmpl-$id", "object": "text_completion", "created": $created, "model": "${json_escape(model)}", "choices": [{"text": "${json_escape(content)}", "index": 0, "logprobs": null, "finish_reason": "$finish_reason"}], "usage": ${usage_json(prompt_tokens, completion_tokens, cached_tokens)}, "timings": ${server_timings_json(cached_tokens, prompt_tokens - cached_tokens, prompt_ms, completion_tokens, predicted_ms)}}"""
 
 pub string completion_logprobs_json([string] tokens, [float32] values,
                                      [[TokenLogprobAlternative]] alternatives):
@@ -2937,7 +2937,7 @@ pub string completion_logprobs_json_at([string] tokens, [float32] values,
             offset_json = "{offset_json}, "
         token_json = "{token_json}\"{json_escape(tokens[i])}\""
         value_json = "{value_json}{values[i]}"
-        var string top = "{{"
+        var string top = '''{'''
         var int j = 0
         while j < alternatives[i].length:
             if j > 0:
@@ -2949,21 +2949,21 @@ pub string completion_logprobs_json_at([string] tokens, [float32] values,
         offset_json = "{offset_json}{offset}"
         offset += tokens[i].chars().length
         i += 1
-    "{{\"tokens\": {token_json}], \"token_logprobs\": {value_json}], \"top_logprobs\": {top_json}], \"text_offset\": {offset_json}]}}"
+    $"""{"tokens": $token_json], "token_logprobs": $value_json], "top_logprobs": $top_json], "text_offset": $offset_json]}"""
 
 pub string text_completion_json_logprobs(string id, string model, string content, string finish_reason,
                                           int prompt_tokens, int completion_tokens, int cached_tokens,
                                           uint64 created,
                                           [string] tokens, [float32] values,
                                           [[TokenLogprobAlternative]] alternatives):
-    "{{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(content)}\", \"index\": 0, \"logprobs\": {completion_logprobs_json(tokens, values, alternatives)}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}}}"
+    $"""{"id": "cmpl-$id", "object": "text_completion", "created": $created, "model": "${json_escape(model)}", "choices": [{"text": "${json_escape(content)}", "index": 0, "logprobs": ${completion_logprobs_json(tokens, values, alternatives)}, "finish_reason": "$finish_reason"}], "usage": ${usage_json(prompt_tokens, completion_tokens, cached_tokens)}}"""
 
 pub string text_completion_json_logprobs_timed(string id, string model, string content, string finish_reason,
                                                 int prompt_tokens, int completion_tokens, int cached_tokens,
                                                 uint64 created, [string] tokens, [float32] values,
                                                 [[TokenLogprobAlternative]] alternatives,
                                                 int prompt_ms, int predicted_ms):
-    "{{\"id\": \"cmpl-{id}\", \"object\": \"text_completion\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"text\": \"{json_escape(content)}\", \"index\": 0, \"logprobs\": {completion_logprobs_json(tokens, values, alternatives)}, \"finish_reason\": \"{finish_reason}\"}}], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}, \"timings\": {server_timings_json(cached_tokens, prompt_tokens - cached_tokens, prompt_ms, completion_tokens, predicted_ms)}}}"
+    $"""{"id": "cmpl-$id", "object": "text_completion", "created": $created, "model": "${json_escape(model)}", "choices": [{"text": "${json_escape(content)}", "index": 0, "logprobs": ${completion_logprobs_json(tokens, values, alternatives)}, "finish_reason": "$finish_reason"}], "usage": ${usage_json(prompt_tokens, completion_tokens, cached_tokens)}, "timings": ${server_timings_json(cached_tokens, prompt_tokens - cached_tokens, prompt_ms, completion_tokens, predicted_ms)}}"""
 
 string sse_chunk(string id, string model, string delta, string finish_reason, uint64 created):
     let fr = if finish_reason == "": "null" else: "\"{finish_reason}\""
@@ -2974,10 +2974,10 @@ string sse_chunk(string id, string model, string delta, string finish_reason, ui
 # completion_sse (below) composes the same events into a complete body.
 
 pub string sse_role_event(string id, string model, uint64 created):
-    sse_chunk(id, model, "{{\"role\": \"assistant\", \"content\": \"\"}}", "", created)
+    sse_chunk(id, model, '''{"role": "assistant", "content": ""}''', "", created)
 
 pub string sse_content_event(string id, string model, string text, uint64 created):
-    sse_chunk(id, model, "{{\"content\": \"{json_escape(text)}\"}}", "", created)
+    sse_chunk(id, model, $"""{"content": "${json_escape(text)}"}""", "", created)
 
 pub string sse_content_event_logprobs(string id, string model, string text, uint64 created,
                                        [string] tokens, [[uint8]] token_bytes, [float32] values,
@@ -2985,13 +2985,13 @@ pub string sse_content_event_logprobs(string id, string model, string text, uint
     "data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [{{\"index\": 0, \"delta\": {{\"content\": \"{json_escape(text)}\"}}, \"logprobs\": {chat_logprobs_json(tokens, token_bytes, values, alternatives)}, \"finish_reason\": null}}]}}\n\n"
 
 pub string sse_reasoning_event(string id, string model, string text, uint64 created):
-    sse_chunk(id, model, "{{\"reasoning_content\": \"{json_escape(text)}\"}}", "", created)
+    sse_chunk(id, model, $"""{"reasoning_content": "${json_escape(text)}"}""", "", created)
 
 pub string sse_tool_calls_event(string id, string model, [ParsedToolCall] calls, uint64 created):
     sse_chunk(id, model, "{{\"tool_calls\": {tool_calls_json(id, calls, true)}}}", "", created)
 
 pub string sse_finish_event(string id, string model, string finish_reason, uint64 created):
-    sse_chunk(id, model, "{{}}", finish_reason, created)
+    sse_chunk(id, model, '''{}''', finish_reason, created)
 
 pub string sse_usage_event(string id, string model, int prompt_tokens, int completion_tokens, int cached_tokens, uint64 created):
     "data: {{\"id\": \"chatcmpl-{id}\", \"object\": \"chat.completion.chunk\", \"created\": {created}, \"model\": \"{json_escape(model)}\", \"choices\": [], \"usage\": {usage_json(prompt_tokens, completion_tokens, cached_tokens)}}}\n\n"
@@ -3037,7 +3037,7 @@ pub string server_timings_json(int cached_tokens, int prompt_tokens, int prompt_
     let prompt_per_second = if prompt_ms > 0: prompt_tokens as float * 1000.0 / prompt_ms as float else: 0.0
     let predicted_per_token = if predicted_tokens > 0: predicted_ms as float / predicted_tokens as float else: 0.0
     let predicted_per_second = if predicted_ms > 0: predicted_tokens as float * 1000.0 / predicted_ms as float else: 0.0
-    "{{\"cache_n\": {cached_tokens}, \"prompt_n\": {prompt_tokens}, \"prompt_ms\": {prompt_ms}, \"prompt_per_token_ms\": {prompt_per_token}, \"prompt_per_second\": {prompt_per_second}, \"predicted_n\": {predicted_tokens}, \"predicted_ms\": {predicted_ms}, \"predicted_per_token_ms\": {predicted_per_token}, \"predicted_per_second\": {predicted_per_second}}}"
+    $"""{"cache_n": $cached_tokens, "prompt_n": $prompt_tokens, "prompt_ms": $prompt_ms, "prompt_per_token_ms": $prompt_per_token, "prompt_per_second": $prompt_per_second, "predicted_n": $predicted_tokens, "predicted_ms": $predicted_ms, "predicted_per_token_ms": $predicted_per_token, "predicted_per_second": $predicted_per_second}"""
 
 pub string native_timings_json(int prompt_tokens, int prompt_ms,
                                 int predicted_tokens, int predicted_ms):
@@ -3050,7 +3050,7 @@ pub string native_completion_json(string model, string content, [int] tokens, bo
     let evaluated_tokens = prompt_tokens - cached_tokens
     let returned_tokens = if return_tokens: token_ids_json(tokens) else: "[]"
     let has_new_line = content.contains("\n")
-    "{{\"index\": 0, \"content\": \"{json_escape(content)}\", \"tokens\": {returned_tokens}, \"id_slot\": {id_slot}, \"stop\": {stop_value}, \"model\": \"{json_escape(model)}\", \"tokens_predicted\": {completion_tokens}, \"tokens_evaluated\": {prompt_tokens}, \"generation_settings\": {generation_settings}, \"prompt\": \"{json_escape(prompt)}\", \"has_new_line\": {has_new_line}, \"truncated\": {truncated}, \"stop_type\": \"{stop_type}\", \"stopping_word\": \"{json_escape(stopping_word)}\", \"tokens_cached\": {cached_tokens}, \"timings\": {server_timings_json(cached_tokens, evaluated_tokens, prompt_ms, completion_tokens, predicted_ms)}}}"
+    $"""{"index": 0, "content": "${json_escape(content)}", "tokens": $returned_tokens, "id_slot": $id_slot, "stop": $stop_value, "model": "${json_escape(model)}", "tokens_predicted": $completion_tokens, "tokens_evaluated": $prompt_tokens, "generation_settings": $generation_settings, "prompt": "${json_escape(prompt)}", "has_new_line": $has_new_line, "truncated": $truncated, "stop_type": "$stop_type", "stopping_word": "${json_escape(stopping_word)}", "tokens_cached": $cached_tokens, "timings": ${server_timings_json(cached_tokens, evaluated_tokens, prompt_ms, completion_tokens, predicted_ms)}}"""
 
 string native_logprobs_json([int] ids, [string] tokens, [float32] values,
                             [[uint8]] token_bytes, [[TokenLogprobAlternative]] alternatives,
@@ -3068,9 +3068,9 @@ string native_logprobs_json([int] ids, [string] tokens, [float32] values,
             if j > 0:
                 tops = "{tops}, "
             let alternative = alternatives[i][j]
-            tops = "{tops}{{\"id\": {alternative.id}, \"token\": \"{json_escape(alternative.token)}\", \"bytes\": {logprob_bytes_json(alternative.bytes)}, \"{value_key}\": {alternative.logprob}}}"
+            tops = $"""$tops{"id": ${alternative.id}, "token": "${json_escape(alternative.token)}", "bytes": ${logprob_bytes_json(alternative.bytes)}, "$value_key": ${alternative.logprob}}"""
             j += 1
-        out = "{out}{{\"id\": {ids[i]}, \"token\": \"{json_escape(tokens[i])}\", \"bytes\": {logprob_bytes_json(token_bytes[i])}, \"{value_key}\": {values[i]}, \"{top_key}\": {tops}]}}"
+        out = $"""$out{"id": ${ids[i]}, "token": "${json_escape(tokens[i])}", "bytes": ${logprob_bytes_json(token_bytes[i])}, "$value_key": ${values[i]}, "$top_key": $tops]}"""
         i += 1
     "{out}]"
 
@@ -3085,7 +3085,7 @@ pub string native_completion_json_logprobs(string model, string content, [int] t
     let evaluated_tokens = prompt_tokens - cached_tokens
     let returned_tokens = if return_tokens: token_ids_json(tokens) else: "[]"
     let has_new_line = content.contains("\n")
-    "{{\"index\": 0, \"content\": \"{json_escape(content)}\", \"tokens\": {returned_tokens}, \"id_slot\": {id_slot}, \"stop\": {stop_value}, \"model\": \"{json_escape(model)}\", \"tokens_predicted\": {completion_tokens}, \"tokens_evaluated\": {prompt_tokens}, \"generation_settings\": {generation_settings}, \"prompt\": \"{json_escape(prompt)}\", \"has_new_line\": {has_new_line}, \"truncated\": {truncated}, \"stop_type\": \"{stop_type}\", \"stopping_word\": \"{json_escape(stopping_word)}\", \"tokens_cached\": {cached_tokens}, \"timings\": {server_timings_json(cached_tokens, evaluated_tokens, prompt_ms, completion_tokens, predicted_ms)}, \"completion_probabilities\": {native_logprobs_json(tokens, prob_tokens, values, token_bytes, alternatives, post_sampling_probs)}}}"
+    $"""{"index": 0, "content": "${json_escape(content)}", "tokens": $returned_tokens, "id_slot": $id_slot, "stop": $stop_value, "model": "${json_escape(model)}", "tokens_predicted": $completion_tokens, "tokens_evaluated": $prompt_tokens, "generation_settings": $generation_settings, "prompt": "${json_escape(prompt)}", "has_new_line": $has_new_line, "truncated": $truncated, "stop_type": "$stop_type", "stopping_word": "${json_escape(stopping_word)}", "tokens_cached": $cached_tokens, "timings": ${server_timings_json(cached_tokens, evaluated_tokens, prompt_ms, completion_tokens, predicted_ms)}, "completion_probabilities": ${native_logprobs_json(tokens, prob_tokens, values, token_bytes, alternatives, post_sampling_probs)}}"""
 
 pub string native_stream_timings_suffix(bool enabled, int cached_tokens, int evaluated_tokens,
                                          int prompt_ms, int predicted_tokens, int predicted_ms):
@@ -3116,7 +3116,7 @@ pub string native_completion_final_json(string model, int id_slot, string stop_t
                                          int cached_tokens, int prompt_ms, int predicted_ms,
                                          string generation_settings, string prompt, bool has_new_line):
     let evaluated_tokens = prompt_tokens - cached_tokens
-    "{{\"index\": 0, \"content\": \"\", \"tokens\": [], \"id_slot\": {id_slot}, \"stop\": true, \"model\": \"{json_escape(model)}\", \"tokens_predicted\": {completion_tokens}, \"tokens_evaluated\": {prompt_tokens}, \"generation_settings\": {generation_settings}, \"prompt\": \"{json_escape(prompt)}\", \"has_new_line\": {has_new_line}, \"truncated\": {truncated}, \"stop_type\": \"{stop_type}\", \"stopping_word\": \"{json_escape(stopping_word)}\", \"tokens_cached\": {cached_tokens}, \"timings\": {server_timings_json(cached_tokens, evaluated_tokens, prompt_ms, completion_tokens, predicted_ms)}}}"
+    $"""{"index": 0, "content": "", "tokens": [], "id_slot": $id_slot, "stop": true, "model": "${json_escape(model)}", "tokens_predicted": $completion_tokens, "tokens_evaluated": $prompt_tokens, "generation_settings": $generation_settings, "prompt": "${json_escape(prompt)}", "has_new_line": $has_new_line, "truncated": $truncated, "stop_type": "$stop_type", "stopping_word": "${json_escape(stopping_word)}", "tokens_cached": $cached_tokens, "timings": ${server_timings_json(cached_tokens, evaluated_tokens, prompt_ms, completion_tokens, predicted_ms)}}"""
 
 pub string native_completion_final_sse_event(string model, int id_slot, string stop_type, string stopping_word, bool truncated,
                                                int prompt_tokens, int completion_tokens,

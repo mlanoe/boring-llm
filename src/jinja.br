@@ -140,7 +140,7 @@ pub string jv_to_json(JValue v):
                 i += 1
             "{out}]"
         JDict(fields, keys):
-            var string out = "{{"
+            var string out = '''{'''
             var int i = 0
             while i < keys.length:
                 if i > 0:
@@ -800,7 +800,7 @@ struct RawTok:
     var string buf = ""
     var int i = 0
     while i < n:
-        if chars[i] == "{{" and i + 1 < n and (chars[i + 1] == "{{" or chars[i + 1] == "%"):
+        if chars[i] == '''{''' and i + 1 < n and (chars[i + 1] == '''{''' or chars[i + 1] == "%"):
             if buf.length > 0:
                 toks.push(RawTok(0, buf, false, false))
                 buf = ""
@@ -836,8 +836,8 @@ struct RawTok:
                     content = "{content}{chars[j]}"
                     j += 1
                 else:
-                    let at_dash_close = chars[j] == "-" and j + 2 < n and ((is_stmt and chars[j + 1] == "%" and chars[j + 2] == "}}") or (not is_stmt and chars[j + 1] == "}}" and chars[j + 2] == "}}"))
-                    let at_plain_close = j + 1 < n and ((is_stmt and chars[j] == "%" and chars[j + 1] == "}}") or (not is_stmt and chars[j] == "}}" and chars[j + 1] == "}}"))
+                    let at_dash_close = chars[j] == "-" and j + 2 < n and ((is_stmt and chars[j + 1] == "%" and chars[j + 2] == '''}''') or (not is_stmt and chars[j + 1] == '''}''' and chars[j + 2] == '''}'''))
+                    let at_plain_close = j + 1 < n and ((is_stmt and chars[j] == "%" and chars[j + 1] == '''}''') or (not is_stmt and chars[j] == '''}''' and chars[j + 1] == '''}'''))
                     if at_dash_close:
                         trim_right = true
                         j += 3
