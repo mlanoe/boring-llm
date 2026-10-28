@@ -114,7 +114,17 @@ def reference(W, c):
         x = x + (rms(proj, L["post_attn"]) if c.get("post_norms") else proj)
         h = rms(x, L["ffn_norm"])
         act = gelu if c["act"] == "gelu" else silu
-        ffn = (act(h @ L["gate"].T) * (h @ L["up"].T)) @ L["down"].T
+        if "router" in L:  # mixture of experts, as llama.cpp's build_moe_ffn: softmax gate, top-k, renormalized
+            probs = np.exp(h @ L["router"].T)
+            probs /= probs.sum(-1, keepdims=True)
+            ffn = np.zeros_like(h)
+            for t in range(seq):
+                top = np.argsort(-probs[t])[: c["n_used"]]
+                wts = probs[t, top] / probs[t, top].sum()
+                for e, wt in zip(top, wts):
+                    ffn[t] += wt * ((act(h[t] @ L["eg"][e].T) * (h[t] @ L["eu"][e].T)) @ L["ed"][e].T)
+        else:
+            ffn = (act(h @ L["gate"].T) * (h @ L["up"].T)) @ L["down"].T
         x = x + (rms(ffn, L["post_ffn"]) if c.get("post_norms") else ffn)
     x = rms(x, W["out_norm"])
     logits = x @ W["out"].T
@@ -139,13 +149,22 @@ def make_weights(rng, d_head, tied):
     return W
 
 
+def add_moe(rng, W, n_expert, ffn_e):
+    """Replaces every layer's dense FFN by `n_expert` experts of width `ffn_e` and a router."""
+    for L in W["layers"]:
+        L["router"] = rng.normal(0, 0.6, (n_expert, D))
+        L["eg"] = rng.normal(0, 0.3, (n_expert, ffn_e, D))
+        L["eu"] = rng.normal(0, 0.3, (n_expert, ffn_e, D))
+        L["ed"] = rng.normal(0, 0.3, (n_expert, D, ffn_e))
+
+
 def requantize(W):
     """Round-trips every matrix through Q8_0 so the reference sees what the file holds."""
     def rt(a):
         a = np.asarray(a, dtype=np.float32)
         return gguf.quants.dequantize(gguf.quants.quantize(a, gguf.GGMLQuantizationType.Q8_0),
                                       gguf.GGMLQuantizationType.Q8_0).astype(np.float64)
-    out = {**W, "emb": rt(W["emb"]), "layers": [{k: (rt(v) if k in ("q", "k", "v", "o", "gate", "up", "down") else v)
+    out = {**W, "emb": rt(W["emb"]), "layers": [{k: (rt(v) if k in ("q", "k", "v", "o", "gate", "up", "down", "eg", "eu", "ed") else v)
                                                  for k, v in L.items()} for L in W["layers"]]}
     out["out"] = out["emb"] if W["out"] is W["emb"] else rt(W["out"])
     return out
@@ -202,6 +221,14 @@ def write(name, arch, W, c, fused=False, tied=False, meta=None, extra_tensors=No
             w.add_tensor(f"{p}.attn_q_norm.weight", f32(L["q_norm"]))
             w.add_tensor(f"{p}.attn_k_norm.weight", f32(L["k_norm"]))
         mat(f"{p}.attn_output.weight", L["o"])
+        if "router" in L:
+            w.add_tensor(f"{p}.ffn_gate_inp.weight", f32(L["router"]))
+            mat(f"{p}.ffn_gate_exps.weight", L["eg"])
+            mat(f"{p}.ffn_up_exps.weight", L["eu"])
+            mat(f"{p}.ffn_down_exps.weight", L["ed"])
+            for n in ("q", "k", "v"):
+                mat(f"{p}.attn_{n}.weight", L[n])
+            continue
         mat(f"{p}.ffn_down.weight", L["down"])
         if fused:
             mat(f"{p}.attn_qkv.weight", np.concatenate([L["q"], L["k"], L["v"]]))
@@ -258,6 +285,16 @@ def run():
     factors = rng.uniform(1.0, 3.0, dh // 2)
     write("phi3", "phi3", W, {**base, "rope": rope_table(dh, 10000.0, factors=factors, attn=1.2)}, fused=True,
           meta={"rope.scaling.attn_factor": 1.2}, extra_tensors={"rope_factors_short.weight": factors})
+
+    # Mixture of experts: Mixtral (llama arch with expert_count) and Qwen3-MoE (qk-norm, per-expert width)
+    Wm = make_weights(rng, dh, False)
+    add_moe(rng, Wm, 4, FFN)
+    write("mixtral", "llama", Wm, {**base, "neox": False, "rope": rope_table(dh, 10000.0), "n_used": 2},
+          meta={"expert_count": 4, "expert_used_count": 2})
+    Wq = make_weights(rng, dh, False)
+    add_moe(rng, Wq, 6, FFN // 2)
+    write("qwen3moe", "qwen3moe", Wq, {**base, "qk_norm": True, "rope": rope_table(dh, 10000.0), "n_used": 3},
+          meta={"expert_count": 6, "expert_used_count": 3, "expert_feed_forward_length": FFN // 2})
 
     # Phi-3 with both factor sets and an original context of 32: which set does llama.cpp pick at n_ctx 16 / 64?
     f_long = rng.uniform(2.0, 4.0, dh // 2)

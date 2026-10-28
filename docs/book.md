@@ -507,7 +507,7 @@ Every hyperparameter is read from the GGUF's own `{arch}.*` metadata keys, never
 - **Attention biases**: Qwen2 has Q, K and V biases, Llama and Qwen3 do not; a missing bias tensor becomes an all-zero vector.
 - **Query and key norms** (`qwen3`): an RMS norm over each head's query and key vectors, with its own `attn_q_norm` and `attn_k_norm` weights of one head's size, applied after the projection and before RoPE. It is switched on when the file has those tensors.
 
-Grouped-query attention is handled with the usual head mapping, and tied embeddings (no separate `output.weight`) are detected from the tensor list. There is no mixture-of-experts and no vision support.
+Grouped-query attention is handled with the usual head mapping, and tied embeddings (no separate `output.weight`) are detected from the tensor list. - **Mixture of experts** (`llama` with `expert_count`, i.e. Mixtral, and `qwen3moe`): `ffn_gate_inp.weight` is the router and `ffn_{gate,up,down}_exps.weight` hold every expert's matrix, stacked; each expert becomes its own resident buffer. A token's router logits go through a softmax, the `expert_used_count` most probable experts are kept and their probabilities renormalized to sum to 1 (llama.cpp's `build_moe_ffn`). The router runs on the GPU and its logits are read back to route on the host; each expert that received rows then runs on just those rows (gathered into a batch) and its output, scaled by the routing weight, is accumulated. This costs one host round trip per layer and token. Not supported: shared experts (Qwen2-MoE), DeepSeek-style routing and gating, expert groups, and keeping experts off the GPU. There is no vision support.
 
 ### 6.3 Tokenizers
 
@@ -871,7 +871,7 @@ This writes `docs/book.html`, `README.html` at the repository root, and one HTML
 
 - **One request at a time.** There is no batching and no concurrent decoding.
 - **Context** is limited by `--ctx-size` and memory. The default KV cache is float32; select matching `-ctk f16 -ctv f16` for a half-sized main cache on models with 64- or 128-wide attention heads.
-- **Architectures**: Llama-style GGUF layouts only (`qwen2` and `llama` are the tested ones); no mixture-of-experts, no vision.
+- **Architectures**: Llama-style GGUF layouts only (`qwen2` and `llama` are the tested ones); no vision; mixture of experts only in the Mixtral and Qwen3-MoE layouts (chapter 6).
 - **Chat templates** use a Jinja2 subset; an unsupported construct is reported.
 - **Standard split GGUF naming required.** Multi-file models are discovered from any `model-00001-of-000NN.gguf` shard using their `split.no`, `split.count`, and `split.tensors.count` metadata. Arbitrary shard filenames are not guessed.
 - **Unix only for the disk features**: the streaming loader and snapshots use Unix file APIs.

@@ -3220,8 +3220,18 @@ req [float32]'kernel'unified tensor_linear_schedule_gpu([float32]'kernel'global 
         kernel.tensors.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "q3_k")
     elif w_type == 20:
         kernel.tensors.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "iq4_nl")
+    elif w_type == 3:
+        kernel.tensors.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "q4_1")
+    elif w_type == 7:
+        kernel.tensors.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "q5_1")
+    elif w_type == 13:
+        kernel.tensors.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "q5_k")
+    elif w_type == 1:
+        kernel.tensors.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "f16")
+    elif w_type == 30:
+        kernel.tensors.linear(x, w_packed, bv, y, m = seq, n = d_out, k = d_in, format = "bf16")
     else:
-        throw "tensor_linear_schedule_gpu: unsupported ggml type id {w_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
+        throw "tensor_linear_schedule_gpu: unsupported ggml type id {w_type} (supported: F16=1, Q4_0=2, Q4_1=3, Q5_0=6, Q5_1=7, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q5_K=13, Q6_K=14, IQ4_NL=20, BF16=30)"
     y
 
 # Shape-aware entry points model.br actually calls. `kernel.tensors.linear` (the
@@ -3256,16 +3266,24 @@ pub def set_gpu_batch_limit(int limit): native
 pub def set_kquant_prefill_handwritten(bool v):
     kquant_prefill_handwritten = v
 
-# Formats that still take the compiler's `kernel.tensors.linear` schedule at decode shapes. Q4_0 and
-# Q5_0 left this list: the lane-per-block kernels above are ~6x faster than the compiler's schedule
-# for them (test/bench_decode_formats.br).
-bool has_tensor_schedule(int w_type):
-    w_type == 8 or w_type == 10 or w_type == 11 or w_type == 12 or w_type == 14
+# Formats that take the compiler's `kernel.tensors.linear` schedule. Q4_0 and Q5_0 had left this list
+# (the compiler's schedule was ~6x slower than the lane-per-block kernels) until `boring.toml` enabled
+# their native Metal kernels (`q4_0 = "native"`, ... under `[tensor.linear.prefill]`); with those, and the
+# native Q4_1/Q5_1/Q5_K/F16/BF16 ones, every format below decodes at Q8_0 speed on Metal
+# (test/bench_decode_formats.br). F16/BF16 need d_in % 32 == 0 (the kernels' K tile).
+bool has_tensor_schedule(int w_type, int d_in):
+    w_type == 2 or w_type == 3 or w_type == 6 or w_type == 7 or w_type == 8 or w_type == 10 or w_type == 11 or w_type == 12 or w_type == 13 or w_type == 14 or ((w_type == 1 or w_type == 30) and d_in % 32 == 0)
+
+# Prefill (seq > 1) on the compiler's SIMD-group kernels: Q8_0, Q4_0/Q4_1/Q5_0/Q5_1, F16/BF16 always (3-5x
+# faster than the hand-written tiled kernels on Metal); the K-quants unless `--kquant-prefill handwritten`.
+# Q2_K/Q3_K/IQ4_NL prefill stays on `fused_linear_gpu`.
+bool tensor_prefill(int w_type):
+    w_type == 8 or w_type == 2 or w_type == 3 or w_type == 6 or w_type == 7 or w_type == 1 or w_type == 30 or ((w_type == 12 or w_type == 13 or w_type == 14) and not kquant_prefill_handwritten)
 
 pub req [float32]'kernel'unified tensor_linear_gpu([float32]'kernel'global x,
                        [uint8]'kernel'global w_packed, int w_type,
                        [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
-    if has_tensor_schedule(w_type) and (seq == 1 or w_type == 8 or ((w_type == 12 or w_type == 14) and not kquant_prefill_handwritten)):
+    if has_tensor_schedule(w_type, d_in) and (seq == 1 or tensor_prefill(w_type)):
         tensor_linear_schedule_gpu(x, w_packed, w_type, bv, seq, d_in, d_out)
     else:
         fused_linear_gpu(x, w_packed, w_type, bv, seq, d_in, d_out)
@@ -3273,7 +3291,7 @@ pub req [float32]'kernel'unified tensor_linear_gpu([float32]'kernel'global x,
 pub req [float32]'kernel'unified tensor_linear_nobias_gpu([float32]'kernel'global x,
                        [uint8]'kernel'global w_packed, int w_type,
                        int seq, int d_in, int d_out) throws:
-    if has_tensor_schedule(w_type) and (seq == 1 or w_type == 8 or ((w_type == 12 or w_type == 14) and not kquant_prefill_handwritten)):
+    if has_tensor_schedule(w_type, d_in) and (seq == 1 or tensor_prefill(w_type)):
         tensor_linear_nobias_schedule_gpu(x, w_packed, w_type, seq, d_in, d_out)
     else:
         let [float32] zero_bias = [0.0 for i in 0..<d_out]
@@ -3299,8 +3317,18 @@ req [float32]'kernel'unified tensor_linear_nobias_schedule_gpu([float32]'kernel'
         kernel.tensors.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "q3_k")
     elif w_type == 20:
         kernel.tensors.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "iq4_nl")
+    elif w_type == 3:
+        kernel.tensors.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "q4_1")
+    elif w_type == 7:
+        kernel.tensors.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "q5_1")
+    elif w_type == 13:
+        kernel.tensors.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "q5_k")
+    elif w_type == 1:
+        kernel.tensors.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "f16")
+    elif w_type == 30:
+        kernel.tensors.linear(x, w_packed, y, m = seq, n = d_out, k = d_in, format = "bf16")
     else:
-        throw "tensor_linear_nobias_schedule_gpu: unsupported ggml type id {w_type} (supported: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q6_K=14, IQ4_NL=20)"
+        throw "tensor_linear_nobias_schedule_gpu: unsupported ggml type id {w_type} (supported: F16=1, Q4_0=2, Q4_1=3, Q5_0=6, Q5_1=7, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q5_K=13, Q6_K=14, IQ4_NL=20, BF16=30)"
     y
 
 # ── Kernel: RMSNorm (row-wise) ───────────────────────────────────────────
@@ -3547,6 +3575,40 @@ pub req [float32]'kernel'unified glu_combine_gpu([float32]'kernel'global gate, [
                 let inner = 0.7978845608 * (g + 0.044715 * g * g * g)
                 activated = 0.5 * g * (1.0 + inner.tanh())
             out[i] = activated * up[i]
+        out
+
+# ── Mixture-of-experts helpers ─────────────────────────────────────────────
+# Rows of `x` (d floats each) picked by `idx` (row numbers stored as floats, exact up to 2^24).
+pub req [float32]'kernel'unified gather_rows_gpu([float32]'kernel'global x, [float32]'kernel'global idx, int m, int d) throws:
+    let int total = m * d
+    let int blocks = (total + 255) / 256
+    kernel(block = 256, grid = blocks):
+        mut [float32]'unified out = [0.0 for ..<total]
+        let cell = .thread.x + .block.x * .block_dim.x
+        if cell < total:
+            let r = cell / d
+            let j = cell % d
+            let src = idx[r] as int
+            out[cell] = x[src * d + j]
+        out
+
+# acc + routing weight * expert output, for the rows an expert handled: `pos[r]` is row r's index in
+# the expert's batch (-1 when the expert did not get that row), `wts` the weight of each batched row.
+pub req [float32]'kernel'unified moe_accumulate_gpu([float32]'kernel'global acc, [float32]'kernel'global y,
+                       [float32]'kernel'global pos, [float32]'kernel'global wts, int n, int d) throws:
+    let int total = n * d
+    let int blocks = (total + 255) / 256
+    kernel(block = 256, grid = blocks):
+        mut [float32]'unified out = [0.0 for ..<total]
+        let cell = .thread.x + .block.x * .block_dim.x
+        if cell < total:
+            let r = cell / d
+            let j = cell % d
+            let p = pos[r] as int
+            var float32 value = acc[cell]
+            if p >= 0:
+                value = value + wts[p] * y[p * d + j]
+            out[cell] = value
         out
 
 # ── Kernel: elementwise add (residual connection) ────────────────────────
