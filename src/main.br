@@ -15,6 +15,7 @@ use model
 use tokenizer
 use sampling
 use embedding
+use grammar
 use server
 use json
 use openai
@@ -416,7 +417,7 @@ def run_chat(GgufFile file, string system_msg, int max_new_tokens, bool kv_cache
     let tok = load_tokenizer(file)
     (file, m, tok)
 
-def run_serve(string path, string model_name, [string] model_tags, string chat_template_override, int ctx_size, int max_tokens, int cache_slots, string prompt_cache_dir, string slot_save_dir, int prompt_cache_files, int prompt_cache_max_mb, string host, int port, [string] api_keys, string api_prefix, string cors_origins, string cors_methods, string cors_headers, bool cors_credentials, bool metrics_enabled, bool slots_enabled, bool cache_prompt_default, bool context_shift, int sse_ping_interval_default, string reasoning_format_default, string reasoning_effort_default, JValue chat_template_kwargs_default, int gpu_layers, ServerSamplingDefaults extra_defaults, SamplingParams params, bool embeddings_enabled, string pooling_name_arg) throws:
+def run_serve(string path, string model_name, [string] model_tags, string chat_template_override, int ctx_size, int max_tokens, int cache_slots, string prompt_cache_dir, string slot_save_dir, int prompt_cache_files, int prompt_cache_max_mb, string host, int port, [string] api_keys, string api_prefix, string cors_origins, string cors_methods, string cors_headers, bool cors_credentials, bool metrics_enabled, bool slots_enabled, bool cache_prompt_default, bool context_shift, int sse_ping_interval_default, string reasoning_format_default, string reasoning_effort_default, JValue chat_template_kwargs_default, int gpu_layers, ServerSamplingDefaults extra_defaults, SamplingParams params, string default_grammar, bool embeddings_enabled, string pooling_name_arg) throws:
     guard host != "" else throw "--host must not be empty"
     guard port >= 1 and port <= 65535 else throw "--port must be between 1 and 65535"
     guard ctx_size >= 2 else throw "--ctx-size must be at least 2"
@@ -461,7 +462,7 @@ def run_serve(string path, string model_name, [string] model_tags, string chat_t
     guard pooling <= 3 else throw "pooling type {pooling_name(pooling)} (reranking) is not supported; boring-llm does not load ranking models"
     if embeddings_enabled:
         print "[serve] embeddings enabled (pooling: {pooling_name(pooling)}, default normalization: euclidean)"
-    let ctx = ServerCtx(file, tok, m, path, name, aliases, model_tags, ctx_size, max_tokens, cache_slots, params, extra_defaults, prompt_cache_dir, fp, prompt_cache_files, prompt_cache_max_mb * 1048576, bpt, metrics_enabled, slot_save_dir, api_keys, api_prefix, slots_enabled, cache_prompt_default, context_shift, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, cors_origins, cors_methods, cors_headers, cors_credentials, embeddings_enabled, pooling)
+    let ctx = ServerCtx(file, tok, m, path, name, aliases, model_tags, ctx_size, max_tokens, cache_slots, params, extra_defaults, prompt_cache_dir, fp, prompt_cache_files, prompt_cache_max_mb * 1048576, bpt, metrics_enabled, slot_save_dir, api_keys, api_prefix, slots_enabled, cache_prompt_default, context_shift, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, cors_origins, cors_methods, cors_headers, cors_credentials, default_grammar, embeddings_enabled, pooling)
     serve(ctx, host, port, disk)
 
 def run_render_request(GgufFile file, string path) throws:
@@ -647,6 +648,7 @@ def main() throws:
     let jinja_env = environment_default(argv, ["--jinja", "--no-jinja"], "LLAMA_ARG_JINJA", "true")
     guard parse_bool_arg("LLAMA_ARG_JINJA", jinja_env) else throw "LLAMA_ARG_JINJA cannot disable the chat-template engine"
     let embeddings_env = environment_default(argv, ["--embedding", "--embeddings"], "LLAMA_ARG_EMBEDDINGS", "false")
+    var string grammar_default = ""
     var bool embeddings_enabled = parse_bool_arg("LLAMA_ARG_EMBEDDINGS", embeddings_env)
     let pooling_env = environment_default(argv, ["--pooling"], "LLAMA_ARG_POOLING", "")
     var string pooling_name_arg = pooling_env
@@ -939,6 +941,13 @@ def main() throws:
         elif a == "--embedding" or a == "--embeddings":
             embeddings_enabled = true
             i += 1
+        elif a == "--grammar" and i + 1 < argv.length:
+            grammar_default = argv[i + 1]
+            i += 2
+        elif a == "--grammar-file" and i + 1 < argv.length:
+            let grammar_bytes = fs.readBytes(argv[i + 1])
+            grammar_default = bytes_to_str(grammar_bytes)
+            i += 2
         elif a == "--pooling" and i + 1 < argv.length:
             pooling_name_arg = argv[i + 1]
             i += 2
@@ -1128,6 +1137,10 @@ def main() throws:
         chat_template_kwargs_default = jv_set(chat_template_kwargs_default, "preserve_reasoning", JValue.JBool(reasoning_preserve_default == "on"))
 
     guard not embeddings_enabled or serve_mode else throw "--embeddings requires --serve"
+    guard grammar_default == "" or serve_mode else throw "--grammar and --grammar-file require --serve"
+    if grammar_default != "":
+        let checked = try? parse_gbnf(grammar_default)
+        guard checked != nil else throw "--grammar is not a valid GBNF grammar"
     set_decode_profile_stage(requested_profile_stage)
     set_kv_cache_type(cache_type_k)
     set_rope_context_size(ctx_size)
@@ -1139,7 +1152,7 @@ def main() throws:
         # kept resident for every request. Handled before the generic parse
         # below (which would also be fine now: no mode holds the file in memory).
         let extra_defaults = ServerSamplingDefaults(presence_penalty, frequency_penalty, mirostat, mirostat_tau, mirostat_eta, adaptive_target, adaptive_decay, samplers, ignore_eos)
-        run_serve(gguf_path, model_name, model_tags, chat_template_override, ctx_size, max_tokens, cache_slots, prompt_cache_dir, slot_save_dir, prompt_cache_files, prompt_cache_max_mb, host, port, api_keys, api_prefix, cors_origins, cors_methods, cors_headers, cors_credentials, metrics_enabled, slots_enabled, cache_prompt_default, context_shift, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, gpu_layers, extra_defaults, SamplingParams(temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, []), embeddings_enabled, pooling_name_arg)
+        run_serve(gguf_path, model_name, model_tags, chat_template_override, ctx_size, max_tokens, cache_slots, prompt_cache_dir, slot_save_dir, prompt_cache_files, prompt_cache_max_mb, host, port, api_keys, api_prefix, cors_origins, cors_methods, cors_headers, cors_credentials, metrics_enabled, slots_enabled, cache_prompt_default, context_shift, sse_ping_interval_default, reasoning_format_default, reasoning_effort_default, chat_template_kwargs_default, gpu_layers, extra_defaults, SamplingParams(temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, []), grammar_default, embeddings_enabled, pooling_name_arg)
         return
 
     print "[diag] parsing {gguf_path}..."

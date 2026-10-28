@@ -115,6 +115,7 @@ The first request of a session is the slow one, because the ~7.5k-token prompt h
 | `--op-offload` | enabled | accepted because inference uses GPU tensor kernels; `--no-op-offload` is rejected because no CPU inference path exists |
 | `-fa`, `--flash-attn [on\|auto]` | `auto` | compatibility setting; both values use boring-llm's always-enabled fused attention kernels, while `off` is rejected |
 | `-ctk`, `--cache-type-k TYPE`; `-ctv`, `--cache-type-v TYPE` | `f32` | KV-cache storage: `f32` or half-sized `f16`; K and V must currently use the same type, and f16 supports head sizes 64/128 |
+| `--grammar GBNF`, `--grammar-file FILE` | none | default GBNF grammar for requests that set none (see `grammar` in chapter 4); `--serve` only |
 | `--embeddings`, `--embedding`; `--pooling none\|mean\|cls\|last`; `LLAMA_ARG_EMBEDDINGS`, `LLAMA_ARG_POOLING` | off; the GGUF's `{arch}.pooling_type`, else none | serve embeddings (`/embedding`, `/embeddings`, `/v1/embeddings`) from the final-norm hidden state of a decoder model, pooled over the prompt; `rank` (reranking) is rejected |
 | `--no-mmproj`, `--no-mmproj-auto` | current behavior | accepted text-only settings; projector and reranking modes are rejected before model loading |
 | `LLAMA_ARG_MODEL`, `LLAMA_ARG_ALIAS`, `LLAMA_ARG_TAGS`, `LLAMA_ARG_HOST`, `LLAMA_ARG_PORT`, `LLAMA_ARG_CTX_SIZE`, `LLAMA_ARG_N_PREDICT`, `LLAMA_API_KEY` | unset | core llama-server environment defaults; an explicit command-line option takes precedence |

@@ -1,0 +1,52 @@
+# JSON Schema -> GBNF (src/schema_grammar.br): what the generated grammar accepts and rejects.
+#   boring run test/test_schema_grammar.br
+
+use json
+use grammar
+use schema_grammar
+
+bool accepts(Grammar g, string text) throws:
+    grammar_complete(grammar_advance_text(g, grammar_start(g), text))
+
+bool viable(Grammar g, string text) throws:
+    grammar_advance_text(g, grammar_start(g), text).length > 0
+
+Grammar compile(string schema_json) throws:
+    parse_gbnf(json_schema_to_gbnf(json_parse(schema_json)))
+
+def main() throws:
+    let ob = chr(123)
+    let cb = chr(125)
+    let q = chr(34)
+
+    # object: required first, optional afterwards, no unknown keys
+    let g1 = compile("{ob}\"type\":\"object\",\"properties\":{ob}\"n\":{ob}\"type\":\"integer\"{cb},\"s\":{ob}\"type\":\"string\"{cb},\"b\":{ob}\"type\":\"boolean\"{cb}{cb},\"required\":[\"n\"]{cb}")
+    assert(accepts(g1, "{ob}\"n\": 5{cb}") and accepts(g1, "{ob}\"n\":5,\"s\":\"x\",\"b\":true{cb}") and accepts(g1, "{ob}\"n\": -12, \"b\": false{cb}"), "object")
+    assert(not accepts(g1, "{ob}\"s\": \"x\"{cb}") and not viable(g1, "{ob}\"x\"") and not viable(g1, q) and not viable(g1, "5"), "object rejects")
+    assert(not viable(g1, "{ob}\"n\": 5{cb} "), "no trailing whitespace after the root object")
+    assert(not accepts(g1, "{ob}\"n\": 5.5{cb}") and not accepts(g1, "{ob}\"n\": \"5\"{cb}"), "integer typed")
+
+    # the case that exposed prefix-only JSON checking: a string must not start an object schema
+    let g2 = compile("{ob}\"type\":\"object\",\"properties\":{ob}\"n\":{ob}\"type\":\"integer\"{cb}{cb},\"required\":[\"n\"]{cb}")
+    assert(not viable(g2, q) and viable(g2, "{ob}") and viable(g2, "{ob}\"n\": 2"), "object root")
+
+    # all-optional object, enum, const, arrays with bounds, anyOf, type list, additionalProperties
+    let g3 = compile("{ob}\"type\":\"object\",\"properties\":{ob}\"a\":{ob}\"type\":\"integer\"{cb},\"b\":{ob}\"enum\":[\"x\",\"y\"]{cb}{cb}{cb}")
+    assert(accepts(g3, "{ob}{cb}") and accepts(g3, "{ob}\"b\": \"y\"{cb}") and accepts(g3, "{ob}\"a\": 1, \"b\": \"x\"{cb}") and not accepts(g3, "{ob}\"b\": \"z\"{cb}") and not viable(g3, "{ob},"), "optional members")
+    let g4 = compile("{ob}\"type\":\"array\",\"items\":{ob}\"type\":\"integer\"{cb},\"minItems\":2,\"maxItems\":3{cb}")
+    assert(accepts(g4, "[1, 2]") and accepts(g4, "[1,2,3]") and not accepts(g4, "[1]") and not viable(g4, "[1,2,3,"), "array bounds")
+    let g5 = compile("{ob}\"anyOf\":[{ob}\"type\":\"string\"{cb},{ob}\"type\":\"null\"{cb}]{cb}")
+    assert(accepts(g5, "null") and accepts(g5, "\"hi\"") and not accepts(g5, "5"), "anyOf")
+    let g6 = compile("{ob}\"type\":[\"integer\",\"boolean\"]{cb}")
+    assert(accepts(g6, "42") and accepts(g6, "true") and not accepts(g6, "\"x\""), "type list")
+    let g7 = compile("{ob}\"const\":\"fixed\"{cb}")
+    assert(accepts(g7, "\"fixed\"") and not accepts(g7, "\"other\""), "const")
+    let g8 = compile("{ob}\"type\":\"object\",\"additionalProperties\":{ob}\"type\":\"integer\"{cb}{cb}")
+    assert(accepts(g8, "{ob}{cb}") and accepts(g8, "{ob}\"a\": 1, \"b\": 2{cb}") and not accepts(g8, "{ob}\"a\": \"x\"{cb}"), "additionalProperties schema")
+    let g9 = compile("{ob}\"type\":\"string\",\"minLength\":2,\"maxLength\":3{cb}")
+    assert(accepts(g9, "\"ab\"") and accepts(g9, "\"abc\"") and not accepts(g9, "\"a\"") and not viable(g9, "\"abcd"), "string length")
+
+    # $ref and recursion
+    let g10 = compile("{ob}\"$ref\":\"#/$defs/node\",\"$defs\":{ob}\"node\":{ob}\"type\":\"object\",\"properties\":{ob}\"v\":{ob}\"type\":\"integer\"{cb},\"next\":{ob}\"anyOf\":[{ob}\"$ref\":\"#/$defs/node\"{cb},{ob}\"type\":\"null\"{cb}]{cb}{cb},\"required\":[\"v\",\"next\"]{cb}{cb}{cb}")
+    assert(accepts(g10, "{ob}\"v\": 1, \"next\": {ob}\"v\": 2, \"next\": null{cb}{cb}") and not accepts(g10, "{ob}\"v\": 1{cb}"), "recursive $ref")
+    print "test_schema_grammar: all assertions passed"

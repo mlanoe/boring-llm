@@ -1,0 +1,434 @@
+# boring-llm — GBNF grammars (pure: parser and incremental matcher, no sockets, no GPU)
+#
+# llama.cpp's grammar format (grammars/README.md): `name ::= alternatives` rules, string
+# literals "..." with \n \t \r \xNN \uNNNN \UNNNNNNNN escapes, character classes [a-z] / [^...],
+# `.`, groups ( ), alternation |, repetition * + ? {n} {n,} {n,m}, `#` comments, rule `root`.
+# A rule ends at a newline unless it is inside parentheses or after `::=` / `|`.
+#
+# The matcher is llama.cpp's stack machine: a state is a set of stacks of pending elements
+# (top = last), each stack one way the text so far can still be completed. Rule references on
+# top of a stack are expanded into their alternatives; a terminal consumes one code point.
+# The text is complete when some stack is empty.
+
+use jinja
+
+pub struct GElem:
+    int kind             # 0 = character set, 1 = rule reference
+    int rule             # kind 1: the rule
+    [int] ranges         # kind 0: lo, hi pairs
+    bool negated         # kind 0: matches everything outside the ranges
+    string key           # identity, to deduplicate stacks
+
+pub struct Grammar:
+    [[[GElem]]] rules    # rules[r][alternative] = sequence of elements
+    int root
+
+struct GParser:
+    [int] src
+    var int pos
+    var {string=int} names
+    var [string] rule_names
+    var [bool] defined
+    var [[[GElem]]] rules
+
+# ── Parser ───────────────────────────────────────────────────────────────
+
+GElem charset_elem([int] ranges, bool negated):
+    var string key = if negated: "n" else: "c"
+    for r in ranges:
+        key = "{key},{r}"
+    GElem(0, -1, ranges, negated, key)
+
+GElem ref_elem(int rule):
+    GElem(1, rule, [], false, "r{rule}")
+
+bool is_name_char(int c):
+    (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 45 or c == 95
+
+int hex_value(int c) throws:
+    if c >= 48 and c <= 57: c - 48
+    elif c >= 97 and c <= 102: c - 87
+    elif c >= 65 and c <= 70: c - 55
+    else: throw "grammar: invalid hex digit"
+
+def skip_space(mut GParser& p, bool newline_ok):
+    var bool going = true
+    while going and p.pos < p.src.length:
+        let c = p.src[p.pos]
+        if c == 32 or c == 9 or (newline_ok and (c == 10 or c == 13)):
+            p.pos += 1
+        elif c == 35:
+            while p.pos < p.src.length and p.src[p.pos] != 10 and p.src[p.pos] != 13:
+                p.pos += 1
+        else:
+            going = false
+
+int parse_char(mut GParser& p) throws:
+    guard p.pos < p.src.length else throw "grammar: unexpected end of input"
+    let c = p.src[p.pos]
+    if c != 92:
+        p.pos += 1
+        return c
+    guard p.pos + 1 < p.src.length else throw "grammar: unexpected end of input after '\\'"
+    let e = p.src[p.pos + 1]
+    p.pos += 2
+    if e == 116: return 9
+    if e == 114: return 13
+    if e == 110: return 10
+    if e == 92 or e == 34 or e == 91 or e == 93: return e
+    var int digits = 0
+    if e == 120: digits = 2
+    elif e == 117: digits = 4
+    elif e == 85: digits = 8
+    else: throw "grammar: unknown escape \\{chr(e)}"
+    var int value = 0
+    var int i = 0
+    while i < digits:
+        guard p.pos < p.src.length else throw "grammar: truncated escape"
+        value = value * 16 + hex_value(p.src[p.pos])
+        p.pos += 1
+        i += 1
+    value
+
+string parse_name(mut GParser& p) throws:
+    var string name = ""
+    while p.pos < p.src.length and is_name_char(p.src[p.pos]):
+        name = "{name}{chr(p.src[p.pos])}"
+        p.pos += 1
+    guard name != "" else throw "grammar: expected a rule name at offset {p.pos}"
+    name
+
+int rule_id(mut GParser& p, string name):
+    if p.names.contains(name):
+        return p.names[name]
+    let id = p.rules.length
+    p.names[name] = id
+    p.rule_names.push(name)
+    p.defined.push(false)
+    p.rules.push([])
+    id
+
+int anonymous_rule(mut GParser& p):
+    let id = p.rules.length
+    p.rule_names.push("(anonymous {id})")
+    p.defined.push(true)
+    p.rules.push([])
+    id
+
+# x{min,max} (max = -1: unbounded) as elements: `min` copies, then an unbounded loop or
+# right-nested optional copies, each optional step being its own rule.
+[GElem] repeat_symbol(mut GParser& p, [GElem] sym, int min, int max):
+    mut [GElem] out = []
+    var int i = 0
+    while i < min:
+        for e in sym:
+            out.push(e)
+        i += 1
+    if max < 0:
+        let r = anonymous_rule(p)
+        mut [GElem] looped = []
+        for e in sym:
+            looped.push(e)
+        looped.push(ref_elem(r))
+        p.rules[r] = [looped, []]
+        out.push(ref_elem(r))
+    elif max > min:
+        mut [GElem] inner = []
+        var int k = 0
+        while k < max - min:
+            let r = anonymous_rule(p)
+            mut [GElem] step = []
+            for e in sym:
+                step.push(e)
+            for e in inner:
+                step.push(e)
+            p.rules[r] = [step, []]
+            inner = [ref_elem(r)]
+            k += 1
+        for e in inner:
+            out.push(e)
+    out
+
+int parse_int(mut GParser& p) throws:
+    var int value = 0
+    var int digits = 0
+    while p.pos < p.src.length and p.src[p.pos] >= 48 and p.src[p.pos] <= 57:
+        value = value * 10 + (p.src[p.pos] - 48)
+        p.pos += 1
+        digits += 1
+    guard digits > 0 else throw "grammar: expected a number in a repetition at offset {p.pos}"
+    value
+
+[GElem] parse_sequence(mut GParser& p, bool nested) throws:
+    mut [GElem] out = []
+    var int last_start = 0
+    var bool going = true
+    while going and p.pos < p.src.length:
+        let c = p.src[p.pos]
+        if c == 34:
+            p.pos += 1
+            last_start = out.length
+            while p.pos < p.src.length and p.src[p.pos] != 34:
+                let cp = parse_char(p)
+                out.push(charset_elem([cp, cp], false))
+            guard p.pos < p.src.length else throw "grammar: unterminated string literal"
+            p.pos += 1
+            skip_space(p, nested)
+        elif c == 91:
+            p.pos += 1
+            var bool negated = false
+            if p.pos < p.src.length and p.src[p.pos] == 94:
+                negated = true
+                p.pos += 1
+            last_start = out.length
+            mut [int] ranges = []
+            while p.pos < p.src.length and p.src[p.pos] != 93:
+                let lo = parse_char(p)
+                var int hi = lo
+                if p.pos + 1 < p.src.length and p.src[p.pos] == 45 and p.src[p.pos + 1] != 93:
+                    p.pos += 1
+                    hi = parse_char(p)
+                ranges.push(lo)
+                ranges.push(hi)
+            guard p.pos < p.src.length else throw "grammar: unterminated character class"
+            p.pos += 1
+            out.push(charset_elem(ranges, negated))
+            skip_space(p, nested)
+        elif is_name_char(c):
+            let name = parse_name(p)
+            skip_space(p, nested)
+            last_start = out.length
+            out.push(ref_elem(rule_id(p, name)))
+        elif c == 40:
+            p.pos += 1
+            skip_space(p, true)
+            let sub = anonymous_rule(p)
+            parse_alternates(p, sub, true)
+            guard p.pos < p.src.length and p.src[p.pos] == 41 else throw "grammar: expected ')' at offset {p.pos}"
+            p.pos += 1
+            skip_space(p, nested)
+            last_start = out.length
+            out.push(ref_elem(sub))
+        elif c == 46:
+            p.pos += 1
+            skip_space(p, nested)
+            last_start = out.length
+            out.push(charset_elem([], true))
+        elif c == 42 or c == 43 or c == 63 or c == 123:
+            guard out.length > last_start else throw "grammar: a repetition needs something to repeat (offset {p.pos})"
+            mut [GElem] sym = []
+            var int i = last_start
+            while i < out.length:
+                sym.push(out[i])
+                i += 1
+            mut [GElem] before = []
+            i = 0
+            while i < last_start:
+                before.push(out[i])
+                i += 1
+            var int min = 0
+            var int max = -1
+            if c == 42:
+                p.pos += 1
+            elif c == 43:
+                min = 1
+                p.pos += 1
+            elif c == 63:
+                max = 1
+                p.pos += 1
+            else:
+                p.pos += 1
+                skip_space(p, false)
+                min = parse_int(p)
+                skip_space(p, false)
+                max = min
+                if p.pos < p.src.length and p.src[p.pos] == 44:
+                    p.pos += 1
+                    skip_space(p, false)
+                    if p.pos < p.src.length and p.src[p.pos] >= 48 and p.src[p.pos] <= 57:
+                        max = parse_int(p)
+                        skip_space(p, false)
+                    else:
+                        max = -1
+                guard p.pos < p.src.length and p.src[p.pos] == 125 else throw "grammar: expected '}}' at offset {p.pos}"
+                p.pos += 1
+            guard max < 0 or max >= min else throw "grammar: repetition maximum is smaller than its minimum"
+            let rep = repeat_symbol(p, sym, min, max)
+            out = before
+            last_start = out.length
+            for e in rep:
+                out.push(e)
+            skip_space(p, nested)
+        else:
+            going = false
+    out
+
+def parse_alternates(mut GParser& p, int id, bool nested) throws:
+    mut [[GElem]] alts = []
+    alts.push(parse_sequence(p, nested))
+    while p.pos < p.src.length and p.src[p.pos] == 124:
+        p.pos += 1
+        skip_space(p, true)
+        alts.push(parse_sequence(p, nested))
+    p.rules[id] = alts
+
+def parse_rule(mut GParser& p) throws:
+    let name = parse_name(p)
+    skip_space(p, false)
+    guard p.pos + 2 < p.src.length and p.src[p.pos] == 58 and p.src[p.pos + 1] == 58 and p.src[p.pos + 2] == 61 else throw "grammar: expected '::=' after rule name '{name}' at offset {p.pos}"
+    p.pos += 3
+    skip_space(p, true)
+    let id = rule_id(p, name)
+    guard not p.defined[id] else throw "grammar: rule '{name}' is defined twice"
+    p.defined[id] = true
+    parse_alternates(p, id, false)
+    if p.pos < p.src.length and not (p.src[p.pos] == 10 or p.src[p.pos] == 13):
+        let at = p.pos
+        throw "grammar: unexpected '{chr(p.src[at])}' at offset {at} in rule '{name}'"
+    while p.pos < p.src.length and (p.src[p.pos] == 10 or p.src[p.pos] == 13):
+        p.pos += 1
+
+# Parses GBNF text; throws a message naming the problem on a bad grammar.
+pub Grammar parse_gbnf(string text) throws:
+    mut [int] src = []
+    for ch in text.chars():
+        src.push(ord(ch))
+    mut GParser p = GParser(src, 0, {=}, [], [], [])
+    skip_space(p, true)
+    while p.pos < p.src.length:
+        parse_rule(p)
+        skip_space(p, true)
+    var int i = 0
+    while i < p.rules.length:
+        guard p.defined[i] else throw "grammar: undefined rule '{p.rule_names[i]}'"
+        i += 1
+    guard p.names.contains("root") else throw "grammar: there is no `root` rule"
+    Grammar(p.rules, p.names["root"])
+
+# ── Matcher ──────────────────────────────────────────────────────────────
+
+string stack_key([GElem] stack):
+    var string key = ""
+    for e in stack:
+        key = "{key}|{e.key}"
+    key
+
+[GElem] reversed_alt([GElem] alt):
+    mut [GElem] out = []
+    var int i = alt.length - 1
+    while i >= 0:
+        out.push(alt[i])
+        i -= 1
+    out
+
+# Expands rule references on top of every stack until each stack is empty or has a terminal on
+# top, dropping duplicates. Left-recursive or hopelessly ambiguous grammars hit the size guard.
+[[GElem]] expand_stacks(Grammar g, [[GElem]] stacks) throws:
+    mut [[GElem]] work = []
+    mut {string=bool} queued = {=}
+    for st in stacks:
+        let k = stack_key(st)
+        if not queued.contains(k):
+            queued[k] = true
+            work.push(st)
+    mut [[GElem]] out = []
+    var int i = 0
+    while i < work.length:
+        guard work.length < 20000 else throw "grammar is left-recursive or too ambiguous to match"
+        let st = work[i]
+        i += 1
+        if st.length == 0 or st[st.length - 1].kind == 0:
+            out.push(st)
+        else:
+            let top = st[st.length - 1]
+            mut [GElem] base = []
+            var int j = 0
+            while j < st.length - 1:
+                base.push(st[j])
+                j += 1
+            for alt in g.rules[top.rule]:
+                mut [GElem] next = []
+                for e in base:
+                    next.push(e)
+                for e in reversed_alt(alt):
+                    next.push(e)
+                let k = stack_key(next)
+                if not queued.contains(k):
+                    queued[k] = true
+                    work.push(next)
+    out
+
+pub [[GElem]] grammar_start(Grammar g) throws:
+    mut [[GElem]] stacks = []
+    for alt in g.rules[g.root]:
+        stacks.push(reversed_alt(alt))
+    expand_stacks(g, stacks)
+
+bool elem_matches(GElem e, int cp):
+    var bool inside = false
+    var int i = 0
+    while i + 1 < e.ranges.length:
+        if cp >= e.ranges[i] and cp <= e.ranges[i + 1]:
+            inside = true
+        i += 2
+    inside != e.negated
+
+# The stacks after consuming one code point (empty when nothing can follow it).
+pub [[GElem]] grammar_advance(Grammar g, [[GElem]] stacks, int cp) throws:
+    mut [[GElem]] next = []
+    for st in stacks:
+        if st.length > 0 and elem_matches(st[st.length - 1], cp):
+            mut [GElem] rest = []
+            var int j = 0
+            while j < st.length - 1:
+                rest.push(st[j])
+                j += 1
+            next.push(rest)
+    expand_stacks(g, next)
+
+# True when some stack could take a non-ASCII code point next (a UTF-8 sequence cut by a token
+# boundary can only be the start of one).
+bool grammar_allows_non_ascii([[GElem]] stacks):
+    for st in stacks:
+        if st.length > 0:
+            let top = st[st.length - 1]
+            if top.kind == 0:
+                if top.negated:
+                    return true
+                var int i = 1
+                while i < top.ranges.length:
+                    if top.ranges[i] >= 128:
+                        return true
+                    i += 2
+    false
+
+# Advances over the characters of `text`. A trailing U+FFFD is the decoded form of a UTF-8 sequence cut
+# in the middle by a token boundary: it is left pending, and only allowed when the grammar could take a
+# non-ASCII character there (otherwise the candidate would be accepted for free and then never complete).
+pub [[GElem]] grammar_advance_text(Grammar g, [[GElem]] stacks, string text) throws:
+    var [[GElem]] state = stacks
+    let chars = text.chars()
+    var int i = 0
+    while i < chars.length and state.length > 0:
+        let cp = ord(chars[i])
+        if cp == 0xFFFD and i == chars.length - 1:
+            if not grammar_allows_non_ascii(state):
+                state = []
+        else:
+            state = grammar_advance(g, state, cp)
+        i += 1
+    state
+
+# True when the text so far is a complete sentence of the grammar.
+pub bool grammar_complete([[GElem]] stacks):
+    for st in stacks:
+        if st.length == 0:
+            return true
+    false
+
+# True when some stack still wants another character.
+pub bool grammar_can_continue([[GElem]] stacks):
+    for st in stacks:
+        if st.length > 0:
+            return true
+    false

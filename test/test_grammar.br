@@ -1,0 +1,55 @@
+# GBNF parser and matcher (src/grammar.br).   boring run test/test_grammar.br
+
+use grammar
+
+# true when `text` is a complete sentence of the grammar
+bool accepts(Grammar g, string text) throws:
+    grammar_complete(grammar_advance_text(g, grammar_start(g), text))
+
+# true when `text` can still be extended into a sentence
+bool viable(Grammar g, string text) throws:
+    grammar_advance_text(g, grammar_start(g), text).length > 0
+
+def main() throws:
+    let g1 = parse_gbnf("root ::= \"yes\" | \"no\"")
+    assert(accepts(g1, "yes") and accepts(g1, "no"), "alternatives")
+    assert(not accepts(g1, "ye") and viable(g1, "ye") and not viable(g1, "x"), "prefixes")
+
+    let g2 = parse_gbnf("root ::= [a-c]+ \"!\"?  # letters then an optional bang\n")
+    assert(accepts(g2, "abca") and accepts(g2, "ab!") and not accepts(g2, "") and not viable(g2, "d"), "class, + and ?")
+    assert(not viable(g2, "a!b"), "nothing after the optional bang")
+
+    let g3 = parse_gbnf("root ::= item (\",\" item)*\nitem ::= [0-9]{{2,3}}")
+    assert(accepts(g3, "12") and accepts(g3, "123,45,678") and not accepts(g3, "1") and not viable(g3, "1234"), "{{2,3}} and groups")
+    let g4 = parse_gbnf("root ::= \"a\"{{3}}")
+    assert(accepts(g4, "aaa") and not accepts(g4, "aa") and not viable(g4, "aaaa"), "{{3}}")
+    let g5 = parse_gbnf("root ::= \"a\"{{2,}}")
+    assert(accepts(g5, "aa") and accepts(g5, "aaaaa") and not accepts(g5, "a"), "{{2,}}")
+
+    # negated class, '.', escapes, multi-line alternation inside parentheses, rule references
+    let g6 = parse_gbnf("root ::= greeting \" \" name\ngreeting ::= (\n  \"hi\" |\n  \"hello\"\n)\nname ::= [^ \\n]+")
+    assert(accepts(g6, "hello bob") and accepts(g6, "hi x") and not viable(g6, "hey"), "rules and parentheses")
+    assert(not accepts(g6, "hi "), "name needs a character")
+    let g7 = parse_gbnf("root ::= . \"\\x41\" \"\\u00e9\"")
+    assert(accepts(g7, "zAé") and not accepts(g7, "zBé"), "dot and escapes")
+
+    # the JSON grammar shipped with llama.cpp (grammars/json.gbnf)
+    let json_gbnf = "root   ::= object\nvalue  ::= object | array | string | number | (\"true\" | \"false\" | \"null\") ws\nobject ::=\n  \"{{\" ws (\n            string \":\" ws value\n    (\",\" ws string \":\" ws value)*\n  )? \"}}\" ws\narray  ::=\n  \"[\" ws (\n            value\n    (\",\" ws value)*\n  )? \"]\" ws\nstring ::=\n  \"\\\"\" (\n    [^\"\\\\\\x7F\\x00-\\x1F] |\n    \"\\\\\" ([\"\\\\bfnrt] | \"u\" [0-9a-fA-F]{{4}})\n  )* \"\\\"\" ws\nnumber ::= (\"-\"? ([0-9] | [1-9] [0-9]{{0,15}})) (\".\" [0-9]+)? ([eE] [-+]? [0-9]+)? ws\nws ::= | \" \" | \"\\n\" [ \\t]{{0,20}}\n"
+    let gj = parse_gbnf(json_gbnf)
+    assert(accepts(gj, "{{\"a\": [1, 2.5, true], \"b\": {{\"c\": null}}}}"), "json object")
+    assert(not accepts(gj, "{{\"a\": }}") and not viable(gj, "[1]"), "json errors")
+
+    # a UTF-8 sequence cut by a token boundary (decoded as a trailing U+FFFD) needs a non-ASCII-capable class
+    let partial = chr(0xFFFD)
+    assert(not viable(g1, "{partial}") and viable(g6, "hi {partial}"), "partial characters")
+    assert(not viable(g2, "{partial}") and viable(parse_gbnf("root ::= [^x]+"), "a{partial}"), "partial characters, classes")
+
+    # errors
+    var bool failed = false
+    let bad = try? parse_gbnf("root ::= foo")
+    assert(bad == nil, "undefined rule")
+    let bad2 = try? parse_gbnf("main ::= \"x\"")
+    assert(bad2 == nil, "no root")
+    let bad3 = try? parse_gbnf("root ::= \"x")
+    assert(bad3 == nil, "unterminated literal")
+    print "test_grammar: all assertions passed"

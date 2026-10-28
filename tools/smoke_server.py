@@ -322,9 +322,11 @@ check("400 on JSON Schema response without a schema", s == 400 and json.loads(b)
       and "schema" in json.loads(b)["error"]["message"], b)
 s, h, b = call("/completion", {"prompt": "json", "json_schema": "object", "n_predict": 1})
 check("400 on invalid native JSON Schema", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter", b)
-s, h, b = call("/completion", {"prompt": "grammar", "grammar": 'root ::= "ok"', "n_predict": 1})
-check("400 on unsupported native grammar", s == 400 and json.loads(b)["error"]["code"] == "invalid_parameter"
-      and "not supported" in json.loads(b)["error"]["message"], b)
+s, h, b = call("/completion", {"prompt": "grammar", "grammar": 'root ::= "ok" | "no"', "n_predict": 8, "temperature": 0})
+check("GBNF grammar constrains a native completion", s == 200 and json.loads(b)["content"] in ("ok", "no"), b)
+s, h, b = call("/completion", {"prompt": "grammar", "grammar": "root ::= missing", "n_predict": 1})
+check("400 on an invalid GBNF grammar", s == 400 and json.loads(b)["error"]["code"] == "invalid_grammar"
+      and "missing" in json.loads(b)["error"]["message"], b)
 s, h, b = call("/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "hi"}],
                                          "logprobs": True, "top_logprobs": 3, "max_tokens": 1})
 logprob_response = json.loads(b)

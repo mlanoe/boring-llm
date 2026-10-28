@@ -1910,11 +1910,8 @@ pub string request_validation_error(JValue body):
             return "`json_schema` is invalid: {invalid}"
     let grammar = json_get(body, "grammar")
     if not request_value_is_undefined(grammar):
-        match grammar:
-            JStr(value):
-                if value != "" and request_value_is_undefined(native_schema):
-                    return "native `grammar` is not supported; use `json_schema` or `response_format`"
-            _: return "`grammar` must be a string"
+        if not jv_is_str(grammar):
+            return "`grammar` must be a string"
     if not request_value_is_undefined(response_format):
         match response_format:
             JDict(fields, keys):

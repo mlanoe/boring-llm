@@ -1,0 +1,335 @@
+# boring-llm — JSON Schema -> GBNF (pure)
+#
+# The same idea as llama.cpp's json-schema-to-grammar: the schema becomes a grammar whose language is
+# exactly the JSON texts the schema accepts (for the supported keywords), and the reply is decoded
+# under that grammar (grammar.br). Supported: type (also a list of types), enum, const, anyOf / oneOf,
+# local $ref ("#", "#/definitions/x", "#/$defs/x"), object (properties, required, additionalProperties),
+# array (items, minItems, maxItems), string (minLength, maxLength), integer, number, boolean, null.
+# Numeric ranges, patterns and formats are not enforced by the grammar. Properties are emitted in
+# their declared order, required ones first.
+
+use jinja
+use json
+
+struct SchemaGrammar:
+    JValue root
+    var {string=string} rules       # rule name -> body
+    var [string] order              # rule names, in creation order
+    var {string=string} ref_rules   # $ref -> rule name
+
+# One whitespace rule, as in json.gbnf (newlines and indentation are bounded).
+let string SPACE_RULE = "| \" \" | \"\\n\"{{1,2}} [ \\t]{{0,20}}"
+
+string sanitize_name(string raw):
+    var string out = ""
+    for ch in raw.chars():
+        let c = ord(ch)
+        if (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122):
+            out = "{out}{ch}"
+        else:
+            out = "{out}-"
+    if out == "":
+        "x"
+    else:
+        out
+
+string add_rule(mut SchemaGrammar& g, string hint, string body):
+    let base = sanitize_name(hint)
+    var string name = base
+    var int n = 0
+    while g.rules.contains(name) and g.rules[name] != body:
+        n += 1
+        name = "{base}-{n}"
+    if not g.rules.contains(name):
+        g.rules[name] = body
+        g.order.push(name)
+    name
+
+# GBNF string literal for some text.
+string gbnf_literal(string text):
+    var string out = "\""
+    for ch in text.chars():
+        let c = ord(ch)
+        if c == 34:
+            out = "{out}\\\""
+        elif c == 92:
+            out = "{out}\\\\"
+        elif c == 10:
+            out = "{out}\\n"
+        elif c == 13:
+            out = "{out}\\r"
+        elif c == 9:
+            out = "{out}\\t"
+        else:
+            out = "{out}{ch}"
+    "{out}\""
+
+# The literal matching the JSON text of a value (a string becomes its quoted, escaped form).
+string json_value_literal(JValue v):
+    gbnf_literal(jv_to_json(v))
+
+string drop_prefix(string text, int n):
+    var string out = ""
+    var int i = 0
+    for ch in text.chars():
+        if i >= n:
+            out = "{out}{ch}"
+        i += 1
+    out
+
+JValue resolve_ref(JValue root, string ref_text) throws:
+    guard ref_text.startsWith("#") else throw "only local $ref values are supported (got '{ref_text}')"
+    var JValue node = root
+    let path = drop_prefix(ref_text, 1)
+    if path == "":
+        return node
+    guard path.startsWith("/") else throw "unsupported $ref '{ref_text}'"
+    for part in drop_prefix(path, 1).split("/"):
+        let next = json_get(node, part)
+        if not is_defined(next):
+            throw "$ref '{ref_text}' does not resolve"
+        node = next
+    node
+
+bool is_defined(JValue v):
+    match v:
+        JUndefined: false
+        _: true
+
+bool is_list(JValue v):
+    match v:
+        JList(items): true
+        _: false
+
+[JValue] list_items(JValue v):
+    match v:
+        JList(items): items
+        _: []
+
+[string] string_items(JValue v):
+    mut [string] out = []
+    for it in list_items(v):
+        match it:
+            JStr(s): out.push(s)
+            _: out.push("")
+    out
+
+[string] dict_keys(JValue v):
+    match v:
+        JDict(fields, ks): ks
+        _: []
+
+int int_or(JValue v, int fallback):
+    match v:
+        JInt(n): n
+        _: fallback
+
+bool is_dict(JValue v):
+    match v:
+        JDict(f, k): true
+        _: false
+
+bool schema_allows_extra(JValue schema):
+    let extra = json_get(schema, "additionalProperties")
+    match extra:
+        JBool(b): b
+        JDict(f, k): true
+        _: false
+
+string extra_value_rule(mut SchemaGrammar& g, JValue schema, string name) throws:
+    let extra = json_get(schema, "additionalProperties")
+    if is_dict(extra):
+        visit(g, extra, "{name}-additional")
+    else:
+        "value"
+
+string object_rule(mut SchemaGrammar& g, JValue schema, string name) throws:
+    var [string] req_kv = []
+    var [string] opt_kv = []
+    let required = string_items(json_get(schema, "required"))
+    let keys = dict_keys(json_get(schema, "properties"))
+    let props = json_get(schema, "properties")
+    for want_required in [true, false]:
+        for k in keys:
+            if required.contains(k) == want_required:
+                let child = visit(g, json_get(props, k), "{name}-{k}")
+                let kv = add_rule(g, "{name}-{k}-kv", "{gbnf_literal(jv_to_json(JValue.JStr(k)))} space \":\" space {child}")
+                if want_required:
+                    req_kv.push(kv)
+                else:
+                    opt_kv.push(kv)
+    let extra = schema_allows_extra(schema)
+    var string extra_kv = ""
+    if extra:
+        let extra_child = extra_value_rule(g, schema, name)
+        extra_kv = add_rule(g, "{name}-additional-kv", "string \":\" space {extra_child}")
+    var string body = "\"{{\" space "
+    if req_kv.length > 0:
+        var string inner = req_kv[0]
+        var int i = 1
+        while i < req_kv.length:
+            inner = "{inner} \",\" space {req_kv[i]}"
+            i += 1
+        for o in opt_kv:
+            inner = "{inner} (\",\" space {o})?"
+        if extra:
+            inner = "{inner} (\",\" space {extra_kv})*"
+        body = "{body}{inner} "
+    elif opt_kv.length > 0 or extra:
+        var [string] alts = []
+        var int i = 0
+        while i < opt_kv.length:
+            var string alt = opt_kv[i]
+            var int j = i + 1
+            while j < opt_kv.length:
+                alt = "{alt} (\",\" space {opt_kv[j]})?"
+                j += 1
+            if extra:
+                alt = "{alt} (\",\" space {extra_kv})*"
+            alts.push(alt)
+            i += 1
+        if extra:
+            alts.push("{extra_kv} (\",\" space {extra_kv})*")
+        body = "{body}({alts.join(" | ")})? "
+    "{body}\"}}\" space"
+
+string array_rule(mut SchemaGrammar& g, JValue schema, string name) throws:
+    let items = json_get(schema, "items")
+    let item = if is_dict(items): visit(g, items, "{name}-item") else: "value"
+    let min = json_get_int(schema, "minItems", 0)
+    let max = int_or(json_get(schema, "maxItems"), -1)
+    guard max < 0 or max >= min else throw "maxItems is smaller than minItems"
+    if max == 0:
+        return "\"[\" space \"]\" space"
+    var string inner = item
+    if min > 1 or max > 1 or max < 0:
+        let more_min = if min > 1: min - 1 else: 0
+        if max < 0:
+            inner = "{item} (\",\" space {item}){{{more_min},}}"
+        else:
+            inner = "{item} (\",\" space {item}){{{more_min},{max - 1}}}"
+    if min == 0:
+        "\"[\" space ({inner})? \"]\" space"
+    else:
+        "\"[\" space {inner} \"]\" space"
+
+string visit(mut SchemaGrammar& g, JValue schema, string name) throws:
+    if not is_dict(schema):
+        match schema:
+            JBool(b): return "value"
+            _: throw "a schema must be an object or a boolean"
+    let ref_text = json_get_str(schema, "$ref", "")
+    if ref_text != "":
+        if g.ref_rules.contains(ref_text):
+            return g.ref_rules[ref_text]
+        let ref_name = sanitize_name("ref-{ref_text}")
+        g.ref_rules[ref_text] = ref_name
+        # reserve the name first so recursive schemas can refer to it
+        g.rules[ref_name] = "value"
+        g.order.push(ref_name)
+        let target = visit(g, resolve_ref(g.root, ref_text), ref_name)
+        g.rules[ref_name] = target
+        return ref_name
+    let const_value = json_get(schema, "const")
+    if is_defined(const_value):
+        return add_rule(g, name, json_value_literal(const_value))
+    let options = list_items(json_get(schema, "enum"))
+    if is_list(json_get(schema, "enum")):
+        guard options.length > 0 else throw "enum must not be empty"
+        var [string] lits = []
+        for o in options:
+            lits.push(json_value_literal(o))
+        return add_rule(g, name, "({lits.join(" | ")}) space")
+    var [string] alt_rules = []
+    var bool combined = false
+    for key in ["anyOf", "oneOf"]:
+        if is_list(json_get(schema, key)):
+            var int i = 0
+            for a in list_items(json_get(schema, key)):
+                alt_rules.push(visit(g, a, "{name}-{i}"))
+                i += 1
+            combined = true
+    if combined:
+        return add_rule(g, name, alt_rules.join(" | "))
+    var [string] types = []
+    match json_get(schema, "type"):
+        JStr(t): types.push(t)
+        _: types = string_items(json_get(schema, "type"))
+    if types.length == 0:
+        if is_dict(json_get(schema, "properties")):
+            types.push("object")
+        else:
+            return "value"
+    if types.length > 1:
+        var [string] parts = []
+        for t in types:
+            parts.push(visit_type(g, schema, t, "{name}-{t}"))
+        return add_rule(g, name, parts.join(" | "))
+    visit_type(g, schema, types[0], name)
+
+string visit_type(mut SchemaGrammar& g, JValue schema, string type_name, string name) throws:
+    if type_name == "object":
+        let body = object_rule(g, schema, name)
+        add_rule(g, name, body)
+    elif type_name == "array":
+        let body = array_rule(g, schema, name)
+        add_rule(g, name, body)
+    elif type_name == "string":
+        let min = json_get_int(schema, "minLength", 0)
+        let max = int_or(json_get(schema, "maxLength"), -1)
+        if min == 0 and max < 0:
+            "string"
+        else:
+            let upper = if max < 0: "" else: "{max}"
+            add_rule(g, name, "\"\\\"\" char{{{min},{upper}}} \"\\\"\" space")
+    elif type_name == "integer":
+        "integer"
+    elif type_name == "number":
+        "number"
+    elif type_name == "boolean":
+        "boolean"
+    elif type_name == "null":
+        "null"
+    else:
+        throw "unsupported schema type '{type_name}'"
+
+# The root value ends where its closing token ends: a trailing `space` would let the model keep emitting
+# newlines and indentation until the token limit.
+string without_trailing_space(string body):
+    if not body.endsWith(" space"):
+        return body
+    var string out = ""
+    var int i = 0
+    let n = body.chars().length - 6
+    for ch in body.chars():
+        if i < n:
+            out = "{out}{ch}"
+        i += 1
+    out
+
+# The grammar text for a schema; throws a message naming an unsupported construct.
+pub string json_schema_to_gbnf(JValue schema) throws:
+    mut SchemaGrammar g = SchemaGrammar(schema, {=}, [], {=})
+    let top = visit(g, schema, "root")
+    # a composite schema named its own rule `root`; a primitive or a reference is aliased
+    var string out = ""
+    if top == "root":
+        out = "root ::= {without_trailing_space(g.rules["root"])}\n"
+    else:
+        out = "root ::= {top}\n"
+    for name in g.order:
+        if name != "root":
+            out = "{out}{name} ::= {g.rules[name]}\n"
+    var string prims = "space ::= {SPACE_RULE}\n"
+    prims = "{prims}boolean ::= (\"true\" | \"false\") space\n"
+    prims = "{prims}decimal-part ::= [0-9]{{1,16}}\n"
+    prims = "{prims}integral-part ::= [0] | [1-9] [0-9]{{0,15}}\n"
+    prims = "{prims}number ::= (\"-\"? integral-part) (\".\" decimal-part)? ([eE] [-+]? integral-part)? space\n"
+    prims = "{prims}integer ::= (\"-\"? integral-part) space\n"
+    prims = "{prims}null ::= \"null\" space\n"
+    prims = "{prims}char ::= [^\"\\\\\\x7F\\x00-\\x1F] | [\\\\] ([\"\\\\bfnrt] | \"u\" [0-9a-fA-F]{{4}})\n"
+    prims = "{prims}string ::= \"\\\"\" char* \"\\\"\" space\n"
+    prims = "{prims}value ::= object | array | string | number | boolean | null\n"
+    prims = "{prims}object ::= \"{{\" space ( string \":\" space value (\",\" space string \":\" space value)* )? \"}}\" space\n"
+    prims = "{prims}array ::= \"[\" space ( value (\",\" space value)* )? \"]\" space\n"
+    "{out}{prims}"

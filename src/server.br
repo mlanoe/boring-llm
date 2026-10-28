@@ -23,6 +23,8 @@ use model
 use prompt_cache
 use sampling
 use embedding
+use grammar
+use schema_grammar
 use std.net.TcpListener, TcpStream
 use std.io.Read, Write
 use std.time.Instant
@@ -71,6 +73,7 @@ pub struct ServerCtx:
     string cors_methods
     string cors_headers
     bool cors_credentials
+    string default_grammar  # `--grammar` / `--grammar-file`: GBNF used when a request sets none; "" = none
     bool embeddings_enabled # `--embeddings`: serve /embedding, /embeddings and /v1/embeddings
     int pooling             # 0 none, 1 mean, 2 cls, 3 last (see embedding.br)
 
@@ -293,6 +296,64 @@ pub (int, Rng) sample_json_token(Tokenizer tok, Rng rng, [float32] logits,
                 params.dynatemp_range, params.dynatemp_exponent, params.typical_p,
                 params.top_p, params.min_p, params.xtc_probability, params.xtc_threshold, params.min_keep)
         guard k < vocab else throw "JSON response grammar rejected every vocabulary token"
+        k = if k * 4 < vocab: k * 4 else: vocab
+
+# GBNF-constrained sampling (llama.cpp's `grammar` field): a candidate is allowed when the text so far
+# plus the candidate is still a prefix of the grammar's language, an end-of-generation token when
+# the text is a complete sentence. The state is recomputed from the decoded reply on every call.
+pub (int, Rng) sample_grammar_token(Tokenizer tok, Rng rng, [float32] logits,
+                                     int vocab, [int] history, [int] reply_tokens,
+                                     SamplingParams params, Grammar grammar, bool ignore_eos) throws:
+    let decoded_before = tok.decode(reply_tokens)
+    var [string] before_chars = decoded_before.chars()
+    if before_chars.length > 0 and ord(before_chars[before_chars.length - 1]) == 0xFFFD:
+        before_chars.pop()
+    var string settled = ""
+    for ch in before_chars:
+        settled = "{settled}{ch}"
+    let state = grammar_advance_text(grammar, grammar_start(grammar), settled)
+    guard state.length > 0 else throw "the reply no longer matches the grammar"
+    let complete = grammar_complete(state)
+    if complete and not grammar_can_continue(state) and not ignore_eos:
+        return (tok.eos_token_id, rng)
+
+    let repeated = apply_repeat_penalty(logits, history, params.repeat_penalty, params.repeat_last_n)
+    let penalized = apply_dry_penalty(repeated, history, params.dry_multiplier, params.dry_base,
+        params.dry_allowed_length, params.dry_penalty_last_n, params.dry_breakers)
+    var int k = if params.top_k > 0: params.top_k else: vocab
+    if k > vocab: k = vocab
+    while true:
+        let sigma_filtered = top_n_sigma_logits(penalized, vocab, params.top_n_sigma)
+        let (ranked_values, ranked_ids) = rank_candidates(sigma_filtered, vocab, k)
+        mut [float32] allowed_values = []
+        mut [int] allowed_ids = []
+        var int i = 0
+        while i < ranked_ids.length:
+            let candidate = ranked_ids[i]
+            var bool allowed = false
+            if is_eog_token(candidate, tok.eos_token_id):
+                allowed = complete and not ignore_eos
+            else:
+                mut [int] candidate_reply = []
+                for id in reply_tokens:
+                    candidate_reply.push(id)
+                candidate_reply.push(candidate)
+                let after_chars = tok.decode(candidate_reply).chars()
+                var string piece = ""
+                var int c = before_chars.length
+                while c < after_chars.length:
+                    piece = "{piece}{after_chars[c]}"
+                    c += 1
+                allowed = grammar_advance_text(grammar, state, piece).length > 0
+            if allowed:
+                allowed_values.push(ranked_values[i])
+                allowed_ids.push(candidate)
+            i += 1
+        if allowed_ids.length > 0:
+            return sample_candidates(rng, allowed_values, allowed_ids, params.temperature,
+                params.dynatemp_range, params.dynatemp_exponent, params.typical_p,
+                params.top_p, params.min_p, params.xtc_probability, params.xtc_threshold, params.min_keep)
+        guard k < vocab else throw "the grammar rejected every vocabulary token"
         k = if k * 4 < vocab: k * 4 else: vocab
 
 # Constrained compact tool-call form. Named choices generate only their
@@ -654,13 +715,34 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     let json_schema = response_json_schema(body)
     let json_mode = json_object_mode or not request_value_is_undefined(json_schema)
     let constrained_tool_choice = is_chat and tool_choice_required(body)
+    # `grammar` (GBNF), unless a JSON schema / tool choice already constrains the reply (they take priority)
+    # A JSON schema is compiled to a grammar (schema_grammar.br), so the reply is constrained to the
+    # schema while it is generated, not only checked when it closes.
+    let schema_given = not request_value_is_undefined(json_schema)
+    var string grammar_text = json_get_str(body, "grammar", "")
+    if grammar_text == "":
+        grammar_text = ctx.default_grammar
+    if schema_given:
+        let compiled = try? json_schema_to_gbnf(json_schema)
+        guard let compiled else:
+            respond_json(response, sock, 400, "Bad Request", error_json("the JSON schema is not supported: {schema_error(json_schema)}", "invalid_request_error", "invalid_json_schema"))
+            return slots
+        grammar_text = compiled
+    let grammar_mode = not constrained_tool_choice and (schema_given or (grammar_text != "" and not json_mode))
+    var Grammar grammar_parsed = Grammar([], 0)
+    if grammar_mode:
+        let g = try? parse_gbnf(grammar_text)
+        guard let g else:
+            respond_json(response, sock, 400, "Bad Request", error_json("`grammar` is invalid: {grammar_error(grammar_text)}", "invalid_request_error", "invalid_grammar"))
+            return slots
+        grammar_parsed = g
     let requested_native_logprobs = if is_native: json_get_int(body, "n_probs", 0) else: 0
     let requested_post_sampling_probs = is_native and json_get_bool(body, "post_sampling_probs", false)
     let post_sampling_probs = requested_post_sampling_probs and requested_native_logprobs > 0
-    if (mirostat != 0 or adaptive_target >= 0.0 as float32) and (json_mode or constrained_tool_choice):
+    if (mirostat != 0 or adaptive_target >= 0.0 as float32) and (json_mode or constrained_tool_choice or grammar_mode):
         respond_json(response, sock, 400, "Bad Request", error_json("stateful adaptive sampling cannot be combined with constrained decoding", "invalid_request_error", "unsupported_sampler_combination"))
         return slots
-    if post_sampling_probs and (mirostat != 0 or adaptive_target >= 0.0 as float32 or json_mode or constrained_tool_choice):
+    if post_sampling_probs and (mirostat != 0 or adaptive_target >= 0.0 as float32 or json_mode or constrained_tool_choice or grammar_mode):
         respond_json(response, sock, 400, "Bad Request", error_json("post_sampling_probs require the standard unconstrained sampling chain", "invalid_request_error", "unsupported_sampler_combination"))
         return slots
     let wants_chat_logprobs = is_chat and json_get_bool(body, "logprobs", false)
@@ -868,6 +950,8 @@ HttpRequest read_http_request(var TcpStream sock) throws:
         else:
             let (sampled_tok, sampled_rng) = if constrained_tool_choice:
                 sample_tool_choice_token(ctx.tok, rng, penalized, vocab, tokens, reply_tokens, params, body, tools, ignore_eos)
+            elif grammar_mode:
+                sample_grammar_token(ctx.tok, rng, penalized, vocab, tokens, reply_tokens, params, grammar_parsed, ignore_eos)
             elif json_mode:
                 sample_json_token(ctx.tok, rng, penalized, vocab, tokens, reply_tokens, params, json_schema, ignore_eos)
             elif post_sampling_probs:
@@ -1568,6 +1652,24 @@ bool jv_all_ints([JValue] items):
             JInt(n): out.push(n)
             _: out.push(0)
     out
+
+# The message of the error json_schema_to_gbnf throws, for the 400 body.
+string schema_error(JValue schema):
+    var string message = "unsupported schema"
+    try:
+        let g = json_schema_to_gbnf(schema)
+    catch:
+        message = "{error}"
+    message
+
+# The message of the error parse_gbnf throws, for the 400 body.
+string grammar_error(string text):
+    var string message = "invalid grammar"
+    try:
+        let g = parse_gbnf(text)
+    catch:
+        message = "{error}"
+    message
 
 [CacheSlot] dispatch_request(ServerCtx& ctx, mut ServerMetrics& metrics, mut ResponseState& response,
                              var TcpStream sock, int counter, HttpRequest& r,

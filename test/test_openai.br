@@ -620,7 +620,7 @@ def main() throws:
     assert_eq(request_validation_error(empty_native_schema), "" as string)
     assert_eq(json_get_str(response_json_schema(empty_native_schema), "type", ""), "object" as string)
     assert_eq(request_validation_error(json_parse("{{\"grammar\": \"\"}}")), "" as string)
-    assert(request_validation_error(json_parse("{{\"grammar\": \"root ::= \\\"ok\\\"\"}}")) != "", "unsupported native grammar")
+    assert_eq(request_validation_error(json_parse("{{\"grammar\": \"root ::= \\\"ok\\\"\"}}")), "" as string)
     assert(request_validation_error(json_parse("{{\"grammar\": false}}")) != "", "native grammar string")
     assert_eq(json_schema_decoded_candidate_allowed(response_schema, "{{\"ok\": true", "{{\"ok\": true}}", false), true)
     assert_eq(json_schema_decoded_candidate_allowed(response_schema, "{{\"ok\": true}}", "", true), true)
