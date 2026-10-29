@@ -1206,7 +1206,7 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
         x = add_gpu(x, attn_res, seq * d)
 
         let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, seq, d, model.config.rms_eps)
-        mut [float32]'kernel'unified ffn_out = []
+        mut [float32]'kernel'unified ffn_out = normed2
         if layer.is_moe:
             let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, seq)
             ffn_out = moe_out
@@ -1215,11 +1215,9 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
             let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, seq, d, model.config.ffn_dim)
             let hidden = glu_combine_gpu(gate, up, model.config.act)
             ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, seq, model.config.ffn_dim, d)
-        mut [float32]'kernel'unified ffn_res = []
+        mut [float32]'kernel'unified ffn_res = ffn_out
         if model.config.post_norms:
             ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, seq, d, model.config.rms_eps)
-        else:
-            ffn_res = ffn_out
         if model.config.residual_scale != 1.0:
             ffn_res = scale_gpu(ffn_res, model.config.residual_scale, seq * d)
         x = add_gpu(x, ffn_res, seq * d)
@@ -1309,11 +1307,11 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
         q = rope_apply_at_gpu(q, n, model.config.n_head, model.config.d_head, rope_t, base_pos, model.config.rope_neox)
         let k_rope_raw = rope_apply_at_gpu(k, n, model.config.n_kv_head, model.config.d_head, rope_t, base_pos, model.config.rope_neox)
         let seq_k = base_pos + n
-        mut [float32]'kernel'unified full_k = []
-        mut [float32]'kernel'unified full_v = []
+        mut [float32]'kernel'unified full_k = k_rope_raw
+        mut [float32]'kernel'unified full_v = v
         mut [float16]'kernel'unified full_hk = []
         mut [float16]'kernel'unified full_hv = []
-        mut [float32]'kernel'unified attn_out = []
+        mut [float32]'kernel'unified attn_out = q
         if cache.f16:
             # Batched prefill still uses the general float32 attention path.
             # Widen the old main cache for this comparatively infrequent path,
@@ -1340,7 +1338,7 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
         x = add_gpu(x, attn_res, n * d)
 
         let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, n, d, model.config.rms_eps)
-        mut [float32]'kernel'unified ffn_out = []
+        mut [float32]'kernel'unified ffn_out = normed2
         if layer.is_moe:
             let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, n)
             ffn_out = moe_out
@@ -1349,11 +1347,9 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
             let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, n, d, model.config.ffn_dim)
             let hidden = glu_combine_gpu(gate, up, model.config.act)
             ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, n, model.config.ffn_dim, d)
-        mut [float32]'kernel'unified ffn_res = []
+        mut [float32]'kernel'unified ffn_res = ffn_out
         if model.config.post_norms:
             ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, n, d, model.config.rms_eps)
-        else:
-            ffn_res = ffn_out
         if model.config.residual_scale != 1.0:
             ffn_res = scale_gpu(ffn_res, model.config.residual_scale, n * d)
         x = add_gpu(x, ffn_res, n * d)
@@ -1420,11 +1416,11 @@ pub ([float32], GenCache) forward_batch_gpu_quantized(QuantModel model, GenCache
         q = rope_apply_at_gpu(q, n, model.config.n_head, model.config.d_head, rope_t, base_pos, model.config.rope_neox)
         let k_rope_raw = rope_apply_at_gpu(k, n, model.config.n_kv_head, model.config.d_head, rope_t, base_pos, model.config.rope_neox)
         let seq_k = base_pos + n
-        mut [float32]'kernel'unified full_k = []
-        mut [float32]'kernel'unified full_v = []
+        mut [float32]'kernel'unified full_k = k_rope_raw
+        mut [float32]'kernel'unified full_v = v
         mut [float16]'kernel'unified full_hk = []
         mut [float16]'kernel'unified full_hv = []
-        mut [float32]'kernel'unified attn_out = []
+        mut [float32]'kernel'unified attn_out = q
         if cache.f16:
             # Batched prefill still uses the general float32 attention path.
             # Widen the old main cache for this comparatively infrequent path,
@@ -1451,7 +1447,7 @@ pub ([float32], GenCache) forward_batch_gpu_quantized(QuantModel model, GenCache
         x = add_gpu(x, attn_res, n * d)
 
         let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, n, d, model.config.rms_eps)
-        mut [float32]'kernel'unified ffn_out = []
+        mut [float32]'kernel'unified ffn_out = normed2
         if layer.is_moe:
             let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, n)
             ffn_out = moe_out
@@ -1460,11 +1456,9 @@ pub ([float32], GenCache) forward_batch_gpu_quantized(QuantModel model, GenCache
             let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, n, d, model.config.ffn_dim)
             let hidden = glu_combine_gpu(gate, up, model.config.act)
             ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, n, model.config.ffn_dim, d)
-        mut [float32]'kernel'unified ffn_res = []
+        mut [float32]'kernel'unified ffn_res = ffn_out
         if model.config.post_norms:
             ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, n, d, model.config.rms_eps)
-        else:
-            ffn_res = ffn_out
         if model.config.residual_scale != 1.0:
             ffn_res = scale_gpu(ffn_res, model.config.residual_scale, n * d)
         x = add_gpu(x, ffn_res, n * d)
@@ -1518,7 +1512,10 @@ pub GenCache fold_cache(QuantModel model, GenCache cache) throws:
 pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int token) throws:
     guard cache.pos > 0 else throw "forward_step needs a prefilled cache"
     guard not (cache.f16 and model.config.attn_ext) else throw "the float16 KV cache is not supported for Gemma 2/3"
-    set_gpu_batch_limit(8)
+    # Launches per command buffer. Not monotonic: on the 3B Q4_K_M the old value 8
+    # decoded at ~105 ms/token, 6 at ~149, and 1-4 or 12+ at ~55-60 (paired A/B,
+    # same outputs); 3 is the one that never lost on the 0.5B models either.
+    set_gpu_batch_limit(3)
     let d = model.config.d_model
     let qkv_dim = model.config.n_head * model.config.d_head
     let kv_dim = model.config.n_kv_head * model.config.d_head
@@ -1569,13 +1566,16 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
         # No causal mask: the single new query is always the most recent
         # position, so every key already in the cache (including the one
         # just appended) is a legitimate position to attend to.
-        let attn_out = if model.config.attn_ext:
-            attention_tail_ext_gpu(q, lc.k, lc.v, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head,
+        # An if-expression here would be typed as a host Vec and read the result back; assigning
+        # into a variable initialised from a resident value keeps it on the device.
+        mut [float32]'kernel'unified attn_out = q
+        if model.config.attn_ext:
+            attn_out = attention_tail_ext_gpu(q, lc.k, lc.v, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head,
                 model.config.attn_scale, model.config.attn_softcap, layer_window(model.config, l))
         elif cache.f16:
-            attention_gqa_tail_f16_gpu(q, lc.hk, lc.hv, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
+            attn_out = attention_gqa_tail_f16_gpu(q, lc.hk, lc.hv, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
         else:
-            attention_gqa_tail_gpu(q, lc.k, lc.v, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
+            attn_out = attention_gqa_tail_gpu(q, lc.k, lc.v, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
         if decode_profile_stage == 2:
             if cache.f16:
                 let _ = attention_gqa_tail_f16_gpu(q, lc.hk, lc.hv, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
@@ -1594,7 +1594,10 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
         if decode_profile_stage == 4:
             let (_, _) = add_rms_norm_decode_gpu(x, attn_proj, layer.ffn_norm_w, d, model.config.rms_eps)
         x = x_after_attn
-        mut [float32]'kernel'unified ffn_out = []
+        # Initialised from a device-resident value, not `[]`: an empty-array initialiser makes
+        # the transpiler type the variable as a host Vec, so every later assignment of a GPU
+        # result read it back (one flush per layer) and re-uploaded it.
+        mut [float32]'kernel'unified ffn_out = normed2
         if layer.is_moe:
             let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, 1)
             ffn_out = moe_out
@@ -1616,11 +1619,9 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
                 let profile_up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, 1, d, model.config.ffn_dim)
                 let profile_hidden = glu_combine_gpu(profile_gate, profile_up, model.config.act)
                 let _ = tensor_linear_nobias_gpu(profile_hidden, layer.down_w_q8, layer.down_w_type, 1, model.config.ffn_dim, d)
-        mut [float32]'kernel'unified ffn_res = []
+        mut [float32]'kernel'unified ffn_res = ffn_out
         if model.config.post_norms:
             ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, 1, d, model.config.rms_eps)
-        else:
-            ffn_res = ffn_out
         if model.config.residual_scale != 1.0:
             ffn_res = scale_gpu(ffn_res, model.config.residual_scale, 1 * d)
         if l + 1 < model.config.n_layer:

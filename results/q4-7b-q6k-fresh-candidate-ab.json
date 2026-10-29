@@ -1,0 +1,118 @@
+{
+ "schema": 1,
+ "machine": "Apple M3 / 17179869184",
+ "load_samples": [
+  2.97314453125,
+  2.97314453125,
+  3.451171875,
+  3.34619140625,
+  3.34619140625,
+  4.27587890625,
+  4.0615234375,
+  4.0615234375,
+  3.9775390625,
+  3.63037109375,
+  3.63037109375,
+  2.92724609375
+ ],
+ "configuration": {
+  "gguf": "/Users/m.lanoe/Documents/dev/git/perso/boring-llm/weights/qwen2.5-7b-instruct-q4_k_m.gguf",
+  "baseline": "/private/tmp/boring-llm-main-q6-baseline",
+  "candidate": "/private/tmp/boring-llm-q6candidate/src/main_metal/target/release/main",
+  "prompt_tokens": 512,
+  "generated_tokens": 64,
+  "repetitions": 4,
+  "context_size": 2048,
+  "max_load": 6.0
+ },
+ "summary_ms_per_token": {
+  "baseline": {
+   "min": 212.5067609344651,
+   "median": 245.60716051636234,
+   "max": 261.3525648852314
+  },
+  "candidate": {
+   "min": 232.61361749180534,
+   "median": 241.93336476226432,
+   "max": 246.92524113114084
+  }
+ },
+ "paired_deltas_ms_per_token": [
+  -18.793018426236557,
+  -1.6745040819409382,
+  -10.000958327837566,
+  28.80042213106867
+ ],
+ "paired_median_delta_ms_per_token": -5.837731204889252,
+ "median_speedup": 1.0151851554567848,
+ "raw": {
+  "baseline": [
+   {
+    "prompt_tokens": 567,
+    "generated": 62,
+    "ttft_s": 4.58479104199796,
+    "prefill_tps": 123.66975829566113,
+    "decode_tps": 3.8262490381111554,
+    "ms_per_token": 261.3525648852314
+   },
+   {
+    "prompt_tokens": 567,
+    "generated": 62,
+    "ttft_s": 5.759380458002852,
+    "prefill_tps": 98.44808901487565,
+    "decode_tps": 4.022530269059094,
+    "ms_per_token": 248.59974521308177
+   },
+   {
+    "prompt_tokens": 568,
+    "generated": 62,
+    "ttft_s": 7.230614166997839,
+    "prefill_tps": 78.5548760978674,
+    "decode_tps": 4.121763899063465,
+    "ms_per_token": 242.6145758196429
+   },
+   {
+    "prompt_tokens": 568,
+    "generated": 62,
+    "ttft_s": 7.400834000000032,
+    "prefill_tps": 76.74810703766596,
+    "decode_tps": 4.705732634588458,
+    "ms_per_token": 212.5067609344651
+   }
+  ],
+  "candidate": [
+   {
+    "prompt_tokens": 567,
+    "generated": 62,
+    "ttft_s": 4.999221124999167,
+    "prefill_tps": 113.41766763719508,
+    "decode_tps": 4.122699001537966,
+    "ms_per_token": 242.55954645899484
+   },
+   {
+    "prompt_tokens": 567,
+    "generated": 62,
+    "ttft_s": 4.788137540999742,
+    "prefill_tps": 118.41765094358858,
+    "decode_tps": 4.049808741378953,
+    "ms_per_token": 246.92524113114084
+   },
+   {
+    "prompt_tokens": 568,
+    "generated": 62,
+    "ttft_s": 4.729680290998658,
+    "prefill_tps": 120.0926838714649,
+    "decode_tps": 4.298974457225096,
+    "ms_per_token": 232.61361749180534
+   },
+   {
+    "prompt_tokens": 568,
+    "generated": 62,
+    "ttft_s": 7.475670583000465,
+    "prefill_tps": 75.97980591756162,
+    "decode_tps": 4.144095452510512,
+    "ms_per_token": 241.30718306553376
+   }
+  ]
+ }
+}
