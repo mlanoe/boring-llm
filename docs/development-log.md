@@ -936,3 +936,16 @@ Paired A/B against the previous commit, decode ms/token (median), 128 generated 
 | 0.5B Q8_0, 4096-token prompt | 27.5 | 15.2 (1.80x) | not measured |
 
 Outputs are unchanged: the logits oracle gives 594/613 and 601/613 on the 0.5B Q8_0 and Q4_K_M and 581/613 on the 3B (94.8%, as before), the decode oracle gaps are identical on the three models, and a 3889-token prompt, which goes through the chunked resume path, generates exactly the same 48 tokens on the previous commit and on the fix for the 0.5B Q8_0 and the 3B. Raw samples: `results/prefill-resident-kv-ab.json`. The warp-shuffle kernel is kept out of this commit: it adds about 6 ms at 4096 tokens and nothing measurable at 512, for about 140 lines. The README comparison table is not updated here; it needs a new run against llama.cpp.
+
+## 2026-10-31 — Comparison with llama.cpp after the three decode changes
+
+`tools/bench_vs_llamacpp.py` at commit `3f91eb9` (3 alternating runs, load 1.8-2.6; raw samples in `results/vs-llamacpp-2026-10-31.json`), medians, tokens per second:
+
+| Model | Prompt | boring-llm prefill | llama.cpp prefill | boring-llm decode | llama.cpp decode |
+|---|---|---|---|---|---|
+| Qwen2.5-3B Q4_K_M | ~570 | 331 | 444 (0.75x) | 33.1 | 40.4 (0.82x) |
+| Qwen2.5-3B Q4_K_M | ~4150 | 240 | 381 (0.63x) | 24.9 | 31.1 (0.80x) |
+| Qwen2.5-0.5B Q8_0 | ~570 | 2,093 | 2,941 (0.71x) | 110.0 | 125.1 (0.88x) |
+| Qwen2.5-0.5B Q8_0 | ~4150 | 1,225 | 2,182 (0.56x) | 64.1 | 83.1 (0.77x) |
+
+The decode cost of a longer context, between ~570 and ~4150 prompt tokens, is +9.9 ms/token on the 3B for boring-llm (+2.77 ms per 1k tokens) against +7.5 for llama.cpp (+2.08), and +6.5 on the 0.5B against +4.0 (+1.82 and +1.13 ms per 1k tokens); it was +26.5 and +9.5 ms per 1k tokens in the 2026-10-30 run. Both engines were faster than in that run (llama.cpp decoded the 3B at 28 tok/s on 2026-10-29 and at 40 here), so ratios are only comparable inside one run. The README table was updated with this run and no longer marks the long-context rows as provisional: the earlier 0.5B long-context figure that did not reproduce (0.89x against 0.37x) was a host-side KV cache, not a measurement difference. Prefill is the remaining gap (0.56-0.75x); the 7B and 4B rows are older measurements.

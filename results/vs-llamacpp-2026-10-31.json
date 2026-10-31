@@ -1,0 +1,284 @@
+{
+ "schema": 1,
+ "description": "tools/bench_vs_llamacpp.py at commit 3f91eb9 (prefill KV cache kept on the GPU), 2026-10-31, Apple M3, 3 alternating runs, load 1.8-2.6.",
+ "models": {
+  "qwen2.5-0.5b-instruct-q8_0": {
+   "schema": 2,
+   "label": "",
+   "machine": "Apple M3 / 17179869184",
+   "load_average": {
+    "before": 1.94775390625,
+    "after": 2.22265625
+   },
+   "configuration": {
+    "gguf": "weights/qwen2.5-0.5b-instruct-q8_0.gguf",
+    "binary": "build",
+    "prompt_tokens": [
+     512,
+     4096
+    ],
+    "generated_tokens": 64,
+    "repetitions": 3,
+    "context_size": 8192,
+    "engines": [
+     "ours",
+     "llama"
+    ],
+    "llama_kv": "f16",
+    "llama_flash_attn": false,
+    "ours_arg": []
+   },
+   "results": {
+    "boring-llm|512": [
+     {
+      "prompt_tokens": 567,
+      "generated": 50,
+      "ttft_s": 0.2686334589961916,
+      "prefill_tps": 2110.6827203086355,
+      "decode_tps": 85.45147260879052
+     },
+     {
+      "prompt_tokens": 567,
+      "generated": 64,
+      "ttft_s": 0.2709486670210026,
+      "prefill_tps": 2092.647312991021,
+      "decode_tps": 109.94784391920864
+     },
+     {
+      "prompt_tokens": 568,
+      "generated": 64,
+      "ttft_s": 0.27159954197122715,
+      "prefill_tps": 2091.314277916467,
+      "decode_tps": 110.0693109047703
+     }
+    ],
+    "boring-llm|4096": [
+     {
+      "prompt_tokens": 4147,
+      "generated": 50,
+      "ttft_s": 3.385460666992003,
+      "prefill_tps": 1224.9440793783103,
+      "decode_tps": 63.933085136519125
+     },
+     {
+      "prompt_tokens": 4147,
+      "generated": 50,
+      "ttft_s": 3.385191790992394,
+      "prefill_tps": 1225.0413731460326,
+      "decode_tps": 64.04607477840393
+     },
+     {
+      "prompt_tokens": 4148,
+      "generated": 50,
+      "ttft_s": 3.3875274159945548,
+      "prefill_tps": 1224.4919348592714,
+      "decode_tps": 64.15980062124672
+     }
+    ],
+    "llama.cpp|512": [
+     {
+      "prompt_tokens": 567,
+      "generated": 64,
+      "ttft_s": 0.19307883302099071,
+      "prefill_tps": 2936.624336953384,
+      "decode_tps": 124.99778848345717
+     },
+     {
+      "prompt_tokens": 568,
+      "generated": 64,
+      "ttft_s": 0.19291050001629628,
+      "prefill_tps": 2944.3705757437656,
+      "decode_tps": 125.12363407252572
+     },
+     {
+      "prompt_tokens": 568,
+      "generated": 64,
+      "ttft_s": 0.19310729199787602,
+      "prefill_tps": 2941.3700234906064,
+      "decode_tps": 125.04677890600429
+     }
+    ],
+    "llama.cpp|4096": [
+     {
+      "prompt_tokens": 4147,
+      "generated": 64,
+      "ttft_s": 1.899725583003601,
+      "prefill_tps": 2182.9468619585036,
+      "decode_tps": 82.92463793980703
+     },
+     {
+      "prompt_tokens": 4148,
+      "generated": 64,
+      "ttft_s": 1.9010382919805124,
+      "prefill_tps": 2181.965517211434,
+      "decode_tps": 83.10749936581875
+     },
+     {
+      "prompt_tokens": 4148,
+      "generated": 64,
+      "ttft_s": 1.9066380409931298,
+      "prefill_tps": 2175.557138175733,
+      "decode_tps": 83.18189222344239
+     }
+    ]
+   },
+   "decode_slopes": {
+    "boring-llm": {
+     "low_size": 512,
+     "high_size": 4096,
+     "low_ms": 9.095221555547877,
+     "high_ms": 15.61375936714229,
+     "delta_ms": 6.518537811594413,
+     "ms_per_1k_tokens": 1.8187884518957627
+    },
+    "llama.cpp": {
+     "low_size": 512,
+     "high_size": 4096,
+     "low_ms": 7.997007269988813,
+     "high_ms": 12.032608460498206,
+     "delta_ms": 4.035601190509394,
+     "ms_per_1k_tokens": 1.1260047964590942
+    }
+   }
+  },
+  "qwen2.5-3b-instruct-q4_k_m": {
+   "schema": 2,
+   "label": "",
+   "machine": "Apple M3 / 17179869184",
+   "load_average": {
+    "before": 2.64013671875,
+    "after": 1.94775390625
+   },
+   "configuration": {
+    "gguf": "weights/qwen2.5-3b-instruct-q4_k_m.gguf",
+    "binary": "build",
+    "prompt_tokens": [
+     512,
+     4096
+    ],
+    "generated_tokens": 64,
+    "repetitions": 3,
+    "context_size": 8192,
+    "engines": [
+     "ours",
+     "llama"
+    ],
+    "llama_kv": "f16",
+    "llama_flash_attn": false,
+    "ours_arg": []
+   },
+   "results": {
+    "boring-llm|512": [
+     {
+      "prompt_tokens": 567,
+      "generated": 63,
+      "ttft_s": 1.7155974170018453,
+      "prefill_tps": 330.4971168532542,
+      "decode_tps": 33.091954072967354
+     },
+     {
+      "prompt_tokens": 567,
+      "generated": 63,
+      "ttft_s": 1.7155117089860141,
+      "prefill_tps": 330.5136286916608,
+      "decode_tps": 33.08957495851929
+     },
+     {
+      "prompt_tokens": 568,
+      "generated": 63,
+      "ttft_s": 1.7150864579889458,
+      "prefill_tps": 331.1786396273096,
+      "decode_tps": 33.079482381630115
+     }
+    ],
+    "boring-llm|4096": [
+     {
+      "prompt_tokens": 4147,
+      "generated": 63,
+      "ttft_s": 17.227970959007507,
+      "prefill_tps": 240.71319889425365,
+      "decode_tps": 24.888883179567554
+     },
+     {
+      "prompt_tokens": 4147,
+      "generated": 63,
+      "ttft_s": 17.253908000013325,
+      "prefill_tps": 240.3513453298115,
+      "decode_tps": 24.918426065958712
+     },
+     {
+      "prompt_tokens": 4148,
+      "generated": 63,
+      "ttft_s": 17.367579292011214,
+      "prefill_tps": 238.83581760343586,
+      "decode_tps": 24.91616205780165
+     }
+    ],
+    "llama.cpp|512": [
+     {
+      "prompt_tokens": 567,
+      "generated": 64,
+      "ttft_s": 1.2783655420062132,
+      "prefill_tps": 443.5351089878205,
+      "decode_tps": 40.388615411327756
+     },
+     {
+      "prompt_tokens": 568,
+      "generated": 64,
+      "ttft_s": 1.2777434590097982,
+      "prefill_tps": 444.5336784898731,
+      "decode_tps": 40.44935379773017
+     },
+     {
+      "prompt_tokens": 568,
+      "generated": 64,
+      "ttft_s": 1.366367167007411,
+      "prefill_tps": 415.70085531550194,
+      "decode_tps": 40.429099262830576
+     }
+    ],
+    "llama.cpp|4096": [
+     {
+      "prompt_tokens": 4147,
+      "generated": 64,
+      "ttft_s": 10.366134707990568,
+      "prefill_tps": 400.0526827809166,
+      "decode_tps": 31.04206041591814
+     },
+     {
+      "prompt_tokens": 4148,
+      "generated": 64,
+      "ttft_s": 10.890655249997508,
+      "prefill_tps": 380.8769908496506,
+      "decode_tps": 31.138023081691067
+     },
+     {
+      "prompt_tokens": 4148,
+      "generated": 64,
+      "ttft_s": 11.583633041009307,
+      "prefill_tps": 358.0914541504308,
+      "decode_tps": 31.07460547787028
+     }
+    ]
+   },
+   "decode_slopes": {
+    "boring-llm": {
+     "low_size": 512,
+     "high_size": 4096,
+     "low_ms": 30.22099864545218,
+     "high_ms": 40.134592064385934,
+     "delta_ms": 9.913593418933754,
+     "ms_per_1k_tokens": 2.7660695923364265
+    },
+    "llama.cpp": {
+     "low_size": 512,
+     "high_size": 4096,
+     "low_ms": 24.734659397157856,
+     "high_ms": 32.18061773019606,
+     "delta_ms": 7.445958333038206,
+     "ms_per_1k_tokens": 2.077555338459321
+    }
+   }
+  }
+ }
+}

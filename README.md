@@ -173,7 +173,7 @@ Server-executed tools and the Web UI's MCP CORS proxy remain disabled: `GET`/`PO
 
 ## Performance
 
-Measured on one 16 GB Apple-silicon machine (Apple M3, Metal). The 3B and 0.5B rows are from 2026-10-30 (`tools/bench_vs_llamacpp.py`, 3 alternating runs, load 2.1-2.4, raw samples in `results/decode-readback-fix-ab.json`); the other models are earlier clean runs. Timings can move by tens of percent between repetitions, so read the ratios as indications rather than constants and reproduce them with `tools/bench_vs_llamacpp.py` on your hardware.
+Measured on one 16 GB Apple-silicon machine (Apple M3, Metal). The 3B and 0.5B rows are from 2026-10-31 (`tools/bench_vs_llamacpp.py`, 3 alternating runs, load 1.8-2.6, raw samples in `results/vs-llamacpp-2026-10-31.json`); the other models are earlier clean runs. Timings can move by tens of percent between repetitions, so read the ratios as indications rather than constants and reproduce them with `tools/bench_vs_llamacpp.py` on your hardware.
 
 Against llama.cpp (llama-cpp-python, Metal, same GGUF, same machine, 3 alternating runs, medians, `tools/bench_vs_llamacpp.py`), tokens per second:
 
@@ -183,16 +183,16 @@ Against llama.cpp (llama-cpp-python, Metal, same GGUF, same machine, 3 alternati
 | Qwen2.5-7B Q4_K_M | ~4150 | 87 | 122 | 0.71x | 6.1 | 10.0 | 0.61x |
 | Qwen3-4B Q4_K_M | ~550 | 181 | 277 | 0.66x | 10.8 | 28.3 | 0.38x |
 | Qwen3-4B Q4_K_M | ~4130 | 130 | 221 | 0.59x | 9.0 | 15.6 | 0.58x |
-| Qwen2.5-3B Q4_K_M | ~570 | 253 | 335 | 0.76x | 26.2 | 28.1 | 0.93x |
-| Qwen2.5-3B Q4_K_M | ~4150 | 170 | 265 | 0.64x | 7.5 | 21.3 | 0.35x |
-| Qwen2.5-0.5B Q8_0 | ~570 | 1,369 | 1,328 | 1.03x | 85.6 | 99.6 | 0.86x |
-| Qwen2.5-0.5B Q8_0 | ~4150 | 746 | 1,594 | 0.47x | 21.9 | 59.8 | 0.37x |
+| Qwen2.5-3B Q4_K_M | ~570 | 331 | 444 | 0.75x | 33.1 | 40.4 | 0.82x |
+| Qwen2.5-3B Q4_K_M | ~4150 | 240 | 381 | 0.63x | 24.9 | 31.1 | 0.80x |
+| Qwen2.5-0.5B Q8_0 | ~570 | 2,093 | 2,941 | 0.71x | 110.0 | 125.1 | 0.88x |
+| Qwen2.5-0.5B Q8_0 | ~4150 | 1,225 | 2,182 | 0.56x | 64.1 | 83.1 | 0.77x |
 
 The server needs 3.1 GB (peak 3.3 GB) for the 3B model and 6.4 GB (peak 6.8 GB) for the 7B, and is ready in about 4 s on the 7B (disk-streaming loader). Through OpenCode, the 7B model's first request (7,539 tokens, ten tools) spent 115 s in prefill cold and 2.5 s on the follow-up that reused 7,559 of 7,638 tokens; a cold start used to take 321-453 s.
 
-Where the gap to llama.cpp is: at ~570 prompt tokens decode is close on the 3B (0.93x) and the 0.5B (0.86x), and prefill is at parity on the 0.5B (1.03x) and 0.76x on the 3B. At ~4150 tokens decode falls to 0.35x (3B) and 0.37x (0.5B): from ~570 to ~4150 prompt tokens decode grows by 26.5 ms/token per 1k tokens on the 3B and 9.5 on the 0.5B, against 3.2 and 1.9 for llama.cpp, so long-context attention over the float32 KV cache is now the main gap, followed by long-context prefill (0.47-0.64x). The 7B row still shows an earlier measurement (decode about 0.6x).
+Where the gap to llama.cpp is: decode is at 0.77-0.88x on the 3B and the 0.5B at both prompt sizes, and the decode cost of a long context is now close to llama.cpp's (+2.8 ms/token per 1k prompt tokens on the 3B against 2.1, +1.8 against 1.1 on the 0.5B). Prefill is the main remaining gap: 0.71-0.75x at ~570 tokens and 0.56-0.63x at ~4150. The 7B and 4B rows are earlier measurements taken before the changes below, so their ratios are not comparable with the 3B and 0.5B ones. Absolute numbers on this machine move by tens of percent between sessions (the same llama.cpp decoded the 3B at 28 tok/s on 2026-10-29 and at 40 on 2026-10-31), so read a ratio from one run only.
 
-Two same-day changes explain most of the 3B's move from 0.41x to 0.93x at short context: the decode batch limit (8 -> 3, which sat on a launch-batching cliff) and the removal of 73 device-to-host readbacks per decoded token (`ffn_out`, `ffn_res` and `attn_out` were typed as host arrays and read back from the GPU at every layer); against a build of the previous commit the 3B decodes 3.8x faster at 512 prompt tokens and 1.8x at 4096 (details in the development log). Earlier runs of this table measured the 0.5B at ~4150 tokens at 0.89x; the same tool now reads 0.37x, and that discrepancy is not explained yet, so treat the long-context rows as provisional.
+Three changes from 2026-10-30 and 2026-10-31 account for the 3B going from 0.41x (short context) and 0.49x (long context) to 0.82x and 0.80x: the decode batch limit (8 -> 3, which sat on a launch-batching cliff), the removal of 73 device-to-host readbacks per decoded token, and keeping the KV cache built by prefill on the GPU (it was host-side and was re-uploaded at every layer of every decoded token). The last two share one cause: the transpiler types a `mut` variable initialised with `[]` as a host array (details in the development log).
 
 On wgpu the portable K-quant prefill is still ~3x slower than the hand-written kernels (hence `--kquant-prefill handwritten` there).
 
