@@ -221,6 +221,14 @@ def main() throws:
     check_tail_attention(128, 4, 2, 90, 26)
     check_tail_attention(128, 4, 2, 520, 456)
     check_tail_attention(128, 4, 2, 130, 129)
+    # Grouped kernel (one workgroup per KV head): groups of 8, 7, 4 and 1 query heads, several
+    # 128-key tiles per split (seq_k beyond 64 * 128), tails of various lengths.
+    check_tail_attention(128, 16, 2, 90, 26)
+    check_tail_attention(128, 16, 2, 520, 456)
+    check_tail_attention(128, 14, 2, 700, 640)
+    check_tail_attention(128, 8, 2, 1030, 1024)
+    check_tail_attention(128, 4, 4, 333, 300)
+    check_tail_attention(128, 16, 2, 9000, 8960)
     check_tail_attention(96, 4, 2, 40, 33)
 
     # --- q8_linear_gpu vs. CPU dequantize_q8_0 + linear_bias ---

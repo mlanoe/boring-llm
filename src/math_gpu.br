@@ -4577,6 +4577,147 @@ kernel FlashDecodeTail128Kernel:
             part[base] = m
             part[base + 1] = l
 
+# Single-query decode attention for a main + tail cache, one simdgroup (32 threads) per
+# (key split, KV head). Every query head of the group (at most 8) is handled by the same
+# simdgroup, so each K and V row is read once per group; lane `l` owns dimensions l, l+32,
+# l+64 and l+96, which makes every row read fully coalesced, keeps the query slice and the
+# output accumulators in registers, and reduces the dot products with warp shuffles (no
+# shared memory, no barriers). The partial results keep the head-major layout of
+# FlashDecodeTail128Kernel, so FlashDecodeCombine128Kernel merges them unchanged.
+kernel FlashDecodeWarpTail128Kernel:
+    let  [float32]'global   q          # (n_head*128), the single query row
+    let  [float32]'global   k          # (main_len * d_kv)
+    let  [float32]'global   v
+    let  [float32]'global   tk         # the newest (seq_k - main_len) rows of K
+    let  [float32]'global   tv
+    let int             main_len
+    mut  [float32]'unified  part       # per (head, split): m, l, then 128 partial output dims
+    let int             seq_k
+    let int             d_kv
+    let int             group
+    let int             nsplit
+    let int             chunk
+    let float32         scale
+    mut [float32, 32] wq        # thread-private: 4 query values per head of the group
+    mut [float32, 32] wa        # 4 output accumulators per head
+    mut [float32, 8] wm
+    mut [float32, 8] wl
+    mut [float32, 8] ws
+
+    init([float32]'global qi, [float32]'global ki, [float32]'global vi,
+         [float32]'global tki, [float32]'global tvi, int ml,
+         int sk, int dkv, int grp, int ns, int ch, float32 sc, int nparts):
+        q      = qi
+        k      = ki
+        v      = vi
+        tk     = tki
+        tv     = tvi
+        main_len = ml
+        seq_k  = sk
+        d_kv   = dkv
+        group  = grp
+        nsplit = ns
+        chunk  = ch
+        scale  = sc
+        part   = [0.0 for ..<nparts]
+
+    def ():
+        let lane  = .thread.x
+        let split = .block.x
+        let kvh   = .block.y
+        let k_off = kvh * 128
+        let start = split * chunk
+        var int stop = start + chunk
+        if stop > seq_k:
+            stop = seq_k
+        for g in 0..<8:
+            for i in 0..<4:
+                if g < group:
+                    wq[g * 4 + i] = q[(kvh * group + g) * 128 + lane + 32 * i] * scale
+                else:
+                    wq[g * 4 + i] = 0.0
+                wa[g * 4 + i] = 0.0
+            wm[g] = -1.0e30
+            wl[g] = 0.0
+        var int j = start
+        while j < stop:
+            var float32 k0 = 0.0
+            var float32 k1 = 0.0
+            var float32 k2 = 0.0
+            var float32 k3 = 0.0
+            var float32 v0 = 0.0
+            var float32 v1 = 0.0
+            var float32 v2 = 0.0
+            var float32 v3 = 0.0
+            if j < main_len:
+                let o = j * d_kv + k_off + lane
+                k0 = k[o]
+                k1 = k[o + 32]
+                k2 = k[o + 64]
+                k3 = k[o + 96]
+                v0 = v[o]
+                v1 = v[o + 32]
+                v2 = v[o + 64]
+                v3 = v[o + 96]
+            else:
+                let o = (j - main_len) * d_kv + k_off + lane
+                k0 = tk[o]
+                k1 = tk[o + 32]
+                k2 = tk[o + 64]
+                k3 = tk[o + 96]
+                v0 = tv[o]
+                v1 = tv[o + 32]
+                v2 = tv[o + 64]
+                v3 = tv[o + 96]
+            for g in 0..<8:
+                var float32 s = wq[g * 4] * k0 + wq[g * 4 + 1] * k1 + wq[g * 4 + 2] * k2 + wq[g * 4 + 3] * k3
+                var int offset = 16
+                while offset > 0:
+                    s += .warp.shuffle_xor(s, offset)
+                    offset = offset / 2
+                ws[g] = s
+            for g in 0..<8:
+                var float32 mn = wm[g]
+                if ws[g] > mn:
+                    mn = ws[g]
+                let alpha = (wm[g] - mn).exp()
+                let p = (ws[g] - mn).exp()
+                wl[g] = wl[g] * alpha + p
+                wa[g * 4] = wa[g * 4] * alpha + p * v0
+                wa[g * 4 + 1] = wa[g * 4 + 1] * alpha + p * v1
+                wa[g * 4 + 2] = wa[g * 4 + 2] * alpha + p * v2
+                wa[g * 4 + 3] = wa[g * 4 + 3] * alpha + p * v3
+                wm[g] = mn
+            j += 1
+        for g in 0..<8:
+            if g < group:
+                let base = ((kvh * group + g) * nsplit + split) * (128 + 2)
+                for i in 0..<4:
+                    part[base + 2 + lane + 32 * i] = wa[g * 4 + i]
+                if lane == 0:
+                    part[base] = wm[g]
+                    part[base + 1] = wl[g]
+
+pub req [float32]'kernel'unified attention_decode128_group_tail_gpu([float32]'kernel'global q, [float32]'kernel'global k, [float32]'kernel'global v,
+                          [float32]'kernel'global tk, [float32]'kernel'global tv, int main_len,
+                          int seq_k, int n_head, int n_kv_head) throws:
+    let int d_kv  = n_kv_head * 128
+    let int group = n_head / n_kv_head
+    let float32 scale = 1.0 / (128.0 as float32).sqrt()
+    var int nsplit = (seq_k + 63) / 64
+    if nsplit < 1:
+        nsplit = 1
+    if nsplit > 64:
+        nsplit = 64
+    let int chunk = (seq_k + nsplit - 1) / nsplit
+    mut kd = FlashDecodeWarpTail128Kernel(q, k, v, tk, tv, main_len, seq_k, d_kv, group, nsplit, chunk, scale, n_head * nsplit * (128 + 2))
+    kernel:
+        kd(block = 32, grid = (nsplit, n_kv_head))
+    mut kc = FlashDecodeCombine128Kernel(kd.part, nsplit, n_head * 128)
+    kernel:
+        kc(block = 128, grid = n_head)
+    kc.o
+
 pub req [float32]'kernel'unified attention_decode64_tail_gpu([float32]'kernel'global q, [float32]'kernel'global k, [float32]'kernel'global v,
                           [float32]'kernel'global tk, [float32]'kernel'global tv, int main_len,
                           int seq_k, int n_head, int n_kv_head) throws:
@@ -4624,6 +4765,8 @@ pub req [float32]'kernel'unified attention_gqa_tail_gpu([float32]'kernel'global 
                           int seq_k, int n_head, int n_kv_head, int d_head) throws:
     if d_head == 64:
         attention_decode64_tail_gpu(q, k, v, tk, tv, main_len, seq_k, n_head, n_kv_head)
+    elif d_head == 128 and n_head / n_kv_head <= 8:
+        attention_decode128_group_tail_gpu(q, k, v, tk, tv, main_len, seq_k, n_head, n_kv_head)
     elif d_head == 128:
         attention_decode128_tail_gpu(q, k, v, tk, tv, main_len, seq_k, n_head, n_kv_head)
     else:
