@@ -227,7 +227,7 @@ tools/                    oracles, accuracy and speed comparisons with llama.cpp
 test/                     interpreter tests (test_*.br) and compiled real-model tests (*_real.br)
 docs/book.md              the book: using, operating, understanding and extending the engine
 docs/build.py             generates the HTML versions of the documentation (python3 docs/build.py)
-boring.toml               kernel scheduling policy (native Metal paths for Q8_0, Q4_K, Q6_K)
+boring.toml               kernel scheduling policy (native Metal paths for Q8_0, Q4_K, Q6_K; prefill `precision = "mixed"`, needs a recent `boring`)
 ```
 
 ## Limits
