@@ -44,7 +44,7 @@ def main() throws:
     let g8 = compile($"""$ob"type":"object","additionalProperties":$ob"type":"integer"${cb}$cb""")
     assert(accepts(g8, "{ob}{cb}") and accepts(g8, $"""$ob"a": 1, "b": 2$cb""") and not accepts(g8, $"""$ob"a": "x"$cb"""), "additionalProperties schema")
     let g9 = compile($"""$ob"type":"string","minLength":2,"maxLength":3$cb""")
-    assert(accepts(g9, '''"ab"''') and accepts(g9, '''"abc"''') and not accepts(g9, '''"a"''') and not viable(g9, "\"abcd"), "string length")
+    assert(accepts(g9, '''"ab"''') and accepts(g9, '''"abc"''') and not accepts(g9, '''"a"''') and not viable(g9, '"abcd'), "string length")
 
     # $ref and recursion
     let g10 = compile($"""$ob"$$ref":"#/$$defs/node","$$defs":$ob"node":$ob"type":"object","properties":$ob"v":$ob"type":"integer"$cb,"next":$ob"anyOf":[$ob"$$ref":"#/$$defs/node"$cb,$ob"type":"null"$cb]${cb}$cb,"required":["v","next"]${cb}${cb}$cb""")

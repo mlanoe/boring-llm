@@ -47,7 +47,7 @@ string add_rule(mut SchemaGrammar& g, string hint, string body):
 
 # GBNF string literal for some text.
 string gbnf_literal(string text):
-    var string out = "\""
+    var string out = '"'
     for ch in text.chars():
         let c = ord(ch)
         if c == 34:

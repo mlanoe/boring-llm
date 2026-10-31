@@ -48,7 +48,7 @@ def main() throws:
 
     # Malformed input is a clean error, never a crash.
     var int errors = 0
-    for bad in ["", '''{''', "[1, 2", '''{"a" 1}''', '''{"a": }''', "\"abc", "[1] x", "tru", '''{'a': 1}''', '''"\u12"''',
+    for bad in ["", '''{''', "[1, 2", '''{"a" 1}''', '''{"a": }''', '"abc', "[1] x", "tru", '''{'a': 1}''', '''"\u12"''',
                 '''"bad\q"''', "\"raw{chr(10)}newline\"", "+1", "01", "-01", "1.", "1e", "1e+", "--1"]:
         try:
             let _ = json_parse(bad)

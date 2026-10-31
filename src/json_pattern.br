@@ -27,7 +27,7 @@ bool pattern_is_space(string ch):
 int pattern_atom_end([string] pattern, int start):
     if start >= pattern.length: return -1
     let ch = pattern[start]
-    if ch == "\\":
+    if ch == '\':
         if start + 1 >= pattern.length: return -1
         let escaped = pattern[start + 1]
         if escaped == "b" or escaped == "B": return -1
@@ -37,7 +37,7 @@ int pattern_atom_end([string] pattern, int start):
         if i < pattern.length and pattern[i] == "^": i += 1
         let first = i
         while i < pattern.length and pattern[i] != "]":
-            if pattern[i] == "\\":
+            if pattern[i] == '\':
                 i += 1
                 if i >= pattern.length: return -1
             i += 1
@@ -67,7 +67,7 @@ bool pattern_class_matches([string] pattern, int start, int end, string ch):
         i += 1
     var bool matched = false
     while i < end - 1:
-        if pattern[i] == "\\":
+        if pattern[i] == '\':
             if pattern_escape_matches(pattern[i + 1], ch): matched = true
             i += 2
         elif i + 2 < end - 1 and pattern[i + 1] == "-":
@@ -83,7 +83,7 @@ bool pattern_class_matches([string] pattern, int start, int end, string ch):
 
 bool pattern_atom_matches([string] pattern, int start, int end, string ch):
     if pattern[start] == ".": return true
-    if pattern[start] == "\\": return pattern_escape_matches(pattern[start + 1], ch)
+    if pattern[start] == '\': return pattern_escape_matches(pattern[start + 1], ch)
     if pattern[start] == "[": return pattern_class_matches(pattern, start, end, ch)
     pattern[start] == ch
 

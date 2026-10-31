@@ -1038,12 +1038,12 @@ string balanced_object([string] cs, int start):
         if in_str:
             if esc:
                 esc = false
-            elif ch == "\\":
+            elif ch == '\':
                 esc = true
-            elif ch == "\"":
+            elif ch == '"':
                 in_str = false
         else:
-            if ch == "\"":
+            if ch == '"':
                 in_str = true
             elif ch == '''{''':
                 depth += 1
@@ -2419,7 +2419,7 @@ pub string slot_erased_json(int id_slot, int n_erased):
 
 pub string slot_filename_validation_error(string filename):
     if filename == "": return "`filename` is required and must be a non-empty string"
-    if filename.contains("/") or filename.contains("\\") or filename == "." or filename == "..":
+    if filename.contains("/") or filename.contains('\') or filename == "." or filename == "..":
         return "`filename` must be a plain file name without path components"
     ""
 
@@ -2800,7 +2800,7 @@ pub string props_json(string model_path, string chat_template, int n_ctx, int to
                          float32 adaptive_target, float32 adaptive_decay,
                          float32 presence_penalty, float32 frequency_penalty, [string] samplers,
                          bool ignore_eos):
-    let params = llama_sampling_params_json(max_tokens, temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, ["\n", ":", "\"", "*"], mirostat, mirostat_tau, mirostat_eta, adaptive_target, adaptive_decay, samplers, presence_penalty, frequency_penalty, [], ignore_eos, true, 0, false, 0, 30, false, model_path, n_ctx, true, false, false, 0)
+    let params = llama_sampling_params_json(max_tokens, temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, ["\n", ":", '"', "*"], mirostat, mirostat_tau, mirostat_eta, adaptive_target, adaptive_decay, samplers, presence_penalty, frequency_penalty, [], ignore_eos, true, 0, false, 0, 30, false, model_path, n_ctx, true, false, false, 0)
     let next_token = llama_next_token_json(max_tokens)
     let caps = chat_template_caps_json(chat_template)
     $"""{"default_generation_settings": {"id": 0, "id_task": -1, "n_ctx": $n_ctx, "speculative": false, "is_processing": false, "params": $params, "prompt": "", "next_token": $next_token}, "total_slots": $total_slots, "model_path": "${json_escape(model_path)}", "chat_template": "${json_escape(chat_template)}", "chat_template_caps": $caps, "modalities": {"vision": false}, "media_marker": "", "build_info": "boring-llm", "is_sleeping": false}"""
@@ -2825,7 +2825,7 @@ pub string slots_json(int n_slots, [int] cached_tokens, string model, int n_ctx,
         if slot > 0:
             out = "{out}, "
         let n_past = if slot < cached_tokens.length: cached_tokens[slot] else: 0
-        let params = llama_sampling_params_json(max_tokens, temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, ["\n", ":", "\"", "*"], mirostat, mirostat_tau, mirostat_eta, adaptive_target, adaptive_decay, samplers, presence_penalty, frequency_penalty, [], ignore_eos, true, 0, false, 0, 30, false, model, n_ctx, true, false, false, 0)
+        let params = llama_sampling_params_json(max_tokens, temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, ["\n", ":", '"', "*"], mirostat, mirostat_tau, mirostat_eta, adaptive_target, adaptive_decay, samplers, presence_penalty, frequency_penalty, [], ignore_eos, true, 0, false, 0, 30, false, model, n_ctx, true, false, false, 0)
         let next_token = llama_next_token_json(max_tokens)
         out = $"""$out{"id": $slot, "id_task": -1, "n_ctx": $n_ctx, "speculative": false, "is_processing": false, "params": $params, "prompt": "", "generated": "", "next_token": $next_token, "n_past": $n_past, "n_prompt_tokens": 0, "n_predicted": 0, "stopped_eos": false, "stopped_word": false, "stopped_limit": false}"""
         slot += 1

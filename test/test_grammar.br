@@ -50,6 +50,6 @@ def main() throws:
     assert(bad == nil, "undefined rule")
     let bad2 = try? parse_gbnf('''main ::= "x"''')
     assert(bad2 == nil, "no root")
-    let bad3 = try? parse_gbnf("root ::= \"x")
+    let bad3 = try? parse_gbnf('root ::= "x')
     assert(bad3 == nil, "unterminated literal")
     print "test_grammar: all assertions passed"

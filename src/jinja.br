@@ -100,9 +100,9 @@ string jv_to_str(JValue v):
 pub string json_escape(string s):
     var string out = ""
     for ch in s.chars():
-        if ch == "\"":
+        if ch == '"':
             out = "{out}\\\""
-        elif ch == "\\":
+        elif ch == '\':
             out = "{out}\\\\"
         elif ch == "\n":
             out = "{out}\\n"
@@ -517,12 +517,12 @@ pub [EToken] lex_expr_tokens(string src) throws:
         let c = chars[i]
         if is_ws_char(c):
             i += 1
-        elif c == "'" or c == "\"":
+        elif c == "'" or c == '"':
             let quote = c
             var string s = ""
             i += 1
             while i < n and chars[i] != quote:
-                if chars[i] == "\\" and i + 1 < n:
+                if chars[i] == '\' and i + 1 < n:
                     let nc = chars[i + 1]
                     if nc == "n":
                         s = "{s}\n"
@@ -823,7 +823,7 @@ struct RawTok:
             var string quote_char = ""
             while j < n and not closed:
                 if quote_char != "":
-                    if chars[j] == "\\" and j + 1 < n:
+                    if chars[j] == '\' and j + 1 < n:
                         content = "{content}{chars[j]}{chars[j + 1]}"
                         j += 2
                     else:
@@ -831,7 +831,7 @@ struct RawTok:
                             quote_char = ""
                         content = "{content}{chars[j]}"
                         j += 1
-                elif chars[j] == "'" or chars[j] == "\"":
+                elif chars[j] == "'" or chars[j] == '"':
                     quote_char = chars[j]
                     content = "{content}{chars[j]}"
                     j += 1

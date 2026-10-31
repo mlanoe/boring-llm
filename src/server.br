@@ -185,7 +185,7 @@ int gguf_parameter_count(GgufFile file):
     (out, -1)
 
 ([string], [[int]]) request_dry_breakers(Tokenizer tok, JValue body, bool enabled):
-    mut [string] values = ["\n", ":", "\"", "*"]
+    mut [string] values = ["\n", ":", '"', "*"]
     match json_get(body, "dry_sequence_breakers"):
         JList(items):
             values = []

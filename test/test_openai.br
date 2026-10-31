@@ -241,10 +241,10 @@ def main() throws:
     assert(not model_alias_path_matches(["primary"], "/v1/models/other"), "unknown alias path")
 
     # ── completion_json is valid JSON with the right fields ──
-    let plain = completion_json("7", "m\"1", ParsedReply("hi \"there\"\nbye", []), "stop", 10, 3, 4, 123)
+    let plain = completion_json("7", 'm"1', ParsedReply("hi \"there\"\nbye", []), "stop", 10, 3, 4, 123)
     let pj = json_parse(plain)
     assert_eq(json_get_str(pj, "id", ""), "chatcmpl-7" as string)
-    assert_eq(json_get_str(pj, "model", ""), "m\"1" as string)
+    assert_eq(json_get_str(pj, "model", ""), 'm"1' as string)
     let choice = json_get_list(pj, "choices")[0]
     assert_eq(json_get_str(choice, "finish_reason", ""), "stop" as string)
     assert_eq(json_get_str(json_get(choice, "message"), "content", ""), "hi \"there\"\nbye" as string)

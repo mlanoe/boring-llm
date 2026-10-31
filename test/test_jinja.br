@@ -77,7 +77,7 @@ def main() throws:
 
     # tojson filter
     mut {string=JValue} env7 = {=}
-    env7["x"] = JValue.JStr("a\"b")
+    env7["x"] = JValue.JStr('a"b')
     let out7 = render_jinja("{ob}{ob} x | tojson {cb}{cb}", env7)
     assert_eq(out7, '''"a\"b"''' as string)
 

@@ -34,7 +34,7 @@ int json_hex_val(string ch) throws:
         throw "json: invalid hex digit '{ch}' in \\u escape"
 
 int json_hex4([string] cs, int pos) throws:
-    guard pos + 4 <= cs.length else throw "json: truncated \\u escape"
+    guard pos + 4 <= cs.length else throw 'json: truncated \u escape'
     var int v = 0
     var int i = 0
     while i < 4:
@@ -51,9 +51,9 @@ int json_hex4([string] cs, int pos) throws:
     while true:
         guard p < cs.length else throw "json: unterminated string"
         let ch = cs[p]
-        if ch == "\"":
+        if ch == '"':
             return (out, p + 1)
-        elif ch == "\\":
+        elif ch == '\':
             guard p + 1 < cs.length else throw "json: truncated escape"
             let e = cs[p + 1]
             if e == "n":
@@ -75,7 +75,7 @@ int json_hex4([string] cs, int pos) throws:
                 var int cp = json_hex4(cs, p + 2)
                 p += 6
                 if cp >= 0xD800 and cp <= 0xDBFF:
-                    guard p + 1 < cs.length and cs[p] == "\\" and cs[p + 1] == "u" else throw "json: high surrogate without a low surrogate"
+                    guard p + 1 < cs.length and cs[p] == '\' and cs[p + 1] == "u" else throw "json: high surrogate without a low surrogate"
                     let lo = json_hex4(cs, p + 2)
                     guard lo >= 0xDC00 and lo <= 0xDFFF else throw "json: invalid low surrogate"
                     cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
@@ -83,7 +83,7 @@ int json_hex4([string] cs, int pos) throws:
                 elif cp >= 0xDC00 and cp <= 0xDFFF:
                     throw "json: low surrogate without a high surrogate"
                 out = "{out}{chr(cp)}"
-            elif e == "\"" or e == "\\" or e == "/":
+            elif e == '"' or e == '\' or e == "/":
                 out = "{out}{e}"
                 p += 2
             else:
@@ -161,7 +161,7 @@ bool json_has_literal([string] cs, int pos, string lit):
             return (JValue.JDict(fields, keys), q + 1)
         while true:
             q = json_skip_ws(cs, q)
-            guard q < cs.length and cs[q] == "\"" else throw "json: expected object key at {q}"
+            guard q < cs.length and cs[q] == '"' else throw "json: expected object key at {q}"
             let (key, after_key) = json_parse_string(cs, q)
             q = json_skip_ws(cs, after_key)
             guard q < cs.length and cs[q] == ":" else throw "json: expected ':' after key '{key}'"
@@ -195,7 +195,7 @@ bool json_has_literal([string] cs, int pos, string lit):
             else:
                 throw "json: expected ',' or ']' at {q}"
         (JValue.JUndefined, q)
-    elif ch == "\"":
+    elif ch == '"':
         let (s, np) = json_parse_string(cs, p)
         (JValue.JStr(s), np)
     elif json_has_literal(cs, p, "true"):
@@ -260,17 +260,17 @@ pub int json_prefix_state(string src):
             if ch == '''}''':
                 states.pop()
                 p += 1
-            elif ch != "\"":
+            elif ch != '"':
                 return -1
             else:
                 p += 1
                 var bool closed = false
                 while p < cs.length and not closed:
                     let c = cs[p]
-                    if c == "\"":
+                    if c == '"':
                         closed = true
                         p += 1
-                    elif c == "\\":
+                    elif c == '\':
                         p += 1
                         if p >= cs.length: return 0
                         let e = cs[p]
@@ -283,7 +283,7 @@ pub int json_prefix_state(string src):
                                 if not ((x >= "0" and x <= "9") or (x >= "a" and x <= "f") or (x >= "A" and x <= "F")): return -1
                                 h += 1
                             p += 1
-                        elif e == "\"" or e == "\\" or e == "/" or e == "b" or e == "f" or e == "n" or e == "r" or e == "t":
+                        elif e == '"' or e == '\' or e == "/" or e == "b" or e == "f" or e == "n" or e == "r" or e == "t":
                             p += 1
                         else:
                             return -1
@@ -312,15 +312,15 @@ pub int json_prefix_state(string src):
                 elif ch == "[":
                     states.push(5)
                     p += 1
-                elif ch == "\"":
+                elif ch == '"':
                     p += 1
                     var bool closed = false
                     while p < cs.length and not closed:
                         let c = cs[p]
-                        if c == "\"":
+                        if c == '"':
                             closed = true
                             p += 1
-                        elif c == "\\":
+                        elif c == '\':
                             p += 1
                             if p >= cs.length: return 0
                             let e = cs[p]
@@ -333,7 +333,7 @@ pub int json_prefix_state(string src):
                                     if not ((x >= "0" and x <= "9") or (x >= "a" and x <= "f") or (x >= "A" and x <= "F")): return -1
                                     h += 1
                                 p += 1
-                            elif e == "\"" or e == "\\" or e == "/" or e == "b" or e == "f" or e == "n" or e == "r" or e == "t":
+                            elif e == '"' or e == '\' or e == "/" or e == "b" or e == "f" or e == "n" or e == "r" or e == "t":
                                 p += 1
                             else:
                                 return -1
