@@ -1,0 +1,64 @@
+# Prefill attention microbenchmark (compiled, --target metal): one chunk of
+# `seq_q` queries against `seq_k` cached keys, causal, resident inputs, one
+# synchronisation at the end. Reports ms per call and the effective TFLOP/s of the
+# attention itself (4 * n_head * d_head * seq_q * (seq_k - seq_q / 2) multiply-adds
+# counted as 2 FLOPs each) so kernels can be compared at the shapes of a real prefill.
+#
+#   boring build --target metal test/bench_prefill_attention.br
+#   cd test/bench_prefill_attention_metal && cargo build --release
+#   ./target/release/bench_prefill_attention [seq_q seq_k n_head n_kv d_head calls]
+#   ./target/release/bench_prefill_attention 512 4096 16 2 128 10   (Qwen2.5-3B, last chunk of a 4096 prompt)
+
+use math_gpu
+use std.time.Instant
+
+[float32] bench_vals(int n, int salt):
+    mut [float32] v = [0.0 for i in 0..<n]
+    var int i = 0
+    while i < n:
+        v[i] = (((i * 7 + salt * 13) % 101) as float32) / 101.0 * 4.0 - 2.0
+        i += 1
+    v
+
+int arg_or(int index, int fallback) throws:
+    let [string] argv = args()
+    if argv.length > index:
+        guard let parsed = (argv[index] as int) else throw "expected an integer argument"
+        return parsed
+    fallback
+
+def main() throws:
+    let seq_q = arg_or(1, 512)
+    let seq_k = arg_or(2, 4096)
+    let n_head = arg_or(3, 16)
+    let n_kv = arg_or(4, 2)
+    let d_head = arg_or(5, 128)
+    let calls = arg_or(6, 10)
+    guard seq_k >= seq_q and n_head % n_kv == 0 and calls > 0 else throw "expected seq_k >= seq_q, n_head divisible by n_kv, calls > 0"
+    let kv_dim = n_kv * d_head
+    let q = upload_floats_gpu(bench_vals(seq_q * n_head * d_head, 1))
+    let k = upload_floats_gpu(bench_vals(seq_k * kv_dim, 2))
+    let v = upload_floats_gpu(bench_vals(seq_k * kv_dim, 3))
+    let offset = seq_k - seq_q
+
+    let warm = attention_gqa_gpu(q, k, v, seq_q, seq_k, n_head, n_kv, d_head, true, offset)
+    with warm:
+        let sink = warm[0]
+
+    let started = Instant.now()
+    var iteration = 1
+    var mut result = attention_gqa_gpu(q, k, v, seq_q, seq_k, n_head, n_kv, d_head, true, offset)
+    while iteration < calls:
+        result = attention_gqa_gpu(q, k, v, seq_q, seq_k, n_head, n_kv, d_head, true, offset)
+        iteration += 1
+    with result:
+        let micros = started.elapsed().asMicros() as float64
+        let per_call_ms = micros / (calls as float64) / 1000.0
+        let flops = 4.0 as float64 * (n_head as float64) * (d_head as float64) * (seq_q as float64) * ((seq_k as float64) - (seq_q as float64) / 2.0)
+        let tflops = flops / (per_call_ms / 1000.0) / 1.0e12
+        var sum = 0.0 as float64
+        var i = 0
+        while i < result.length:
+            sum += result[i] as float64
+            i += 1
+        print "prefill attention seq_q={seq_q} seq_k={seq_k} heads={n_head}/{n_kv} d={d_head}: {per_call_ms:.3f} ms/call, {tflops:.3f} TFLOP/s, checksum={sum:.4f}"

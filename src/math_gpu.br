@@ -4087,6 +4087,348 @@ kernel FlashAttn128Kernel:
             for e in 0..<8:
                 o[col = q_off + tx + 16 * e, row = i] = acc[e] * inv
 
+# Prefill attention for d_head 128 with register blocking. One block handles 32 query rows of one
+# head against all the keys the causal mask allows, 64 keys per step; each thread owns a micro-tile
+# of 2 query rows x 4 keys of scores and 2 rows x 8 output dimensions, so the score loop does 6
+# shared reads per 8 multiply-adds (the 16 x 16 kernel above does 2 per 1) and the value loop 10 per
+# 16. The 16 threads sharing a query row combine their row maxima with warp shuffles and keep a
+# partial row sum that is reduced once at the end. Tiles are padded by one column to avoid bank
+# conflicts. Same interface and masking as FlashAttn128Kernel.
+kernel FlashAttn128RegKernel:
+    let  [float32, col, row]'global   q          # (seq_q x n_head*128)
+    let  [float32, col, row]'global   k          # (seq_k x n_kv_head*128), cache layout
+    let  [float32, col, row]'global   v          # (seq_k x n_kv_head*128)
+    mut  [float32, col, row]'unified  o          # (seq_q x n_head*128)
+    let int             seq_q
+    let int             seq_k
+    let int             group
+    let float32         scale
+    let int             causal
+    let int             causal_offset
+    mut [float32, width = 33, height = 32]'actor rq_s     # query chunk: 32 rows x 32 dimensions
+    mut [float32, width = 33, height = 64]'actor rk_s     # key chunk: 64 keys x 32 dimensions
+    mut [float32, width = 65, height = 32]'actor rp_s     # probabilities: 32 rows x 64 keys
+    mut [float32, width = 129, height = 16]'actor rv_s    # value sub-tile: 16 keys x 128 dimensions
+    mut [float32, 8] rs         # thread-private: scores of 2 rows x 4 keys
+    mut [float32, 16] racc      # thread-private: 2 rows x 8 output dimensions
+    mut [float32, 2] rm         # running row maxima
+    mut [float32, 2] rl         # partial row sums (this thread's keys only)
+
+    init([float32]'global qi, [float32]'global ki, [float32]'global vi,
+         int sq, int sk, int d_q, int d_kv, int grp, float32 sc, int caus, int caus_off):
+        q      = qi.reshape(col = d_q, row = sq)
+        k      = ki.reshape(col = d_kv, row = sk)
+        v      = vi.reshape(col = d_kv, row = sk)
+        o      = [0.0 for col = d_q, row = sq]
+        seq_q  = sq
+        seq_k  = sk
+        group  = grp
+        scale  = sc
+        causal = caus
+        causal_offset = caus_off
+
+    def ():
+        let tx   = .thread.x
+        let ty   = .thread.y
+        let h    = .block.z
+        let row0 = .block.y * 32
+        let q_off = h * 128
+        let k_off = (h / group) * 128
+        let lin  = ty * 16 + tx
+        for e in 0..<16:
+            racc[e] = 0.0
+        for i in 0..<2:
+            rm[i] = -1.0e30
+            rl[i] = 0.0
+        var int kmax = seq_k
+        if causal == 1:
+            let lim = causal_offset + row0 + 32
+            if lim < kmax:
+                kmax = lim
+        let ntiles = (kmax + 63) / 64
+        for t in 0..<ntiles:
+            let j0 = t * 64
+            for e in 0..<8:
+                rs[e] = 0.0
+            for dc in 0..<4:
+                sync
+                for r in 0..<4:
+                    let idx = lin + r * 256
+                    let rr = idx / 32
+                    let cc = idx % 32
+                    if row0 + rr < seq_q:
+                        rq_s[width = cc, height = rr] = q[col = q_off + dc * 32 + cc, row = row0 + rr]
+                    else:
+                        rq_s[width = cc, height = rr] = 0.0
+                for r in 0..<8:
+                    let idx = lin + r * 256
+                    let rr = idx / 32
+                    let cc = idx % 32
+                    if j0 + rr < seq_k:
+                        rk_s[width = cc, height = rr] = k[col = k_off + dc * 32 + cc, row = j0 + rr]
+                    else:
+                        rk_s[width = cc, height = rr] = 0.0
+                sync
+                for d in 0..<32:
+                    let qa0 = rq_s[width = d, height = ty]
+                    let qa1 = rq_s[width = d, height = ty + 16]
+                    for j in 0..<4:
+                        let kb = rk_s[width = d, height = tx + 16 * j]
+                        rs[j] = rs[j] + qa0 * kb
+                        rs[4 + j] = rs[4 + j] + qa1 * kb
+            for i in 0..<2:
+                let row = row0 + ty + 16 * i
+                var float32 lmax = -1.0e30
+                for j in 0..<4:
+                    let key = j0 + tx + 16 * j
+                    var float32 sv = rs[i * 4 + j] * scale
+                    var int ok = 1
+                    if key >= seq_k:
+                        ok = 0
+                    if causal == 1 and key > row + causal_offset:
+                        ok = 0
+                    if ok == 0:
+                        sv = -1.0e30 as float32
+                    rs[i * 4 + j] = sv
+                    if sv > lmax:
+                        lmax = sv
+                var int off = 8
+                while off > 0:
+                    let other = .warp.shuffle_xor(lmax, off)
+                    if other > lmax:
+                        lmax = other
+                    off = off / 2
+                var float32 mx = rm[i]
+                if lmax > mx:
+                    mx = lmax
+                let alpha = (rm[i] - mx).exp()
+                var float32 psum = 0.0
+                for j in 0..<4:
+                    var float32 pv = 0.0
+                    if rs[i * 4 + j] > -1.0e29:
+                        pv = (rs[i * 4 + j] - mx).exp()
+                    psum += pv
+                    rp_s[width = tx + 16 * j, height = ty + 16 * i] = pv
+                rl[i] = rl[i] * alpha + psum
+                rm[i] = mx
+                for e in 0..<8:
+                    racc[i * 8 + e] = racc[i * 8 + e] * alpha
+            for vs in 0..<4:
+                sync
+                for r in 0..<8:
+                    let idx = lin + r * 256
+                    let rr = idx / 128
+                    let cc = idx % 128
+                    if j0 + vs * 16 + rr < seq_k:
+                        rv_s[width = cc, height = rr] = v[col = k_off + cc, row = j0 + vs * 16 + rr]
+                    else:
+                        rv_s[width = cc, height = rr] = 0.0
+                sync
+                for jl in 0..<16:
+                    let pj0 = rp_s[width = vs * 16 + jl, height = ty]
+                    let pj1 = rp_s[width = vs * 16 + jl, height = ty + 16]
+                    for e in 0..<8:
+                        let ve = rv_s[width = tx + 16 * e, height = jl]
+                        racc[e] = racc[e] + pj0 * ve
+                        racc[8 + e] = racc[8 + e] + pj1 * ve
+        for i in 0..<2:
+            var float32 lt = rl[i]
+            var int off = 8
+            while off > 0:
+                lt += .warp.shuffle_xor(lt, off)
+                off = off / 2
+            var float32 inv = 0.0
+            if lt > 0.0:
+                inv = 1.0 / lt
+            let row = row0 + ty + 16 * i
+            if row < seq_q:
+                for e in 0..<8:
+                    o[col = q_off + tx + 16 * e, row = row] = racc[i * 8 + e] * inv
+
+# Prefill attention for d_head 64 with register blocking (the d_head 128 kernel above, with 64 dimensions). One block handles 32 query rows of one
+# head against all the keys the causal mask allows, 64 keys per step; each thread owns a micro-tile
+# of 2 query rows x 4 keys of scores and 2 rows x 8 output dimensions, so the score loop does 6
+# shared reads per 8 multiply-adds (the 16 x 16 kernel above does 2 per 1) and the value loop 10 per
+# 16. The 16 threads sharing a query row combine their row maxima with warp shuffles and keep a
+# partial row sum that is reduced once at the end. Tiles are padded by one column to avoid bank
+# conflicts. Same interface and masking as FlashAttn64Kernel.
+kernel FlashAttn64RegKernel:
+    let  [float32, col, row]'global   q          # (seq_q x n_head*128)
+    let  [float32, col, row]'global   k          # (seq_k x n_kv_head*128), cache layout
+    let  [float32, col, row]'global   v          # (seq_k x n_kv_head*128)
+    mut  [float32, col, row]'unified  o          # (seq_q x n_head*128)
+    let int             seq_q
+    let int             seq_k
+    let int             group
+    let float32         scale
+    let int             causal
+    let int             causal_offset
+    mut [float32, width = 33, height = 32]'actor rq_s     # query chunk: 32 rows x 32 dimensions
+    mut [float32, width = 33, height = 64]'actor rk_s     # key chunk: 64 keys x 32 dimensions
+    mut [float32, width = 65, height = 32]'actor rp_s     # probabilities: 32 rows x 64 keys
+    mut [float32, width = 65, height = 16]'actor rv_s     # value sub-tile: 16 keys x 64 dimensions
+    mut [float32, 8] rs         # thread-private: scores of 2 rows x 4 keys
+    mut [float32, 8] racc       # thread-private: 2 rows x 4 output dimensions
+    mut [float32, 2] rm         # running row maxima
+    mut [float32, 2] rl         # partial row sums (this thread's keys only)
+
+    init([float32]'global qi, [float32]'global ki, [float32]'global vi,
+         int sq, int sk, int d_q, int d_kv, int grp, float32 sc, int caus, int caus_off):
+        q      = qi.reshape(col = d_q, row = sq)
+        k      = ki.reshape(col = d_kv, row = sk)
+        v      = vi.reshape(col = d_kv, row = sk)
+        o      = [0.0 for col = d_q, row = sq]
+        seq_q  = sq
+        seq_k  = sk
+        group  = grp
+        scale  = sc
+        causal = caus
+        causal_offset = caus_off
+
+    def ():
+        let tx   = .thread.x
+        let ty   = .thread.y
+        let h    = .block.z
+        let row0 = .block.y * 32
+        let q_off = h * 64
+        let k_off = (h / group) * 64
+        let lin  = ty * 16 + tx
+        for e in 0..<8:
+            racc[e] = 0.0
+        for i in 0..<2:
+            rm[i] = -1.0e30
+            rl[i] = 0.0
+        var int kmax = seq_k
+        if causal == 1:
+            let lim = causal_offset + row0 + 32
+            if lim < kmax:
+                kmax = lim
+        let ntiles = (kmax + 63) / 64
+        for t in 0..<ntiles:
+            let j0 = t * 64
+            for e in 0..<8:
+                rs[e] = 0.0
+            for dc in 0..<2:
+                sync
+                for r in 0..<4:
+                    let idx = lin + r * 256
+                    let rr = idx / 32
+                    let cc = idx % 32
+                    if row0 + rr < seq_q:
+                        rq_s[width = cc, height = rr] = q[col = q_off + dc * 32 + cc, row = row0 + rr]
+                    else:
+                        rq_s[width = cc, height = rr] = 0.0
+                for r in 0..<8:
+                    let idx = lin + r * 256
+                    let rr = idx / 32
+                    let cc = idx % 32
+                    if j0 + rr < seq_k:
+                        rk_s[width = cc, height = rr] = k[col = k_off + dc * 32 + cc, row = j0 + rr]
+                    else:
+                        rk_s[width = cc, height = rr] = 0.0
+                sync
+                for d in 0..<32:
+                    let qa0 = rq_s[width = d, height = ty]
+                    let qa1 = rq_s[width = d, height = ty + 16]
+                    for j in 0..<4:
+                        let kb = rk_s[width = d, height = tx + 16 * j]
+                        rs[j] = rs[j] + qa0 * kb
+                        rs[4 + j] = rs[4 + j] + qa1 * kb
+            for i in 0..<2:
+                let row = row0 + ty + 16 * i
+                var float32 lmax = -1.0e30
+                for j in 0..<4:
+                    let key = j0 + tx + 16 * j
+                    var float32 sv = rs[i * 4 + j] * scale
+                    var int ok = 1
+                    if key >= seq_k:
+                        ok = 0
+                    if causal == 1 and key > row + causal_offset:
+                        ok = 0
+                    if ok == 0:
+                        sv = -1.0e30 as float32
+                    rs[i * 4 + j] = sv
+                    if sv > lmax:
+                        lmax = sv
+                var int off = 8
+                while off > 0:
+                    let other = .warp.shuffle_xor(lmax, off)
+                    if other > lmax:
+                        lmax = other
+                    off = off / 2
+                var float32 mx = rm[i]
+                if lmax > mx:
+                    mx = lmax
+                let alpha = (rm[i] - mx).exp()
+                var float32 psum = 0.0
+                for j in 0..<4:
+                    var float32 pv = 0.0
+                    if rs[i * 4 + j] > -1.0e29:
+                        pv = (rs[i * 4 + j] - mx).exp()
+                    psum += pv
+                    rp_s[width = tx + 16 * j, height = ty + 16 * i] = pv
+                rl[i] = rl[i] * alpha + psum
+                rm[i] = mx
+                for e in 0..<4:
+                    racc[i * 4 + e] = racc[i * 4 + e] * alpha
+            for vs in 0..<4:
+                sync
+                for r in 0..<4:
+                    let idx = lin + r * 256
+                    let rr = idx / 64
+                    let cc = idx % 64
+                    if j0 + vs * 16 + rr < seq_k:
+                        rv_s[width = cc, height = rr] = v[col = k_off + cc, row = j0 + vs * 16 + rr]
+                    else:
+                        rv_s[width = cc, height = rr] = 0.0
+                sync
+                for jl in 0..<16:
+                    let pj0 = rp_s[width = vs * 16 + jl, height = ty]
+                    let pj1 = rp_s[width = vs * 16 + jl, height = ty + 16]
+                    for e in 0..<4:
+                        let ve = rv_s[width = tx + 16 * e, height = jl]
+                        racc[e] = racc[e] + pj0 * ve
+                        racc[4 + e] = racc[4 + e] + pj1 * ve
+        for i in 0..<2:
+            var float32 lt = rl[i]
+            var int off = 8
+            while off > 0:
+                lt += .warp.shuffle_xor(lt, off)
+                off = off / 2
+            var float32 inv = 0.0
+            if lt > 0.0:
+                inv = 1.0 / lt
+            let row = row0 + ty + 16 * i
+            if row < seq_q:
+                for e in 0..<4:
+                    o[col = q_off + tx + 16 * e, row = row] = racc[i * 4 + e] * inv
+
+pub req [float32]'kernel'unified attention_flash64reg_gpu([float32]'kernel'global q, [float32]'kernel'global k, [float32]'kernel'global v,
+                          int seq_q, int seq_k, int n_head, int n_kv_head,
+                          bool causal, int causal_offset) throws:
+    let int d_q   = n_head * 64
+    let int d_kv  = n_kv_head * 64
+    let int group = n_head / n_kv_head
+    let float32 scale = 1.0 / (64.0 as float32).sqrt()
+    let int causal_i = if causal: 1 else: 0
+    mut kf = FlashAttn64RegKernel(q, k, v, seq_q, seq_k, d_q, d_kv, group, scale, causal_i, causal_offset)
+    kernel:
+        kf(block = (16, 16), grid = (1, (seq_q + 31) / 32, n_head))
+    kf.o
+
+pub req [float32]'kernel'unified attention_flash128reg_gpu([float32]'kernel'global q, [float32]'kernel'global k, [float32]'kernel'global v,
+                          int seq_q, int seq_k, int n_head, int n_kv_head,
+                          bool causal, int causal_offset) throws:
+    let int d_q   = n_head * 128
+    let int d_kv  = n_kv_head * 128
+    let int group = n_head / n_kv_head
+    let float32 scale = 1.0 / (128.0 as float32).sqrt()
+    let int causal_i = if causal: 1 else: 0
+    mut kf = FlashAttn128RegKernel(q, k, v, seq_q, seq_k, d_q, d_kv, group, scale, causal_i, causal_offset)
+    kernel:
+        kf(block = (16, 16), grid = (1, (seq_q + 31) / 32, n_head))
+    kf.o
+
 pub req [float32]'kernel'unified attention_flash128_gpu([float32]'kernel'global q, [float32]'kernel'global k, [float32]'kernel'global v,
                           int seq_q, int seq_k, int n_head, int n_kv_head,
                           bool causal, int causal_offset) throws:
@@ -4918,9 +5260,9 @@ pub req [float32]'kernel'unified attention_gqa_gpu([float32]'kernel'global q, [f
                           bool causal, int causal_offset) throws:
     let bool sees_all = (not causal) or (causal_offset + 1 >= seq_k)
     if d_head == 64 and seq_q > 1:
-        attention_flash64_gpu(q, k, v, seq_q, seq_k, n_head, n_kv_head, causal, causal_offset)
+        attention_flash64reg_gpu(q, k, v, seq_q, seq_k, n_head, n_kv_head, causal, causal_offset)
     elif d_head == 128 and seq_q > 1:
-        attention_flash128_gpu(q, k, v, seq_q, seq_k, n_head, n_kv_head, causal, causal_offset)
+        attention_flash128reg_gpu(q, k, v, seq_q, seq_k, n_head, n_kv_head, causal, causal_offset)
     elif d_head == 64 and seq_q == 1 and sees_all:
         attention_decode64_gpu(q, k, v, seq_k, n_head, n_kv_head)
     elif d_head == 128 and seq_q == 1 and sees_all:

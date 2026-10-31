@@ -183,14 +183,14 @@ Against llama.cpp (llama-cpp-python, Metal, same GGUF, same machine, 3 alternati
 | Qwen2.5-7B Q4_K_M | ~4150 | 87 | 122 | 0.71x | 6.1 | 10.0 | 0.61x |
 | Qwen3-4B Q4_K_M | ~550 | 181 | 277 | 0.66x | 10.8 | 28.3 | 0.38x |
 | Qwen3-4B Q4_K_M | ~4130 | 130 | 221 | 0.59x | 9.0 | 15.6 | 0.58x |
-| Qwen2.5-3B Q4_K_M | ~570 | 331 | 444 | 0.75x | 33.1 | 40.4 | 0.82x |
-| Qwen2.5-3B Q4_K_M | ~4150 | 240 | 381 | 0.63x | 24.9 | 31.1 | 0.80x |
-| Qwen2.5-0.5B Q8_0 | ~570 | 2,093 | 2,941 | 0.71x | 110.0 | 125.1 | 0.88x |
-| Qwen2.5-0.5B Q8_0 | ~4150 | 1,225 | 2,182 | 0.56x | 64.1 | 83.1 | 0.77x |
+| Qwen2.5-3B Q4_K_M | ~570 | 322 | 392 | 0.82x | 31.0 | 38.8 | 0.80x |
+| Qwen2.5-3B Q4_K_M | ~4150 | 240 | 333 | 0.72x | 28.6 | 30.1 | 0.95x |
+| Qwen2.5-0.5B Q8_0 | ~570 | 2,154 | 2,868 | 0.75x | 105.3 | 120.5 | 0.87x |
+| Qwen2.5-0.5B Q8_0 | ~4150 | 1,465 | 2,027 | 0.72x | 62.1 | 80.4 | 0.77x |
 
 The server needs 3.1 GB (peak 3.3 GB) for the 3B model and 6.4 GB (peak 6.8 GB) for the 7B, and is ready in about 4 s on the 7B (disk-streaming loader). Through OpenCode, the 7B model's first request (7,539 tokens, ten tools) spent 115 s in prefill cold and 2.5 s on the follow-up that reused 7,559 of 7,638 tokens; a cold start used to take 321-453 s.
 
-Where the gap to llama.cpp is: decode is at 0.77-0.88x on the 3B and the 0.5B at both prompt sizes, and the decode cost of a long context is now close to llama.cpp's (+2.8 ms/token per 1k prompt tokens on the 3B against 2.1, +1.8 against 1.1 on the 0.5B). Prefill is the main remaining gap: 0.71-0.75x at ~570 tokens and 0.56-0.63x at ~4150. The 7B and 4B rows are earlier measurements taken before the changes below, so their ratios are not comparable with the 3B and 0.5B ones. Absolute numbers on this machine move by tens of percent between sessions (the same llama.cpp decoded the 3B at 28 tok/s on 2026-10-29 and at 40 on 2026-10-31), so read a ratio from one run only.
+Where the gap to llama.cpp is: decode is at 0.77-0.88x on the 3B and the 0.5B at both prompt sizes, and the decode cost of a long context is now close to llama.cpp's (+2.8 ms/token per 1k prompt tokens on the 3B against 2.1, +1.8 against 1.1 on the 0.5B). Prefill is the main remaining gap: 0.75-0.82x at ~570 tokens and 0.72x at ~4150 (it was 0.56-0.63x before the register-blocked prefill attention kernels; the 0.5B went from 1,225 to 1,465 tok/s at ~4150). The 7B and 4B rows are earlier measurements taken before the changes below, so their ratios are not comparable with the 3B and 0.5B ones. Absolute numbers on this machine move by tens of percent between sessions (the same llama.cpp decoded the 3B at 28 tok/s on 2026-10-29 and at 40 on 2026-10-31), so read a ratio from one run only.
 
 Three changes from 2026-10-30 and 2026-10-31 account for the 3B going from 0.41x (short context) and 0.49x (long context) to 0.82x and 0.80x: the decode batch limit (8 -> 3, which sat on a launch-batching cliff), the removal of 73 device-to-host readbacks per decoded token, and keeping the KV cache built by prefill on the GPU (it was host-side and was re-uploaded at every layer of every decoded token). The last two share one cause: the transpiler types a `mut` variable initialised with `[]` as a host array (details in the development log).
 

@@ -1,0 +1,139 @@
+{
+ "schema": 2,
+ "label": "",
+ "machine": "Apple M3 / 17179869184",
+ "load_average": {
+  "before": 2.40380859375,
+  "after": 1.59423828125
+ },
+ "configuration": {
+  "gguf": "/Users/m.lanoe/Documents/dev/git/perso/boring-llm/weights/qwen2.5-3b-instruct-q4_k_m.gguf",
+  "binary": "/private/tmp/claude-923340534/-Users-m-lanoe-Documents-dev-git-perso/85e6be14-829c-42de-b4af-fc030dcf11eb/scratchpad/cand2/src/main_metal/target/release/main",
+  "prompt_tokens": [
+   512,
+   4096
+  ],
+  "generated_tokens": 64,
+  "repetitions": 3,
+  "context_size": 8192,
+  "engines": [
+   "ours",
+   "llama"
+  ],
+  "llama_kv": "f16",
+  "llama_flash_attn": false,
+  "ours_arg": []
+ },
+ "results": {
+  "boring-llm|512": [
+   {
+    "prompt_tokens": 567,
+    "generated": 63,
+    "ttft_s": 1.7515745000273455,
+    "prefill_tps": 323.70875460401373,
+    "decode_tps": 30.966984689023782
+   },
+   {
+    "prompt_tokens": 567,
+    "generated": 63,
+    "ttft_s": 1.7628409590106457,
+    "prefill_tps": 321.63990580194815,
+    "decode_tps": 31.022939524809225
+   },
+   {
+    "prompt_tokens": 568,
+    "generated": 63,
+    "ttft_s": 1.8118937920080498,
+    "prefill_tps": 313.48415812524433,
+    "decode_tps": 30.90728459048603
+   }
+  ],
+  "boring-llm|4096": [
+   {
+    "prompt_tokens": 4147,
+    "generated": 63,
+    "ttft_s": 16.4103209169989,
+    "prefill_tps": 252.7068191399147,
+    "decode_tps": 28.57076971903309
+   },
+   {
+    "prompt_tokens": 4147,
+    "generated": 63,
+    "ttft_s": 17.31763241699082,
+    "prefill_tps": 239.46691442250852,
+    "decode_tps": 28.16445491077426
+   },
+   {
+    "prompt_tokens": 4148,
+    "generated": 63,
+    "ttft_s": 17.735749792016577,
+    "prefill_tps": 233.8779047202812,
+    "decode_tps": 28.61734380730767
+   }
+  ],
+  "llama.cpp|512": [
+   {
+    "prompt_tokens": 567,
+    "generated": 64,
+    "ttft_s": 1.3533117909973953,
+    "prefill_tps": 418.9721864331937,
+    "decode_tps": 36.94204409968263
+   },
+   {
+    "prompt_tokens": 568,
+    "generated": 64,
+    "ttft_s": 1.4508963749976829,
+    "prefill_tps": 391.48212773011244,
+    "decode_tps": 38.87885118600013
+   },
+   {
+    "prompt_tokens": 568,
+    "generated": 64,
+    "ttft_s": 1.496658583986573,
+    "prefill_tps": 379.5120718093551,
+    "decode_tps": 38.76517137537804
+   }
+  ],
+  "llama.cpp|4096": [
+   {
+    "prompt_tokens": 4147,
+    "generated": 64,
+    "ttft_s": 11.91114887499134,
+    "prefill_tps": 348.16120959641813,
+    "decode_tps": 28.79712796206531
+   },
+   {
+    "prompt_tokens": 4148,
+    "generated": 64,
+    "ttft_s": 12.447066499997163,
+    "prefill_tps": 333.2512122435391,
+    "decode_tps": 30.046345300141795
+   },
+   {
+    "prompt_tokens": 4148,
+    "generated": 64,
+    "ttft_s": 12.623906249995343,
+    "prefill_tps": 328.58292178789986,
+    "decode_tps": 30.134249271373907
+   }
+  ]
+ },
+ "decode_slopes": {
+  "boring-llm": {
+   "low_size": 512,
+   "high_size": 4096,
+   "low_ms": 32.29245630603644,
+   "high_ms": 35.00080711279635,
+   "delta_ms": 2.70835080675991,
+   "ms_per_1k_tokens": 0.7556782384932783
+  },
+  "llama.cpp": {
+   "low_size": 512,
+   "high_size": 4096,
+   "low_ms": 25.796351841621338,
+   "high_ms": 33.281917984057806,
+   "delta_ms": 7.485566142436468,
+   "ms_per_1k_tokens": 2.0886066245637465
+  }
+ }
+}

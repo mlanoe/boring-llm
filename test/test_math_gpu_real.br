@@ -207,6 +207,27 @@ def main() throws:
     check_fused_attention(64, 4, 2, 5, 21, false, 0)
     check_fused_attention(128, 4, 2, 18, 18, true, 0)
     check_fused_attention(128, 4, 2, 33, 70, true, 37)
+    # Register-blocked prefill kernel (32-row query blocks, 64-key tiles): block and tile
+    # boundaries, groups of 8, 7, 4 and 1 query heads, a causal offset, the non-causal case.
+    check_fused_attention(128, 16, 2, 32, 32, true, 0)
+    check_fused_attention(128, 16, 2, 33, 33, true, 0)
+    check_fused_attention(128, 16, 2, 64, 64, true, 0)
+    check_fused_attention(128, 16, 2, 65, 130, true, 65)
+    check_fused_attention(128, 14, 2, 70, 333, true, 263)
+    check_fused_attention(128, 8, 2, 100, 100, false, 0)
+    check_fused_attention(128, 4, 4, 31, 95, true, 64)
+    check_fused_attention(128, 4, 1, 45, 45, true, 0)
+    check_fused_attention(128, 16, 2, 512, 1536, true, 1024)
+    # The same, for the d_head 64 register-blocked kernel (Qwen2.5-0.5B: 14 heads over 2 KV heads).
+    check_fused_attention(64, 14, 2, 32, 32, true, 0)
+    check_fused_attention(64, 14, 2, 33, 33, true, 0)
+    check_fused_attention(64, 14, 2, 64, 64, true, 0)
+    check_fused_attention(64, 14, 2, 65, 130, true, 65)
+    check_fused_attention(64, 14, 2, 70, 333, true, 263)
+    check_fused_attention(64, 8, 2, 100, 100, false, 0)
+    check_fused_attention(64, 4, 4, 31, 95, true, 64)
+    check_fused_attention(64, 4, 1, 45, 45, true, 0)
+    check_fused_attention(64, 14, 2, 512, 1536, true, 1024)
 
     check_decode_attention(64, 4, 2, 1, false)
     check_decode_attention(64, 4, 2, 37, false)

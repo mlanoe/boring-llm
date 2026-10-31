@@ -1,0 +1,200 @@
+{
+ "schema": 1,
+ "description": "Paired A/B of the prefill speed of the register-blocked d_head-128 attention kernel (candidate) against the previous kernel (reference), Qwen2.5-3B Q4_K_M, 16 generated tokens, 3 alternating repetitions, 2026-10-31, Apple M3, load 1.5-2.2. Read prefill_tps and ttft_s in each raw sample.",
+ "prompt_4096": {
+  "schema": 1,
+  "machine": "Apple M3 / 17179869184",
+  "load_samples": [
+   1.75341796875,
+   1.75341796875,
+   1.94677734375,
+   1.8876953125,
+   1.8876953125,
+   1.75927734375,
+   1.5615234375,
+   1.5615234375,
+   1.61669921875
+  ],
+  "configuration": {
+   "gguf": "weights/qwen2.5-3b-instruct-q4_k_m.gguf",
+   "baseline": "reference build",
+   "candidate": "candidate build",
+   "prompt_tokens": 4096,
+   "generated_tokens": 16,
+   "repetitions": 3,
+   "context_size": 9216,
+   "max_load": 5.0
+  },
+  "summary_ms_per_token": {
+   "baseline": {
+    "min": 37.196949357166886,
+    "median": 37.383148856211584,
+    "max": 38.00769350034118
+   },
+   "candidate": {
+    "min": 36.62883928544553,
+    "median": 37.06665471379113,
+    "max": 37.350062501250896
+   }
+  },
+  "paired_deltas_ms_per_token": [
+   -0.7543095707660541,
+   -0.13029464337575547,
+   -0.6576309990902871
+  ],
+  "paired_median_delta_ms_per_token": -0.6576309990902871,
+  "median_speedup": 1.0085385137899348,
+  "raw": {
+   "baseline": [
+    {
+     "prompt_tokens": 4147,
+     "generated": 15,
+     "ttft_s": 17.92903674999252,
+     "prefill_tps": 231.30076968589682,
+     "decode_tps": 26.75002054659288,
+     "ms_per_token": 37.383148856211584
+    },
+    {
+     "prompt_tokens": 4147,
+     "generated": 15,
+     "ttft_s": 17.87095454201335,
+     "prefill_tps": 232.05251796991013,
+     "decode_tps": 26.883925087456827,
+     "ms_per_token": 37.196949357166886
+    },
+    {
+     "prompt_tokens": 4148,
+     "generated": 15,
+     "ttft_s": 18.15932974999305,
+     "prefill_tps": 228.42252754409,
+     "decode_tps": 26.3104626433336,
+     "ms_per_token": 38.00769350034118
+    }
+   ],
+   "candidate": [
+    {
+     "prompt_tokens": 4147,
+     "generated": 15,
+     "ttft_s": 16.432952750008553,
+     "prefill_tps": 252.3587856112981,
+     "decode_tps": 27.30089239812057,
+     "ms_per_token": 36.62883928544553
+    },
+    {
+     "prompt_tokens": 4147,
+     "generated": 15,
+     "ttft_s": 16.379884124995442,
+     "prefill_tps": 253.17639418900066,
+     "decode_tps": 26.978425965911,
+     "ms_per_token": 37.06665471379113
+    },
+    {
+     "prompt_tokens": 4148,
+     "generated": 15,
+     "ttft_s": 16.92347866698401,
+     "prefill_tps": 245.1032723013577,
+     "decode_tps": 26.773716910554267,
+     "ms_per_token": 37.350062501250896
+    }
+   ]
+  }
+ },
+ "prompt_7600": {
+  "schema": 1,
+  "machine": "Apple M3 / 17179869184",
+  "load_samples": [
+   1.5244140625,
+   1.5244140625,
+   2.2255859375,
+   1.9736328125,
+   1.9736328125,
+   1.990234375,
+   1.8349609375,
+   1.8349609375,
+   1.98974609375
+  ],
+  "configuration": {
+   "gguf": "weights/qwen2.5-3b-instruct-q4_k_m.gguf",
+   "baseline": "reference build",
+   "candidate": "candidate build",
+   "prompt_tokens": 7600,
+   "generated_tokens": 16,
+   "repetitions": 3,
+   "context_size": 9216,
+   "max_load": 5.0
+  },
+  "summary_ms_per_token": {
+   "baseline": {
+    "min": 40.791601144259666,
+    "median": 41.07431842878993,
+    "max": 42.08607142832729
+   },
+   "candidate": {
+    "min": 40.68376485832103,
+    "median": 41.07831549897258,
+    "max": 42.04307435845424
+   }
+  },
+  "paired_deltas_ms_per_token": [
+   0.9687559296643116,
+   0.2867143547129132,
+   -1.4023065700062602
+  ],
+  "paired_median_delta_ms_per_token": 0.2867143547129132,
+  "median_speedup": 0.999902696346379,
+  "raw": {
+   "baseline": [
+    {
+     "prompt_tokens": 7657,
+     "generated": 15,
+     "ttft_s": 44.956830582988914,
+     "prefill_tps": 170.31894599120852,
+     "decode_tps": 24.346113051971596,
+     "ms_per_token": 41.07431842878993
+    },
+    {
+     "prompt_tokens": 7657,
+     "generated": 15,
+     "ttft_s": 53.01824558398221,
+     "prefill_tps": 144.42197993653193,
+     "decode_tps": 24.51485040911966,
+     "ms_per_token": 40.791601144259666
+    },
+    {
+     "prompt_tokens": 7658,
+     "generated": 15,
+     "ttft_s": 52.10667379098595,
+     "prefill_tps": 146.96773834995344,
+     "decode_tps": 23.7608302714356,
+     "ms_per_token": 42.08607142832729
+    }
+   ],
+   "candidate": [
+    {
+     "prompt_tokens": 7657,
+     "generated": 15,
+     "ttft_s": 40.6445012089971,
+     "prefill_tps": 188.38956740118735,
+     "decode_tps": 23.78513025651072,
+     "ms_per_token": 42.04307435845424
+    },
+    {
+     "prompt_tokens": 7657,
+     "generated": 15,
+     "ttft_s": 41.63509808300296,
+     "prefill_tps": 183.90733665944887,
+     "decode_tps": 24.34374408622017,
+     "ms_per_token": 41.07831549897258
+    },
+    {
+     "prompt_tokens": 7658,
+     "generated": 15,
+     "ttft_s": 46.112599916988984,
+     "prefill_tps": 166.0717464160725,
+     "decode_tps": 24.57982941063702,
+     "ms_per_token": 40.68376485832103
+    }
+   ]
+  }
+ }
+}
