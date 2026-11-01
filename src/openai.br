@@ -1603,11 +1603,55 @@ pub ParsedReply parse_reply_for_tools(string text, JValue body, [JValue] tools):
             return parsed
     parsed
 
+# Field checks shared by `request_validation_error`: each returns "" when the field is absent or
+# valid, else the error message.  A request-field's type error is derived from its key; `msg` is
+# the out-of-range message.
+string int_field_error(JValue body, string key, int lo, int hi, string msg):
+    match json_get(body, key):
+        JUndefined: return ""
+        JInt(n):
+            if n < lo or n > hi:
+                return msg
+        _:
+            return "`{key}` must be an integer"
+    ""
+
+# `lo`/`hi` are inclusive unless `lo_open`/`hi_open` make the bound exclusive.
+string num_field_error(JValue body, string key, float lo, bool lo_open, float hi, bool hi_open, string msg):
+    let value = json_get(body, key)
+    if request_value_is_undefined(value):
+        return ""
+    if not jv_is_number(value):
+        return "`{key}` must be a number"
+    let v = json_get_float(body, key, 0.0)
+    if v < lo or v > hi or (lo_open and v == lo) or (hi_open and v == hi):
+        return msg
+    ""
+
+# `kind` is "boolean", "string" or "object".
+string type_field_error(JValue body, string key, string kind):
+    let value = json_get(body, key)
+    if request_value_is_undefined(value):
+        return ""
+    let ok = if kind == "boolean": jv_is_bool(value) elif kind == "string": jv_is_str(value) else: jv_is_dict(value)
+    if ok:
+        return ""
+    let article = if kind == "object": "an" else: "a"
+    "`{key}` must be {article} {kind}"
+
+string first_error([string] errors):
+    for e in errors:
+        if e != "":
+            return e
+    ""
+
 # Validates the generation fields consumed by server.br.  Returning one stable
 # message (rather than silently substituting a default) makes malformed client
 # requests fail like llama-server/OpenAI requests do.  Unknown fields remain
 # allowed for forward compatibility.
 pub string request_validation_error(JValue body):
+    let BIG = 1.0e300
+    let IBIG = 1000000000000
     let model = json_get(body, "model")
     if not request_value_is_undefined(model):
         match model:
@@ -1616,137 +1660,30 @@ pub string request_validation_error(JValue body):
                     return "`model` must be a non-empty string"
             _: return "`model` must be a non-empty string"
 
-    let n_choices = json_get(body, "n")
-    if not request_value_is_undefined(n_choices):
-        match n_choices:
-            JInt(n):
-                if n != 1:
-                    return "`n` must be 1; multiple choices are not supported"
-            _:
-                return "`n` must be an integer"
-
-    let mt = json_get(body, "max_tokens")
-    if not request_value_is_undefined(mt):
-        match mt:
-            JInt(n):
-                if n <= 0:
-                    return "`max_tokens` must be greater than 0"
-            _:
-                return "`max_tokens` must be an integer"
-    let mct = json_get(body, "max_completion_tokens")
-    if not request_value_is_undefined(mct):
-        match mct:
-            JInt(n):
-                if n <= 0:
-                    return "`max_completion_tokens` must be greater than 0"
-            _:
-                return "`max_completion_tokens` must be an integer"
-    let np = json_get(body, "n_predict")
-    if not request_value_is_undefined(np):
-        match np:
-            JInt(n):
-                if n < -1:
-                    return "`n_predict` must be -1 or greater"
-            _:
-                return "`n_predict` must be an integer"
-
-    let temp = json_get(body, "temperature")
-    if not request_value_is_undefined(temp):
-        if not jv_is_number(temp):
-            return "`temperature` must be a number"
-        let v = json_get_float(body, "temperature", 0.0)
-        if v < 0.0 or v > 2.0:
-            return "`temperature` must be between 0 and 2"
-    let dynatemp_range = json_get(body, "dynatemp_range")
-    if not request_value_is_undefined(dynatemp_range):
-        if not jv_is_number(dynatemp_range):
-            return "`dynatemp_range` must be a number"
-        if json_get_float(body, "dynatemp_range", 0.0) < 0.0:
-            return "`dynatemp_range` must be non-negative"
-    let dynatemp_exponent = json_get(body, "dynatemp_exponent")
-    if not request_value_is_undefined(dynatemp_exponent):
-        if not jv_is_number(dynatemp_exponent):
-            return "`dynatemp_exponent` must be a number"
-        if json_get_float(body, "dynatemp_exponent", 1.0) <= 0.0:
-            return "`dynatemp_exponent` must be positive"
-    let tp = json_get(body, "top_p")
-    if not request_value_is_undefined(tp):
-        if not jv_is_number(tp):
-            return "`top_p` must be a number"
-        let v = json_get_float(body, "top_p", 1.0)
-        if v <= 0.0 or v > 1.0:
-            return "`top_p` must be greater than 0 and at most 1"
-    let typical = json_get(body, "typical_p")
-    if not request_value_is_undefined(typical):
-        if not jv_is_number(typical):
-            return "`typical_p` must be a number"
-        let v = json_get_float(body, "typical_p", 1.0)
-        if v <= 0.0 or v > 1.0:
-            return "`typical_p` must be greater than 0 and at most 1"
-    let top_n_sigma = json_get(body, "top_n_sigma")
-    if not request_value_is_undefined(top_n_sigma) and not jv_is_number(top_n_sigma):
-        return "`top_n_sigma` must be a number"
-    for key in ["xtc_probability", "xtc_threshold"]:
-        let value = json_get(body, key)
-        if not request_value_is_undefined(value):
-            if not jv_is_number(value):
-                return "`{key}` must be a number"
-            let numeric = json_get_float(body, key, 0.0)
-            if numeric < 0.0 or numeric > 1.0:
-                return "`{key}` must be between 0 and 1"
-    let mp = json_get(body, "min_p")
-    if not request_value_is_undefined(mp):
-        if not jv_is_number(mp):
-            return "`min_p` must be a number"
-        let v = json_get_float(body, "min_p", 0.0)
-        if v < 0.0 or v > 1.0:
-            return "`min_p` must be between 0 and 1"
-    let min_keep = json_get(body, "min_keep")
-    if not request_value_is_undefined(min_keep):
-        match min_keep:
-            JInt(value):
-                if value < 0:
-                    return "`min_keep` must be a non-negative integer"
-            _: return "`min_keep` must be an integer"
-    let n_indent = json_get(body, "n_indent")
-    if not request_value_is_undefined(n_indent):
-        match n_indent:
-            JInt(value):
-                if value < 0: return "`n_indent` must be a non-negative integer"
-            _: return "`n_indent` must be an integer"
-    let tk = json_get(body, "top_k")
-    if not request_value_is_undefined(tk):
-        match tk:
-            JInt(n): true
-            _:
-                return "`top_k` must be an integer"
-    let seed = json_get(body, "seed")
-    if not request_value_is_undefined(seed):
-        match seed:
-            JInt(n): true
-            _: return "`seed` must be an integer"
-
-    for key in ["frequency_penalty", "presence_penalty"]:
-        let p = json_get(body, key)
-        if not request_value_is_undefined(p):
-            if not jv_is_number(p):
-                return "`{key}` must be a number"
-            let v = json_get_float(body, key, 0.0)
-            if v < -2.0 or v > 2.0:
-                return "`{key}` must be between -2 and 2"
-    let rp = json_get(body, "repeat_penalty")
-    if not request_value_is_undefined(rp):
-        if not jv_is_number(rp):
-            return "`repeat_penalty` must be a number"
-        if json_get_float(body, "repeat_penalty", 1.0) <= 0.0:
-            return "`repeat_penalty` must be greater than 0"
-    let rln = json_get(body, "repeat_last_n")
-    if not request_value_is_undefined(rln):
-        match rln:
-            JInt(n):
-                if n < -1:
-                    return "`repeat_last_n` must be -1 or greater"
-            _: return "`repeat_last_n` must be an integer"
+    let sampling = first_error([
+        int_field_error(body, "n", 1, 1, "`n` must be 1; multiple choices are not supported"),
+        int_field_error(body, "max_tokens", 1, IBIG, "`max_tokens` must be greater than 0"),
+        int_field_error(body, "max_completion_tokens", 1, IBIG, "`max_completion_tokens` must be greater than 0"),
+        int_field_error(body, "n_predict", -1, IBIG, "`n_predict` must be -1 or greater"),
+        num_field_error(body, "temperature", 0.0, false, 2.0, false, "`temperature` must be between 0 and 2"),
+        num_field_error(body, "dynatemp_range", 0.0, false, BIG, false, "`dynatemp_range` must be non-negative"),
+        num_field_error(body, "dynatemp_exponent", 0.0, true, BIG, false, "`dynatemp_exponent` must be positive"),
+        num_field_error(body, "top_p", 0.0, true, 1.0, false, "`top_p` must be greater than 0 and at most 1"),
+        num_field_error(body, "typical_p", 0.0, true, 1.0, false, "`typical_p` must be greater than 0 and at most 1"),
+        num_field_error(body, "top_n_sigma", -BIG, false, BIG, false, ""),
+        num_field_error(body, "xtc_probability", 0.0, false, 1.0, false, "`xtc_probability` must be between 0 and 1"),
+        num_field_error(body, "xtc_threshold", 0.0, false, 1.0, false, "`xtc_threshold` must be between 0 and 1"),
+        num_field_error(body, "min_p", 0.0, false, 1.0, false, "`min_p` must be between 0 and 1"),
+        int_field_error(body, "min_keep", 0, IBIG, "`min_keep` must be a non-negative integer"),
+        int_field_error(body, "n_indent", 0, IBIG, "`n_indent` must be a non-negative integer"),
+        int_field_error(body, "top_k", -IBIG, IBIG, ""),
+        int_field_error(body, "seed", -IBIG, IBIG, ""),
+        num_field_error(body, "frequency_penalty", -2.0, false, 2.0, false, "`frequency_penalty` must be between -2 and 2"),
+        num_field_error(body, "presence_penalty", -2.0, false, 2.0, false, "`presence_penalty` must be between -2 and 2"),
+        num_field_error(body, "repeat_penalty", 0.0, true, BIG, false, "`repeat_penalty` must be greater than 0"),
+        int_field_error(body, "repeat_last_n", -1, IBIG, "`repeat_last_n` must be -1 or greater")])
+    if sampling != "":
+        return sampling
     let samplers = json_get(body, "samplers")
     if not request_value_is_undefined(samplers):
         match samplers:
@@ -1762,22 +1699,13 @@ pub string request_validation_error(JValue body):
                             previous_rank = rank
                         _: return "`samplers` must be an array of strings"
             _: return "`samplers` must be an array of strings"
-    let dry_multiplier = json_get(body, "dry_multiplier")
-    if not request_value_is_undefined(dry_multiplier):
-        if not jv_is_number(dry_multiplier):
-            return "`dry_multiplier` must be a number"
-        if json_get_float(body, "dry_multiplier", 0.0) < 0.0:
-            return "`dry_multiplier` must be non-negative"
-    let dry_base = json_get(body, "dry_base")
-    if not request_value_is_undefined(dry_base) and not jv_is_number(dry_base):
-        return "`dry_base` must be a number"
-    for key in ["dry_allowed_length", "dry_penalty_last_n"]:
-        let value = json_get(body, key)
-        if not request_value_is_undefined(value):
-            match value:
-                JInt(n):
-                    if n < 0: return "`{key}` must be a non-negative integer"
-                _: return "`{key}` must be an integer"
+    let dry = first_error([
+        num_field_error(body, "dry_multiplier", 0.0, false, BIG, false, "`dry_multiplier` must be non-negative"),
+        num_field_error(body, "dry_base", -BIG, false, BIG, false, ""),
+        int_field_error(body, "dry_allowed_length", 0, IBIG, "`dry_allowed_length` must be a non-negative integer"),
+        int_field_error(body, "dry_penalty_last_n", 0, IBIG, "`dry_penalty_last_n` must be a non-negative integer")])
+    if dry != "":
+        return dry
     let dry_breakers = json_get(body, "dry_sequence_breakers")
     if not request_value_is_undefined(dry_breakers):
         match dry_breakers:
@@ -1790,48 +1718,26 @@ pub string request_validation_error(JValue body):
                             if value == "": return "`dry_sequence_breakers` entries must not be empty"
                         _: return "`dry_sequence_breakers` must be a non-empty array of strings"
             _: return "`dry_sequence_breakers` must be a non-empty array of strings"
-    let mirostat = json_get(body, "mirostat")
-    if not request_value_is_undefined(mirostat):
-        match mirostat:
-            JInt(mode):
-                if mode < 0 or mode > 2: return "`mirostat` must be 0, 1, or 2"
-            _: return "`mirostat` must be an integer"
-    for key in ["mirostat_tau", "mirostat_eta"]:
-        let value = json_get(body, key)
-        if not request_value_is_undefined(value):
-            if not jv_is_number(value): return "`{key}` must be a number"
-            if json_get_float(body, key, 0.0) <= 0.0: return "`{key}` must be positive"
-    let adaptive_target = json_get(body, "adaptive_target")
-    if not request_value_is_undefined(adaptive_target):
-        if not jv_is_number(adaptive_target): return "`adaptive_target` must be a number"
-        let value = json_get_float(body, "adaptive_target", -1.0)
-        if value > 1.0: return "`adaptive_target` must be at most 1"
-    let adaptive_decay = json_get(body, "adaptive_decay")
-    if not request_value_is_undefined(adaptive_decay):
-        if not jv_is_number(adaptive_decay): return "`adaptive_decay` must be a number"
-        let value = json_get_float(body, "adaptive_decay", 0.9)
-        if value < 0.0 or value > 0.99: return "`adaptive_decay` must be between 0 and 0.99"
+    let mirostat = first_error([
+        int_field_error(body, "mirostat", 0, 2, "`mirostat` must be 0, 1, or 2"),
+        num_field_error(body, "mirostat_tau", 0.0, true, BIG, false, "`mirostat_tau` must be positive"),
+        num_field_error(body, "mirostat_eta", 0.0, true, BIG, false, "`mirostat_eta` must be positive"),
+        num_field_error(body, "adaptive_target", -BIG, false, 1.0, false, "`adaptive_target` must be at most 1"),
+        num_field_error(body, "adaptive_decay", 0.0, false, 0.99, false, "`adaptive_decay` must be between 0 and 0.99")])
+    if mirostat != "":
+        return mirostat
     if json_get_int(body, "mirostat", 0) != 0 and json_get_float(body, "adaptive_target", -1.0) >= 0.0:
         return "`mirostat` and `adaptive_target` cannot be enabled together"
 
-    let stream_value = json_get(body, "stream")
-    if not request_value_is_undefined(stream_value):
-        match stream_value:
-            JBool(b): true
-            _: return "`stream` must be a boolean"
-    let ignore_eos = json_get(body, "ignore_eos")
-    if not request_value_is_undefined(ignore_eos) and not jv_is_bool(ignore_eos):
-        return "`ignore_eos` must be a boolean"
-    let stream_options = json_get(body, "stream_options")
-    if not request_value_is_undefined(stream_options):
-        match stream_options:
-            JDict(fields, keys):
-                let include_usage = json_get(stream_options, "include_usage")
-                if not request_value_is_undefined(include_usage):
-                    match include_usage:
-                        JBool(b): true
-                        _: return "`stream_options.include_usage` must be a boolean"
-            _: return "`stream_options` must be an object"
+    let streaming = first_error([
+        type_field_error(body, "stream", "boolean"),
+        type_field_error(body, "ignore_eos", "boolean"),
+        type_field_error(body, "stream_options", "object")])
+    if streaming != "":
+        return streaming
+    let include_usage = json_get(json_get(body, "stream_options"), "include_usage")
+    if not request_value_is_undefined(include_usage) and not jv_is_bool(include_usage):
+        return "`stream_options.include_usage` must be a boolean"
 
     let stop = json_get(body, "stop")
     if not request_value_is_undefined(stop):
@@ -1843,14 +1749,11 @@ pub string request_validation_error(JValue body):
                         return "`stop` must contain only strings"
             _: return "`stop` must be a string or an array of strings"
 
-    let kwargs = json_get(body, "chat_template_kwargs")
-    if not request_value_is_undefined(kwargs):
-        match kwargs:
-            JDict(fields, keys): true
-            _: return "`chat_template_kwargs` must be an object"
-    let reasoning_effort = json_get(body, "reasoning_effort")
-    if not request_value_is_undefined(reasoning_effort) and not jv_is_str(reasoning_effort):
-        return "`reasoning_effort` must be a string"
+    let template = first_error([
+        type_field_error(body, "chat_template_kwargs", "object"),
+        type_field_error(body, "reasoning_effort", "string")])
+    if template != "":
+        return template
     let reasoning_format = json_get(body, "reasoning_format")
     if not request_value_is_undefined(reasoning_format):
         match reasoning_format:
@@ -1858,39 +1761,17 @@ pub string request_validation_error(JValue body):
                 if format != "auto" and format != "deepseek" and format != "deepseek-legacy" and format != "none":
                     return "`reasoning_format` must be one of auto, deepseek, deepseek-legacy, or none"
             _: return "`reasoning_format` must be a string"
-    let parallel_tool_calls = json_get(body, "parallel_tool_calls")
-    if not request_value_is_undefined(parallel_tool_calls):
-        match parallel_tool_calls:
-            JBool(enabled): true
-            _: return "`parallel_tool_calls` must be a boolean"
-    let cache_prompt = json_get(body, "cache_prompt")
-    if not request_value_is_undefined(cache_prompt) and not jv_is_bool(cache_prompt):
-        return "`cache_prompt` must be a boolean"
-    let return_tokens = json_get(body, "return_tokens")
-    if not request_value_is_undefined(return_tokens) and not jv_is_bool(return_tokens):
-        return "`return_tokens` must be a boolean"
-    let predict_timeout = json_get(body, "t_max_predict_ms")
-    if not request_value_is_undefined(predict_timeout):
-        match predict_timeout:
-            JInt(value):
-                if value < -1:
-                    return "`t_max_predict_ms` must be -1 or a non-negative integer"
-            _: return "`t_max_predict_ms` must be an integer"
-    let return_progress = json_get(body, "return_progress")
-    if not request_value_is_undefined(return_progress) and not jv_is_bool(return_progress):
-        return "`return_progress` must be a boolean"
-    let timings_per_token = json_get(body, "timings_per_token")
-    if not request_value_is_undefined(timings_per_token) and not jv_is_bool(timings_per_token):
-        return "`timings_per_token` must be a boolean"
-    let sse_ping_interval = json_get(body, "sse_ping_interval")
-    if not request_value_is_undefined(sse_ping_interval):
-        match sse_ping_interval:
-            JInt(value):
-                if value < -1: return "`sse_ping_interval` must be -1 or a non-negative integer"
-            _: return "`sse_ping_interval` must be an integer"
-    let post_sampling_probs = json_get(body, "post_sampling_probs")
-    if not request_value_is_undefined(post_sampling_probs) and not jv_is_bool(post_sampling_probs):
-        return "`post_sampling_probs` must be a boolean"
+    let flags = first_error([
+        type_field_error(body, "parallel_tool_calls", "boolean"),
+        type_field_error(body, "cache_prompt", "boolean"),
+        type_field_error(body, "return_tokens", "boolean"),
+        int_field_error(body, "t_max_predict_ms", -1, IBIG, "`t_max_predict_ms` must be -1 or a non-negative integer"),
+        type_field_error(body, "return_progress", "boolean"),
+        type_field_error(body, "timings_per_token", "boolean"),
+        int_field_error(body, "sse_ping_interval", -1, IBIG, "`sse_ping_interval` must be -1 or a non-negative integer"),
+        type_field_error(body, "post_sampling_probs", "boolean")])
+    if flags != "":
+        return flags
     let response_fields = json_get(body, "response_fields")
     if not request_value_is_undefined(response_fields):
         match response_fields:
@@ -1908,10 +1789,9 @@ pub string request_validation_error(JValue body):
         let invalid = tool_schema_validation_error(native_schema)
         if invalid != "":
             return "`json_schema` is invalid: {invalid}"
-    let grammar = json_get(body, "grammar")
-    if not request_value_is_undefined(grammar):
-        if not jv_is_str(grammar):
-            return "`grammar` must be a string"
+    let grammar = type_field_error(body, "grammar", "string")
+    if grammar != "":
+        return grammar
     if not request_value_is_undefined(response_format):
         match response_format:
             JDict(fields, keys):
@@ -1961,22 +1841,14 @@ pub string request_validation_error(JValue body):
                 if count < 0 or count > 5:
                     return "integer `logprobs` must be between 0 and 5"
             _: return "`logprobs` must be a boolean or integer"
-    let top_logprobs = json_get(body, "top_logprobs")
-    if not request_value_is_undefined(top_logprobs):
-        match top_logprobs:
-            JInt(count):
-                if count < 0 or count > 20:
-                    return "`top_logprobs` must be between 0 and 20"
-                if count > 0 and not json_get_bool(body, "logprobs", false):
-                    return "`top_logprobs` requires `logprobs: true`"
-            _: return "`top_logprobs` must be an integer"
-    let n_probs = json_get(body, "n_probs")
-    if not request_value_is_undefined(n_probs):
-        match n_probs:
-            JInt(count):
-                if count < 0 or count > 20:
-                    return "`n_probs` must be between 0 and 20"
-            _: return "`n_probs` must be an integer"
+    let top_logprobs = int_field_error(body, "top_logprobs", 0, 20, "`top_logprobs` must be between 0 and 20")
+    if top_logprobs != "":
+        return top_logprobs
+    if json_get_int(body, "top_logprobs", 0) > 0 and not json_get_bool(body, "logprobs", false):
+        return "`top_logprobs` requires `logprobs: true`"
+    let n_probs = int_field_error(body, "n_probs", 0, 20, "`n_probs` must be between 0 and 20")
+    if n_probs != "":
+        return n_probs
     let logit_bias = json_get(body, "logit_bias")
     if not request_value_is_undefined(logit_bias):
         match logit_bias:
