@@ -865,77 +865,13 @@ pub req [float32]'kernel'unified tiled_linear_gpu([float32]'kernel'global x, [ui
     guard d_in % weight_block_elems(fmt) == 0 else throw "tiled_linear_gpu: d_in ({d_in}) must be a multiple of {weight_block_elems(fmt)} for ggml type {fmt}"
     let int gx = (d_out + 15) / 16
     let int gy = (seq + 15) / 16
-    if fmt == 8:
-        mut k8 = TiledLinearKernel<8>(x, w_packed, bv, seq, d_in, d_out)
+    dispatch fmt in [8, 6, 14, 12, 2, 10, 11, 20, 3, 7, 13, 1, 30, 23]:
+        mut k = TiledLinearKernel<fmt>(x, w_packed, bv, seq, d_in, d_out)
         kernel:
-            k8(block = (16, 16), grid = (gx, gy))
-        return k8.y
-    if fmt == 6:
-        mut k6 = TiledLinearKernel<6>(x, w_packed, bv, seq, d_in, d_out)
-        kernel:
-            k6(block = (16, 16), grid = (gx, gy))
-        return k6.y
-    if fmt == 14:
-        mut k14 = TiledLinearKernel<14>(x, w_packed, bv, seq, d_in, d_out)
-        kernel:
-            k14(block = (16, 16), grid = (gx, gy))
-        return k14.y
-    if fmt == 12:
-        mut k12 = TiledLinearKernel<12>(x, w_packed, bv, seq, d_in, d_out)
-        kernel:
-            k12(block = (16, 16), grid = (gx, gy))
-        return k12.y
-    if fmt == 2:
-        mut k2 = TiledLinearKernel<2>(x, w_packed, bv, seq, d_in, d_out)
-        kernel:
-            k2(block = (16, 16), grid = (gx, gy))
-        return k2.y
-    if fmt == 10:
-        mut k10 = TiledLinearKernel<10>(x, w_packed, bv, seq, d_in, d_out)
-        kernel:
-            k10(block = (16, 16), grid = (gx, gy))
-        return k10.y
-    if fmt == 11:
-        mut k11 = TiledLinearKernel<11>(x, w_packed, bv, seq, d_in, d_out)
-        kernel:
-            k11(block = (16, 16), grid = (gx, gy))
-        return k11.y
-    if fmt == 20:
-        mut k20 = TiledLinearKernel<20>(x, w_packed, bv, seq, d_in, d_out)
-        kernel:
-            k20(block = (16, 16), grid = (gx, gy))
-        return k20.y
-    if fmt == 3:
-        mut k3 = TiledLinearKernel<3>(x, w_packed, bv, seq, d_in, d_out)
-        kernel:
-            k3(block = (16, 16), grid = (gx, gy))
-        return k3.y
-    if fmt == 7:
-        mut k7 = TiledLinearKernel<7>(x, w_packed, bv, seq, d_in, d_out)
-        kernel:
-            k7(block = (16, 16), grid = (gx, gy))
-        return k7.y
-    if fmt == 13:
-        mut k13 = TiledLinearKernel<13>(x, w_packed, bv, seq, d_in, d_out)
-        kernel:
-            k13(block = (16, 16), grid = (gx, gy))
-        return k13.y
-    if fmt == 1:
-        mut k1 = TiledLinearKernel<1>(x, w_packed, bv, seq, d_in, d_out)
-        kernel:
-            k1(block = (16, 16), grid = (gx, gy))
-        return k1.y
-    if fmt == 30:
-        mut k30 = TiledLinearKernel<30>(x, w_packed, bv, seq, d_in, d_out)
-        kernel:
-            k30(block = (16, 16), grid = (gx, gy))
-        return k30.y
-    if fmt == 23:
-        mut k23 = TiledLinearKernel<23>(x, w_packed, bv, seq, d_in, d_out)
-        kernel:
-            k23(block = (16, 16), grid = (gx, gy))
-        return k23.y
-    throw "tiled_linear_gpu: unsupported ggml type id {fmt}"
+            k(block = (16, 16), grid = (gx, gy))
+        return k.y
+    else:
+        throw "tiled_linear_gpu: unsupported ggml type id {fmt}"
 
 pub req [float32]'kernel'unified q8_linear_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
                        [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
@@ -1134,25 +1070,11 @@ req [float32]'kernel'unified warp_broadcast_gpu([float32]'kernel'global x, [uint
     let int blocks = (seq * d_out + warps_per_block - 1) / warps_per_block
     let int gx = if blocks > 65535: 65535 else: blocks
     let int gy = (blocks + gx - 1) / gx
-    if fmt == 8:
-        mut k = WarpBroadcastKernel<8>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    dispatch fmt in [8, 6, 2, 20]:
+        mut k = WarpBroadcastKernel<fmt>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
         kernel:
             k(block = (32, warps_per_block), grid = (gx, gy))
         return k.y
-    if fmt == 6:
-        mut k = WarpBroadcastKernel<6>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
-        kernel:
-            k(block = (32, warps_per_block), grid = (gx, gy))
-        return k.y
-    if fmt == 2:
-        mut k = WarpBroadcastKernel<2>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
-        kernel:
-            k(block = (32, warps_per_block), grid = (gx, gy))
-        return k.y
-    mut k = WarpBroadcastKernel<20>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
-    kernel:
-        k(block = (32, warps_per_block), grid = (gx, gy))
-    k.y
 
 # Public wrappers (the decode-step kernels `fused_linear_gpu` dispatches to). `q8_linear_warp_gpu`
 # was the benchmarked-and-rejected variant without the scale broadcast; it is numerically the same
@@ -1438,52 +1360,13 @@ pub req [float32]'kernel'unified warp_linear_gpu([float32]'kernel'global x, [uin
     let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
     let int gx = if blocks > 65535: 65535 else: blocks
     let int gy = (blocks + gx - 1) / gx
-    if fmt == 1:
-        mut k1 = WarpLinearKernel<1>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
+    dispatch fmt in [1, 30, 3, 7, 13, 2, 6, 20, 23]:
+        mut k = WarpLinearKernel<fmt>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
         kernel:
-            k1(block = (32, warps_per_block), grid = (gx, gy))
-        return k1.y
-    if fmt == 30:
-        mut k30 = WarpLinearKernel<30>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
-        kernel:
-            k30(block = (32, warps_per_block), grid = (gx, gy))
-        return k30.y
-    if fmt == 3:
-        mut k3 = WarpLinearKernel<3>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
-        kernel:
-            k3(block = (32, warps_per_block), grid = (gx, gy))
-        return k3.y
-    if fmt == 7:
-        mut k7 = WarpLinearKernel<7>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
-        kernel:
-            k7(block = (32, warps_per_block), grid = (gx, gy))
-        return k7.y
-    if fmt == 13:
-        mut k13 = WarpLinearKernel<13>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
-        kernel:
-            k13(block = (32, warps_per_block), grid = (gx, gy))
-        return k13.y
-    if fmt == 2:
-        mut k2 = WarpLinearKernel<2>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
-        kernel:
-            k2(block = (32, warps_per_block), grid = (gx, gy))
-        return k2.y
-    if fmt == 6:
-        mut k6 = WarpLinearKernel<6>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
-        kernel:
-            k6(block = (32, warps_per_block), grid = (gx, gy))
-        return k6.y
-    if fmt == 20:
-        mut k20 = WarpLinearKernel<20>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
-        kernel:
-            k20(block = (32, warps_per_block), grid = (gx, gy))
-        return k20.y
-    if fmt == 23:
-        mut k23 = WarpLinearKernel<23>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
-        kernel:
-            k23(block = (32, warps_per_block), grid = (gx, gy))
-        return k23.y
-    throw "warp_linear_gpu: unsupported ggml type id {fmt}"
+            k(block = (32, warps_per_block), grid = (gx, gy))
+        return k.y
+    else:
+        throw "warp_linear_gpu: unsupported ggml type id {fmt}"
 
 pub req [float32]'kernel'unified f16_linear_warp_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed,
                        [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
@@ -1553,52 +1436,13 @@ pub req [float32]'kernel'unified dequantize_gpu([uint8]'kernel'global w_packed, 
     let int blocks = (n + 255) / 256
     let int gx = if blocks > 65535: 65535 else: blocks
     let int gy = (blocks + gx - 1) / gx
-    if fmt == 3:
-        mut k3 = DequantKernel<3>(w_packed, n)
+    dispatch fmt in [3, 7, 13, 1, 30, 2, 6, 20, 23]:
+        mut k = DequantKernel<fmt>(w_packed, n)
         kernel:
-            k3(block = 256, grid = (gx, gy))
-        return k3.out
-    if fmt == 7:
-        mut k7 = DequantKernel<7>(w_packed, n)
-        kernel:
-            k7(block = 256, grid = (gx, gy))
-        return k7.out
-    if fmt == 13:
-        mut k13 = DequantKernel<13>(w_packed, n)
-        kernel:
-            k13(block = 256, grid = (gx, gy))
-        return k13.out
-    if fmt == 1:
-        mut k1 = DequantKernel<1>(w_packed, n)
-        kernel:
-            k1(block = 256, grid = (gx, gy))
-        return k1.out
-    if fmt == 30:
-        mut k30 = DequantKernel<30>(w_packed, n)
-        kernel:
-            k30(block = 256, grid = (gx, gy))
-        return k30.out
-    if fmt == 2:
-        mut k2 = DequantKernel<2>(w_packed, n)
-        kernel:
-            k2(block = 256, grid = (gx, gy))
-        return k2.out
-    if fmt == 6:
-        mut k6 = DequantKernel<6>(w_packed, n)
-        kernel:
-            k6(block = 256, grid = (gx, gy))
-        return k6.out
-    if fmt == 20:
-        mut k20 = DequantKernel<20>(w_packed, n)
-        kernel:
-            k20(block = 256, grid = (gx, gy))
-        return k20.out
-    if fmt == 23:
-        mut k23 = DequantKernel<23>(w_packed, n)
-        kernel:
-            k23(block = 256, grid = (gx, gy))
-        return k23.out
-    throw "dequantize_gpu: unsupported ggml type id {fmt}"
+            k(block = 256, grid = (gx, gy))
+        return k.out
+    else:
+        throw "dequantize_gpu: unsupported ggml type id {fmt}"
 
 # IQ4_XS and IQ4_NL (codebook formats): same kernel shapes as the Q4_x / Q5_x ones above.
 
