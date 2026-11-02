@@ -1,0 +1,297 @@
+# Q8_0-style quantized storage for the KV cache (`-ctk q8_0 -ctv q8_0`).
+#
+# One plane is two resident buffers: `qs` holds one byte per element (the
+# signed int8 value in two's complement) and `sc` holds one float16 scale per
+# block of 32 consecutive elements, like ggml's block_q8_0. Both head widths of
+# the optimized decode path (64 and 128) are multiples of 32, so a block never
+# straddles two heads or two positions. Arithmetic stays float32: values are
+# widened at the point of use, as in float16_gpu.br.
+#
+# Packing is split in two kernels (block scales, then values) so every kernel
+# has a single output and so the values are rounded against the float16-rounded
+# scale that decoding will actually use.
+
+# One thread per block of 32: scale = max|x| / 127, stored as float16.
+pub req [float16]'kernel'unified q8kv_scales_gpu([float32]'kernel'global src) throws:
+    let int n = src.length
+    let int nblocks = n / 32
+    let int tblocks = (nblocks + 255) / 256
+    let int gx = if tblocks > 65535: 65535 else: tblocks
+    let int gy = (tblocks + gx - 1) / gx
+    kernel(block = 256, grid = (gx, gy)):
+        mut [float16]'unified out = [0.0 as float16 for ..<nblocks]
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let b = .thread.x + block_idx * .block_dim.x
+        if b < nblocks:
+            var float32 amax = 0.0
+            for j in 0..<32:
+                let a = src[b * 32 + j].abs()
+                if a > amax:
+                    amax = a
+            out[b] = (amax / 127.0) as float16
+        out
+
+# Quantize `src` against already computed scales (`scales[i / 32]`).
+pub req [uint8]'kernel'unified q8kv_quantize_gpu([float32]'kernel'global src,
+        [float16]'kernel'global scales) throws:
+    let int n = src.length
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    kernel(block = 256, grid = (gx, gy)):
+        mut [uint8]'unified out = [0 as uint8 for ..<n]
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let i = .thread.x + block_idx * .block_dim.x
+        if i < n:
+            let s = scales[i / 32] as float32
+            var int q = 0
+            if s > 0.0:
+                let r = src[i] / s
+                let rr = if r >= 0.0: r + 0.5 else: r - 0.5
+                q = int(rr)
+                if q > 127:
+                    q = 127
+                if q < -127:
+                    q = -127
+            out[i] = ((q + 256) % 256) as uint8
+        out
+
+# Append already quantized values: copy `old` (first `old_n` bytes) and
+# quantize the `new_n` fresh float32 values behind it.
+pub req [uint8]'kernel'unified q8kv_append_gpu([uint8]'kernel'global old,
+        [float32]'kernel'global fresh, [float16]'kernel'global fresh_scales,
+        int old_n, int new_n) throws:
+    let int n = old_n + new_n
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    kernel(block = 256, grid = (gx, gy)):
+        mut [uint8]'unified out = [0 as uint8 for ..<n]
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let i = .thread.x + block_idx * .block_dim.x
+        if i < old_n:
+            out[i] = old[i]
+        elif i < n:
+            let j = i - old_n
+            let s = fresh_scales[j / 32] as float32
+            var int q = 0
+            if s > 0.0:
+                let r = fresh[j] / s
+                let rr = if r >= 0.0: r + 0.5 else: r - 0.5
+                q = int(rr)
+                if q > 127:
+                    q = 127
+                if q < -127:
+                    q = -127
+            out[i] = ((q + 256) % 256) as uint8
+        out
+
+# Grow a scale buffer: `old_n`/`new_n` are block counts.
+pub req [float16]'kernel'unified q8kv_append_scales_gpu([float16]'kernel'global old,
+        [float16]'kernel'global fresh, int old_n, int new_n) throws:
+    let int n = old_n + new_n
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    kernel(block = 256, grid = (gx, gy)):
+        mut [float16]'unified out = [0.0 as float16 for ..<n]
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let i = .thread.x + block_idx * .block_dim.x
+        if i < old_n:
+            out[i] = old[i]
+        elif i < n:
+            out[i] = fresh[i - old_n]
+        out
+
+pub req [float32]'kernel'unified q8kv_dequantize_gpu([uint8]'kernel'global qs,
+        [float16]'kernel'global scales) throws:
+    let int n = qs.length
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    kernel(block = 256, grid = (gx, gy)):
+        mut [float32]'unified out = [0.0 as float32 for ..<n]
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let i = .thread.x + block_idx * .block_dim.x
+        if i < n:
+            var int b = int(qs[i])
+            if b > 127:
+                b = b - 256
+            out[i] = (b as float32) * (scales[i / 32] as float32)
+        out
+
+# Single-query grouped attention over a quantized main cache and a short
+# float32 tail; same structure and head-width limits as
+# FlashDecodeTailF16Kernel.
+kernel FlashDecodeTailQ8Kernel:
+    let [float32]'global q
+    let [uint8]'global kq
+    let [float16]'global ks
+    let [uint8]'global vq
+    let [float16]'global vs
+    let [float32]'global tk
+    let [float32]'global tv
+    let int main_len
+    mut [float32]'unified part
+    let int seq_k
+    let int d_kv
+    let int d_head
+    let int group
+    let int nsplit
+    let int chunk
+    let float32 scale
+    mut [float32, width = 128, height = 1]'actor q_s
+    mut [float32, width = 128, height = 1]'actor p_s
+
+    init([float32]'global qi, [uint8]'global kqi, [float16]'global ksi,
+         [uint8]'global vqi, [float16]'global vsi,
+         [float32]'global tki, [float32]'global tvi, int ml,
+         int sk, int dkv, int dh, int grp, int ns, int ch, float32 sc,
+         int nparts):
+        q = qi
+        kq = kqi
+        ks = ksi
+        vq = vqi
+        vs = vsi
+        tk = tki
+        tv = tvi
+        main_len = ml
+        seq_k = sk
+        d_kv = dkv
+        d_head = dh
+        group = grp
+        nsplit = ns
+        chunk = ch
+        scale = sc
+        part = [0.0 as float32 for ..<nparts]
+
+    def ():
+        let t = .thread.x
+        let split = .block.x
+        let h = .block.y
+        let k_off = (h / group) * d_head
+        let start = split * chunk
+        var int stop = start + chunk
+        if stop > seq_k:
+            stop = seq_k
+        q_s[width = t, height = 0] = q[h * d_head + t]
+        var float32 m = -1.0e30
+        var float32 l = 0.0
+        var float32 acc = 0.0
+        var int ntiles = 0
+        if stop > start:
+            ntiles = (stop - start + d_head - 1) / d_head
+        for ti in 0..<ntiles:
+            let j0 = start + ti * d_head
+            let jg = j0 + t
+            sync
+            var float32 s = -1.0e30
+            if jg < stop:
+                var float32 dot = 0.0
+                if jg < main_len:
+                    let base_k = jg * d_kv + k_off
+                    for blk in 0..<(d_head / 32):
+                        let sck = ks[(base_k + blk * 32) / 32] as float32
+                        var float32 bdot = 0.0
+                        for d in 0..<32:
+                            var int bk = int(kq[base_k + blk * 32 + d])
+                            if bk > 127:
+                                bk = bk - 256
+                            bdot += q_s[width = blk * 32 + d, height = 0] * (bk as float32)
+                        dot += bdot * sck
+                else:
+                    for d in 0..<d_head:
+                        dot += q_s[width = d, height = 0] * tk[(jg - main_len) * d_kv + k_off + d]
+                s = dot * scale
+            p_s[width = t, height = 0] = s
+            sync
+            var float32 mx = m
+            for j in 0..<d_head:
+                let sv = p_s[width = j, height = 0]
+                if sv > mx:
+                    mx = sv
+            let alpha = (m - mx).exp()
+            var float32 pv = 0.0
+            if jg < stop:
+                pv = (s - mx).exp()
+            sync
+            p_s[width = t, height = 0] = pv
+            sync
+            var float32 psum = 0.0
+            var float32 nacc = 0.0
+            for j in 0..<d_head:
+                let pj = p_s[width = j, height = 0]
+                psum += pj
+                if j0 + j < stop:
+                    if j0 + j < main_len:
+                        let vi = (j0 + j) * d_kv + k_off + t
+                        var int bv = int(vq[vi])
+                        if bv > 127:
+                            bv = bv - 256
+                        nacc += pj * (bv as float32) * (vs[vi / 32] as float32)
+                    else:
+                        nacc += pj * tv[(j0 + j - main_len) * d_kv + k_off + t]
+            l = l * alpha + psum
+            acc = acc * alpha + nacc
+            m = mx
+        let base = (h * nsplit + split) * (d_head + 2)
+        part[base + 2 + t] = acc
+        if t == 0:
+            part[base] = m
+            part[base + 1] = l
+
+kernel FlashDecodeCombineQ8Kernel:
+    let [float32]'global part
+    mut [float32]'unified out
+    let int nsplit
+    let int d_head
+
+    init([float32]'global pi, int ns, int dh, int n):
+        part = pi
+        nsplit = ns
+        d_head = dh
+        out = [0.0 as float32 for ..<n]
+
+    def ():
+        let t = .thread.x
+        let h = .block.x
+        var float32 big = -1.0e30
+        for s in 0..<nsplit:
+            let ms = part[(h * nsplit + s) * (d_head + 2)]
+            if ms > big:
+                big = ms
+        var float32 total = 0.0
+        var float32 acc = 0.0
+        for s in 0..<nsplit:
+            let base = (h * nsplit + s) * (d_head + 2)
+            let w = (part[base] - big).exp()
+            total += part[base + 1] * w
+            acc += part[base + 2 + t] * w
+        if total > 0.0:
+            out[h * d_head + t] = acc / total
+
+pub req [float32]'kernel'unified attention_gqa_tail_q8_gpu(
+        [float32]'kernel'global q,
+        [uint8]'kernel'global kq, [float16]'kernel'global ks,
+        [uint8]'kernel'global vq, [float16]'kernel'global vs,
+        [float32]'kernel'global tk, [float32]'kernel'global tv,
+        int main_len, int seq_k, int n_head, int n_kv_head, int d_head) throws:
+    guard d_head % 32 == 0 and d_head <= 128 else throw "Q8_0 KV attention requires d_head a multiple of 32 up to 128"
+    let int d_kv = n_kv_head * d_head
+    let int group = n_head / n_kv_head
+    let float32 scale = 1.0 / (d_head as float32).sqrt()
+    var int nsplit = (seq_k + 127) / 128
+    if nsplit < 1:
+        nsplit = 1
+    if nsplit > 64:
+        nsplit = 64
+    let int chunk = (seq_k + nsplit - 1) / nsplit
+    mut kd = FlashDecodeTailQ8Kernel(q, kq, ks, vq, vs, tk, tv, main_len, seq_k,
+        d_kv, d_head, group, nsplit, chunk, scale,
+        n_head * nsplit * (d_head + 2))
+    kernel:
+        kd(block = d_head, grid = (nsplit, n_head))
+    mut kc = FlashDecodeCombineQ8Kernel(kd.part, nsplit, d_head, n_head * d_head)
+    kernel:
+        kc(block = d_head, grid = n_head)
+    kc.out

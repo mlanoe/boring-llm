@@ -29,6 +29,7 @@ use gguf_file
 use io
 use math_gpu
 use float16_gpu
+use q8kv_gpu
 use model
 use openai
 use std.fs.File
@@ -171,6 +172,11 @@ pub def save_snapshot_file(string path, int fp, int seq, QuantModel model, GenCa
             k_host = download_floats_gpu(k_resident, n * kv_dim)
             let v_resident = unpack_float16_gpu(folded.layers[l].hv)
             v_host = download_floats_gpu(v_resident, n * kv_dim)
+        elif folded.q8:
+            let k_resident = q8kv_dequantize_gpu(folded.layers[l].kq, folded.layers[l].ks)
+            k_host = download_floats_gpu(k_resident, n * kv_dim)
+            let v_resident = q8kv_dequantize_gpu(folded.layers[l].vq, folded.layers[l].vs)
+            v_host = download_floats_gpu(v_resident, n * kv_dim)
         else:
             k_host = download_floats_gpu(folded.layers[l].k, n * kv_dim)
             v_host = download_floats_gpu(folded.layers[l].v, n * kv_dim)
@@ -213,8 +219,12 @@ pub GenCache load_snapshot_file(string path, DiskSnap snap, QuantModel model, in
         let k_host = read_floats(f, data_off + 2 * l * plane, common * kv_dim)
         let v_host = read_floats(f, data_off + (2 * l + 1) * plane, common * kv_dim)
         if uses_float16_kv_cache():
-            layers.push(LayerCache([], [], pack_float16_gpu(k_host), pack_float16_gpu(v_host), [], []))
+            layers.push(LayerCache([], [], pack_float16_gpu(k_host), pack_float16_gpu(v_host), [], [], [], [], [], []))
+        elif uses_q8_kv_cache():
+            let k_scales = q8kv_scales_gpu(k_host)
+            let v_scales = q8kv_scales_gpu(v_host)
+            layers.push(LayerCache([], [], [], [], [], [], q8kv_quantize_gpu(k_host, k_scales), k_scales, q8kv_quantize_gpu(v_host, v_scales), v_scales))
         else:
-            layers.push(LayerCache(upload_floats_gpu(k_host), upload_floats_gpu(v_host), [], [], [], []))
+            layers.push(LayerCache(upload_floats_gpu(k_host), upload_floats_gpu(v_host), [], [], [], [], [], [], [], []))
         l += 1
-    GenCache(layers, common, 0, uses_float16_kv_cache())
+    GenCache(layers, common, 0, uses_float16_kv_cache(), uses_q8_kv_cache())

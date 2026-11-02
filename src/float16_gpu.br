@@ -191,7 +191,7 @@ pub req [float32]'kernel'unified attention_gqa_tail_f16_gpu(
         [float16]'kernel'global k, [float16]'kernel'global v,
         [float32]'kernel'global tk, [float32]'kernel'global tv,
         int main_len, int seq_k, int n_head, int n_kv_head, int d_head) throws:
-    guard d_head == 64 or d_head == 128 else throw "float16 KV attention requires d_head 64 or 128"
+    guard d_head % 32 == 0 and d_head <= 128 else throw "float16 KV attention requires d_head a multiple of 32 up to 128"
     let int d_kv = n_kv_head * d_head
     let int group = n_head / n_kv_head
     let float32 scale = 1.0 / (d_head as float32).sqrt()

@@ -136,5 +136,7 @@ def main() throws:
     assert_close(empty_host[1], -0.625 as float32, 0.001 as float32, "float16 empty append[1]")
     print "float16 resident append: OK"
 
+    check_attention(32)
     check_attention(64)
+    check_attention(96)
     check_attention(128)

@@ -52,8 +52,8 @@ This book is the reference for installing, using, operating, understanding and e
 | `qwen2` | Qwen2.5 0.5B, 3B, 7B Instruct |
 | `qwen3` | Qwen3 4B (thinking and non-thinking) |
 | `llama` | TinyLlama 1.1B Chat |
-| `phi3` | synthetic short/long-context fixtures |
-| `gemma`, `gemma2`, `gemma3` | synthetic fixtures; Gemma 3 270M on real weights |
+| `phi3` | synthetic short/long-context fixtures; Phi-3.1 mini 4k Q4_K_M on real weights |
+| `gemma`, `gemma2`, `gemma3` | synthetic fixtures; Gemma 3 270M and Gemma 2 2B Q4_K_M on real weights |
 | `granite`, `smollm3` | synthetic fixtures |
 | Mixtral-layout `llama`, `qwen3moe` | synthetic fixtures; a small Mixtral-layout model on real weights |
 
@@ -197,7 +197,7 @@ For `--serve`, the sampling flags set server defaults. Alongside `temperature`, 
 | `--prio N`, `--prio-batch N`; `--poll N`, `--poll-batch N` | llama-server defaults | accept and validate CPU priority (`-1..3`/`0..3`) and polling (`0..100`/`0..1`) settings; they remain inert for GPU-resident inference |
 | `-C`, `--cpu-mask`; `-Cr`, `--cpu-range`; `-Cb`, `--cpu-mask-batch`; `-Crb`, `--cpu-range-batch`; `--cpu-strict`, `--cpu-strict-batch` | unset/non-strict | accept hexadecimal masks, inclusive `lo-hi` ranges and strictness values `0`/`1`; these CPU-affinity settings remain inert for GPU-resident inference |
 | `--no-mmap` | current behavior | accepted because the loader reads only the GGUF header and one tensor range at a time; `--mlock` is rejected because weights move to GPU memory instead of remaining resident in host RAM |
-| `-ctk`, `--cache-type-k TYPE`; `-ctv`, `--cache-type-v TYPE` | `f32` | select `f32` or a half-sized `f16` main KV cache; K and V must match, and f16 currently supports attention head widths 64 and 128 |
+| `-ctk`, `--cache-type-k TYPE`; `-ctv`, `--cache-type-v TYPE` | `f32` | select `f32`, a half-sized `f16` or a `q8_0` main KV cache (int8 values plus one float16 scale per 32, about 0.53x of f16); K and V must match, and f16/q8_0 currently support attention head widths that are a multiple of 32 up to 128, and Gemma 2/3 (whose attention reads a widened float32 copy of the packed main cache each step) |
 | `--no-webui`, `--no-ui` | current behavior | accepted because boring-llm is API-only; `--webui`/`--ui` is rejected |
 | `--spec-type none\|ngram-simple`; `--draft-max N`, `--draft-min N`, `--spec-ngram-size-n N` | `none`; 8, 3, 3 | speculative decoding by prompt lookup: when the last tokens already occurred earlier in the prompt or reply, the tokens that followed are verified in one batched pass; a drafted token the sampler would have chosen saves a decode step. Output is unchanged, sampling included. Pays off on repetitive text (a repeated passage: 1.5-1.7x on 0.5B-1.1B models), costs a little elsewhere on very small models, so it is opt-in; `--serve` only |
 | `--grammar GBNF`, `--grammar-file FILE` | none | default GBNF grammar for requests that set none (see `grammar` in chapter 4); `--serve` only |
@@ -876,7 +876,7 @@ This writes `docs/book.html`, `README.html` at the repository root, and one HTML
 ## 13. Limits and Known Issues
 
 - **One request at a time.** There is no batching and no concurrent decoding.
-- **Context** is limited by `--ctx-size` and memory. The default KV cache is float32; select matching `-ctk f16 -ctv f16` for a half-sized main cache on models with 64- or 128-wide attention heads.
+- **Context** is limited by `--ctx-size` and memory. The default KV cache is float32; select matching `-ctk f16 -ctv f16` for a half-sized main cache, or `-ctk q8_0 -ctv q8_0` for about a quarter, on models whose attention heads are a multiple of 32 up to 128 wide.
 - **Architectures**: Llama-style GGUF layouts only (`qwen2` and `llama` are the tested ones); no vision; mixture of experts only in the Mixtral and Qwen3-MoE layouts (chapter 6).
 - **Chat templates** use a Jinja2 subset; an unsupported construct is reported.
 - **Standard split GGUF naming required.** Multi-file models are discovered from any `model-00001-of-000NN.gguf` shard using their `split.no`, `split.count`, and `split.tensors.count` metadata. Arbitrary shard filenames are not guessed.

@@ -150,6 +150,8 @@ def main():
     ap.add_argument("--binary", help="a boring-llm executable (Metal or wgpu build)")
     ap.add_argument("--prompts-file", help="JSON list of prompt strings (default: three ChatML prompts)")
     ap.add_argument("--new-tokens", type=int, default=32)
+    ap.add_argument("--binary-args", default="",
+                    help="extra arguments for the binary, e.g. '-ctk q8_0 -ctv q8_0'")
     ap.add_argument("--max-gap", type=float, default=1.0,
                     help="largest logit gap, in llama.cpp's own logits, that still counts as a near-tie")
     ap.add_argument("--cache-dir", default=".accuracy-cache")
@@ -170,7 +172,7 @@ def main():
     for text, (ids, ref, eos, tops) in zip(prompts, rows):
         run = subprocess.run(
             [args.binary, "--gguf", args.gguf, "--generate-tokens", ",".join(map(str, ids)),
-             "--max-tokens", str(args.new_tokens)],
+             "--max-tokens", str(args.new_tokens)] + args.binary_args.split(),
             capture_output=True, text=True, timeout=args.timeout, stdin=subprocess.DEVNULL,
         )
         ours = parse_generated(run.stdout)
