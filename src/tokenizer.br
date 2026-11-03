@@ -56,6 +56,7 @@ pub struct Tokenizer:
     bool is_spm             # true = SentencePiece (Llama/Mistral), false = GPT-2/Qwen2 BPE
     [float32] scores        # SentencePiece per-token merge priority (empty when is_spm is false)
     [int] byte_token_id     # SentencePiece byte-fallback: raw byte value -> "<0xXX>" token id (-1 if absent)
+    bool add_space_prefix   # tokenizer.ggml.add_space_prefix (SentencePiece; Gemma sets it false)
     {string=int} special_tokens  # "special" vocab entries (GGUF token_type CONTROL) -> id, e.g.
                                   # "<|im_start|>"/"<s>" — matched atomically against rendered
                                   # chat-template text instead of going through ordinary BPE/SPM
@@ -245,7 +246,8 @@ pub struct Tokenizer:
     # project only ever tokenizes short, interactive prompts, so the
     # asymptotics don't matter, and a rescan is much simpler to get right in
     # Boring than reimplementing a heap. Always prepends one leading space
-    # before escaping (llama.cpp's own `add_space_prefix`/`is_prev_special`
+    # before escaping when the GGUF's `add_space_prefix` is true (its default;
+    # Gemma sets it false: no prefix at all) (llama.cpp's own `add_space_prefix`/`is_prev_special`
     # default for a fresh, non-continuation prompt — see llama-vocab.cpp's
     # `tokenize()` SPM branch).
     #
@@ -264,7 +266,8 @@ pub struct Tokenizer:
     # per-byte `<0xXX>` tokens.
     req [int] encode_spm(string text):
         var string escaped = ""
-        for ch in " {text}".chars():
+        let lead = if self.add_space_prefix: " " else: ""
+        for ch in "{lead}{text}".chars():
             if ch == " ":
                 escaped = "{escaped}{chr(9601)}"
             else:
@@ -679,6 +682,8 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
     let eos = gguf_get_int(file.metadata, "tokenizer.ggml.eos_token_id") else 0
     let add_bos = gguf_get_bool(file.metadata, "tokenizer.ggml.add_bos_token") else false
     let add_eos = gguf_get_bool(file.metadata, "tokenizer.ggml.add_eos_token") else false
+    # llama.cpp's default is true for SentencePiece; Gemma's GGUFs set it false
+    let add_space_prefix = gguf_get_bool(file.metadata, "tokenizer.ggml.add_space_prefix") else true
 
     let byte_to_uni = build_byte_to_unicode()
     let uni_to_byte = build_unicode_to_byte()
@@ -726,7 +731,7 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
                 close_id = id
     set_eog_tokens(eog, close_id)
 
-    Tokenizer(vocab, reverse, merge_rank, byte_to_uni, uni_to_byte, bos, eos, add_bos, add_eos, is_spm, scores, byte_token_id, special_tokens)
+    Tokenizer(vocab, reverse, merge_rank, byte_to_uni, uni_to_byte, bos, eos, add_bos, add_eos, is_spm, scores, byte_token_id, add_space_prefix, special_tokens)
 
 # Builds the full prompt token sequence for a chat turn using the GGUF's
 # own embedded `tokenizer.chat_template` (any architecture, any template —

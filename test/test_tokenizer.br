@@ -84,7 +84,7 @@ def main() throws:
     reverse[5] = "e"
     reverse[6] = byte_to_uni[0xC3]
     reverse[999] = "<SPECIAL>"
-    let tok = Tokenizer(vocab, reverse, {=}, byte_to_uni, uni_to_byte, 0, 0, false, false, false, [], [], special)
+    let tok = Tokenizer(vocab, reverse, {=}, byte_to_uni, uni_to_byte, 0, 0, false, false, false, [], [], true, special)
     let ids = tok.encode_with_specials("hi<SPECIAL>bye")
     assert_eq(ids.length, 6)
     assert_eq(ids[0], 1)
@@ -95,7 +95,7 @@ def main() throws:
     assert_eq(ids[5], 5)
     assert_eq(tok.decode(ids), "hi<SPECIAL>bye" as string)
     assert_eq(tok.encode_completion_prompt("hi")[0], 1 as int)
-    let tok_bos = Tokenizer(vocab, reverse, {=}, byte_to_uni, uni_to_byte, 42, 0, true, false, false, [], [], special)
+    let tok_bos = Tokenizer(vocab, reverse, {=}, byte_to_uni, uni_to_byte, 42, 0, true, false, false, [], [], true, special)
     let bos_ids = tok_bos.encode_completion_prompt("hi")
     assert_eq(bos_ids.length, 3 as int)
     assert_eq(bos_ids[0], 42 as int)
@@ -115,9 +115,28 @@ def main() throws:
     mut {string=int} overlapping = {=}
     overlapping["<a>"] = 900
     overlapping["<ab>"] = 901
-    let tok2 = Tokenizer({=}, {=}, {=}, byte_to_uni, uni_to_byte, 0, 0, false, false, false, [], [], overlapping)
+    let tok2 = Tokenizer({=}, {=}, {=}, byte_to_uni, uni_to_byte, 0, 0, false, false, false, [], [], true, overlapping)
     let ids2 = tok2.encode_with_specials("<ab>")
     assert_eq(ids2.length, 1)
     assert_eq(ids2[0], 901)
+
+    # SentencePiece's leading space: "a" encodes as "▁a" with the GGUF's add_space_prefix
+    # (the default), and as plain "a" when it is false (Gemma's setting)
+    let sp = chr(9601)
+    mut {string=int} spm_vocab = {=}
+    spm_vocab["{sp}a"] = 5
+    spm_vocab["a"] = 6
+    spm_vocab[sp] = 7
+    mut {int=string} spm_reverse = {=}
+    spm_reverse[5] = "{sp}a"
+    spm_reverse[6] = "a"
+    spm_reverse[7] = sp
+    mut [float32] spm_scores = [0.0 as float32 for i in 0..<8]
+    spm_scores[5] = -1.0 as float32
+    let spm_on = Tokenizer(spm_vocab, spm_reverse, {=}, byte_to_uni, uni_to_byte, 0, 0, false, false, true, spm_scores, [], true, {=})
+    let spm_off = Tokenizer(spm_vocab, spm_reverse, {=}, byte_to_uni, uni_to_byte, 0, 0, false, false, true, spm_scores, [], false, {=})
+    assert_eq(spm_on.encode("a")[0], 5)
+    assert_eq(spm_off.encode("a")[0], 6)
+    assert_eq(spm_off.encode("a").length, 1)
 
     print "test_tokenizer: all assertions passed"
