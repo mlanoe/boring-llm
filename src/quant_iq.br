@@ -1,0 +1,345 @@
+# CPU dequantization of ggml's IQ1 / IQ2 / IQ3 formats (the "i-quants" built on lookup
+# grids): IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S and IQ1_M. Ported from
+# ggml's dequantize_row_iq* and checked value for value against the Python `gguf`
+# package (tools/make_quant_test_fixtures.py, test/test_quant_formats.br). The
+# grids live in the generated src/iq_grids.br.
+#
+# Every format packs 256 values per block. Within a block the values come in groups
+# of 8 (4 for none of them: IQ3 groups are two grid entries of 4), each group being
+# a grid row times a sign pattern times a block-wise scale.
+
+use io
+use iq_grids
+
+let int IQK = 256
+
+pub let int IQ2_XXS_BLOCK_BYTES = 66
+pub let int IQ2_XS_BLOCK_BYTES = 74
+pub let int IQ2_S_BLOCK_BYTES = 82
+pub let int IQ3_XXS_BLOCK_BYTES = 98
+pub let int IQ3_S_BLOCK_BYTES = 110
+pub let int IQ1_S_BLOCK_BYTES = 50
+pub let int IQ1_M_BLOCK_BYTES = 56
+
+let float32 IQ1_DELTA = 0.125
+
+# ── tables, decoded from their hex strings once ─────────────────────────────
+
+static var [uint8] iq2xxs_cache = []
+static var [uint8] iq2xs_cache = []
+static var [uint8] iq2s_cache = []
+static var [uint8] iq3xxs_cache = []
+static var [uint8] iq3s_cache = []
+static var [uint8] iq1s_cache = []
+static var [uint8] ksigns_cache = []
+
+int hex_digit(string c):
+    if c >= "a":
+        ord(c) - 87
+    else:
+        ord(c) - 48
+
+[uint8] decode_hex(string hex):
+    let cs = hex.chars()
+    mut [uint8] out = [0 as uint8 for i in 0..<(cs.length / 2)]
+    var int i = 0
+    while i < out.length:
+        out[i] = (hex_digit(cs[2 * i]) * 16 + hex_digit(cs[2 * i + 1])) as uint8
+        i += 1
+    out
+
+[uint8] iq2xxs_grid():
+    if iq2xxs_cache.length == 0:
+        iq2xxs_cache = decode_hex(IQ2XXS_GRID_HEX)
+    iq2xxs_cache
+
+[uint8] iq2xs_grid():
+    if iq2xs_cache.length == 0:
+        iq2xs_cache = decode_hex(IQ2XS_GRID_HEX)
+    iq2xs_cache
+
+[uint8] iq2s_grid():
+    if iq2s_cache.length == 0:
+        iq2s_cache = decode_hex(IQ2S_GRID_HEX)
+    iq2s_cache
+
+[uint8] iq3xxs_grid():
+    if iq3xxs_cache.length == 0:
+        iq3xxs_cache = decode_hex(IQ3XXS_GRID_HEX)
+    iq3xxs_cache
+
+[uint8] iq3s_grid():
+    if iq3s_cache.length == 0:
+        iq3s_cache = decode_hex(IQ3S_GRID_HEX)
+    iq3s_cache
+
+[uint8] iq1s_grid():
+    if iq1s_cache.length == 0:
+        iq1s_cache = decode_hex(IQ1S_GRID_HEX)
+    iq1s_cache
+
+[uint8] ksigns_table():
+    if ksigns_cache.length == 0:
+        ksigns_cache = decode_hex(KSIGNS_HEX)
+    ksigns_cache
+
+# +1 / -1 for bit `j` of a sign byte
+float32 sign_of(int sign_byte, int j):
+    if ((sign_byte >> j) & 1) == 1:
+        -1.0 as float32
+    else:
+        1.0 as float32
+
+# ── IQ2_XXS (66 bytes): f16 d, then 8 groups of two u32 ──────────────────────
+# u32 #0 holds four grid indices (one byte each), u32 #1 four 7-bit sign-pattern
+# indices and, in its top nibble, the group scale.
+pub [float32] dequantize_iq2_xxs([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % IQK == 0 else throw "dequantize_iq2_xxs: n_elements must be a multiple of {IQK}, got {n_elements}"
+    let grid = iq2xxs_grid()
+    let ksigns = ksigns_table()
+    mut [float32] result = [0.0 for i in 0..<n_elements]
+    var int b = 0
+    while b < n_elements / IQK:
+        let base = offset + b * IQ2_XXS_BLOCK_BYTES
+        guard base + IQ2_XXS_BLOCK_BYTES <= bytes.length else throw "dequantize_iq2_xxs: truncated block {b}"
+        let d = f16_bits_to_f32(read_u16_le(bytes, base))
+        var int ib = 0
+        while ib < 8:
+            let aux0 = read_u32_le(bytes, base + 2 + ib * 8)
+            let aux1 = read_u32_le(bytes, base + 2 + ib * 8 + 4)
+            let db = (d * ((0.5 as float32) + ((aux1 >> 28) as float32))) * (0.25 as float32)
+            var int l = 0
+            while l < 4:
+                let gi = (aux0 >> (8 * l)) & 255
+                let sb = int(ksigns[(aux1 >> (7 * l)) & 127])
+                var int j = 0
+                while j < 8:
+                    let g = int(grid[gi * 8 + j]) as float32
+                    result[b * IQK + ib * 32 + l * 8 + j] = (db * g) * sign_of(sb, j)
+                    j += 1
+                l += 1
+            ib += 1
+        b += 1
+    result
+
+# ── IQ2_XS (74 bytes): f16 d, 32 u16 (9-bit grid index + 7-bit sign index), 8 scale bytes ──
+pub [float32] dequantize_iq2_xs([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % IQK == 0 else throw "dequantize_iq2_xs: n_elements must be a multiple of {IQK}, got {n_elements}"
+    let grid = iq2xs_grid()
+    let ksigns = ksigns_table()
+    mut [float32] result = [0.0 for i in 0..<n_elements]
+    var int b = 0
+    while b < n_elements / IQK:
+        let base = offset + b * IQ2_XS_BLOCK_BYTES
+        guard base + IQ2_XS_BLOCK_BYTES <= bytes.length else throw "dequantize_iq2_xs: truncated block {b}"
+        let d = f16_bits_to_f32(read_u16_le(bytes, base))
+        let scales_at = base + 2 + 64
+        var int g = 0
+        while g < 32:
+            let q = read_u16_le(bytes, base + 2 + g * 2)
+            let gi = q & 511
+            let sb = int(ksigns[q >> 9])
+            let s = (int(bytes[scales_at + g / 4]) >> (4 * ((g / 2) % 2))) & 15
+            let db = (d * ((0.5 as float32) + (s as float32))) * (0.25 as float32)
+            var int j = 0
+            while j < 8:
+                let gv = int(grid[gi * 8 + j]) as float32
+                result[b * IQK + g * 8 + j] = (db * gv) * sign_of(sb, j)
+                j += 1
+            g += 1
+        b += 1
+    result
+
+# ── IQ2_S (82 bytes): f16 d, 32 grid-index bytes, 32 sign bytes, 8 high-bit bytes, 8 scale bytes ──
+pub [float32] dequantize_iq2_s([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % IQK == 0 else throw "dequantize_iq2_s: n_elements must be a multiple of {IQK}, got {n_elements}"
+    let grid = iq2s_grid()
+    mut [float32] result = [0.0 for i in 0..<n_elements]
+    var int b = 0
+    while b < n_elements / IQK:
+        let base = offset + b * IQ2_S_BLOCK_BYTES
+        guard base + IQ2_S_BLOCK_BYTES <= bytes.length else throw "dequantize_iq2_s: truncated block {b}"
+        let d = f16_bits_to_f32(read_u16_le(bytes, base))
+        let qs_at = base + 2
+        let signs_at = base + 2 + 32
+        let qh_at = base + 2 + 64
+        let scales_at = base + 2 + 72
+        var int g = 0
+        while g < 32:
+            let high = (int(bytes[qh_at + g / 4]) >> (2 * (g % 4))) & 3
+            let gi = int(bytes[qs_at + g]) | (high << 8)
+            let sb = int(bytes[signs_at + g])
+            let s = (int(bytes[scales_at + g / 4]) >> (4 * ((g / 2) % 2))) & 15
+            let db = (d * ((0.5 as float32) + (s as float32))) * (0.25 as float32)
+            var int j = 0
+            while j < 8:
+                let gv = int(grid[gi * 8 + j]) as float32
+                result[b * IQK + g * 8 + j] = (db * gv) * sign_of(sb, j)
+                j += 1
+            g += 1
+        b += 1
+    result
+
+# ── IQ3_XXS (98 bytes): f16 d, 64 grid-index bytes (4-value rows), then 8 u32 of signs + scale ──
+pub [float32] dequantize_iq3_xxs([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % IQK == 0 else throw "dequantize_iq3_xxs: n_elements must be a multiple of {IQK}, got {n_elements}"
+    let grid = iq3xxs_grid()
+    let ksigns = ksigns_table()
+    mut [float32] result = [0.0 for i in 0..<n_elements]
+    var int b = 0
+    while b < n_elements / IQK:
+        let base = offset + b * IQ3_XXS_BLOCK_BYTES
+        guard base + IQ3_XXS_BLOCK_BYTES <= bytes.length else throw "dequantize_iq3_xxs: truncated block {b}"
+        let d = f16_bits_to_f32(read_u16_le(bytes, base))
+        let qs_at = base + 2
+        let sc_at = base + 2 + 64
+        var int ib = 0
+        while ib < 8:
+            let aux = read_u32_le(bytes, sc_at + ib * 4)
+            let db = (d * ((0.5 as float32) + ((aux >> 28) as float32))) * (0.5 as float32)
+            var int l = 0
+            while l < 4:
+                let sb = int(ksigns[(aux >> (7 * l)) & 127])
+                let g1 = int(bytes[qs_at + ib * 8 + 2 * l])
+                let g2 = int(bytes[qs_at + ib * 8 + 2 * l + 1])
+                var int j = 0
+                while j < 4:
+                    let v1 = int(grid[g1 * 4 + j]) as float32
+                    let v2 = int(grid[g2 * 4 + j]) as float32
+                    result[b * IQK + ib * 32 + l * 8 + j] = (db * v1) * sign_of(sb, j)
+                    result[b * IQK + ib * 32 + l * 8 + 4 + j] = (db * v2) * sign_of(sb, 4 + j)
+                    j += 1
+                l += 1
+            ib += 1
+        b += 1
+    result
+
+# ── IQ3_S (110 bytes): f16 d, 64 grid bytes, 8 high-bit bytes, 32 sign bytes, 4 scale bytes ──
+pub [float32] dequantize_iq3_s([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % IQK == 0 else throw "dequantize_iq3_s: n_elements must be a multiple of {IQK}, got {n_elements}"
+    let grid = iq3s_grid()
+    mut [float32] result = [0.0 for i in 0..<n_elements]
+    var int b = 0
+    while b < n_elements / IQK:
+        let base = offset + b * IQ3_S_BLOCK_BYTES
+        guard base + IQ3_S_BLOCK_BYTES <= bytes.length else throw "dequantize_iq3_s: truncated block {b}"
+        let d = f16_bits_to_f32(read_u16_le(bytes, base))
+        let qs_at = base + 2
+        let qh_at = base + 2 + 64
+        let signs_at = base + 2 + 72
+        let scales_at = base + 2 + 104
+        var int gg = 0
+        while gg < 32:
+            let s = (int(bytes[scales_at + gg / 8]) >> (4 * ((gg / 4) % 2))) & 15
+            let db = d * ((1 + 2 * s) as float32)
+            let sb = int(bytes[signs_at + gg])
+            var int half = 0
+            while half < 2:
+                let e = gg * 2 + half
+                let high = (int(bytes[qh_at + e / 8]) >> (e % 8)) & 1
+                let gi = int(bytes[qs_at + e]) | (high << 8)
+                var int j = 0
+                while j < 4:
+                    let v = int(grid[gi * 4 + j]) as float32
+                    result[b * IQK + gg * 8 + half * 4 + j] = (db * v) * sign_of(sb, half * 4 + j)
+                    j += 1
+                half += 1
+            gg += 1
+        b += 1
+    result
+
+# ── IQ1_S (50 bytes): f16 d, 32 grid-index bytes, 8 u16 (3 high bits x 4, scale, delta sign) ──
+pub [float32] dequantize_iq1_s([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % IQK == 0 else throw "dequantize_iq1_s: n_elements must be a multiple of {IQK}, got {n_elements}"
+    let grid = iq1s_grid()
+    mut [float32] result = [0.0 for i in 0..<n_elements]
+    var int b = 0
+    while b < n_elements / IQK:
+        let base = offset + b * IQ1_S_BLOCK_BYTES
+        guard base + IQ1_S_BLOCK_BYTES <= bytes.length else throw "dequantize_iq1_s: truncated block {b}"
+        let d = f16_bits_to_f32(read_u16_le(bytes, base))
+        let qs_at = base + 2
+        let qh_at = base + 2 + 32
+        var int ib = 0
+        while ib < 8:
+            let qh = read_u16_le(bytes, qh_at + ib * 2)
+            let dl = d * ((2 * ((qh >> 12) & 7) + 1) as float32)
+            let delta = if (qh & 32768) == 0: IQ1_DELTA else: -IQ1_DELTA
+            var int l = 0
+            while l < 4:
+                let gi = int(bytes[qs_at + ib * 4 + l]) | (((qh >> (3 * l)) & 7) << 8)
+                var int j = 0
+                while j < 8:
+                    let v = (int(grid[gi * 8 + j]) - 1) as float32
+                    result[b * IQK + ib * 32 + l * 8 + j] = dl * (v + delta)
+                    j += 1
+                l += 1
+            ib += 1
+        b += 1
+    result
+
+# ── IQ1_M (56 bytes): 32 grid-index bytes, 16 high-nibble bytes, 4 u16 of scales whose top nibbles hold the f16 d ──
+pub [float32] dequantize_iq1_m([uint8] bytes, int offset, int n_elements) throws:
+    guard n_elements % IQK == 0 else throw "dequantize_iq1_m: n_elements must be a multiple of {IQK}, got {n_elements}"
+    let grid = iq1s_grid()
+    mut [float32] result = [0.0 for i in 0..<n_elements]
+    var int b = 0
+    while b < n_elements / IQK:
+        let base = offset + b * IQ1_M_BLOCK_BYTES
+        guard base + IQ1_M_BLOCK_BYTES <= bytes.length else throw "dequantize_iq1_m: truncated block {b}"
+        let qs_at = base
+        let qh_at = base + 32
+        let sc_at = base + 48
+        let s0 = read_u16_le(bytes, sc_at)
+        let s1 = read_u16_le(bytes, sc_at + 2)
+        let s2 = read_u16_le(bytes, sc_at + 4)
+        let s3 = read_u16_le(bytes, sc_at + 6)
+        let d_bits = (s0 >> 12) | ((s1 >> 12) << 4) | ((s2 >> 12) << 8) | ((s3 >> 12) << 12)
+        let d = f16_bits_to_f32(d_bits)
+        var int g = 0
+        while g < 32:
+            # scale slot for this group of 8: two per 16 values, 3 bits each, 4 per u16
+            let slot = g / 2
+            let word = if slot / 4 == 0: s0 elif slot / 4 == 1: s1 elif slot / 4 == 2: s2 else: s3
+            let sc = (word >> (3 * (slot % 4))) & 7
+            let dl = d * ((2 * sc + 1) as float32)
+            let nib = (int(bytes[qh_at + g / 2]) >> (4 * (g % 2))) & 15
+            let gi = int(bytes[qs_at + g]) | ((nib & 7) << 8)
+            let delta = if (nib & 8) == 0: IQ1_DELTA else: -IQ1_DELTA
+            var int j = 0
+            while j < 8:
+                let v = (int(grid[gi * 8 + j]) - 1) as float32
+                result[b * IQK + g * 8 + j] = dl * (v + delta)
+                j += 1
+            g += 1
+        b += 1
+    result
+
+# ── lookup tables for the GPU ────────────────────────────────────────────────
+# The bytes a weight buffer of this format starts with (iq_decode.br lists the layout): the
+# grid, then the sign patterns for the formats that use them.
+
+pub int iq_gpu_prefix_bytes(int ggml_type):
+    if ggml_type == 16:
+        2176
+    elif ggml_type == 17:
+        4224
+    elif ggml_type == 22:
+        8192
+    elif ggml_type == 18:
+        1152
+    elif ggml_type == 21:
+        2048
+    else:
+        16384
+
+pub [uint8] iq_gpu_prefix(int ggml_type) throws:
+    mut out = []
+    let grid = if ggml_type == 16: iq2xxs_grid() elif ggml_type == 17: iq2xs_grid() elif ggml_type == 22: iq2s_grid() elif ggml_type == 18: iq3xxs_grid() elif ggml_type == 21: iq3s_grid() else: iq1s_grid()
+    for b in grid:
+        out.push(b)
+    if ggml_type == 16 or ggml_type == 17 or ggml_type == 18:
+        for b in ksigns_table():
+            out.push(b)
+    guard out.length == iq_gpu_prefix_bytes(ggml_type) else throw "iq_gpu_prefix: type {ggml_type} table is {out.length} bytes, expected {iq_gpu_prefix_bytes(ggml_type)}"
+    out

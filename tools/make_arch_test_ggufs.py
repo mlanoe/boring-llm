@@ -361,6 +361,23 @@ def fmt_matrix(rng, qtype, a):
         view[:, :, 0:2] = rng.normal(0, sd, n).astype(np.float16).view(np.uint8).reshape(view.shape[0], -1, 2)
         view[:, :, 2:4] = rng.normal(0, sd, n).astype(np.float16).view(np.uint8).reshape(view.shape[0], -1, 2)
         return raw, gguf.quants.dequantize(raw, qtype).astype(np.float64)
+    if qtype in (T.IQ2_XXS, T.IQ2_XS, T.IQ2_S, T.IQ3_XXS, T.IQ3_S, T.IQ1_S, T.IQ1_M):  # grid formats: random blocks too
+        block, size = gguf.GGML_QUANT_SIZES[qtype]
+        raw = rng.integers(0, 256, size=(a.shape[0], a.shape[1] // block * size), dtype=np.uint8)
+        view = raw.reshape(a.shape[0], -1, size)
+        n = view.shape[0] * view.shape[1]
+        sd = 0.0001 if qtype == T.IQ3_S else 0.0003
+        d_bits = rng.normal(0, sd, n).astype(np.float16).view(np.uint16)
+        if qtype == T.IQ1_M:  # its f16 scale is spread over the top nibbles of the four u16 scale words at bytes 48..55
+            flat = view.reshape(n, size)
+            for k in range(4):
+                word = flat[:, 48 + 2 * k].astype(np.uint32) | (flat[:, 49 + 2 * k].astype(np.uint32) << 8)
+                word = (word & 0x0FFF) | (((d_bits.astype(np.uint32) >> (4 * k)) & 0xF) << 12)
+                flat[:, 48 + 2 * k] = (word & 0xFF).astype(np.uint8)
+                flat[:, 49 + 2 * k] = (word >> 8).astype(np.uint8)
+        else:
+            view[:, :, 0:2] = d_bits.view(np.uint8).reshape(view.shape[0], -1, 2)
+        return raw, gguf.quants.dequantize(raw, qtype).astype(np.float64)
     raw = gguf.quants.quantize(a, qtype)
     return raw, gguf.quants.dequantize(raw, qtype).astype(np.float64)
 
@@ -375,7 +392,7 @@ def run_formats():
     TOKENS = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2, 3, 8, 4]  # 20 rows: also takes the dequantize-then-matmul prefill path (>= 16 rows)
     D, FFN, NL, NH, NKV, Q8, PREFIX = 256, 256, 1, 2, 1, False, "fmt-"
     dh = 128
-    for name, qtype in (("q4_0", T.Q4_0), ("q5_0", T.Q5_0), ("q4_1", T.Q4_1), ("q5_1", T.Q5_1), ("q5_k", T.Q5_K), ("iq4_xs", T.IQ4_XS), ("iq4_nl", T.IQ4_NL), ("f16", T.F16), ("bf16", T.BF16)):
+    for name, qtype in (("q4_0", T.Q4_0), ("q5_0", T.Q5_0), ("q4_1", T.Q4_1), ("q5_1", T.Q5_1), ("q5_k", T.Q5_K), ("iq4_xs", T.IQ4_XS), ("iq4_nl", T.IQ4_NL), ("iq2_xxs", T.IQ2_XXS), ("iq2_xs", T.IQ2_XS), ("iq2_s", T.IQ2_S), ("iq3_xxs", T.IQ3_XXS), ("iq3_s", T.IQ3_S), ("iq1_s", T.IQ1_S), ("iq1_m", T.IQ1_M), ("f16", T.F16), ("bf16", T.BF16)):
         rng = np.random.default_rng(23)
         W = make_weights(rng, dh, False)
         raws = {}

@@ -250,3 +250,38 @@ pub float32 f16_bits_to_f32(int bits):
         0.0 - mag
     else:
         mag
+
+# The IEEE binary16 bit pattern nearest to `v` (ties to even), saturating to infinity.
+pub int f32_to_f16_bits(float32 v):
+    let sign = if v < 0.0: 32768 else: 0
+    let a = if v < 0.0: 0.0 - v else: v
+    if a == 0.0:
+        return sign
+    if a >= 65520.0:
+        return sign | 31744
+    # the largest exponent e with 2^e <= a, from -25 up to 15
+    var int e = -25
+    var float32 p = pow2i(-25)
+    while e < 15 and p * 2.0 <= a:
+        p = p * 2.0
+        e += 1
+    if e < -14:
+        # subnormal: a multiple of 2^-24
+        let scaled = a / pow2i(-24)
+        var int q = scaled.floor() as int
+        let frac = scaled - (q as float32)
+        if frac > 0.5 or (frac == 0.5 and q % 2 == 1):
+            q += 1
+        return sign | q
+    let mant = (a / p - 1.0) * 1024.0
+    var int m = mant.floor() as int
+    let frac = mant - (m as float32)
+    if frac > 0.5 or (frac == 0.5 and m % 2 == 1):
+        m += 1
+    var int exp = e + 15
+    if m == 1024:
+        m = 0
+        exp += 1
+    if exp >= 31:
+        return sign | 31744
+    sign | (exp << 10) | m

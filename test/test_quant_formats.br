@@ -22,11 +22,49 @@ def check(string name, int ggml_type, int n) throws:
     assert(worst == 0.0 as float32, "{name}: max |dequantized - gguf.py| = {worst}")
     print "{name}: OK ({n} values identical to gguf.py)"
 
+# float32 -> binary16 bit patterns against numpy's, and Q8_0 re-quantization against gguf.py's
+def check_conversions() throws:
+    let tin = fs.readBytes("test/fixtures/quant-tof16.in.f32")
+    let tout = fs.readBytes("test/fixtures/quant-tof16.out.u16")
+    let n = tin.length / 4
+    var int i = 0
+    while i < n:
+        let got = f32_to_f16_bits(read_f32_le(tin, i * 4) as float32)
+        let want = read_u16_le(tout, i * 2)
+        assert(got == want, "f32_to_f16_bits[{i}]: got {got}, want {want}")
+        i += 1
+    print "f32_to_f16_bits: OK ({n} values identical to numpy)"
+    let values = fs.readBytes("test/fixtures/quant-iq2_xxs.f32")
+    mut [float32] xs = []
+    var int k = 0
+    while k < values.length / 4:
+        xs.push(read_f32_le(values, k * 4) as float32)
+        k += 1
+    let got_q = quantize_q8_0(xs)
+    let want_q = fs.readBytes("test/fixtures/quant-q8req.out.bin")
+    assert_eq(got_q.length, want_q.length)
+    var int bad = 0
+    var int m = 0
+    while m < got_q.length:
+        if got_q[m] != want_q[m]:
+            bad += 1
+        m += 1
+    assert(bad == 0, "quantize_q8_0: {bad} bytes differ from gguf.py")
+    print "quantize_q8_0: OK ({got_q.length} bytes identical to gguf.py)"
+
 def main() throws:
+    check_conversions()
     check("q4_1", 3, 96)
     check("q5_1", 7, 96)
     check("q5_k", 13, 768)
     check("iq4_xs", 23, 768)
     check("iq4_nl", 20, 96)
+    check("iq2_xxs", 16, 768)
+    check("iq2_xs", 17, 768)
+    check("iq2_s", 22, 768)
+    check("iq3_xxs", 18, 768)
+    check("iq3_s", 21, 768)
+    check("iq1_s", 19, 768)
+    check("iq1_m", 29, 768)
     check("f16", 1, 64)
     check("bf16", 30, 64)
