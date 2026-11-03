@@ -531,7 +531,17 @@ The model's own `tokenizer.chat_template` is rendered by a Jinja2 subset interpr
 - `{{ expression }}` output, `and`, `or`, `not`, `==`, `!=`, string concatenation with `+`, attribute and subscript access, `is defined`;
 - the `trim` and `tojson` filters, and the `{%-` / `-%}` whitespace-trim markers.
 
-Qwen3's template adds `namespace(...)` objects with `{% set ns.attr = ... %}`, `range(...)`, the string methods `split`, `strip`, `lstrip`, `rstrip`, `startswith`, `endswith`, `replace` and `lower`, `in` and `not in`, the comparison operators, negative list indices, the tests `is string`, `is none`, `is false` and friends, the `length` filter, `raise_exception(...)`, and the Jinja rule that a `for` body has its own scope (a namespace is the way to carry state out of it). There are no macros, includes, or dict or list literals. An unsupported construct is reported as an error, not ignored. Rendering was compared token for token with `jinja2` on the Qwen2.5, Qwen3 and TinyLlama templates (`tools/oracle_render_request.py`, which also covers the multi-turn tool-call, reasoning and `enable_thinking` request fixtures).
+Qwen3's template adds `namespace(...)` objects with `{% set ns.attr = ... %}`, `range(...)`, the string methods `split`, `strip`, `lstrip`, `rstrip`, `startswith`, `endswith`, `replace` and `lower`, `in` and `not in`, the comparison operators, negative list indices, the tests `is string`, `is none`, `is false` and friends, the `length` filter, `raise_exception(...)`, and the Jinja rule that a `for` body has its own scope (a namespace is the way to carry state out of it). A second round, driven by `tools/jinja_diff.py` (175 small templates rendered by `jinja2` and by `src/jinja.br`, 167 of which agree), added the rest of what chat templates in the wild use:
+
+- operators `~`, `*`, `/`, `//`, `%`, `**`, float literals and arithmetic, chained comparisons, `a if c else b`, and `and`/`or` that yield one of their operands (`x or 'default'`);
+- list, tuple and dict literals, `[::-1]`-style slices with a step, string indexing, list concatenation;
+- filters `upper`, `lower`, `title`, `capitalize`, `first`, `last`, `join`, `reverse`, `sort`, `default`/`d`, `string`, `int`, `float`, `replace`, `trim(chars)`, `list`, `items`, `dictsort`, `map`, `select`, `reject`, `selectattr`, `rejectattr`, `unique`, `sum`, `min`, `max`, `abs`, `round`, `count`, `indent`, `wordcount`, `format`, `e`, `safe`, and `tojson(indent=n)`, all with arguments;
+- tests `odd`, `even`, `divisibleby`, `in`, `eq`/`ne`/`lt`/`gt`/`le`/`ge`, `float`, `integer`, `boolean`, `callable`;
+- methods `dict.items/keys/values/get`, `str.upper/title/capitalize/find/count/join/split(sep, maxsplit)/rsplit/splitlines/isdigit/removeprefix/removesuffix`, and `loop.cycle(...)`;
+- `dict(...)` and `strftime_now(fmt)` (UTC; `%Y %y %m %d %e %H %I %M %S %p %B %b %A %a %j`);
+- statements: `for ... else`, `for x in xs if cond`, tuple unpacking in `for` and `set`, `loop.revindex`, `loop.revindex0`, `loop.length`, `loop.previtem`, `loop.nextitem`, `{% set x %}...{% endset %}`, `{% macro %}` (with defaults and keyword arguments), `{# comments #}` and `{% raw %}`.
+
+Not supported, and reported as an error: `include`, `import`, `extends`, `call` blocks (`caller()`), `{% with %}`, `{% filter %}`, `break`/`continue`, the `batch` filter, `cycler`, and mutating methods such as `list.append`. A JSON `null` is read as undefined, so `{{ none }}` prints nothing where `jinja2` prints `None`. An unsupported construct is reported as an error, not ignored. Rendering was compared token for token with `jinja2` on the Qwen2.5, Qwen3 and TinyLlama templates (`tools/oracle_render_request.py`, which also covers the multi-turn tool-call, reasoning and `enable_thinking` request fixtures).
 
 ### 6.5 Memory
 
@@ -878,7 +888,7 @@ This writes `docs/book.html`, `README.html` at the repository root, and one HTML
 - **One request at a time.** There is no batching and no concurrent decoding.
 - **Context** is limited by `--ctx-size` and memory. The default KV cache is float32; select matching `-ctk f16 -ctv f16` for a half-sized main cache, or `-ctk q8_0 -ctv q8_0` for about a quarter, on models whose attention heads are a multiple of 32 up to 128 wide.
 - **Architectures**: Llama-style GGUF layouts only (`qwen2` and `llama` are the tested ones); no vision; mixture of experts only in the Mixtral and Qwen3-MoE layouts (chapter 6).
-- **Chat templates** use a Jinja2 subset; an unsupported construct is reported.
+- **Chat templates** use a Jinja2 subset (see [section 6.4](#64-chat-templates) for what is and is not covered); an unsupported construct is reported.
 - **Standard split GGUF naming required.** Multi-file models are discovered from any `model-00001-of-000NN.gguf` shard using their `split.no`, `split.count`, and `split.tensors.count` metadata. Arbitrary shard filenames are not guessed.
 - **Unix only for the disk features**: the streaming loader and snapshots use Unix file APIs.
 - **wgpu, CUDA, ROCm**: K-quant prefill through the portable schedule is about three times slower than the hand-written kernels; CUDA and ROCm have never been run.

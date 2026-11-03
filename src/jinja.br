@@ -41,6 +41,8 @@
 # preferred idiom independent of that bug, not just a workaround for it.
 
 use gguf
+use std.time.SystemTime
+use std.time.UNIX_EPOCH
 
 # ── Values ───────────────────────────────────────────────────────────────
 
@@ -81,21 +83,101 @@ bool jv_eq(JValue l, JValue r):
         JInt(a):
             match r:
                 JInt(b): a == b
+                JFloat(b): (a as float) == b
+                _: false
+        JFloat(a):
+            match r:
+                JInt(b): a == (b as float)
+                JFloat(b): a == b
                 _: false
         JBool(a):
             match r:
                 JBool(b): a == b
                 _: false
+        JList(a):
+            match r:
+                JList(b):
+                    var bool same = a.length == b.length
+                    var int i = 0
+                    while same and i < a.length:
+                        if not jv_eq(a[i], b[i]):
+                            same = false
+                        i += 1
+                    same
+                _: false
+        JUndefined:
+            match r:
+                JUndefined: true
+                _: false
         _: false
+
+# Python's `str(float)`: a whole number keeps its ".0".
+string jv_float_str(float f):
+    if f == f.floor() and f < 1.0e15 and f > -1.0e15:
+        let n = f as int
+        "{n}.0"
+    else:
+        "{f}"
+
+# Python's `repr(str)`: single quotes unless the text has a single and no double quote.
+string py_str_repr(string s):
+    let q = if s.contains("'") and not s.contains('"'): '"' else: "'"
+    var string out = q
+    for ch in s.chars():
+        if ch == q or ch == '\':
+            out = "{out}\\{ch}"
+        elif ch == "\n":
+            out = "{out}\\n"
+        elif ch == "\r":
+            out = "{out}\\r"
+        elif ch == "\t":
+            out = "{out}\\t"
+        else:
+            out = "{out}{ch}"
+    "{out}{q}"
+
+# Python's `repr` of a template value, as `{{ some_list }}` prints it.
+string jv_repr(JValue v):
+    let ob = chr(123)
+    let cb = chr(125)
+    match v:
+        JStr(s): py_str_repr(s)
+        JInt(n): "{n}"
+        JBool(b): if b: "True" else: "False"
+        JFloat(f): jv_float_str(f)
+        JUndefined: "None"
+        JList(items):
+            var string out = "["
+            var int i = 0
+            while i < items.length:
+                if i > 0:
+                    out = "{out}, "
+                out = "{out}{jv_repr(items[i])}"
+                i += 1
+            "{out}]"
+        JDict(fields, keys):
+            var string out = ob
+            var int i = 0
+            var int shown = 0
+            while i < keys.length:
+                if keys[i] != "__namespace__":
+                    if shown > 0:
+                        out = "{out}, "
+                    let child = fields[keys[i]] else JValue.JUndefined
+                    out = "{out}{py_str_repr(keys[i])}: {jv_repr(child)}"
+                    shown += 1
+                i += 1
+            "{out}{cb}"
 
 string jv_to_str(JValue v):
     match v:
         JStr(s): s
         JInt(n): "{n}"
         JBool(b): if b: "True" else: "False"
-        JFloat(f): "{f}"
+        JFloat(f): jv_float_str(f)
         JUndefined: ""
-        _: ""
+        JList(items): jv_repr(v)
+        JDict(fields, keys): jv_repr(v)
 
 pub string json_escape(string s):
     var string out = ""
@@ -177,12 +259,14 @@ pub enum JExpr:
     EAttr(JExpr base, string name)
     EIndex(JExpr base, JExpr idx)
     ECond(JExpr cond, JExpr then_e, JExpr else_e)   # `a if cond else b`
-    ESlice(JExpr base, JExpr lo, JExpr hi)   # base[lo:hi]; a missing bound is ELit(JUndefined)
+    ESlice(JExpr base, JExpr lo, JExpr hi, JExpr step)   # base[lo:hi:step]; a missing part is ELit(JUndefined)
+    EList([JExpr] items)                     # `[a, b]` and tuples `(a, b)`
+    EDict([JExpr] keys, [JExpr] vals)        # `{k: v}`
     EBinOp(string op, JExpr left, JExpr right)
     ENot(JExpr e)
     EIsDefined(JExpr e)
-    ETest(JExpr e, string test)
-    EFilter(JExpr base, string name)
+    ETest(JExpr e, string test, [JExpr] args)
+    EFilter(JExpr base, string name, [JExpr] args, [string] kwnames, [JExpr] kwvals)
     ECall(JExpr callee, [JExpr] args, [string] kwnames, [JExpr] kwvals)
 
 JValue jv_get_attr(JValue base, string name):
@@ -205,6 +289,16 @@ JValue jv_get_index(JValue base, JValue idx):
             match idx:
                 JStr(k): fields[k] else JValue.JUndefined
                 _: JValue.JUndefined
+        JStr(str):
+            match idx:
+                JInt(n):
+                    let cs = str.chars()
+                    let at = if n < 0: n + cs.length else: n
+                    if at >= 0 and at < cs.length:
+                        JValue.JStr(cs[at])
+                    else:
+                        JValue.JUndefined
+                _: JValue.JUndefined
         _: JValue.JUndefined
 
 # Python/Jinja slice semantics for lists and strings: negative bounds count from
@@ -221,42 +315,750 @@ int slice_bound(JValue b, int n, int default_at):
                 at
         _: default_at
 
-JValue jv_slice(JValue base, JValue lo, JValue hi):
+# Indices a slice visits (Python's `slice.indices`), for a step that may be negative.
+[int] slice_indices(JValue lo, JValue hi, JValue step, int n) throws:
+    var int st = 1
+    match step:
+        JInt(k): st = k
+        _: st = 1
+    guard st != 0 else throw "jinja: slice step cannot be zero"
+    mut [int] out = []
+    if st > 0:
+        let a = slice_bound(lo, n, 0)
+        let b = slice_bound(hi, n, n)
+        var int i = a
+        while i < b:
+            out.push(i)
+            i += st
+    else:
+        var int a = n - 1
+        match lo:
+            JInt(k):
+                let at = if k < 0: k + n else: k
+                a = if at < -1: -1 elif at > n - 1: n - 1 else: at
+            _: a = n - 1
+        var int b = -1
+        match hi:
+            JInt(k):
+                let at = if k < 0: k + n else: k
+                b = if at < -1: -1 elif at > n - 1: n - 1 else: at
+            _: b = -1
+        var int i = a
+        while i > b:
+            out.push(i)
+            i += st
+    out
+
+JValue jv_slice(JValue base, JValue lo, JValue hi, JValue step) throws:
     match base:
         JList(items):
-            let a = slice_bound(lo, items.length, 0)
-            let b = slice_bound(hi, items.length, items.length)
             mut [JValue] out = []
-            var int i = a
-            while i < b:
+            for i in slice_indices(lo, hi, step, items.length):
                 out.push(items[i])
-                i += 1
             JValue.JList(out)
         JStr(str):
             let cs = str.chars()
-            let a = slice_bound(lo, cs.length, 0)
-            let b = slice_bound(hi, cs.length, cs.length)
             var string out = ""
-            var int i = a
-            while i < b:
+            for i in slice_indices(lo, hi, step, cs.length):
                 out = "{out}{cs[i]}"
-                i += 1
             JValue.JStr(out)
         _: JValue.JUndefined
 
-JValue apply_filter(string name, JValue v) throws:
+# ── dates (UTC) ──────────────────────────────────────────────────────────
+
+# Year, month (1-12) and day of month for a day count since 1970-01-01
+# (Howard Hinnant's civil-from-days).
+(int, int, int) civil_from_days(int days):
+    let z = days + 719468
+    let era = (if z >= 0: z else: z - 146096) / 146097
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10: mp + 3 else: mp - 9
+    let y = yoe + era * 400 + (if m <= 2: 1 else: 0)
+    (y, m, d)
+
+# The first `n` characters (`s.slice(0, n)` inside an interpolation transpiles as an array slice).
+string first_chars(string s, int n):
+    var string out = ""
+    var int i = 0
+    for ch in s.chars():
+        if i < n:
+            out = "{out}{ch}"
+        i += 1
+    out
+
+string pad_num(int n, int width):
+    var string t = "{n}"
+    while t.length < width:
+        t = "0{t}"
+    t
+
+# `strftime` for a Unix timestamp (UTC): %Y %y %m %d %e %H %I %M %S %p %B %b %A %a %j %%.
+pub string strftime_at(string fmt, int secs) throws:
+    let months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+    let weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    let days = (if secs >= 0: secs else: secs - 86399) / 86400
+    let rem = secs - days * 86400
+    let (y, m, d) = civil_from_days(days)
+    let hour = rem / 3600
+    let minute = (rem % 3600) / 60
+    let second = rem % 60
+    let weekday = ((days + 4) % 7 + 7) % 7
+    # day of the year: days since January 1st of `y`
+    var int yday = 1
+    var int mi = 1
+    while mi < m:
+        let long_month = mi == 1 or mi == 3 or mi == 5 or mi == 7 or mi == 8 or mi == 10 or mi == 12
+        let leap = (y % 4 == 0 and y % 100 != 0) or y % 400 == 0
+        yday += if mi == 2: (if leap: 29 else: 28) elif long_month: 31 else: 30
+        mi += 1
+    yday += d - 1
+    var string out = ""
+    let cs = fmt.chars()
+    var int i = 0
+    while i < cs.length:
+        if cs[i] == "%" and i + 1 < cs.length:
+            let c = cs[i + 1]
+            if c == "Y":
+                out = "{out}{y}"
+            elif c == "y":
+                out = "{out}{pad_num(y % 100, 2)}"
+            elif c == "m":
+                out = "{out}{pad_num(m, 2)}"
+            elif c == "d":
+                out = "{out}{pad_num(d, 2)}"
+            elif c == "e":
+                let lead = if d < 10: " " else: ""
+                out = "{out}{lead}{d}"
+            elif c == "H":
+                out = "{out}{pad_num(hour, 2)}"
+            elif c == "I":
+                let h12 = if hour % 12 == 0: 12 else: hour % 12
+                out = "{out}{pad_num(h12, 2)}"
+            elif c == "M":
+                out = "{out}{pad_num(minute, 2)}"
+            elif c == "S":
+                out = "{out}{pad_num(second, 2)}"
+            elif c == "p":
+                let meridiem = if hour < 12: "AM" else: "PM"
+                out = "{out}{meridiem}"
+            elif c == "B":
+                out = "{out}{months[m - 1]}"
+            elif c == "b":
+                out = "{out}{first_chars(months[m - 1], 3)}"
+            elif c == "A":
+                out = "{out}{weekdays[weekday]}"
+            elif c == "a":
+                out = "{out}{first_chars(weekdays[weekday], 3)}"
+            elif c == "j":
+                out = "{out}{pad_num(yday, 3)}"
+            elif c == "%":
+                out = "{out}%"
+            else:
+                throw "jinja: unsupported strftime directive '%{c}'"
+            i += 2
+        else:
+            out = "{out}{cs[i]}"
+            i += 1
+    out
+
+# ── numbers ──────────────────────────────────────────────────────────────
+
+bool jv_is_number(JValue v):
+    match v:
+        JInt(n): true
+        JFloat(f): true
+        _: false
+
+float jv_as_float(JValue v):
+    match v:
+        JInt(n): n as float
+        JFloat(f): f
+        _: 0.0
+
+# `a < b` for sorting and `min`/`max`: numbers numerically, strings by code
+# point (case-folded unless `case_sensitive`).
+bool jv_less(JValue a, JValue b, bool case_sensitive):
+    match a:
+        JStr(x):
+            match b:
+                JStr(y):
+                    if case_sensitive:
+                        x < y
+                    else:
+                        x.toLower() < y.toLower()
+                _: false
+        _:
+            if jv_is_number(a) and jv_is_number(b):
+                jv_as_float(a) < jv_as_float(b)
+            else:
+                false
+
+bool jv_sort_before(JValue a, JValue b, bool case_sensitive, bool descending):
+    if descending:
+        jv_less(b, a, case_sensitive)
+    else:
+        jv_less(a, b, case_sensitive)
+
+[JValue] jv_sorted([JValue] items, bool case_sensitive, bool descending):
+    mut [JValue] out = []
+    for it in items:
+        var int pos = out.length
+        while pos > 0 and jv_sort_before(it, out[pos - 1], case_sensitive, descending):
+            pos -= 1
+        out.insert(pos, it)
+    out
+
+JValue jv_attr_path(JValue v, string path):
+    var JValue cur = v
+    for part in path.split("."):
+        match cur:
+            JList(items):
+                var int idx = 0
+                var bool numeric = part.length > 0
+                for ch in part.chars():
+                    if not is_digit_char(ch):
+                        numeric = false
+                if numeric:
+                    idx = (part as int) else 0
+                    cur = jv_get_index(cur, JValue.JInt(idx))
+                else:
+                    cur = JValue.JUndefined
+            _: cur = jv_get_attr(cur, part)
+    cur
+
+# A keyword argument by name, else the `pos`-th positional one, else `fallback`.
+JValue jv_arg([JValue] args, [string] kwnames, [JValue] kwvals, int pos, string name, JValue fallback):
+    var JValue found = fallback
+    if pos >= 0 and pos < args.length:
+        found = args[pos]
+    var int i = 0
+    while i < kwnames.length:
+        if kwnames[i] == name:
+            found = kwvals[i]
+        i += 1
+    found
+
+int jv_int_arg(JValue v, int fallback):
+    match v:
+        JInt(n): n
+        JFloat(f): f as int
+        _: fallback
+
+string html_escape(string s):
+    var string out = ""
+    for ch in s.chars():
+        if ch == "&":
+            out = "{out}&amp;"
+        elif ch == "<":
+            out = "{out}&lt;"
+        elif ch == ">":
+            out = "{out}&gt;"
+        elif ch == "'":
+            out = "{out}&#39;"
+        elif ch == '"':
+            out = "{out}&#34;"
+        else:
+            out = "{out}{ch}"
+    out
+
+# Jinja's `title` filter: a letter after a space or one of `-({[<` starts a word.
+string title_filter(string s):
+    var string out = ""
+    var bool start = true
+    for ch in s.chars():
+        if start:
+            out = "{out}{ch.toUpper()}"
+        else:
+            out = "{out}{ch.toLower()}"
+        start = ch == " " or ch == "\n" or ch == "\t" or ch == "-" or ch == "(" or ch == "[" or ch == "<" or ch == chr(123)
+    out
+
+# Python's `str.title()`: a letter after any non-letter starts a word.
+string py_title(string s):
+    var string out = ""
+    var bool prev_letter = false
+    for ch in s.chars():
+        let is_letter = ch.toUpper() != ch.toLower()
+        if is_letter and not prev_letter:
+            out = "{out}{ch.toUpper()}"
+        elif is_letter:
+            out = "{out}{ch.toLower()}"
+        else:
+            out = "{out}{ch}"
+        prev_letter = is_letter
+    out
+
+string capitalize_str(string s):
+    var string out = ""
+    var int i = 0
+    for ch in s.chars():
+        if i == 0:
+            out = "{out}{ch.toUpper()}"
+        else:
+            out = "{out}{ch.toLower()}"
+        i += 1
+    out
+
+# Pieces of `s` around `sep`, at most `maxsplit` splits (negative: all), from the left or the right.
+[string] split_limited(string s, string sep, int maxsplit, bool from_right):
+    let pieces = s.split(sep)
+    if maxsplit < 0 or pieces.length <= maxsplit + 1:
+        return pieces
+    mut [string] out = []
+    if not from_right:
+        var int i = 0
+        while i < maxsplit:
+            out.push(pieces[i])
+            i += 1
+        var string rest = pieces[maxsplit]
+        var int j = maxsplit + 1
+        while j < pieces.length:
+            rest = "{rest}{sep}{pieces[j]}"
+            j += 1
+        out.push(rest)
+    else:
+        let keep = pieces.length - maxsplit
+        var string head = pieces[0]
+        var int i = 1
+        while i < keep:
+            head = "{head}{sep}{pieces[i]}"
+            i += 1
+        out.push(head)
+        var int j = keep
+        while j < pieces.length:
+            out.push(pieces[j])
+            j += 1
+    out
+
+[string] split_whitespace(string s):
+    mut [string] out = []
+    var string cur = ""
+    for ch in s.chars():
+        if is_ws_char(ch):
+            if cur.length > 0:
+                out.push(cur)
+                cur = ""
+        else:
+            cur = "{cur}{ch}"
+    if cur.length > 0:
+        out.push(cur)
+    out
+
+# `json.dumps(v, ensure_ascii=False, indent=n)` (HF's `tojson(indent=n)`).
+string jv_to_json_indent(JValue v, int indent, int level):
+    let ob = chr(123)
+    let cb = chr(125)
+    let pad = " ".repeat((level + 1) * indent)
+    let pad_close = " ".repeat(level * indent)
+    match v:
+        JList(items):
+            if items.length == 0:
+                "[]"
+            else:
+                var string out = "[\n"
+                var int i = 0
+                while i < items.length:
+                    out = "{out}{pad}{jv_to_json_indent(items[i], indent, level + 1)}"
+                    if i < items.length - 1:
+                        out = "{out},"
+                    out = "{out}\n"
+                    i += 1
+                "{out}{pad_close}]"
+        JDict(fields, keys):
+            if keys.length == 0:
+                "{ob}{cb}"
+            else:
+                var string out = "{ob}\n"
+                var int i = 0
+                while i < keys.length:
+                    let child = fields[keys[i]] else JValue.JUndefined
+                    out = "{out}{pad}\"{json_escape(keys[i])}\": {jv_to_json_indent(child, indent, level + 1)}"
+                    if i < keys.length - 1:
+                        out = "{out},"
+                    out = "{out}\n"
+                    i += 1
+                "{out}{pad_close}{cb}"
+        _: jv_to_json(v)
+
+JValue apply_filter(string name, JValue v, [JValue] args, [string] kwnames, [JValue] kwvals) throws:
     if name == "trim":
         match v:
-            JStr(s): JValue.JStr(strip_ws(s))
+            JStr(s):
+                if args.length > 0:
+                    JValue.JStr(strip_chars(s, jv_to_str(args[0]), true, true))
+                else:
+                    JValue.JStr(strip_ws(s))
             _: v
     elif name == "tojson":
-        JValue.JStr(jv_to_json(v))
-    elif name == "length":
+        let ind = jv_arg(args, kwnames, kwvals, 0, "indent", JValue.JUndefined)
+        match ind:
+            JInt(n): JValue.JStr(jv_to_json_indent(v, n, 0))
+            _: JValue.JStr(jv_to_json(v))
+    elif name == "length" or name == "count":
         match v:
             JStr(x): JValue.JInt(x.chars().length)
             JList(items): JValue.JInt(items.length)
             JDict(fields, keys): JValue.JInt(keys.length)
             _: JValue.JInt(0)
+    elif name == "upper":
+        JValue.JStr(jv_to_str(v).toUpper())
+    elif name == "lower":
+        JValue.JStr(jv_to_str(v).toLower())
+    elif name == "title":
+        JValue.JStr(title_filter(jv_to_str(v)))
+    elif name == "capitalize":
+        JValue.JStr(capitalize_str(jv_to_str(v)))
+    elif name == "string":
+        JValue.JStr(jv_to_str(v))
+    elif name == "safe":
+        v
+    elif name == "e" or name == "escape":
+        JValue.JStr(html_escape(jv_to_str(v)))
+    elif name == "first" or name == "last":
+        match v:
+            JList(items):
+                if items.length == 0:
+                    JValue.JUndefined
+                elif name == "first":
+                    items[0]
+                else:
+                    items[items.length - 1]
+            JStr(x):
+                let cs = x.chars()
+                if cs.length == 0:
+                    JValue.JUndefined
+                elif name == "first":
+                    JValue.JStr(cs[0])
+                else:
+                    JValue.JStr(cs[cs.length - 1])
+            _: JValue.JUndefined
+    elif name == "join":
+        let sep = jv_to_str(jv_arg(args, kwnames, kwvals, 0, "d", JValue.JStr("")))
+        let attr_path = jv_to_str(jv_arg(args, kwnames, kwvals, 1, "attribute", JValue.JUndefined))
+        match v:
+            JList(items):
+                var string out = ""
+                var int i = 0
+                while i < items.length:
+                    if i > 0:
+                        out = "{out}{sep}"
+                    if attr_path != "":
+                        out = "{out}{jv_to_str(jv_attr_path(items[i], attr_path))}"
+                    else:
+                        out = "{out}{jv_to_str(items[i])}"
+                    i += 1
+                JValue.JStr(out)
+            _: JValue.JStr(jv_to_str(v))
+    elif name == "reverse":
+        match v:
+            JList(items):
+                mut [JValue] out = []
+                var int i = items.length - 1
+                while i >= 0:
+                    out.push(items[i])
+                    i -= 1
+                JValue.JList(out)
+            JStr(x):
+                var string out = ""
+                let cs = x.chars()
+                var int i = cs.length - 1
+                while i >= 0:
+                    out = "{out}{cs[i]}"
+                    i -= 1
+                JValue.JStr(out)
+            _: v
+    elif name == "sort":
+        let rev = jv_truthy(jv_arg(args, kwnames, kwvals, 0, "reverse", JValue.JBool(false)))
+        let cs = jv_truthy(jv_arg(args, kwnames, kwvals, 1, "case_sensitive", JValue.JBool(false)))
+        let attr = jv_arg(args, kwnames, kwvals, 2, "attribute", JValue.JUndefined)
+        match v:
+            JList(items):
+                match attr:
+                    JStr(path):
+                        # sort by the attribute, keeping each element
+                        mut [JValue] keyed = []
+                        for it in items:
+                            keyed.push(jv_attr_path(it, path))
+                        mut [JValue] order = []
+                        var int k = 0
+                        while k < items.length:
+                            order.push(JValue.JInt(k))
+                            k += 1
+                        mut [JValue] out = []
+                        var [JValue] sorted_keys = jv_sorted(keyed, cs, rev)
+                        var [bool] used = [false for u in 0..<items.length]
+                        for sk in sorted_keys:
+                            var int m = 0
+                            var bool placed = false
+                            while m < items.length and not placed:
+                                if not used[m] and jv_eq(keyed[m], sk):
+                                    used[m] = true
+                                    out.push(items[m])
+                                    placed = true
+                                m += 1
+                        JValue.JList(out)
+                    _: JValue.JList(jv_sorted(items, cs, rev))
+            _: v
+    elif name == "default" or name == "d":
+        let dflt = jv_arg(args, kwnames, kwvals, 0, "default_value", JValue.JStr(""))
+        let boolean = jv_truthy(jv_arg(args, kwnames, kwvals, 1, "boolean", JValue.JBool(false)))
+        if jv_is_undefined(v) or (boolean and not jv_truthy(v)):
+            dflt
+        else:
+            v
+    elif name == "int":
+        let dflt = jv_arg(args, kwnames, kwvals, 0, "default", JValue.JInt(0))
+        match v:
+            JInt(n): v
+            JFloat(f): JValue.JInt(f as int)
+            JBool(b): JValue.JInt(if b: 1 else: 0)
+            JStr(x):
+                let t = strip_ws(x)
+                let parsed = (t as int)
+                if let n = parsed:
+                    JValue.JInt(n)
+                else:
+                    let pf = (t as float)
+                    if let f = pf:
+                        JValue.JInt(f as int)
+                    else:
+                        dflt
+            _: dflt
+    elif name == "float":
+        let dflt = jv_arg(args, kwnames, kwvals, 0, "default", JValue.JFloat(0.0))
+        match v:
+            JInt(n): JValue.JFloat(n as float)
+            JFloat(f): v
+            JStr(x):
+                let trimmed = strip_ws(x)
+                let pf = (trimmed as float)
+                if let f = pf:
+                    JValue.JFloat(f)
+                else:
+                    dflt
+            _: dflt
+    elif name == "replace":
+        guard args.length >= 2 else throw "jinja: replace() needs two arguments"
+        JValue.JStr(jv_to_str(v).replace(jv_to_str(args[0]), jv_to_str(args[1])))
+    elif name == "format":
+        # printf-style: %s and %d take the next argument, %% is a percent sign
+        var string out = ""
+        let cs = jv_to_str(v).chars()
+        var int ai = 0
+        var int i = 0
+        while i < cs.length:
+            if cs[i] == "%" and i + 1 < cs.length and (cs[i + 1] == "s" or cs[i + 1] == "d"):
+                guard ai < args.length else throw "jinja: not enough arguments for format()"
+                out = "{out}{jv_to_str(args[ai])}"
+                ai += 1
+                i += 2
+            elif cs[i] == "%" and i + 1 < cs.length and cs[i + 1] == "%":
+                out = "{out}%"
+                i += 2
+            else:
+                out = "{out}{cs[i]}"
+                i += 1
+        JValue.JStr(out)
+    elif name == "list":
+        match v:
+            JList(items): v
+            JStr(x):
+                mut [JValue] out = []
+                for ch in x.chars():
+                    out.push(JValue.JStr(ch))
+                JValue.JList(out)
+            JDict(fields, keys):
+                mut [JValue] out = []
+                for k in keys:
+                    if k != "__namespace__":
+                        out.push(JValue.JStr(k))
+                JValue.JList(out)
+            _: JValue.JList([])
+    elif name == "items":
+        match v:
+            JDict(fields, keys):
+                mut [JValue] out = []
+                for k in keys:
+                    let child = fields[k] else JValue.JUndefined
+                    out.push(JValue.JList([JValue.JStr(k), child]))
+                JValue.JList(out)
+            _: JValue.JList([])
+    elif name == "dictsort":
+        match v:
+            JDict(fields, keys):
+                let cs = jv_truthy(jv_arg(args, kwnames, kwvals, 0, "case_sensitive", JValue.JBool(false)))
+                let by_value = jv_to_str(jv_arg(args, kwnames, kwvals, 1, "by", JValue.JStr("key"))) == "value"
+                let rev = jv_truthy(jv_arg(args, kwnames, kwvals, 2, "reverse", JValue.JBool(false)))
+                mut [JValue] sort_keys = []
+                for k in keys:
+                    if by_value:
+                        sort_keys.push(fields[k] else JValue.JUndefined)
+                    else:
+                        sort_keys.push(JValue.JStr(k))
+                var [JValue] ordered = jv_sorted(sort_keys, cs, rev)
+                var [bool] used = [false for u in 0..<keys.length]
+                mut [JValue] out = []
+                for sk in ordered:
+                    var int m = 0
+                    var bool placed = false
+                    while m < keys.length and not placed:
+                        let cand = if by_value: (fields[keys[m]] else JValue.JUndefined) else: JValue.JStr(keys[m])
+                        if not used[m] and jv_eq(cand, sk):
+                            used[m] = true
+                            out.push(JValue.JList([JValue.JStr(keys[m]), fields[keys[m]] else JValue.JUndefined]))
+                            placed = true
+                        m += 1
+                JValue.JList(out)
+            _: JValue.JList([])
+    elif name == "abs":
+        match v:
+            JInt(n): JValue.JInt(if n < 0: -n else: n)
+            JFloat(f): JValue.JFloat(if f < 0.0: -f else: f)
+            _: v
+    elif name == "round":
+        let digits = jv_int_arg(jv_arg(args, kwnames, kwvals, 0, "precision", JValue.JInt(0)), 0)
+        let method = jv_to_str(jv_arg(args, kwnames, kwvals, 1, "method", JValue.JStr("common")))
+        match v:
+            JInt(n): JValue.JFloat(n as float)
+            JFloat(f):
+                let scale = (10.0).powf(digits as float)
+                let x = f * scale
+                var float r = x.floor()
+                let diff = x - r
+                if method == "ceil":
+                    r = x.ceil()
+                elif method == "floor":
+                    r = x.floor()
+                elif diff > 0.5:
+                    r = r + 1.0
+                elif diff == 0.5:
+                    let half = r / 2.0
+                    if half != half.floor():
+                        r = r + 1.0
+                JValue.JFloat(r / scale)
+            _: v
+    elif name == "sum":
+        match v:
+            JList(items):
+                var JValue acc = jv_arg(args, kwnames, kwvals, 1, "start", JValue.JInt(0))
+                let attr_path = jv_to_str(jv_arg(args, kwnames, kwvals, 0, "attribute", JValue.JUndefined))
+                for it in items:
+                    if attr_path != "":
+                        acc = eval_binop("+", acc, jv_attr_path(it, attr_path))
+                    else:
+                        acc = eval_binop("+", acc, it)
+                acc
+            _: JValue.JInt(0)
+    elif name == "min" or name == "max":
+        match v:
+            JList(items):
+                if items.length == 0:
+                    JValue.JUndefined
+                else:
+                    let cs = jv_truthy(jv_arg(args, kwnames, kwvals, 0, "case_sensitive", JValue.JBool(false)))
+                    var JValue best = items[0]
+                    for it in items:
+                        if name == "min" and jv_less(it, best, cs):
+                            best = it
+                        elif name == "max" and jv_less(best, it, cs):
+                            best = it
+                    best
+            _: JValue.JUndefined
+    elif name == "unique":
+        match v:
+            JList(items):
+                mut [JValue] out = []
+                for it in items:
+                    var bool seen = false
+                    for o in out:
+                        if jv_eq(o, it):
+                            seen = true
+                    if not seen:
+                        out.push(it)
+                JValue.JList(out)
+            _: v
+    elif name == "indent":
+        let width = jv_int_arg(jv_arg(args, kwnames, kwvals, 0, "width", JValue.JInt(4)), 4)
+        let first = jv_truthy(jv_arg(args, kwnames, kwvals, 1, "first", JValue.JBool(false)))
+        let blank = jv_truthy(jv_arg(args, kwnames, kwvals, 2, "blank", JValue.JBool(false)))
+        let pad = " ".repeat(width)
+        let lines = jv_to_str(v).split("\n")
+        var string out = ""
+        var int i = 0
+        while i < lines.length:
+            if i > 0:
+                out = "{out}\n"
+            if (i > 0 or first) and (blank or lines[i].length > 0):
+                out = "{out}{pad}{lines[i]}"
+            else:
+                out = "{out}{lines[i]}"
+            i += 1
+        JValue.JStr(out)
+    elif name == "wordcount":
+        var int words = 0
+        var bool inside = false
+        for ch in jv_to_str(v).chars():
+            let word_char = is_ident_char(ch)
+            if word_char and not inside:
+                words += 1
+            inside = word_char
+        JValue.JInt(words)
+    elif name == "map":
+        match v:
+            JList(items):
+                mut [JValue] out = []
+                let attr = jv_arg(args, kwnames, kwvals, -1, "attribute", JValue.JUndefined)
+                match attr:
+                    JStr(path):
+                        for it in items:
+                            out.push(jv_attr_path(it, path))
+                    _:
+                        guard args.length >= 1 else throw "jinja: map() needs a filter name or attribute="
+                        let fname = jv_to_str(args[0])
+                        var [JValue] rest = []
+                        var int ri = 1
+                        while ri < args.length:
+                            rest.push(args[ri])
+                            ri += 1
+                        for it in items:
+                            out.push(apply_filter(fname, it, rest, kwnames, kwvals))
+                JValue.JList(out)
+            _: v
+    elif name == "selectattr" or name == "rejectattr" or name == "select" or name == "reject":
+        let by_attr = name == "selectattr" or name == "rejectattr"
+        let want = name == "selectattr" or name == "select"
+        match v:
+            JList(items):
+                var string path = ""
+                var int test_at = 0
+                if by_attr:
+                    guard args.length >= 1 else throw "jinja: {name}() needs an attribute"
+                    path = jv_to_str(args[0])
+                    test_at = 1
+                var string test_name = ""
+                if args.length > test_at:
+                    test_name = jv_to_str(args[test_at])
+                var [JValue] test_args = []
+                var int ta = test_at + 1
+                while ta < args.length:
+                    test_args.push(args[ta])
+                    ta += 1
+                mut [JValue] out = []
+                for it in items:
+                    let subject = if by_attr: jv_attr_path(it, path) else: it
+                    var bool passed = false
+                    if test_name == "":
+                        passed = jv_truthy(subject)
+                    else:
+                        passed = jv_truthy(jv_test(test_name, subject, test_args))
+                    if passed == want:
+                        out.push(it)
+                JValue.JList(out)
+            _: v
     else:
         throw "jinja: unsupported filter '{name}'"
 
@@ -302,7 +1104,7 @@ bool is_namespace(JValue v):
         JDict(fields, keys): fields.contains("__namespace__")
         _: false
 
-JValue jv_test(string name, JValue v) throws:
+JValue jv_test(string name, JValue v, [JValue] args) throws:
     if name == "defined":
         JValue.JBool(not jv_is_undefined(v))
     elif name == "undefined":
@@ -322,32 +1124,106 @@ JValue jv_test(string name, JValue v) throws:
         match v:
             JBool(b): JValue.JBool(b)
             _: JValue.JBool(false)
+    elif name == "boolean":
+        match v:
+            JBool(b): JValue.JBool(true)
+            _: JValue.JBool(false)
     elif name == "mapping":
         match v:
             JDict(fields, keys): JValue.JBool(true)
             _: JValue.JBool(false)
-    elif name == "number" or name == "integer":
+    elif name == "number":
+        JValue.JBool(jv_is_number(v))
+    elif name == "integer":
         match v:
             JInt(n): JValue.JBool(true)
-            JFloat(f): JValue.JBool(name == "number")
+            _: JValue.JBool(false)
+    elif name == "float":
+        match v:
+            JFloat(f): JValue.JBool(true)
             _: JValue.JBool(false)
     elif name == "sequence" or name == "iterable":
         match v:
             JList(items): JValue.JBool(true)
             JStr(s): JValue.JBool(true)
+            JDict(fields, keys): JValue.JBool(name == "iterable")
+            _: JValue.JBool(false)
+    elif name == "callable":
+        match v:
+            JDict(fields, keys): JValue.JBool(fields.contains("__macro__"))
+            _: JValue.JBool(false)
+    elif name == "odd" or name == "even":
+        match v:
+            JInt(n):
+                let odd = ((n % 2) + 2) % 2 == 1
+                JValue.JBool(if name == "odd": odd else: not odd)
+            _: JValue.JBool(false)
+    elif name == "divisibleby":
+        guard args.length >= 1 else throw "jinja: 'divisibleby' needs an argument"
+        match v:
+            JInt(n):
+                match args[0]:
+                    JInt(d):
+                        guard d != 0 else throw "jinja: 'divisibleby' by zero"
+                        JValue.JBool(n % d == 0)
+                    _: JValue.JBool(false)
+            _: JValue.JBool(false)
+    elif name == "eq" or name == "equalto" or name == "==" or name == "sameas":
+        guard args.length >= 1 else throw "jinja: '{name}' needs an argument"
+        JValue.JBool(jv_eq(v, args[0]))
+    elif name == "ne" or name == "!=":
+        guard args.length >= 1 else throw "jinja: '{name}' needs an argument"
+        JValue.JBool(not jv_eq(v, args[0]))
+    elif name == "lt" or name == "lessthan" or name == "<":
+        guard args.length >= 1 else throw "jinja: '{name}' needs an argument"
+        JValue.JBool(jv_less(v, args[0], true))
+    elif name == "gt" or name == "greaterthan" or name == ">":
+        guard args.length >= 1 else throw "jinja: '{name}' needs an argument"
+        JValue.JBool(jv_less(args[0], v, true))
+    elif name == "le" or name == "<=":
+        guard args.length >= 1 else throw "jinja: '{name}' needs an argument"
+        JValue.JBool(not jv_less(args[0], v, true))
+    elif name == "ge" or name == ">=":
+        guard args.length >= 1 else throw "jinja: '{name}' needs an argument"
+        JValue.JBool(not jv_less(v, args[0], true))
+    elif name == "in":
+        guard args.length >= 1 else throw "jinja: 'in' needs an argument"
+        JValue.JBool(jv_contains(args[0], v))
+    elif name == "lower" or name == "upper":
+        let t = jv_to_str(v)
+        match v:
+            JStr(x): JValue.JBool(if name == "lower": x == x.toLower() else: x == x.toUpper())
             _: JValue.JBool(false)
     else:
         throw "jinja: unsupported test 'is {name}'"
 
-JValue call_method(JValue recv, string name, [JValue] args) throws:
+JValue call_method(JValue recv, string name, [JValue] args, [string] kwnames, [JValue] kwvals) throws:
     match recv:
         JStr(s):
             let arg0 = if args.length > 0: jv_to_str(args[0]) else: ""
-            if name == "split":
-                guard args.length >= 1 and arg0 != "" else throw "jinja: split() needs a non-empty separator"
+            if name == "split" or name == "rsplit":
+                let maxsplit = jv_int_arg(jv_arg(args, kwnames, kwvals, 1, "maxsplit", JValue.JInt(-1)), -1)
+                let sep_v = jv_arg(args, kwnames, kwvals, 0, "sep", JValue.JUndefined)
                 mut [JValue] parts = []
-                for piece in s.split(arg0):
-                    parts.push(JValue.JStr(piece))
+                match sep_v:
+                    JStr(sep):
+                        guard sep != "" else throw "jinja: split() needs a non-empty separator"
+                        for piece in split_limited(s, sep, maxsplit, name == "rsplit"):
+                            parts.push(JValue.JStr(piece))
+                    _:
+                        for piece in split_whitespace(s):
+                            parts.push(JValue.JStr(piece))
+                JValue.JList(parts)
+            elif name == "splitlines":
+                mut [JValue] parts = []
+                let pieces = s.split("\n")
+                var int last = pieces.length
+                if last > 0 and pieces[last - 1] == "":
+                    last -= 1
+                var int pi = 0
+                while pi < last:
+                    parts.push(JValue.JStr(pieces[pi]))
+                    pi += 1
                 JValue.JList(parts)
             elif name == "strip" or name == "lstrip" or name == "rstrip":
                 let chars = if args.length > 0: arg0 else: " \n\t\r"
@@ -356,13 +1232,96 @@ JValue call_method(JValue recv, string name, [JValue] args) throws:
                 JValue.JBool(s.startsWith(arg0))
             elif name == "endswith":
                 JValue.JBool(s.endsWith(arg0))
+            elif name == "removeprefix":
+                if arg0 != "" and s.startsWith(arg0):
+                    JValue.JStr(s.slice(arg0.length, s.length))
+                else:
+                    JValue.JStr(s)
+            elif name == "removesuffix":
+                if arg0 != "" and s.endsWith(arg0):
+                    JValue.JStr(s.slice(0, s.length - arg0.length))
+                else:
+                    JValue.JStr(s)
             elif name == "replace":
                 guard args.length >= 2 else throw "jinja: replace() needs two arguments"
                 JValue.JStr(s.replace(arg0, jv_to_str(args[1])))
             elif name == "lower":
                 JValue.JStr(s.toLower())
+            elif name == "upper":
+                JValue.JStr(s.toUpper())
+            elif name == "title":
+                JValue.JStr(py_title(s))
+            elif name == "capitalize":
+                JValue.JStr(capitalize_str(s))
+            elif name == "find":
+                if arg0 == "":
+                    JValue.JInt(0)
+                else:
+                    let at = s.indexOf(arg0) else -1
+                    JValue.JInt(at)
+            elif name == "count":
+                if arg0 == "":
+                    JValue.JInt(s.chars().length + 1)
+                else:
+                    JValue.JInt(s.split(arg0).length - 1)
+            elif name == "join":
+                match jv_arg(args, kwnames, kwvals, 0, "iterable", JValue.JUndefined):
+                    JList(items):
+                        var string out = ""
+                        var int i = 0
+                        while i < items.length:
+                            if i > 0:
+                                out = "{out}{s}"
+                            out = "{out}{jv_to_str(items[i])}"
+                            i += 1
+                        JValue.JStr(out)
+                    _: throw "jinja: join() needs a list"
+            elif name == "isdigit" or name == "isalpha" or name == "isalnum" or name == "isspace" or name == "isupper" or name == "islower":
+                let cs = s.chars()
+                var bool all = cs.length > 0
+                for ch in cs:
+                    if name == "isdigit" and not is_digit_char(ch):
+                        all = false
+                    elif name == "isalpha" and ch.toUpper() == ch.toLower():
+                        all = false
+                    elif name == "isalnum" and ch.toUpper() == ch.toLower() and not is_digit_char(ch):
+                        all = false
+                    elif name == "isspace" and not is_ws_char(ch):
+                        all = false
+                    elif name == "isupper" and (ch.toUpper() != ch and ch.toUpper() != ch.toLower()):
+                        all = false
+                    elif name == "islower" and (ch.toLower() != ch and ch.toUpper() != ch.toLower()):
+                        all = false
+                JValue.JBool(all)
             else:
                 throw "jinja: unsupported string method '{name}'"
+        JDict(fields, keys):
+            if name == "items":
+                apply_filter("items", recv, [], [], [])
+            elif name == "keys":
+                apply_filter("list", recv, [], [], [])
+            elif name == "values":
+                mut [JValue] out = []
+                for k in keys:
+                    if k != "__namespace__":
+                        out.push(fields[k] else JValue.JUndefined)
+                JValue.JList(out)
+            elif name == "get":
+                guard args.length >= 1 else throw "jinja: get() needs a key"
+                let k = jv_to_str(args[0])
+                if fields.contains(k):
+                    fields[k] else JValue.JUndefined
+                elif args.length >= 2:
+                    args[1]
+                else:
+                    JValue.JUndefined
+            elif name == "cycle" and fields.contains("index0"):
+                # `loop.cycle(a, b, ...)`
+                guard args.length >= 1 else throw "jinja: cycle() needs arguments"
+                let at = jv_int_arg(fields["index0"] else JValue.JInt(0), 0)
+                args[at % args.length]
+            else:
+                throw "jinja: unsupported method '{name}' on a mapping"
         _: throw "jinja: unsupported method '{name}' on this value"
 
 JValue call_function(string name, [JValue] args, [string] kwnames, [JValue] kwvals) throws:
@@ -392,61 +1351,162 @@ JValue call_function(string name, [JValue] args, [string] kwnames, [JValue] kwva
             v += step
             guard items.length <= 100000 else throw "jinja: range() too long"
         JValue.JList(items)
+    elif name == "strftime_now":
+        let secs = SystemTime.now().durationSince(UNIX_EPOCH).asSecs() as int
+        JValue.JStr(strftime_at(jv_to_str(if args.length > 0: args[0] else: JValue.JStr("%Y-%m-%d %H:%M:%S")), secs))
+    elif name == "dict":
+        mut {string=JValue} fields = {=}
+        mut [string] keys = []
+        var int i = 0
+        while i < kwnames.length:
+            fields[kwnames[i]] = kwvals[i]
+            keys.push(kwnames[i])
+            i += 1
+        JValue.JDict(fields, keys)
     elif name == "raise_exception":
         let msg = if args.length > 0: jv_to_str(args[0]) else: ""
         throw "jinja: template raised: {msg}"
     else:
         throw "jinja: unsupported function '{name}'"
 
+int floor_div_int(int a, int b) throws:
+    guard b != 0 else throw "jinja: division by zero"
+    var int q = a / b
+    if (a % b != 0) and ((a < 0) != (b < 0)):
+        q -= 1
+    q
+
 JValue eval_binop(string op, JValue l, JValue r) throws:
     if op == "+":
-        # Two ints add (`messages[loop.index0 + 1]`, which Qwen's tool-message
-        # branch uses to look at the NEXT message); anything else concatenates
-        # as strings (`'\n' + message.content`), like Jinja.
+        # Two numbers add (`messages[loop.index0 + 1]`, which Qwen's
+        # tool-message branch uses to look at the NEXT message), two lists
+        # join; anything else concatenates as strings (`'\n' + message.content`).
         match l:
             JInt(a):
                 match r:
                     JInt(b): JValue.JInt(a + b)
+                    JFloat(b): JValue.JFloat((a as float) + b)
+                    _: JValue.JStr("{jv_to_str(l)}{jv_to_str(r)}")
+            JFloat(a):
+                if jv_is_number(r):
+                    JValue.JFloat(a + jv_as_float(r))
+                else:
+                    JValue.JStr("{jv_to_str(l)}{jv_to_str(r)}")
+            JList(a):
+                match r:
+                    JList(b):
+                        mut [JValue] joined = []
+                        for x in a:
+                            joined.push(x)
+                        for x in b:
+                            joined.push(x)
+                        JValue.JList(joined)
                     _: JValue.JStr("{jv_to_str(l)}{jv_to_str(r)}")
             _: JValue.JStr("{jv_to_str(l)}{jv_to_str(r)}")
-    elif op == "%" or op == "*":
-        match l:
-            JInt(a):
-                match r:
-                    JInt(b):
-                        if op == "*":
-                            JValue.JInt(a * b)
-                        else:
-                            guard b != 0 else throw "jinja: modulo by zero"
-                            JValue.JInt(((a % b) + b) % b)
-                    _: throw "jinja: '{op}' needs integers"
-            _: throw "jinja: '{op}' needs integers"
+    elif op == "~":
+        JValue.JStr("{jv_to_str(l)}{jv_to_str(r)}")
     elif op == "-":
         match l:
             JInt(a):
                 match r:
                     JInt(b): JValue.JInt(a - b)
-                    _: throw "jinja: '-' requires ints"
-            _: throw "jinja: '-' requires ints"
+                    JFloat(b): JValue.JFloat((a as float) - b)
+                    _: throw "jinja: '-' requires numbers"
+            JFloat(a):
+                if jv_is_number(r):
+                    JValue.JFloat(a - jv_as_float(r))
+                else:
+                    throw "jinja: '-' requires numbers"
+            _: throw "jinja: '-' requires numbers"
+    elif op == "*":
+        match l:
+            JInt(a):
+                match r:
+                    JInt(b): JValue.JInt(a * b)
+                    JFloat(b): JValue.JFloat((a as float) * b)
+                    JStr(t): JValue.JStr(t.repeat(if a > 0: a else: 0))
+                    _: throw "jinja: '*' needs numbers"
+            JFloat(a):
+                if jv_is_number(r):
+                    JValue.JFloat(a * jv_as_float(r))
+                else:
+                    throw "jinja: '*' needs numbers"
+            JStr(t):
+                match r:
+                    JInt(b): JValue.JStr(t.repeat(if b > 0: b else: 0))
+                    _: throw "jinja: '*' needs numbers"
+            _: throw "jinja: '*' needs numbers"
+    elif op == "/":
+        guard jv_is_number(l) and jv_is_number(r) else throw "jinja: '/' needs numbers"
+        guard jv_as_float(r) != 0.0 else throw "jinja: division by zero"
+        JValue.JFloat(jv_as_float(l) / jv_as_float(r))
+    elif op == "//":
+        match l:
+            JInt(a):
+                match r:
+                    JInt(b): JValue.JInt(floor_div_int(a, b))
+                    _:
+                        guard jv_is_number(r) and jv_as_float(r) != 0.0 else throw "jinja: bad '//' operands"
+                        JValue.JFloat((jv_as_float(l) / jv_as_float(r)).floor())
+            _:
+                guard jv_is_number(l) and jv_is_number(r) and jv_as_float(r) != 0.0 else throw "jinja: bad '//' operands"
+                JValue.JFloat((jv_as_float(l) / jv_as_float(r)).floor())
+    elif op == "%":
+        match l:
+            JInt(a):
+                match r:
+                    JInt(b):
+                        guard b != 0 else throw "jinja: modulo by zero"
+                        JValue.JInt(a - floor_div_int(a, b) * b)
+                    _: throw "jinja: '%' needs integers"
+            _: throw "jinja: '%' needs integers"
+    elif op == "**":
+        match l:
+            JInt(a):
+                match r:
+                    JInt(b):
+                        if b >= 0:
+                            var int acc = 1
+                            var int k = 0
+                            while k < b:
+                                acc = acc * a
+                                k += 1
+                            JValue.JInt(acc)
+                        else:
+                            JValue.JFloat((a as float).powf(b as float))
+                    _: throw "jinja: '**' needs numbers"
+            _: throw "jinja: '**' needs integers"
     elif op == "==":
         JValue.JBool(jv_eq(l, r))
     elif op == "!=":
         JValue.JBool(not jv_eq(l, r))
     elif op == "<" or op == ">" or op == "<=" or op == ">=":
-        match l:
-            JInt(a):
-                match r:
-                    JInt(b):
-                        if op == "<":
-                            JValue.JBool(a < b)
-                        elif op == ">":
-                            JValue.JBool(a > b)
-                        elif op == "<=":
-                            JValue.JBool(a <= b)
-                        else:
-                            JValue.JBool(a >= b)
-                    _: throw "jinja: '{op}' compares ints with ints"
-            _: throw "jinja: '{op}' compares ints with ints"
+        var bool lt_known = false
+        var bool less = false
+        var bool greater = false
+        if jv_is_number(l) and jv_is_number(r):
+            lt_known = true
+            less = jv_as_float(l) < jv_as_float(r)
+            greater = jv_as_float(l) > jv_as_float(r)
+        else:
+            match l:
+                JStr(a):
+                    match r:
+                        JStr(b):
+                            lt_known = true
+                            less = a < b
+                            greater = a > b
+                        _: lt_known = false
+                _: lt_known = false
+        guard lt_known else throw "jinja: '{op}' compares numbers with numbers or strings with strings"
+        if op == "<":
+            JValue.JBool(less)
+        elif op == ">":
+            JValue.JBool(greater)
+        elif op == "<=":
+            JValue.JBool(not greater)
+        else:
+            JValue.JBool(not less)
     elif op == "in":
         JValue.JBool(jv_contains(r, l))
     elif op == "not in":
@@ -454,18 +1514,81 @@ JValue eval_binop(string op, JValue l, JValue r) throws:
     else:
         throw "jinja: unsupported operator '{op}'"
 
+bool is_macro(JValue v):
+    match v:
+        JDict(fields, keys): fields.contains("__macro__")
+        _: false
+
+JValue call_macro(JValue m, [JValue] args, [string] kwnames, [JValue] kwvals, {string=JValue} env) throws:
+    match m:
+        JDict(fields, keys):
+            let id = jv_int_arg(fields["__macro__"] else JValue.JInt(0), 0)
+            let pnames = fields["__params__"] else JValue.JList([])
+            var {string=JValue} call_env = env.clone()
+            match pnames:
+                JList(names):
+                    var int i = 0
+                    while i < names.length:
+                        let pname = jv_to_str(names[i])
+                        var JValue val = JValue.JUndefined
+                        var bool given = false
+                        if i < args.length:
+                            val = args[i]
+                            given = true
+                        var int k = 0
+                        while k < kwnames.length:
+                            if kwnames[k] == pname:
+                                val = kwvals[k]
+                                given = true
+                            k += 1
+                        if not given:
+                            val = eval_expr(macro_defaults[id][i], call_env)
+                        call_env[pname] = val
+                        i += 1
+                _: throw "jinja: broken macro value"
+            let (text, _) = render_stmts(macro_bodies[id], call_env)
+            JValue.JStr(text)
+        _: throw "jinja: not a macro"
+
 pub JValue eval_expr(JExpr e, {string=JValue} env) throws:
     match e:
         ELit(v): v
         EVar(name): env[name] else JValue.JUndefined
         EAttr(base, name): jv_get_attr(eval_expr(base, env), name)
         EIndex(base, idxe): jv_get_index(eval_expr(base, env), eval_expr(idxe, env))
-        ESlice(base, lo, hi): jv_slice(eval_expr(base, env), eval_expr(lo, env), eval_expr(hi, env))
+        ESlice(base, lo, hi, step): jv_slice(eval_expr(base, env), eval_expr(lo, env), eval_expr(hi, env), eval_expr(step, env))
+        EList(items):
+            mut [JValue] out = []
+            for it in items:
+                out.push(eval_expr(it, env))
+            JValue.JList(out)
+        EDict(kexprs, vexprs):
+            mut {string=JValue} fields = {=}
+            mut [string] keys = []
+            var int di = 0
+            while di < kexprs.length:
+                let k = jv_to_str(eval_expr(kexprs[di], env))
+                if not str_in_list(k, keys):
+                    keys.push(k)
+                fields[k] = eval_expr(vexprs[di], env)
+                di += 1
+            JValue.JDict(fields, keys)
         ENot(e2): JValue.JBool(not jv_truthy(eval_expr(e2, env)))
         ECond(c, a, b): if jv_truthy(eval_expr(c, env)): eval_expr(a, env) else: eval_expr(b, env)
         EIsDefined(e2): JValue.JBool(not jv_is_undefined(eval_expr(e2, env)))
-        ETest(e2, test): jv_test(test, eval_expr(e2, env))
-        EFilter(base, name): apply_filter(name, eval_expr(base, env))
+        ETest(e2, test, targs):
+            mut [JValue] test_argv = []
+            for ta in targs:
+                test_argv.push(eval_expr(ta, env))
+            jv_test(test, eval_expr(e2, env), test_argv)
+        EFilter(base, name, fargs, fkwnames, fkwexprs):
+            mut [JValue] filter_argv = []
+            for fa in fargs:
+                filter_argv.push(eval_expr(fa, env))
+            mut [JValue] filter_kwv = []
+            for fk in fkwexprs:
+                filter_kwv.push(eval_expr(fk, env))
+            apply_filter(name, eval_expr(base, env), filter_argv, fkwnames, filter_kwv)
         ECall(callee, args, kwnames, kwexprs):
             mut [JValue] argv = []
             for a in args:
@@ -474,22 +1597,28 @@ pub JValue eval_expr(JExpr e, {string=JValue} env) throws:
             for k in kwexprs:
                 kwv.push(eval_expr(k, env))
             match callee:
-                EAttr(recv, mname): call_method(eval_expr(recv, env), mname, argv)
-                EVar(fname): call_function(fname, argv, kwnames, kwv)
+                EAttr(recv, mname): call_method(eval_expr(recv, env), mname, argv, kwnames, kwv)
+                EVar(fname):
+                    let target = env[fname] else JValue.JUndefined
+                    if is_macro(target):
+                        call_macro(target, argv, kwnames, kwv, env)
+                    else:
+                        call_function(fname, argv, kwnames, kwv)
                 _: throw "jinja: unsupported call"
         EBinOp(op, l, r):
+            # `and` / `or` yield one of their operands, as in Python (`x or 'default'`).
             if op == "and":
                 let lv = eval_expr(l, env)
                 if not jv_truthy(lv):
-                    JValue.JBool(false)
+                    lv
                 else:
-                    JValue.JBool(jv_truthy(eval_expr(r, env)))
+                    eval_expr(r, env)
             elif op == "or":
                 let lv = eval_expr(l, env)
                 if jv_truthy(lv):
-                    JValue.JBool(true)
+                    lv
                 else:
-                    JValue.JBool(jv_truthy(eval_expr(r, env)))
+                    eval_expr(r, env)
             else:
                 eval_binop(op, eval_expr(l, env), eval_expr(r, env))
 
@@ -548,7 +1677,21 @@ pub [EToken] lex_expr_tokens(string src) throws:
             while i < n and is_digit_char(chars[i]):
                 num = "{num}{chars[i]}"
                 i += 1
-            toks.push(EToken("int", num))
+            if i + 1 < n and chars[i] == "." and is_digit_char(chars[i + 1]):
+                num = "{num}."
+                i += 1
+                while i < n and is_digit_char(chars[i]):
+                    num = "{num}{chars[i]}"
+                    i += 1
+                toks.push(EToken("float", num))
+            else:
+                toks.push(EToken("int", num))
+        elif c == "/" and i + 1 < n and chars[i + 1] == "/":
+            toks.push(EToken("op", "//"))
+            i += 2
+        elif c == "*" and i + 1 < n and chars[i + 1] == "*":
+            toks.push(EToken("op", "**"))
+            i += 2
         elif c == "=" and i + 1 < n and chars[i + 1] == "=":
             toks.push(EToken("op", "=="))
             i += 2
@@ -580,17 +1723,81 @@ bool tok_is_ident(EToken t, string s):
     elif t.kind == "int":
         guard let n = (t.text as int) else throw "jinja: invalid integer literal '{t.text}'"
         (JExpr.ELit(JValue.JInt(n)), i + 1)
+    elif t.kind == "float":
+        guard let f = (t.text as float) else throw "jinja: invalid number literal '{t.text}'"
+        (JExpr.ELit(JValue.JFloat(f)), i + 1)
     elif t.kind == "ident":
         if t.text == "true" or t.text == "True":
             (JExpr.ELit(JValue.JBool(true)), i + 1)
         elif t.text == "false" or t.text == "False":
             (JExpr.ELit(JValue.JBool(false)), i + 1)
+        elif t.text == "none" or t.text == "None":
+            (JExpr.ELit(JValue.JUndefined), i + 1)
         else:
             (JExpr.EVar(t.text), i + 1)
+    elif tok_is_op(t, "["):
+        # a list literal `[a, b]`
+        mut [JExpr] items = []
+        var int j = i + 1
+        var bool done = false
+        while not done:
+            guard j < toks.length else throw "jinja: unterminated list literal"
+            if tok_is_op(toks[j], "]"):
+                j += 1
+                done = true
+            else:
+                let (v, j2) = parse_or(toks, j)
+                items.push(v)
+                j = j2
+                guard j < toks.length else throw "jinja: unterminated list literal"
+                if tok_is_op(toks[j], ","):
+                    j += 1
+                elif not tok_is_op(toks[j], "]"):
+                    throw "jinja: expected ',' or ']' in a list literal"
+        (JExpr.EList(items), j)
+    elif tok_is_op(t, chr(123)):
+        # a dict literal `{k: v}`
+        mut [JExpr] keys = []
+        mut [JExpr] vals = []
+        var int j = i + 1
+        var bool done = false
+        while not done:
+            guard j < toks.length else throw "jinja: unterminated dict literal"
+            if tok_is_op(toks[j], chr(125)):
+                j += 1
+                done = true
+            else:
+                let (k, j2) = parse_or(toks, j)
+                guard j2 < toks.length and tok_is_op(toks[j2], ":") else throw "jinja: expected ':' in a dict literal"
+                let (v, j3) = parse_or(toks, j2 + 1)
+                keys.push(k)
+                vals.push(v)
+                j = j3
+                guard j < toks.length else throw "jinja: unterminated dict literal"
+                if tok_is_op(toks[j], ","):
+                    j += 1
+                elif not tok_is_op(toks[j], chr(125)):
+                    throw "jinja: expected ',' or the closing brace of a dict literal"
+        (JExpr.EDict(keys, vals), j)
     elif tok_is_op(t, "("):
         let (e, j) = parse_or(toks, i + 1)
-        guard j < toks.length and tok_is_op(toks[j], ")") else throw "jinja: expected ')' in expression"
-        (e, j + 1)
+        guard j < toks.length else throw "jinja: expected ')' in expression"
+        if tok_is_op(toks[j], ","):
+            # a tuple `(a, b)` is a list
+            mut [JExpr] items = [e]
+            var int k = j
+            while k < toks.length and tok_is_op(toks[k], ","):
+                if k + 1 < toks.length and tok_is_op(toks[k + 1], ")"):
+                    k += 1
+                else:
+                    let (more, k2) = parse_or(toks, k + 1)
+                    items.push(more)
+                    k = k2
+            guard k < toks.length and tok_is_op(toks[k], ")") else throw "jinja: expected ')' in tuple"
+            (JExpr.EList(items), k + 1)
+        else:
+            guard tok_is_op(toks[j], ")") else throw "jinja: expected ')' in expression"
+            (e, j + 1)
     elif tok_is_op(t, "-"):
         let (e, j) = parse_postfix(toks, i + 1)
         (JExpr.EBinOp("-", JExpr.ELit(JValue.JInt(0)), e), j)
@@ -649,22 +1856,36 @@ bool tok_is_ident(EToken t, string s):
             guard j2 < toks.length else throw "jinja: unterminated '['"
             if tok_is_op(toks[j2], ":"):
                 var JExpr hi = JExpr.ELit(JValue.JUndefined)
+                var JExpr step = JExpr.ELit(JValue.JUndefined)
                 j2 += 1
                 guard j2 < toks.length else throw "jinja: unterminated '['"
-                if not tok_is_op(toks[j2], "]"):
+                if not tok_is_op(toks[j2], "]") and not tok_is_op(toks[j2], ":"):
                     let (hi_e, j_hi) = parse_or(toks, j2)
                     hi = hi_e
                     j2 = j_hi
+                guard j2 < toks.length else throw "jinja: unterminated '['"
+                if tok_is_op(toks[j2], ":"):
+                    j2 += 1
+                    guard j2 < toks.length else throw "jinja: unterminated '['"
+                    if not tok_is_op(toks[j2], "]"):
+                        let (step_e, j_step) = parse_or(toks, j2)
+                        step = step_e
+                        j2 = j_step
                 guard j2 < toks.length and tok_is_op(toks[j2], "]") else throw "jinja: expected ']'"
-                e = JExpr.ESlice(e, lo, hi)
+                e = JExpr.ESlice(e, lo, hi, step)
             else:
                 guard tok_is_op(toks[j2], "]") else throw "jinja: expected ']'"
                 e = JExpr.EIndex(e, lo)
             j = j2 + 1
         elif tok_is_op(toks[j], "|"):
             guard j + 1 < toks.length and toks[j + 1].kind == "ident" else throw "jinja: expected filter name after '|'"
-            e = JExpr.EFilter(e, toks[j + 1].text)
-            j += 2
+            if j + 2 < toks.length and tok_is_op(toks[j + 2], "("):
+                let (fargs, fkwnames, fkwvals, j_end) = parse_call_args(toks, j + 3)
+                e = JExpr.EFilter(e, toks[j + 1].text, fargs, fkwnames, fkwvals)
+                j = j_end
+            else:
+                e = JExpr.EFilter(e, toks[j + 1].text, [], [], [])
+                j += 2
         elif tok_is_op(toks[j], "("):
             # a call: only a name (`namespace(...)`, `range(...)`) or a method (`x.split(...)`)
             let (call_args, call_kwnames, call_kwvals, j_end) = parse_call_args(toks, j + 1)
@@ -678,24 +1899,43 @@ bool tok_is_ident(EToken t, string s):
                 k += 1
             guard k < toks.length and toks[k].kind == "ident" else throw "jinja: expected a test name after 'is'"
             let test_name = toks[k].text
-            let test_e = if test_name == "defined": JExpr.EIsDefined(e) else: JExpr.ETest(e, test_name)
+            var int after = k + 1
+            # an argument follows a test like `divisibleby 3` / `in items` / `eq 'x'`
+            mut [JExpr] test_args = []
+            if after < toks.length:
+                let nt = toks[after]
+                let starts_arg = nt.kind == "str" or nt.kind == "int" or nt.kind == "float" or tok_is_op(nt, "(") or tok_is_op(nt, "[") or (nt.kind == "ident" and not str_in_list(nt.text, ["and", "or", "if", "else", "is", "in", "not", "for"]))
+                if starts_arg:
+                    let (arg_e, after2) = parse_postfix(toks, after)
+                    test_args.push(arg_e)
+                    after = after2
+            let test_e = if test_name == "defined": JExpr.EIsDefined(e) else: JExpr.ETest(e, test_name, test_args)
             if negate:
                 e = JExpr.ENot(test_e)
             else:
                 e = test_e
-            j = k + 1
+            j = after
         else:
             cont = false
     (e, j)
 
-# `*` and `%` on integers (Gemma's template alternates roles with `loop.index0 % 2`)
+# `**` binds tighter than `*`, `/`, `//` and `%`, and groups to the right.
+(JExpr, int) parse_pow([EToken] toks, int i) throws:
+    let (base, j) = parse_postfix(toks, i)
+    if j < toks.length and tok_is_op(toks[j], "**"):
+        let (exp, j2) = parse_pow(toks, j + 1)
+        (JExpr.EBinOp("**", base, exp), j2)
+    else:
+        (base, j)
+
+# `*`, `/`, `//` and `%` (Gemma's template alternates roles with `loop.index0 % 2`)
 (JExpr, int) parse_mul([EToken] toks, int i) throws:
-    let (e0, i0) = parse_postfix(toks, i)
+    let (e0, i0) = parse_pow(toks, i)
     var JExpr e = e0
     var int j = i0
-    while j < toks.length and (tok_is_op(toks[j], "*") or tok_is_op(toks[j], "%")):
+    while j < toks.length and (tok_is_op(toks[j], "*") or tok_is_op(toks[j], "%") or tok_is_op(toks[j], "/") or tok_is_op(toks[j], "//")):
         let op = toks[j].text
-        let (rhs, j2) = parse_postfix(toks, j + 1)
+        let (rhs, j2) = parse_pow(toks, j + 1)
         e = JExpr.EBinOp(op, e, rhs)
         j = j2
     (e, j)
@@ -705,7 +1945,7 @@ bool tok_is_ident(EToken t, string s):
     var JExpr e = e0
     var int j = i0
     var bool cont = true
-    while cont and j < toks.length and (tok_is_op(toks[j], "+") or tok_is_op(toks[j], "-")):
+    while cont and j < toks.length and (tok_is_op(toks[j], "+") or tok_is_op(toks[j], "-") or tok_is_op(toks[j], "~")):
         let op = toks[j].text
         let (rhs, j2) = parse_mul(toks, j + 1)
         e = JExpr.EBinOp(op, e, rhs)
@@ -714,25 +1954,35 @@ bool tok_is_ident(EToken t, string s):
 
 (JExpr, int) parse_cmp([EToken] toks, int i) throws:
     let (lhs, j0) = parse_add(toks, i)
+    var JExpr last = lhs.clone()
     var JExpr e = lhs
+    var bool chained = false
     var int j = j0
     var bool cont = true
     while cont and j < toks.length:
         let t = toks[j]
+        var string op = ""
+        var int skip = 1
         if t.kind == "op" and (t.text == "==" or t.text == "!=" or t.text == "<" or t.text == ">" or t.text == "<=" or t.text == ">="):
-            let (rhs, j2) = parse_add(toks, j + 1)
-            e = JExpr.EBinOp(t.text, e, rhs)
-            j = j2
+            op = t.text
         elif tok_is_ident(t, "in"):
-            let (rhs, j2) = parse_add(toks, j + 1)
-            e = JExpr.EBinOp("in", e, rhs)
-            j = j2
+            op = "in"
         elif tok_is_ident(t, "not") and j + 1 < toks.length and tok_is_ident(toks[j + 1], "in"):
-            let (rhs, j2) = parse_add(toks, j + 2)
-            e = JExpr.EBinOp("not in", e, rhs)
-            j = j2
-        else:
+            op = "not in"
+            skip = 2
+        if op == "":
             cont = false
+        else:
+            let (rhs, j2) = parse_add(toks, j + skip)
+            # `a < b < c` is `a < b and b < c`
+            let rhs_copy = rhs.clone()
+            if chained:
+                e = JExpr.EBinOp("and", e, JExpr.EBinOp(op, last.clone(), rhs))
+            else:
+                e = JExpr.EBinOp(op, e, rhs)
+            chained = true
+            last = rhs_copy
+            j = j2
     (e, j)
 
 (JExpr, int) parse_not([EToken] toks, int i) throws:
@@ -781,6 +2031,16 @@ pub (JExpr, int) parse_or([EToken] toks, int i) throws:
 pub JExpr parse_expr_str(string s) throws:
     let toks = lex_expr_tokens(s)
     let (e, j) = parse_or(toks, 0)
+    if j < toks.length and tok_is_op(toks[j], ","):
+        # a bare tuple `a, b` (the right side of `{% set a, b = 1, 2 %}`)
+        mut [JExpr] items = [e]
+        var int k = j
+        while k < toks.length and tok_is_op(toks[k], ","):
+            let (more, k2) = parse_or(toks, k + 1)
+            items.push(more)
+            k = k2
+        guard k == toks.length else throw "jinja: trailing tokens in expression '{s}'"
+        return JExpr.EList(items)
     guard j == toks.length else throw "jinja: trailing tokens in expression '{s}'"
     e
 
@@ -800,7 +2060,26 @@ struct RawTok:
     var string buf = ""
     var int i = 0
     while i < n:
-        if chars[i] == '''{''' and i + 1 < n and (chars[i + 1] == '''{''' or chars[i + 1] == "%"):
+        if chars[i] == chr(123) and i + 1 < n and chars[i + 1] == "#":
+            # a comment `{# ... #}`, dropped (its `-` markers still trim the text around it)
+            if buf.length > 0:
+                toks.push(RawTok(0, buf, false, false))
+                buf = ""
+            var int j = i + 2
+            let trim_left = j < n and chars[j] == "-"
+            var bool closed = false
+            var bool trim_right = false
+            while j + 1 < n and not closed:
+                if chars[j] == "#" and chars[j + 1] == chr(125):
+                    closed = true
+                    trim_right = j > i + 2 and chars[j - 1] == "-"
+                    j += 2
+                else:
+                    j += 1
+            guard closed else throw "jinja: unterminated comment in template"
+            toks.push(RawTok(3, "", trim_left, trim_right))
+            i = j
+        elif chars[i] == chr(123) and i + 1 < n and (chars[i + 1] == chr(123) or chars[i + 1] == "%"):
             if buf.length > 0:
                 toks.push(RawTok(0, buf, false, false))
                 buf = ""
@@ -851,6 +2130,45 @@ struct RawTok:
             guard closed else throw "jinja: unterminated tag in template"
             toks.push(RawTok(if is_stmt: 2 else: 1, content, trim_left, trim_right))
             i = j
+            if is_stmt and strip_ws(content) == "raw":
+                # `{% raw %}...{% endraw %}`: everything up to the matching end tag is plain text
+                var int k = i
+                var int body_end = -1
+                var int after = -1
+                while k + 1 < n and body_end < 0:
+                    if chars[k] == chr(123) and chars[k + 1] == "%":
+                        var int m = k + 2
+                        if m < n and chars[m] == "-":
+                            m += 1
+                        while m < n and is_ws_char(chars[m]):
+                            m += 1
+                        let word = "endraw"
+                        var bool matched = true
+                        var int w = 0
+                        while w < word.length:
+                            if m + w >= n or chars[m + w] != word.chars()[w]:
+                                matched = false
+                            w += 1
+                        if matched:
+                            var int e = m + word.length
+                            while e < n and is_ws_char(chars[e]):
+                                e += 1
+                            if e < n and chars[e] == "-":
+                                e += 1
+                            if e + 1 < n and chars[e] == "%" and chars[e + 1] == chr(125):
+                                body_end = k
+                                after = e + 2
+                    k += 1
+                guard body_end >= 0 else throw "jinja: 'raw' without endraw"
+                var string raw_text = ""
+                var int r = i
+                while r < body_end:
+                    raw_text = "{raw_text}{chars[r]}"
+                    r += 1
+                if raw_text.length > 0:
+                    toks.push(RawTok(0, raw_text, false, false))
+                toks.push(RawTok(3, "", false, false))
+                i = after
         else:
             buf = "{buf}{chars[i]}"
             i += 1
@@ -901,8 +2219,10 @@ pub enum JStmt:
     SText(string text)
     SOutput(JExpr expr)
     SIf(JExpr cond, [JStmt] then_body, [JStmt] else_body)
-    SFor(string var_name, JExpr iterable, [JStmt] body)
+    SFor(string var_name, JExpr iterable, [JStmt] body, [JStmt] else_body, JExpr filter)
     SSet(string var_name, JExpr expr)
+    SSetBlock(string var_name, [JStmt] body)             # {% set x %}...{% endset %}
+    SMacro(string name, [string] params, [JExpr] defaults, [JStmt] body)
 
 string first_word(string s):
     let chars = s.chars()
@@ -952,6 +2272,43 @@ string rest_after_word(string s):
         b += 1
     (strip_ws(var_name), strip_ws(iter_src))
 
+# Splits `items if cond` at the first top-level ` if ` (outside quotes and brackets);
+# the second part is "" when there is no loop filter.
+(string, string) split_for_filter(string s):
+    let chars = s.chars()
+    let n = chars.length
+    var int depth = 0
+    var string quote = ""
+    var int found = -1
+    var int i = 0
+    while i < n and found < 0:
+        let c = chars[i]
+        if quote != "":
+            if c == quote:
+                quote = ""
+        elif c == "'" or c == '"':
+            quote = c
+        elif c == "(" or c == "[" or c == chr(123):
+            depth += 1
+        elif c == ")" or c == "]" or c == chr(125):
+            depth -= 1
+        elif depth == 0 and c == " " and i + 3 < n and chars[i + 1] == "i" and chars[i + 2] == "f" and chars[i + 3] == " ":
+            found = i
+        i += 1
+    if found < 0:
+        return (s, "")
+    var string head = ""
+    var int a = 0
+    while a < found:
+        head = "{head}{chars[a]}"
+        a += 1
+    var string tail = ""
+    var int t = found + 4
+    while t < n:
+        tail = "{tail}{chars[t]}"
+        t += 1
+    (strip_ws(head), strip_ws(tail))
+
 (string, string) split_set(string s) throws:
     let chars = s.chars()
     let n = chars.length
@@ -981,6 +2338,63 @@ bool str_in_list(string s, [string] list):
             found = true
     found
 
+bool has_assignment(string s):
+    let chars = s.chars()
+    var bool found = false
+    var int i = 0
+    while i < chars.length:
+        if chars[i] == "=" and (i + 1 >= chars.length or chars[i + 1] != "=") and (i == 0 or chars[i - 1] != "="):
+            found = true
+        i += 1
+    found
+
+# `{% macro name(a, b=2) %}...{% endmacro %}`
+(JStmt, int) parse_macro([RawTok] toks, int i) throws:
+    let header = rest_after_word(toks[i].content)
+    let chars = header.chars()
+    var int open = -1
+    var int idx = 0
+    while idx < chars.length and open < 0:
+        if chars[idx] == "(":
+            open = idx
+        idx += 1
+    guard open > 0 and chars[chars.length - 1] == ")" else throw "jinja: malformed 'macro' header '{header}'"
+    var string name = ""
+    var int a = 0
+    while a < open:
+        name = "{name}{chars[a]}"
+        a += 1
+    var string inner = ""
+    var int b = open + 1
+    while b < chars.length - 1:
+        inner = "{inner}{chars[b]}"
+        b += 1
+    # parameters: reuse the call-argument parser on "inner)"
+    let ptoks = lex_expr_tokens("{inner})")
+    mut [string] params = []
+    mut [JExpr] defaults = []
+    var int j = 0
+    var bool done = false
+    while not done:
+        guard j < ptoks.length else throw "jinja: malformed 'macro' parameters"
+        if tok_is_op(ptoks[j], ")"):
+            done = true
+        else:
+            guard ptoks[j].kind == "ident" else throw "jinja: expected a parameter name in 'macro {name}'"
+            params.push(ptoks[j].text)
+            j += 1
+            if j < ptoks.length and tok_is_op(ptoks[j], "="):
+                let (d, j2) = parse_or(ptoks, j + 1)
+                defaults.push(d)
+                j = j2
+            else:
+                defaults.push(JExpr.ELit(JValue.JUndefined))
+            if j < ptoks.length and tok_is_op(ptoks[j], ","):
+                j += 1
+    let (body, k) = parse_block(toks, i + 1, ["endmacro"])
+    guard k < toks.length else throw "jinja: unterminated 'macro' (missing endmacro)"
+    (JStmt.SMacro(strip_ws(name), params, defaults, body), k + 1)
+
 ([JStmt], int) parse_block([RawTok] toks, int start, [string] stop_words) throws:
     mut [JStmt] stmts = []
     var int i = start
@@ -989,6 +2403,8 @@ bool str_in_list(string s, [string] list):
         let t = toks[i]
         if t.kind == 0:
             stmts.push(JStmt.SText(t.content))
+            i += 1
+        elif t.kind == 3:
             i += 1
         elif t.kind == 1:
             stmts.push(JStmt.SOutput(parse_expr_str(t.content)))
@@ -1006,9 +2422,23 @@ bool str_in_list(string s, [string] list):
                 stmts.push(node)
                 i = next_i
             elif word == "set":
-                let (name, expr_src) = split_set(rest_after_word(t.content))
-                stmts.push(JStmt.SSet(name, parse_expr_str(expr_src)))
+                let rest = rest_after_word(t.content)
+                if has_assignment(rest):
+                    let (name, expr_src) = split_set(rest)
+                    stmts.push(JStmt.SSet(name, parse_expr_str(expr_src)))
+                    i += 1
+                else:
+                    let (body, j) = parse_block(toks, i + 1, ["endset"])
+                    guard j < toks.length else throw "jinja: unterminated 'set' block (missing endset)"
+                    stmts.push(JStmt.SSetBlock(strip_ws(rest), body))
+                    i = j + 1
+            elif word == "raw":
+                # the scanner already turned the raw body into a plain text token
                 i += 1
+            elif word == "macro":
+                let (node, next_i) = parse_macro(toks, i)
+                stmts.push(node)
+                i = next_i
             else:
                 throw "jinja: unsupported statement '{word}' in '{t.content}'"
     (stmts, i)
@@ -1030,11 +2460,18 @@ bool str_in_list(string s, [string] list):
         (JStmt.SIf(cond, then_body, []), j + 1)
 
 (JStmt, int) parse_for([RawTok] toks, int i) throws:
-    let (var_name, iter_src) = split_for_header(rest_after_word(toks[i].content))
+    let (var_name, iter_all) = split_for_header(rest_after_word(toks[i].content))
+    let (iter_src, filter_src) = split_for_filter(iter_all)
     let iter_expr = parse_expr_str(iter_src)
-    let (body, j) = parse_block(toks, i + 1, ["endfor"])
+    let filter_expr = if filter_src == "": JExpr.ELit(JValue.JBool(true)) else: parse_expr_str(filter_src)
+    let (body, j) = parse_block(toks, i + 1, ["else", "endfor"])
     guard j < toks.length else throw "jinja: unterminated 'for' (missing endfor)"
-    (JStmt.SFor(var_name, iter_expr, body), j + 1)
+    if first_word(toks[j].content) == "else":
+        let (else_body, k) = parse_block(toks, j + 1, ["endfor"])
+        guard k < toks.length else throw "jinja: unterminated 'for' (missing endfor after else)"
+        (JStmt.SFor(var_name, iter_expr, body, else_body, filter_expr), k + 1)
+    else:
+        (JStmt.SFor(var_name, iter_expr, body, [], filter_expr), j + 1)
 
 # Real Jinja2 (`keep_trailing_newline=False`, its own default — used by
 # every real chat-template consumer, including `transformers`'
@@ -1065,21 +2502,49 @@ pub [JStmt] parse_template(string src) throws:
     guard end_i == raw.length else throw "jinja: unexpected trailing tag in template (stray elif/else/endif/endfor?)"
     stmts
 
+# Macro bodies and parameter defaults, indexed by the id stored in the macro
+# value (`{"__macro__": id}`); reset by every `render_jinja`.
+static var [[JStmt]] macro_bodies = []
+static var [[JExpr]] macro_defaults = []
+
 # ── Rendering (env threaded via return values — see this file's own
 #    header comment for why) ──────────────────────────────────────────────
 
-JValue build_loop_value(int idx, int count):
+JValue build_loop_value(int idx, int count, [JValue] items):
     mut {string=JValue} fields = {=}
     fields["index0"] = JValue.JInt(idx)
     fields["index"] = JValue.JInt(idx + 1)
     fields["first"] = JValue.JBool(idx == 0)
     fields["last"] = JValue.JBool(idx == count - 1)
-    JValue.JDict(fields, ["index0", "index", "first", "last"])
+    fields["revindex"] = JValue.JInt(count - idx)
+    fields["revindex0"] = JValue.JInt(count - idx - 1)
+    fields["length"] = JValue.JInt(count)
+    fields["previtem"] = if idx > 0: items[idx - 1] else: JValue.JUndefined
+    fields["nextitem"] = if idx < count - 1: items[idx + 1] else: JValue.JUndefined
+    JValue.JDict(fields, ["index0", "index", "first", "last", "revindex", "revindex0", "length", "previtem", "nextitem"])
 
-(string, {string=JValue}) render_for_step(JValue item, int idx, int count, string varname, [JStmt] body, {string=JValue} env) throws:
-    mut {string=JValue} loop_env = env
-    loop_env[varname] = item
-    loop_env["loop"] = build_loop_value(idx, count)
+# Binds a loop/`set` target (`x`, or `a, b` to unpack a list) in `env`.
+{string=JValue} bind_targets(string names, JValue item, {string=JValue} env) throws:
+    mut {string=JValue} out = env
+    if names.contains(","):
+        var [string] targets = []
+        for part in names.split(","):
+            targets.push(strip_ws(part))
+        match item:
+            JList(parts):
+                guard parts.length == targets.length else throw "jinja: cannot unpack {parts.length} values into {targets.length} names"
+                var int k = 0
+                while k < targets.length:
+                    out[targets[k]] = parts[k]
+                    k += 1
+            _: throw "jinja: cannot unpack a non-list value into '{names}'"
+    else:
+        out[names] = item
+    out
+
+(string, {string=JValue}) render_for_step(JValue item, int idx, int count, [JValue] items, string varname, [JStmt] body, {string=JValue} env) throws:
+    var {string=JValue} loop_env = bind_targets(varname, item, env)
+    loop_env["loop"] = build_loop_value(idx, count, items)
     render_stmts(body, loop_env)
 
 pub (string, {string=JValue}) render_stmt(JStmt s, {string=JValue} env) throws:
@@ -1089,6 +2554,8 @@ pub (string, {string=JValue}) render_stmt(JStmt s, {string=JValue} env) throws:
         SSet(name, e):
             let v = eval_expr(e, env)
             mut {string=JValue} env2 = env.clone()
+            if name.contains(","):
+                return ("", bind_targets(name, v, env2))
             let chars = name.chars()
             var int dot = -1
             var int di = 0
@@ -1126,28 +2593,63 @@ pub (string, {string=JValue}) render_stmt(JStmt s, {string=JValue} env) throws:
                 render_stmts(then_body, env)
             else:
                 render_stmts(else_body, env)
-        SFor(varname, iter_e, body):
+        SSetBlock(name, body):
+            let (text, _) = render_stmts(body, env)
+            mut {string=JValue} env2 = env.clone()
+            env2[name] = JValue.JStr(text)
+            ("", env2)
+        SMacro(name, params, defaults, body):
+            let id = macro_bodies.length
+            macro_bodies.push(body)
+            macro_defaults.push(defaults)
+            mut {string=JValue} md = {=}
+            md["__macro__"] = JValue.JInt(id)
+            mut [JValue] pnames = []
+            for pn in params:
+                pnames.push(JValue.JStr(pn))
+            md["__params__"] = JValue.JList(pnames)
+            mut {string=JValue} env2 = env.clone()
+            env2[name] = JValue.JDict(md, ["__macro__", "__params__"])
+            ("", env2)
+        SFor(varname, iter_e, body, else_body, filter_e):
             let iter_v = eval_expr(iter_e, env)
+            mut [JValue] seq = []
             match iter_v:
                 JList(items):
-                    var string out = ""
-                    var {string=JValue} cur_env = env.clone()
-                    var int idx = 0
-                    let count = items.length
-                    while idx < count:
-                        let (piece, new_env) = render_for_step(items[idx], idx, count, varname, body, cur_env)
-                        out = "{out}{piece}"
-                        cur_env = new_env
-                        idx += 1
-                    # The body had its own scope: only namespaces keep what the loop did to them.
-                    mut {string=JValue} after = env.clone()
-                    for key in env.keys():
-                        let outer = env[key] else JValue.JUndefined
-                        if is_namespace(outer):
-                            after[key] = cur_env[key] else outer
-                    (out, after)
-                _:
-                    ("", env)
+                    for it in items:
+                        seq.push(it)
+                JDict(fields, keys):
+                    for k in keys:
+                        if k != "__namespace__":
+                            seq.push(JValue.JStr(k))
+                JStr(text):
+                    for ch in text.chars():
+                        seq.push(JValue.JStr(ch))
+                _: seq = []
+            # a loop filter (`for x in xs if cond`) keeps only the matching items
+            mut [JValue] items = []
+            for it in seq:
+                let probe = bind_targets(varname, it, env)
+                if jv_truthy(eval_expr(filter_e, probe)):
+                    items.push(it)
+            if items.length == 0:
+                return render_stmts(else_body, env)
+            var string out = ""
+            var {string=JValue} cur_env = env.clone()
+            var int idx = 0
+            let count = items.length
+            while idx < count:
+                let (piece, new_env) = render_for_step(items[idx], idx, count, items, varname, body, cur_env)
+                out = "{out}{piece}"
+                cur_env = new_env
+                idx += 1
+            # The body had its own scope: only namespaces keep what the loop did to them.
+            mut {string=JValue} after = env.clone()
+            for key in env.keys():
+                let outer = env[key] else JValue.JUndefined
+                if is_namespace(outer):
+                    after[key] = cur_env[key] else outer
+            (out, after)
 
 pub (string, {string=JValue}) render_stmts([JStmt] stmts, {string=JValue} env0) throws:
     var string out = ""
@@ -1163,6 +2665,8 @@ pub (string, {string=JValue}) render_stmts([JStmt] stmts, {string=JValue} env0) 
 # once per turn; there's no benefit to this project from caching the
 # parsed AST across calls).
 pub string render_jinja(string template_src, {string=JValue} env) throws:
+    macro_bodies = []
+    macro_defaults = []
     let stmts = parse_template(template_src)
     let (out, _) = render_stmts(stmts, env)
     out

@@ -152,4 +152,30 @@ def main() throws:
     sl_env["xs"] = JValue.JList([JValue.JInt(1), JValue.JInt(2), JValue.JInt(3), JValue.JInt(4)])
     assert_eq(render_jinja("{ob}% for x in xs[1:3] %{cb}{ob}{ob} x {cb}{cb}{ob}% endfor %{cb}|{ob}% for x in xs[:-1] %{cb}{ob}{ob} x {cb}{cb}{ob}% endfor %{cb}|{ob}% for x in xs[2:] %{cb}{ob}{ob} x {cb}{cb}{ob}% endfor %{cb}", sl_env), "23|123|34" as string)
 
+    # strftime for fixed timestamps (expected text from Python's datetime in UTC)
+    assert_eq(strftime_at("%Y-%m-%d %H:%M:%S", 0), "1970-01-01 00:00:00" as string)
+    assert_eq(strftime_at("%Y-%m-%d %H:%M:%S|%A %a %B %b|%j|%e|%I %p|%y", 1700000000), "2023-11-14 22:13:20|Tuesday Tue November Nov|318|14|10 PM|23" as string)
+    assert_eq(strftime_at("%j %e %A", 951782400), "060 29 Tuesday" as string)
+    assert_eq(strftime_at("%Y-%m-%d %I %p", 86399), "1970-01-01 11 PM" as string)
+
+    # expression extras: operand-valued or/and, chained comparison, ~, //, list/dict literals, filters with arguments
+    mut {string=JValue} ex = {=}
+    assert_eq(render_jinja("{ob}{ob} missing or 'dflt' {cb}{cb}{ob}{ob} 'a' and 'b' {cb}{cb}", ex), "dfltb" as string)
+    assert_eq(render_jinja("{ob}{ob} 1 < 2 < 3 {cb}{cb}{ob}{ob} 1 < 3 < 2 {cb}{cb}", ex), "TrueFalse" as string)
+    assert_eq(render_jinja("{ob}{ob} 'a' ~ 1 ~ 'b' {cb}{cb}{ob}{ob} 7 // 2 {cb}{cb}{ob}{ob} -7 // 2 {cb}{cb}{ob}{ob} 7 / 2 {cb}{cb}", ex), "a1b3-43.5" as string)
+    assert_eq(render_jinja("{ob}{ob} [3, 1, 2]|sort|join(',') {cb}{cb}{ob}{ob} {ob}'k': 'v'{cb}['k'] {cb}{cb}", ex), "1,2,3v" as string)
+    assert_eq(render_jinja("{ob}{ob} 'a b'|title {cb}{cb}{ob}{ob} missing|default('x') {cb}{cb}{ob}{ob} [1, 2]|map('string')|join('+') {cb}{cb}", ex), "A Bx1+2" as string)
+
+    # statements: for/else, loop filter, tuple unpacking, loop variables, multi-set, set block, macro, comment, raw
+    mut {string=JValue} st = {=}
+    st["d"] = JValue.JDict({"a" = JValue.JInt(1), "b" = JValue.JInt(2)}, ["a", "b"])
+    assert_eq(render_jinja("{ob}% for x in [] %{cb}x{ob}% else %{cb}none{ob}% endfor %{cb}", st), "none" as string)
+    assert_eq(render_jinja("{ob}% for x in [1, 2, 3] if x != 2 %{cb}{ob}{ob} x {cb}{cb}{ob}% endfor %{cb}", st), "13" as string)
+    assert_eq(render_jinja("{ob}% for k, v in d.items() %{cb}{ob}{ob} k {cb}{cb}={ob}{ob} v {cb}{cb};{ob}% endfor %{cb}", st), "a=1;b=2;" as string)
+    assert_eq(render_jinja("{ob}% for x in [7, 8, 9] %{cb}{ob}{ob} loop.revindex {cb}{cb}{ob}{ob} loop.length {cb}{cb}{ob}{ob} loop.previtem {cb}{cb}|{ob}% endfor %{cb}", st), "33|237|138|" as string)
+    assert_eq(render_jinja("{ob}% set a, b = 1, 2 %{cb}{ob}{ob} a + b {cb}{cb}", st), "3" as string)
+    assert_eq(render_jinja("{ob}% set x %{cb}cap{ob}% endset %{cb}[{ob}{ob} x {cb}{cb}]", st), "[cap]" as string)
+    assert_eq(render_jinja("{ob}% macro hi(who, p='!') %{cb}Hi {ob}{ob} who {cb}{cb}{ob}{ob} p {cb}{cb}{ob}% endmacro %{cb}{ob}{ob} hi('A') {cb}{cb}|{ob}{ob} hi('B', p='?') {cb}{cb}", st), "Hi A!|Hi B?" as string)
+    assert_eq(render_jinja("a{ob}# hidden #{cb}b{ob}% raw %{cb}{ob}{ob} x {cb}{cb}{ob}% endraw %{cb}", st), "ab{ob}{ob} x {cb}{cb}" as string)
+
     print "test_jinja: all assertions passed"

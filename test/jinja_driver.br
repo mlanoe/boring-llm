@@ -1,0 +1,42 @@
+# Differential-test driver for src/jinja.br: reads a JSON file holding a list
+# of {"template": ..., "context": {...}} cases, renders each one and prints a
+# JSON list of {"ok": true, "out": ...} / {"ok": false, "error": ...} results
+# (one line), for tools/jinja_diff.py to compare with real jinja2.
+#   boring run test/jinja_driver.br -- cases.json
+
+use io
+use json
+use jinja
+
+def main() throws:
+    let argv = args()
+    guard argv.length >= 1 else throw "usage: jinja_driver cases.json"
+    var int ai = 0
+    while ai < argv.length - 1 and not argv[ai].endsWith(".json"):
+        ai += 1
+    let doc = json_parse(bytes_to_str(fs.readBytes(argv[ai])))
+    let ob = chr(123)
+    let cb = chr(125)
+    let q = chr(34)
+    var string out = "["
+    var int idx = 0
+    for c in json_get_list(doc, "cases"):
+        let template_src = json_get_str(c, "template", "")
+        let ctx = json_get(c, "context")
+        mut {string=JValue} env = {=}
+        match ctx:
+            JDict(fields, keys):
+                for k in keys:
+                    env[k] = fields[k]
+            _:
+                let _unused = 0
+        if idx > 0:
+            out = out + ","
+        let rendered = try? render_jinja(template_src, env)
+        if let r = rendered:
+            out = out + ob + q + "ok" + q + ":true," + q + "out" + q + ":" + q + json_escape(r) + q + cb
+        else:
+            out = out + ob + q + "ok" + q + ":false" + cb
+        idx += 1
+    out = out + "]"
+    print out

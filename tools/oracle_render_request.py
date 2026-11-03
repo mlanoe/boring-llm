@@ -72,6 +72,11 @@ def main():
     eos_id = int(reader.fields["tokenizer.ggml.eos_token_id"].parts[-1][0])
 
     env = jinja2.Environment()
+
+    def raise_exception(message):
+        raise jinja2.exceptions.TemplateError(message)
+
+    env.globals["raise_exception"] = raise_exception
     # HF's own `tojson` (json.dumps, ensure_ascii=False, default separators) —
     # NOT jinja2's built-in one, which sorts keys and HTML-escapes.
     env.filters["tojson"] = lambda x, **kw: json.dumps(x, ensure_ascii=False)
