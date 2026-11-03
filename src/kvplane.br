@@ -1,0 +1,298 @@
+# One K or V plane of the KV cache in any of the three storage types, so K and V
+# can differ (`-ctk q8_0 -ctv f16`).
+#
+# A plane always carries all four buffers; the ones its type does not use hold
+# a tiny dummy (a zero-length GPU buffer cannot be bound to a kernel), which
+# also lets one attention kernel take any combination:
+#   type 0 (f32):  `f`
+#   type 1 (f16):  `h`
+#   type 2 (q8_0): `q` (int8 values, two's complement) and `s` (one float16
+#                  scale per block of 32; see q8kv_gpu.br)
+
+use float16_gpu
+use q8kv_gpu
+use math_gpu
+
+pub struct Plane:
+    [float32]'kernel'unified f
+    [float16]'kernel'unified h
+    [uint8]'kernel'unified q
+    [float16]'kernel'unified s
+
+let int KV_F32 = 0
+let int KV_F16 = 1
+let int KV_Q8 = 2
+
+pub int kv_type_from_name(string name) throws:
+    if name == "f32":
+        0
+    elif name == "f16":
+        1
+    elif name == "q8_0":
+        2
+    else:
+        throw "KV cache type must be f32, f16 or q8_0"
+
+# Planes use rows of kv_dim floats; q8_0 needs whole blocks of 32 per row.
+pub int kv_block_floats():
+    32
+
+# ── building and growing planes ─────────────────────────────────────────────
+
+pub Plane plane_pack([float32]'kernel'global x, int t) throws:
+    let zeros = [0.0 as float32 for i in 0..<32]
+    if t == 0:
+        let dh = pack_float16_gpu(zeros)
+        let dsc = q8kv_scales_gpu(zeros)
+        let dq = q8kv_quantize_gpu(zeros, dsc)
+        Plane(x, dh, dq, dsc)
+    elif t == 1:
+        let df = upload_floats_gpu(zeros)
+        let dsc = q8kv_scales_gpu(zeros)
+        let dq = q8kv_quantize_gpu(zeros, dsc)
+        Plane(df, pack_float16_gpu(x), dq, dsc)
+    else:
+        let df = upload_floats_gpu(zeros)
+        let dh = pack_float16_gpu(zeros)
+        let sc = q8kv_scales_gpu(x)
+        Plane(df, dh, q8kv_quantize_gpu(x, sc), sc)
+
+# The plane's main rows as float32 (for the general attention path and snapshots).
+pub req [float32]'kernel'unified plane_widen(Plane p, int t) throws:
+    if t == 0:
+        upload_floats_gpu(p.f)
+    elif t == 1:
+        unpack_float16_gpu(p.h)
+    else:
+        q8kv_dequantize_gpu(p.q, p.s)
+
+# `p` plus `new_n` fresh float32 values behind its first `old_n` ones.
+pub Plane plane_append(Plane p, [float32]'kernel'global fresh, int old_n, int new_n, int t) throws:
+    let zeros = [0.0 as float32 for i in 0..<32]
+    if t == 0:
+        let dh = pack_float16_gpu(zeros)
+        let dsc = q8kv_scales_gpu(zeros)
+        let dq = q8kv_quantize_gpu(zeros, dsc)
+        Plane(kv_append_gpu(p.f, fresh, old_n, new_n), dh, dq, dsc)
+    elif t == 1:
+        let df = upload_floats_gpu(zeros)
+        let dsc = q8kv_scales_gpu(zeros)
+        let dq = q8kv_quantize_gpu(zeros, dsc)
+        Plane(df, append_float16_gpu(p.h, fresh, old_n, new_n), dq, dsc)
+    else:
+        let df = upload_floats_gpu(zeros)
+        let dh = pack_float16_gpu(zeros)
+        let fsc = q8kv_scales_gpu(fresh)
+        let nq = q8kv_append_gpu(p.q, fresh, fsc, old_n, new_n)
+        let ns = q8kv_append_scales_gpu(p.s, fsc, old_n / 32, new_n / 32)
+        Plane(df, dh, nq, ns)
+
+# ── single-query attention over planes of any types ────────────────────────
+
+# Same structure as FlashDecodeTailQ8Kernel; `kfmt`/`vfmt` (0 f32, 1 f16,
+# 2 q8_0) pick how the main K and V rows are read, uniformly for the whole launch.
+kernel FlashDecodeTailMixKernel:
+    let [float32]'global q
+    let [float32]'global k32
+    let [float16]'global k16
+    let [uint8]'global kq
+    let [float16]'global ks
+    let [float32]'global v32
+    let [float16]'global v16
+    let [uint8]'global vq
+    let [float16]'global vs
+    let [float32]'global tk
+    let [float32]'global tv
+    let int kfmt
+    let int vfmt
+    let int main_len
+    mut [float32]'unified part
+    let int seq_k
+    let int d_kv
+    let int d_head
+    let int group
+    let int nsplit
+    let int chunk
+    let float32 scale
+    mut [float32, width = 128, height = 1]'actor q_s
+    mut [float32, width = 128, height = 1]'actor p_s
+
+    init([float32]'global qi,
+         [float32]'global k32i, [float16]'global k16i, [uint8]'global kqi, [float16]'global ksi,
+         [float32]'global v32i, [float16]'global v16i, [uint8]'global vqi, [float16]'global vsi,
+         [float32]'global tki, [float32]'global tvi, int kf, int vf, int ml,
+         int sk, int dkv, int dh, int grp, int ns, int ch, float32 sc,
+         int nparts):
+        q = qi
+        k32 = k32i
+        k16 = k16i
+        kq = kqi
+        ks = ksi
+        v32 = v32i
+        v16 = v16i
+        vq = vqi
+        vs = vsi
+        tk = tki
+        tv = tvi
+        kfmt = kf
+        vfmt = vf
+        main_len = ml
+        seq_k = sk
+        d_kv = dkv
+        d_head = dh
+        group = grp
+        nsplit = ns
+        chunk = ch
+        scale = sc
+        part = [0.0 as float32 for ..<nparts]
+
+    def ():
+        let t = .thread.x
+        let split = .block.x
+        let h = .block.y
+        let k_off = (h / group) * d_head
+        let start = split * chunk
+        var int stop = start + chunk
+        if stop > seq_k:
+            stop = seq_k
+        q_s[width = t, height = 0] = q[h * d_head + t]
+        var float32 m = -1.0e30
+        var float32 l = 0.0
+        var float32 acc = 0.0
+        var int ntiles = 0
+        if stop > start:
+            ntiles = (stop - start + d_head - 1) / d_head
+        for ti in 0..<ntiles:
+            let j0 = start + ti * d_head
+            let jg = j0 + t
+            sync
+            var float32 s = -1.0e30
+            if jg < stop:
+                var float32 dot = 0.0
+                if jg < main_len:
+                    let base_k = jg * d_kv + k_off
+                    if kfmt == 0:
+                        for d in 0..<d_head:
+                            dot += q_s[width = d, height = 0] * k32[base_k + d]
+                    elif kfmt == 1:
+                        for d in 0..<d_head:
+                            dot += q_s[width = d, height = 0] * (k16[base_k + d] as float32)
+                    else:
+                        for blk in 0..<(d_head / 32):
+                            let sck = ks[(base_k + blk * 32) / 32] as float32
+                            var float32 bdot = 0.0
+                            for d in 0..<32:
+                                var int bk = int(kq[base_k + blk * 32 + d])
+                                if bk > 127:
+                                    bk = bk - 256
+                                bdot += q_s[width = blk * 32 + d, height = 0] * (bk as float32)
+                            dot += bdot * sck
+                else:
+                    for d in 0..<d_head:
+                        dot += q_s[width = d, height = 0] * tk[(jg - main_len) * d_kv + k_off + d]
+                s = dot * scale
+            p_s[width = t, height = 0] = s
+            sync
+            var float32 mx = m
+            for j in 0..<d_head:
+                let sv = p_s[width = j, height = 0]
+                if sv > mx:
+                    mx = sv
+            let alpha = (m - mx).exp()
+            var float32 pv = 0.0
+            if jg < stop:
+                pv = (s - mx).exp()
+            sync
+            p_s[width = t, height = 0] = pv
+            sync
+            var float32 psum = 0.0
+            var float32 nacc = 0.0
+            for j in 0..<d_head:
+                let pj = p_s[width = j, height = 0]
+                psum += pj
+                if j0 + j < stop:
+                    if j0 + j < main_len:
+                        let vi = (j0 + j) * d_kv + k_off + t
+                        if vfmt == 0:
+                            nacc += pj * v32[vi]
+                        elif vfmt == 1:
+                            nacc += pj * (v16[vi] as float32)
+                        else:
+                            var int bv = int(vq[vi])
+                            if bv > 127:
+                                bv = bv - 256
+                            nacc += pj * (bv as float32) * (vs[vi / 32] as float32)
+                    else:
+                        nacc += pj * tv[(j0 + j - main_len) * d_kv + k_off + t]
+            l = l * alpha + psum
+            acc = acc * alpha + nacc
+            m = mx
+        let base = (h * nsplit + split) * (d_head + 2)
+        part[base + 2 + t] = acc
+        if t == 0:
+            part[base] = m
+            part[base + 1] = l
+
+kernel FlashDecodeCombineMixKernel:
+    let [float32]'global part
+    mut [float32]'unified out
+    let int nsplit
+    let int d_head
+
+    init([float32]'global pi, int ns, int dh, int n):
+        part = pi
+        nsplit = ns
+        d_head = dh
+        out = [0.0 as float32 for ..<n]
+
+    def ():
+        let t = .thread.x
+        let h = .block.x
+        var float32 big = -1.0e30
+        for s in 0..<nsplit:
+            let ms = part[(h * nsplit + s) * (d_head + 2)]
+            if ms > big:
+                big = ms
+        var float32 total = 0.0
+        var float32 acc = 0.0
+        for s in 0..<nsplit:
+            let base = (h * nsplit + s) * (d_head + 2)
+            let w = (part[base] - big).exp()
+            total += part[base + 1] * w
+            acc += part[base + 2 + t] * w
+        if total > 0.0:
+            out[h * d_head + t] = acc / total
+
+pub req [float32]'kernel'unified attention_gqa_tail_mix_arrays(
+        [float32]'kernel'global q,
+        [float32]'kernel'global k32, [float16]'kernel'global k16, [uint8]'kernel'global kq, [float16]'kernel'global ks,
+        [float32]'kernel'global v32, [float16]'kernel'global v16, [uint8]'kernel'global vq, [float16]'kernel'global vs,
+        int kt, int vt,
+        [float32]'kernel'global tk, [float32]'kernel'global tv,
+        int main_len, int seq_k, int n_head, int n_kv_head, int d_head) throws:
+    guard d_head % 32 == 0 and d_head <= 128 else throw "mixed-type KV attention requires d_head a multiple of 32 up to 128"
+    let int d_kv = n_kv_head * d_head
+    let int group = n_head / n_kv_head
+    let float32 scale = 1.0 / (d_head as float32).sqrt()
+    var int nsplit = (seq_k + 127) / 128
+    if nsplit < 1:
+        nsplit = 1
+    if nsplit > 64:
+        nsplit = 64
+    let int chunk = (seq_k + nsplit - 1) / nsplit
+    mut kd = FlashDecodeTailMixKernel(q, k32, k16, kq, ks, v32, v16, vq, vs,
+        tk, tv, kt, vt, main_len, seq_k, d_kv, d_head, group, nsplit, chunk, scale,
+        n_head * nsplit * (d_head + 2))
+    kernel:
+        kd(block = d_head, grid = (nsplit, n_head))
+    mut kc = FlashDecodeCombineMixKernel(kd.part, nsplit, d_head, n_head * d_head)
+    kernel:
+        kc(block = d_head, grid = n_head)
+    kc.out
+
+pub req [float32]'kernel'unified attention_gqa_tail_mix_gpu(
+        [float32]'kernel'global q, Plane kp, Plane vp, int kt, int vt,
+        [float32]'kernel'global tk, [float32]'kernel'global tv,
+        int main_len, int seq_k, int n_head, int n_kv_head, int d_head) throws:
+    attention_gqa_tail_mix_arrays(q, kp.f, kp.h, kp.q, kp.s, vp.f, vp.h, vp.q, vp.s, kt, vt,
+        tk, tv, main_len, seq_k, n_head, n_kv_head, d_head)

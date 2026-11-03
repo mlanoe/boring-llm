@@ -1148,7 +1148,6 @@ def main() throws:
 
     guard gguf_path != "" else throw full_usage_text()
     guard repeat_last_n >= -1 else throw "--repeat-last-n must be -1 or greater"
-    guard cache_type_k == cache_type_v else throw "--cache-type-k and --cache-type-v must currently use the same type"
     guard mirostat == 0 or adaptive_target < 0.0 as float32 else throw "--mirostat and --adaptive-target cannot be enabled together"
     guard serve_mode or (presence_penalty == 0.0 as float32 and frequency_penalty == 0.0 as float32 and mirostat == 0 and adaptive_target < 0.0 as float32 and not ignore_eos) else throw "presence/frequency penalties, stateful sampling, and --ignore-eos currently require --serve"
     if reasoning_default == "on" or reasoning_default == "off":
@@ -1163,7 +1162,7 @@ def main() throws:
         let checked = try? parse_gbnf(grammar_default)
         guard checked != nil else throw "--grammar is not a valid GBNF grammar"
     set_decode_profile_stage(requested_profile_stage)
-    set_kv_cache_type(cache_type_k)
+    set_kv_cache_types(cache_type_k, cache_type_v)
     set_rope_context_size(ctx_size)
     set_prefill_chunk_len(effective_prefill_chunk(batch_size, ubatch_size))
 

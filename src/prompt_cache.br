@@ -30,6 +30,7 @@ use io
 use math_gpu
 use float16_gpu
 use q8kv_gpu
+use kvplane
 use model
 use openai
 use std.fs.File
@@ -167,19 +168,10 @@ pub def save_snapshot_file(string path, int fp, int seq, QuantModel model, GenCa
     while l < n_layer:
         mut [float32] k_host = []
         mut [float32] v_host = []
-        if folded.f16:
-            let k_resident = unpack_float16_gpu(folded.layers[l].hk)
-            k_host = download_floats_gpu(k_resident, n * kv_dim)
-            let v_resident = unpack_float16_gpu(folded.layers[l].hv)
-            v_host = download_floats_gpu(v_resident, n * kv_dim)
-        elif folded.q8:
-            let k_resident = q8kv_dequantize_gpu(folded.layers[l].kq, folded.layers[l].ks)
-            k_host = download_floats_gpu(k_resident, n * kv_dim)
-            let v_resident = q8kv_dequantize_gpu(folded.layers[l].vq, folded.layers[l].vs)
-            v_host = download_floats_gpu(v_resident, n * kv_dim)
-        else:
-            k_host = download_floats_gpu(folded.layers[l].k, n * kv_dim)
-            v_host = download_floats_gpu(folded.layers[l].v, n * kv_dim)
+        let k_resident = plane_widen(folded.layers[l].kp, folded.kt)
+        k_host = download_floats_gpu(k_resident, n * kv_dim)
+        let v_resident = plane_widen(folded.layers[l].vp, folded.vt)
+        v_host = download_floats_gpu(v_resident, n * kv_dim)
         write_floats(f, k_host, n * kv_dim, data_off + 2 * l * plane)
         write_floats(f, v_host, n * kv_dim, data_off + (2 * l + 1) * plane)
         l += 1
@@ -218,13 +210,8 @@ pub GenCache load_snapshot_file(string path, DiskSnap snap, QuantModel model, in
     while l < model.config.n_layer:
         let k_host = read_floats(f, data_off + 2 * l * plane, common * kv_dim)
         let v_host = read_floats(f, data_off + (2 * l + 1) * plane, common * kv_dim)
-        if uses_float16_kv_cache():
-            layers.push(LayerCache([], [], pack_float16_gpu(k_host), pack_float16_gpu(v_host), [], [], [], [], [], []))
-        elif uses_q8_kv_cache():
-            let k_scales = q8kv_scales_gpu(k_host)
-            let v_scales = q8kv_scales_gpu(v_host)
-            layers.push(LayerCache([], [], [], [], [], [], q8kv_quantize_gpu(k_host, k_scales), k_scales, q8kv_quantize_gpu(v_host, v_scales), v_scales))
-        else:
-            layers.push(LayerCache(upload_floats_gpu(k_host), upload_floats_gpu(v_host), [], [], [], [], [], [], [], []))
+        let k_dev = upload_floats_gpu(k_host)
+        let v_dev = upload_floats_gpu(v_host)
+        layers.push(LayerCache(plane_pack(k_dev, kv_cache_type_k()), plane_pack(v_dev, kv_cache_type_v()), [], []))
         l += 1
-    GenCache(layers, common, 0, uses_float16_kv_cache(), uses_q8_kv_cache())
+    GenCache(layers, common, 0, kv_cache_type_k(), kv_cache_type_v())

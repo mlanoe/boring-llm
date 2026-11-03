@@ -1,0 +1,136 @@
+# Build + run:
+#   boring build --target metal test/test_kvplane_gpu_real.br
+#   cargo run --manifest-path test/test_kvplane_gpu_real_metal/Cargo.toml
+
+use io
+use q8kv_gpu
+use float16_gpu
+use kvplane
+
+[float32] passthrough([float32] x):
+    x
+
+def assert_close(float32 a, float32 b, float32 tolerance, string msg):
+    let diff = if a > b: a - b else: b - a
+    assert(diff <= tolerance, "{msg}: expected ~{b}, got {a}")
+
+[float32] values(int n, int salt):
+    mut [float32] out = [0.0 as float32 for ..<n]
+    var int i = 0
+    while i < n:
+        out[i] = (((i * 17 + salt * 29) % 127) as float32) / 63.5 - 1.0
+        i += 1
+    out
+
+# Straightforward single-query GQA reference over the exact values stored in
+# the half main cache plus the float32 tail.
+[float32] attention_reference([float32]& q, [float32]& k, [float32]& v,
+        int seq_k, int n_head, int n_kv_head, int d_head):
+    let d_kv = n_kv_head * d_head
+    let group = n_head / n_kv_head
+    let scale = 1.0 / (d_head as float32).sqrt()
+    mut [float32] out = [0.0 as float32 for ..<(n_head * d_head)]
+    var int h = 0
+    while h < n_head:
+        let kv_h = h / group
+        var float32 max_score = -1.0e30
+        var int p = 0
+        while p < seq_k:
+            var float32 dot = 0.0
+            var int d = 0
+            while d < d_head:
+                dot += q[h * d_head + d] * k[p * d_kv + kv_h * d_head + d]
+                d += 1
+            let score = dot * scale
+            if score > max_score:
+                max_score = score
+            p += 1
+        var float32 denom = 0.0
+        p = 0
+        while p < seq_k:
+            var float32 dot = 0.0
+            var int d = 0
+            while d < d_head:
+                dot += q[h * d_head + d] * k[p * d_kv + kv_h * d_head + d]
+                d += 1
+            let weight = (dot * scale - max_score).exp()
+            denom += weight
+            d = 0
+            while d < d_head:
+                out[h * d_head + d] += weight * v[p * d_kv + kv_h * d_head + d]
+                d += 1
+            p += 1
+        var int d = 0
+        while d < d_head:
+            out[h * d_head + d] = out[h * d_head + d] / denom
+            d += 1
+        h += 1
+    out
+
+def check_combo(int kt, int vt, int d_head) throws:
+    let n_head = 4
+    let n_kv_head = 2
+    let main_len = 137
+    let tail_len = 3
+    let seq_k = main_len + tail_len
+    let d_kv = n_kv_head * d_head
+    let q = values(n_head * d_head, 1)
+    let main_k_source = values(main_len * d_kv, 2)
+    let main_v_source = values(main_len * d_kv, 3)
+    let tail_k = values(tail_len * d_kv, 4)
+    let tail_v = values(tail_len * d_kv, 5)
+    let kp = plane_pack(main_k_source, kt)
+    let vp = plane_pack(main_v_source, vt)
+    # oracle from the values the planes actually store
+    let stored_k_raw = plane_widen(kp, kt)
+    let stored_k = passthrough(stored_k_raw)
+    let stored_v_raw = plane_widen(vp, vt)
+    let stored_v = passthrough(stored_v_raw)
+    mut [float32] all_k = stored_k
+    mut [float32] all_v = stored_v
+    var int i = 0
+    while i < tail_k.length:
+        all_k.push(tail_k[i])
+        all_v.push(tail_v[i])
+        i += 1
+    let expected = attention_reference(q, all_k, all_v, seq_k, n_head, n_kv_head, d_head)
+    let got_raw = attention_gqa_tail_mix_gpu(q, kp, vp, kt, vt, tail_k, tail_v, main_len, seq_k, n_head, n_kv_head, d_head)
+    let got = passthrough(got_raw)
+    i = 0
+    while i < expected.length:
+        assert_close(got[i], expected[i], 0.0005 as float32, "mixed attention k={kt} v={vt} d_head={d_head}[{i}]")
+        i += 1
+    print "mixed KV attention k={kt} v={vt} d_head={d_head}: OK"
+
+def check_append(int t) throws:
+    # growing a plane keeps the old values and stores the fresh ones
+    let first = values(96, 7)
+    let fresh = values(64, 9)
+    let p0 = plane_pack(first, t)
+    let p1 = plane_append(p0, fresh, 96, 64, t)
+    let wide_raw = plane_widen(p1, t)
+    let wide = passthrough(wide_raw)
+    var i = 0
+    let tol = if t == 0: 0.0 else: 0.01
+    while i < 96:
+        assert_close(wide[i], first[i], tol as float32, "plane append type {t} old[{i}]")
+        i += 1
+    while i < 160:
+        assert_close(wide[i], fresh[i - 96], tol as float32, "plane append type {t} new[{i}]")
+        i += 1
+    print "plane append type {t}: OK"
+
+def main() throws:
+    check_append(0)
+    check_append(1)
+    check_append(2)
+    var int kt = 0
+    while kt < 3:
+        var int vt = 0
+        while vt < 3:
+            check_combo(kt, vt, 64)
+            vt += 1
+        kt += 1
+    check_combo(2, 1, 96)
+    check_combo(1, 2, 128)
+    check_combo(0, 2, 32)
