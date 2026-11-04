@@ -777,7 +777,7 @@ float32 wdec_iq4xs([uint8]'global w_packed, int flat_idx):
 # IQ1-IQ3 family and the two IQ4 codebook formats (the others have a native schedule of their own, or
 # keep the float32 route).
 bool prefill_via_f16(int t):
-    is_iq_grid_type(t) or t == 20 or t == 23
+    is_iq_grid_type(t) or t == 20 or t == 23 or t == 120 or t == 123
 
 # The IQ1/IQ2/IQ3 formats: their weight buffers start with lookup tables (see iq_decode.br).
 bool is_iq_grid_type(int t):
@@ -813,6 +813,10 @@ float32 weight_at([uint8]'global w_packed, int fmt, int flat_idx):
         wdec_bf16(w_packed, flat_idx)
     elif fmt == 23:
         wdec_iq4xs(w_packed, flat_idx)
+    elif fmt == 120:
+        wdec_iq4nl_t(w_packed, flat_idx)
+    elif fmt == 123:
+        wdec_iq4xs_t(w_packed, flat_idx)
     elif fmt == 16:
         wdec_iq2xxs(w_packed, flat_idx)
     elif fmt == 17:
@@ -880,7 +884,7 @@ kernel TiledLinearKernel<int FMT>:
 int weight_block_elems(int fmt):
     if fmt == 1 or fmt == 30:
         1
-    elif fmt == 2 or fmt == 3 or fmt == 6 or fmt == 7 or fmt == 8 or fmt == 20:
+    elif fmt == 2 or fmt == 3 or fmt == 6 or fmt == 7 or fmt == 8 or fmt == 20 or fmt == 120:
         32
     else:
         256
@@ -890,7 +894,7 @@ pub req [float32]'kernel'unified tiled_linear_gpu([float32]'kernel'global x, [ui
     guard d_in % weight_block_elems(fmt) == 0 else throw "tiled_linear_gpu: d_in ({d_in}) must be a multiple of {weight_block_elems(fmt)} for ggml type {fmt}"
     let int gx = (d_out + 15) / 16
     let int gy = (seq + 15) / 16
-    dispatch fmt in [8, 6, 14, 12, 2, 10, 11, 20, 3, 7, 13, 1, 30, 23, 16, 17, 22, 18, 21, 19, 29]:
+    dispatch fmt in [8, 6, 14, 12, 2, 10, 11, 20, 3, 7, 13, 1, 30, 23, 16, 17, 22, 18, 21, 19, 29, 120, 123]:
         mut k = TiledLinearKernel<fmt>(x, w_packed, bv, seq, d_in, d_out)
         kernel:
             k(block = (16, 16), grid = (gx, gy))
@@ -1331,6 +1335,10 @@ float32 unit_dot([uint8]'global w_packed, [float32]'global x, int fmt, int col, 
         wdot_iq4nlu(w_packed, x, col, row, d_in, n_units, unit)
     elif fmt == 23:
         wdot_iq4xs(w_packed, x, col, row, d_in, n_units, unit)
+    elif fmt == 120:
+        wdot_iq4nl_t(w_packed, x, col, row, d_in, n_units, unit)
+    elif fmt == 123:
+        wdot_iq4xs_t(w_packed, x, col, row, d_in, n_units, unit)
     elif fmt == 16:
         wdot_iq2xxs(w_packed, x, col, row, d_in, n_units, unit)
     elif fmt == 17:
@@ -1399,7 +1407,7 @@ pub req [float32]'kernel'unified warp_linear_gpu([float32]'kernel'global x, [uin
     let int blocks = (total_warps + warps_per_block - 1) / warps_per_block
     let int gx = if blocks > 65535: 65535 else: blocks
     let int gy = (blocks + gx - 1) / gx
-    dispatch fmt in [1, 30, 3, 7, 13, 2, 6, 20, 23, 16, 17, 22, 18, 21, 19, 29]:
+    dispatch fmt in [1, 30, 3, 7, 13, 2, 6, 20, 23, 16, 17, 22, 18, 21, 19, 29, 120, 123]:
         mut k = WarpLinearKernel<fmt>(x, w_packed, bv, seq, d_in, d_out, warps_per_block)
         kernel:
             k(block = (32, warps_per_block), grid = (gx, gy))
@@ -1475,7 +1483,7 @@ pub req [float32]'kernel'unified dequantize_gpu([uint8]'kernel'global w_packed, 
     let int blocks = (n + 255) / 256
     let int gx = if blocks > 65535: 65535 else: blocks
     let int gy = (blocks + gx - 1) / gx
-    dispatch fmt in [3, 7, 13, 1, 30, 2, 6, 20, 23, 16, 17, 22, 18, 21, 19, 29]:
+    dispatch fmt in [3, 7, 13, 1, 30, 2, 6, 20, 23, 16, 17, 22, 18, 21, 19, 29, 120, 123]:
         mut k = DequantKernel<fmt>(w_packed, n)
         kernel:
             k(block = 256, grid = (gx, gy))
@@ -1558,7 +1566,7 @@ pub req [uint8]'kernel'unified dequantize_f16_gpu([uint8]'kernel'global w_packed
     let int blocks = (n + 255) / 256
     let int gx = if blocks > 65535: 65535 else: blocks
     let int gy = (blocks + gx - 1) / gx
-    dispatch fmt in [20, 23, 16, 17, 22, 18, 21, 19, 29]:
+    dispatch fmt in [20, 23, 16, 17, 22, 18, 21, 19, 29, 120, 123]:
         mut k = DequantF16Kernel<fmt>(w_packed, n)
         kernel:
             k(block = 256, grid = (gx, gy))
@@ -1576,10 +1584,10 @@ let int DEQUANT_PREFILL_MIN_ROWS = 16
 
 pub req [float32]'kernel'unified fused_linear_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed, int w_type,
                        [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
-    guard w_type == 1 or w_type == 2 or w_type == 3 or w_type == 6 or w_type == 7 or w_type == 8 or w_type == 10 or w_type == 11 or w_type == 12 or w_type == 13 or w_type == 14 or w_type == 20 or w_type == 23 or w_type == 30 or is_iq_grid_type(w_type) else throw "fused_linear_gpu: unsupported ggml type id {w_type} (supported: F16=1, Q4_0=2, Q4_1=3, Q5_0=6, Q5_1=7, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q5_K=13, Q6_K=14, IQ4_NL=20, IQ4_XS=23, BF16=30, IQ2_XXS=16, IQ2_XS=17, IQ3_XXS=18, IQ1_S=19, IQ3_S=21, IQ2_S=22, IQ1_M=29)"
+    guard w_type == 1 or w_type == 2 or w_type == 3 or w_type == 6 or w_type == 7 or w_type == 8 or w_type == 10 or w_type == 11 or w_type == 12 or w_type == 13 or w_type == 14 or w_type == 20 or w_type == 23 or w_type == 30 or is_iq_grid_type(w_type) or w_type == 120 or w_type == 123 else throw "fused_linear_gpu: unsupported ggml type id {w_type} (supported: F16=1, Q4_0=2, Q4_1=3, Q5_0=6, Q5_1=7, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q5_K=13, Q6_K=14, IQ4_NL=20, IQ4_XS=23, BF16=30, IQ2_XXS=16, IQ2_XS=17, IQ3_XXS=18, IQ1_S=19, IQ3_S=21, IQ2_S=22, IQ1_M=29)"
     # Formats with a single-row warp kernel and a dequantize-once prefill path; the others (Q8_0 and
     # the K-quants) use the tiled kernel for every prompt length.
-    let bool has_warp = w_type == 1 or w_type == 2 or w_type == 3 or w_type == 6 or w_type == 7 or w_type == 13 or w_type == 20 or w_type == 23 or w_type == 30 or is_iq_grid_type(w_type)
+    let bool has_warp = w_type == 1 or w_type == 2 or w_type == 3 or w_type == 6 or w_type == 7 or w_type == 13 or w_type == 20 or w_type == 23 or w_type == 30 or is_iq_grid_type(w_type) or w_type == 120 or w_type == 123
     if seq == 1 and w_type == 8:
         q8_linear_warp_broadcast_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif seq == 1 and has_warp:

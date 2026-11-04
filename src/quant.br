@@ -768,11 +768,22 @@ pub bool is_grid_quant_type(int ggml_type):
 pub [uint8] grid_quant_to_q8_0(int ggml_type, [uint8] raw, int n) throws:
     quantize_q8_0(dequantize_row(ggml_type, raw, 0, n))
 
+# The type id the GPU kernels use for a weight uploaded with `with_iq_prefix`: IQ4_NL and IQ4_XS get
+# the GPU-only ids 120 and 123 (their buffers start with the codebook, see iq_decode.br); the other
+# formats keep their GGUF id.
+pub int gpu_weight_type(int ggml_type):
+    if ggml_type == 20:
+        120
+    elif ggml_type == 23:
+        123
+    else:
+        ggml_type
+
 # The bytes to upload for a weight tensor of `ggml_type`: unchanged, except that the IQ1/IQ2/IQ3
 # formats get their lookup tables in front (the GPU kernels read them from the weight buffer, see
 # iq_decode.br).
 pub [uint8] with_iq_prefix([uint8] raw, int ggml_type) throws:
-    if not is_grid_quant_type(ggml_type):
+    if not (is_grid_quant_type(ggml_type) or ggml_type == 20 or ggml_type == 23):
         return raw
     mut out = iq_gpu_prefix(ggml_type)
     for b in raw:

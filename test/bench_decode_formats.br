@@ -53,12 +53,13 @@ def main() throws:
 
     let x_gpu = upload_floats_gpu(x)
     let w_gpu = upload_bytes_gpu(with_iq_prefix(w, ty))
+    let gty = gpu_weight_type(ty)
     let bv_gpu = upload_floats_gpu(bv)
     set_gpu_batch_limit(8)
-    var out = tensor_linear_gpu(x_gpu, w_gpu, ty, bv_gpu, 1, d_in, d_out)
+    var out = tensor_linear_gpu(x_gpu, w_gpu, gty, bv_gpu, 1, d_in, d_out)
     var n = 0
     while n < iters:
-        out = tensor_linear_gpu(x_gpu, w_gpu, ty, bv_gpu, 1, d_in, d_out)
+        out = tensor_linear_gpu(x_gpu, w_gpu, gty, bv_gpu, 1, d_in, d_out)
         n += 1
     set_gpu_batch_limit(1)
     let sink = passthrough(out)

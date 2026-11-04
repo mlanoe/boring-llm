@@ -534,7 +534,7 @@ pub QuantModel load_model_quantized(GgufFile file) throws:
                 let (eg, eg_ty) = load_rows_quantized(file, "{prefix}.ffn_gate_exps.weight", e * config.expert_ffn, config.expert_ffn)
                 let (eu, eu_ty) = load_rows_quantized(file, "{prefix}.ffn_up_exps.weight", e * config.expert_ffn, config.expert_ffn)
                 let (ed, ed_ty) = load_rows_quantized(file, "{prefix}.ffn_down_exps.weight", e * config.d_model, config.d_model)
-                experts.push(ExpertW(upload_bytes_gpu(with_iq_prefix(eg, eg_ty)), eg_ty, upload_bytes_gpu(with_iq_prefix(eu, eu_ty)), eu_ty, upload_bytes_gpu(with_iq_prefix(ed, ed_ty)), ed_ty))
+                experts.push(ExpertW(upload_bytes_gpu(with_iq_prefix(eg, eg_ty)), gpu_weight_type(eg_ty), upload_bytes_gpu(with_iq_prefix(eu, eu_ty)), gpu_weight_type(eu_ty), upload_bytes_gpu(with_iq_prefix(ed, ed_ty)), gpu_weight_type(ed_ty)))
                 e += 1
         let router_w_host = if moe: load_tensor_f32(file, "{prefix}.ffn_gate_inp.weight") else: [0.0 as float32]
         let q_b = load_tensor_f32_or_zero(file, "{prefix}.attn_q.bias", qkv_dim)
@@ -560,18 +560,18 @@ pub QuantModel load_model_quantized(GgufFile file) throws:
         # and stays resident for the model's lifetime (see upload_bytes_gpu).
         let layer = QuantLayer(
             upload_floats_gpu(load_tensor_f32(file, "{prefix}.attn_norm.weight")),
-            upload_bytes_gpu(with_iq_prefix(q_w, q_ty)), q_ty,
+            upload_bytes_gpu(with_iq_prefix(q_w, q_ty)), gpu_weight_type(q_ty),
             upload_floats_gpu(q_b),
-            upload_bytes_gpu(with_iq_prefix(k_w, k_ty)), k_ty,
+            upload_bytes_gpu(with_iq_prefix(k_w, k_ty)), gpu_weight_type(k_ty),
             upload_floats_gpu(k_b),
-            upload_bytes_gpu(with_iq_prefix(v_w, v_ty)), v_ty,
+            upload_bytes_gpu(with_iq_prefix(v_w, v_ty)), gpu_weight_type(v_ty),
             upload_floats_gpu(v_b),
             upload_bytes_gpu(qkv_w), upload_floats_gpu(qkv_b), qkv_fused,
-            upload_bytes_gpu(with_iq_prefix(o_w, o_ty)), o_ty,
+            upload_bytes_gpu(with_iq_prefix(o_w, o_ty)), gpu_weight_type(o_ty),
             upload_floats_gpu(load_tensor_f32(file, "{prefix}.ffn_norm.weight")),
-            upload_bytes_gpu(with_iq_prefix(gate_w, gate_ty)), gate_ty,
-            upload_bytes_gpu(with_iq_prefix(up_w, up_ty)), up_ty,
-            upload_bytes_gpu(with_iq_prefix(down_w, down_ty)), down_ty,
+            upload_bytes_gpu(with_iq_prefix(gate_w, gate_ty)), gpu_weight_type(gate_ty),
+            upload_bytes_gpu(with_iq_prefix(up_w, up_ty)), gpu_weight_type(up_ty),
+            upload_bytes_gpu(with_iq_prefix(down_w, down_ty)), gpu_weight_type(down_ty),
             upload_floats_gpu(load_tensor_f32_or_zero(file, "{prefix}.attn_q_norm.weight", config.d_head)),
             upload_floats_gpu(load_tensor_f32_or_zero(file, "{prefix}.attn_k_norm.weight", config.d_head)),
             upload_floats_gpu(load_tensor_f32_or_zero(file, "{prefix}.post_attention_norm.weight", config.d_model)),
@@ -584,7 +584,7 @@ pub QuantModel load_model_quantized(GgufFile file) throws:
     let output_norm_w = load_tensor_f32(file, "output_norm.weight")
     let (output_w_q8, output_w_type) = resolve_output_weight_q8(file, config, tok_embd_q8, tok_embd_type)
 
-    QuantModel(config, tok_embd_q8, tok_embd_type, layers, upload_floats_gpu(output_norm_w), upload_bytes_gpu(with_iq_prefix(output_w_q8, output_w_type)), output_w_type)
+    QuantModel(config, tok_embd_q8, tok_embd_type, layers, upload_floats_gpu(output_norm_w), upload_bytes_gpu(with_iq_prefix(output_w_q8, output_w_type)), gpu_weight_type(output_w_type))
 
 ([uint8], int) resolve_output_weight_q8(GgufFile file, Config config, [uint8] tok_embd_q8, int tok_embd_type) throws:
     if config.tied_embeddings:

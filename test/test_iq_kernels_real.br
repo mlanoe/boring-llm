@@ -54,12 +54,13 @@ def assert_rel(float32 got, float32 want, float32 scale, string msg):
     let diff = if got > want: got - want else: want - got
     assert(diff <= scale * 0.0002, "{msg}: expected ~{want}, got {got}")
 
-def check_format(string name, int ggml_type) throws:
+def check_format(string name, int file_type, int n) throws:
     let raw = fs.readBytes("test/fixtures/quant-{name}.bin")
     let expected = fs.readBytes("test/fixtures/quant-{name}.f32")
-    let n = 768
-    var [float32] cpu_w = dequantize_row(ggml_type, raw, 0, n)
-    let prefixed = with_iq_prefix(raw, ggml_type)
+    # the fixture is read as a GGUF tensor of `file_type`; the GPU kernels get the type of the uploaded buffer
+    let ggml_type = gpu_weight_type(file_type)
+    var [float32] cpu_w = dequantize_row(file_type, raw, 0, n)
+    let prefixed = with_iq_prefix(raw, file_type)
 
     # dequantize_gpu == the CPU values, exactly
     let deq_raw = dequantize_gpu(prefixed, ggml_type, n)
@@ -72,8 +73,9 @@ def check_format(string name, int ggml_type) throws:
     # linear layers: two matrix shapes over the same 768 values
     var int shape = 0
     while shape < 2:
-        let d_in = if shape == 0: 256 else: 768
-        let d_out = if shape == 0: 3 else: 1
+        let short_row = if n % 256 == 0: 256 else: 32
+        let d_in = if shape == 0: short_row else: n
+        let d_out = if shape == 0: n / short_row else: 1
         for seq in [1, 3, 20]:
             mut [float32] x = [0.0 for k in 0..<(seq * d_in)]
             var int k = 0
@@ -104,10 +106,12 @@ def check_format(string name, int ggml_type) throws:
 
 def main() throws:
     check_half_bits()
-    check_format("iq2_xxs", 16)
-    check_format("iq2_xs", 17)
-    check_format("iq2_s", 22)
-    check_format("iq3_xxs", 18)
-    check_format("iq3_s", 21)
-    check_format("iq1_s", 19)
-    check_format("iq1_m", 29)
+    check_format("iq2_xxs", 16, 768)
+    check_format("iq2_xs", 17, 768)
+    check_format("iq2_s", 22, 768)
+    check_format("iq3_xxs", 18, 768)
+    check_format("iq3_s", 21, 768)
+    check_format("iq1_s", 19, 768)
+    check_format("iq1_m", 29, 768)
+    check_format("iq4_nl", 20, 96)
+    check_format("iq4_xs", 23, 768)

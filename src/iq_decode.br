@@ -273,3 +273,59 @@ float32 wdot_iq1m([uint8]'global w_packed, [float32]'global x, int col, int row,
             let v = (int(w_packed[gi * 8 + j]) - 1) as float32
             dot += x[xb + gl * 8 + j] * (dl * (v + delta))
     dot
+
+# ── IQ4_NL / IQ4_XS with the codebook in front of the buffer ───────────────────────────────────────
+# GPU-only type ids 120 (IQ4_NL) and 123 (IQ4_XS): the model loader uploads these formats' weights with
+# their 16-entry codebook (the values plus 128, one byte each) as the first 16 bytes and the blocks after
+# it, and tags the buffers 120 / 123 instead of 20 / 23 (the GGUF keeps 20 / 23, so the CPU side is
+# unchanged). Reading the value from the buffer is much cheaper than computing it.
+
+float32 wdec_iq4nl_t([uint8]'global w_packed, int flat_idx):
+    let block_byte = 16 + (flat_idx >> 5) * 18
+    let offset_in_block = (flat_idx & 31)
+    let scale_bits = int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8)
+    let w_scale = f16_bits_to_f32(scale_bits)
+    let j = (offset_in_block & 15)
+    let byte_val = int(w_packed[block_byte + 2 + j])
+    let nib = if offset_in_block < 16: byte_val & 15 else: (byte_val >> 4) & 15
+    ((int(w_packed[nib]) - 128) as float32) * w_scale
+
+float32 wdec_iq4xs_t([uint8]'global w_packed, int flat_idx):
+    let block_byte = 16 + (flat_idx >> 8) * 136
+    let off = (flat_idx & 255)
+    let ib = (off >> 5)
+    let within = (off & 31)
+    let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
+    let sh = int(w_packed[block_byte + 2]) | (int(w_packed[block_byte + 3]) << 8)
+    let low = (int(w_packed[block_byte + 4 + (ib >> 1)]) >> (4 * (ib & 1))) & 15
+    let high = (sh >> (2 * ib)) & 3
+    let dl = w_d * (((low | (high << 4)) - 32) as float32)
+    let q = int(w_packed[block_byte + 8 + ib * 16 + (within & 15)])
+    let nib = if within < 16: q & 15 else: (q >> 4) & 15
+    dl * ((int(w_packed[nib]) - 128) as float32)
+
+float32 wdot_iq4nl_t([uint8]'global w_packed, [float32]'global x, int col, int row, int d_in, int n_units, int unit):
+    let bb = 16 + (col * n_units + unit) * 18
+    let w_d = f16_bits_to_f32_fast(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
+    let xb = row * d_in + unit * 32
+    var float32 dot = 0.0
+    for j in 0..<16:
+        let byte_val = int(w_packed[bb + 2 + j])
+        dot += x[xb + j] * ((int(w_packed[byte_val & 15]) - 128) as float32) + x[xb + 16 + j] * ((int(w_packed[(byte_val >> 4) & 15]) - 128) as float32)
+    w_d * dot
+
+float32 wdot_iq4xs_t([uint8]'global w_packed, [float32]'global x, int col, int row, int d_in, int n_units, int unit):
+    let blocks_per_row = (d_in >> 8)
+    let ib = (unit & 7)
+    let bb = 16 + (col * blocks_per_row + (unit >> 3)) * 136
+    let w_d = f16_bits_to_f32_fast(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
+    let sh = int(w_packed[bb + 2]) | (int(w_packed[bb + 3]) << 8)
+    let low = (int(w_packed[bb + 4 + (ib >> 1)]) >> (4 * (ib & 1))) & 15
+    let high = (sh >> (2 * ib)) & 3
+    let dl = w_d * (((low | (high << 4)) - 32) as float32)
+    let xb = row * d_in + unit * 32
+    var float32 dot = 0.0
+    for j in 0..<16:
+        let q = int(w_packed[bb + 8 + ib * 16 + j])
+        dot += x[xb + j] * ((int(w_packed[q & 15]) - 128) as float32) + x[xb + 16 + j] * ((int(w_packed[(q >> 4) & 15]) - 128) as float32)
+    dl * dot

@@ -41,9 +41,10 @@ def bench(int ty, int seq, int d_in, int d_out, int iters) throws:
     let x = values(seq * d_in, 1)
     let bias = values(d_out, 3)
     let w = fake_weights(ty, d_in * d_out)
+    let gty = gpu_weight_type(ty)
     set_gpu_batch_limit(8)
-    var a = linear_gpu(x, dequantize_gpu(w, ty, d_in * d_out), bias, seq, d_in, d_out)
-    var b = fused_linear_gpu(x, w, ty, bias, seq, d_in, d_out)
+    var a = linear_gpu(x, dequantize_gpu(w, gty, d_in * d_out), bias, seq, d_in, d_out)
+    var b = fused_linear_gpu(x, w, gty, bias, seq, d_in, d_out)
     let warm_a = download_floats_gpu(a, 1)
     let warm_b = download_floats_gpu(b, 1)
     var round = 0
@@ -51,14 +52,14 @@ def bench(int ty, int seq, int d_in, int d_out, int iters) throws:
         let t0 = Instant.now()
         var n = 0
         while n < iters:
-            a = linear_gpu(x, dequantize_gpu(w, ty, d_in * d_out), bias, seq, d_in, d_out)
+            a = linear_gpu(x, dequantize_gpu(w, gty, d_in * d_out), bias, seq, d_in, d_out)
             n += 1
         let sync_a = download_floats_gpu(a, 1)
         let ms_a = t0.elapsed().as_millis() as int
         let t1 = Instant.now()
         n = 0
         while n < iters:
-            b = fused_linear_gpu(x, w, ty, bias, seq, d_in, d_out)
+            b = fused_linear_gpu(x, w, gty, bias, seq, d_in, d_out)
             n += 1
         let sync_b = download_floats_gpu(b, 1)
         let ms_b = t1.elapsed().as_millis() as int
