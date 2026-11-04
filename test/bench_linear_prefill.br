@@ -1,0 +1,90 @@
+# Prefill-shape linear layer on an IQ-format weight matrix, the old route (dequantize to float32, then the
+# hand-written tiled kernel) against the current one (dequantize to binary16, then the compiler's native
+# f16 matrix kernel), timed one after the other in the same process so a loaded machine affects both alike.
+#
+#   boring build --target metal test/bench_linear_prefill.br
+#   cd test/bench_linear_prefill_metal && cargo build --release
+#   ./target/release/bench_linear_prefill [type=16] [seq=512] [d_in=1024] [d_out=4864] [iters=10]
+#   type: 16 IQ2_XXS, 17 IQ2_XS, 22 IQ2_S, 18 IQ3_XXS, 21 IQ3_S, 19 IQ1_S, 29 IQ1_M, 20 IQ4_NL, 23 IQ4_XS
+
+use io
+use gguf
+use quant
+use math
+use math_gpu
+use std.time.Instant
+
+[float32] values(int n, int salt):
+    mut [float32] out = [0.0 as float32 for i in 0..<n]
+    var int i = 0
+    while i < n:
+        out[i] = (((i * 17 + salt * 29) % 127) as float32) / 63.5 - 1.0
+        i += 1
+    out
+
+[uint8] fake_weights(int ty, int n_values) throws:
+    let bytes_per_block = quantized_row_bytes(ty, 256)
+    let n_blocks = n_values / 256
+    mut [uint8] w = []
+    var int b = 0
+    while b < n_blocks:
+        var int j = 0
+        while j < bytes_per_block:
+            # small positive f16 scales (0x2C00 ~ 0.0625) in the first bytes, varied payload after
+            let v = if j == 1 or j == 3: 44 else: ((j * 7 + b) % 251)
+            w.push(v as uint8)
+            j += 1
+        b += 1
+    with_iq_prefix(w, ty)
+
+def bench(int ty, int seq, int d_in, int d_out, int iters) throws:
+    let x = values(seq * d_in, 1)
+    let bias = values(d_out, 3)
+    let w = fake_weights(ty, d_in * d_out)
+    set_gpu_batch_limit(8)
+    var a = linear_gpu(x, dequantize_gpu(w, ty, d_in * d_out), bias, seq, d_in, d_out)
+    var b = fused_linear_gpu(x, w, ty, bias, seq, d_in, d_out)
+    let warm_a = download_floats_gpu(a, 1)
+    let warm_b = download_floats_gpu(b, 1)
+    var round = 0
+    while round < 2:
+        let t0 = Instant.now()
+        var n = 0
+        while n < iters:
+            a = linear_gpu(x, dequantize_gpu(w, ty, d_in * d_out), bias, seq, d_in, d_out)
+            n += 1
+        let sync_a = download_floats_gpu(a, 1)
+        let ms_a = t0.elapsed().as_millis() as int
+        let t1 = Instant.now()
+        n = 0
+        while n < iters:
+            b = fused_linear_gpu(x, w, ty, bias, seq, d_in, d_out)
+            n += 1
+        let sync_b = download_floats_gpu(b, 1)
+        let ms_b = t1.elapsed().as_millis() as int
+        print "type {ty} seq={seq} d_in={d_in} d_out={d_out}: float32+tiled {ms_a / iters} ms/call, f16+native {ms_b / iters} ms/call (first output {sync_a[0]} vs {sync_b[0]})"
+        round += 1
+
+def main() throws:
+    let [string] argv = args()
+    var int ty = 16
+    var int seq = 512
+    var int d_in = 1024
+    var int d_out = 4864
+    var int iters = 10
+    if argv.length > 1:
+        if let v = (argv[1] as int):
+            ty = v
+    if argv.length > 2:
+        if let v = (argv[2] as int):
+            seq = v
+    if argv.length > 3:
+        if let v = (argv[3] as int):
+            d_in = v
+    if argv.length > 4:
+        if let v = (argv[4] as int):
+            d_out = v
+    if argv.length > 5:
+        if let v = (argv[5] as int):
+            iters = v
+    bench(ty, seq, d_in, d_out, iters)

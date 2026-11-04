@@ -198,16 +198,9 @@ pub float32 f16_bits_to_f32_fast(int bits):
 # The 16-entry non-linear codebook of IQ4_NL / IQ4_XS (ggml's kvalues_iq4nl). A function rather than an
 # array so that GPU kernels can call it.
 pub int iq4nl_value(int nib):
-    if nib < 8:
-        if nib < 4:
-            if nib == 0: -127 elif nib == 1: -104 elif nib == 2: -83 else: -65
-        else:
-            if nib == 4: -49 elif nib == 5: -35 elif nib == 6: -22 else: -10
-    else:
-        if nib < 12:
-            if nib == 8: 1 elif nib == 9: 13 elif nib == 10: 25 else: 38
-        else:
-            if nib == 12: 53 elif nib == 13: 69 elif nib == 14: 89 else: 113
+    # the 16 values, biased by +128, packed four to a 32-bit word: no data-dependent branches
+    let w = if (nib >> 2) == 0: 1059919873 elif (nib >> 2) == 1: 1986682191 elif (nib >> 2) == 2: 2795081089 else: 4057580981
+    ((w >> ((nib & 3) * 8)) & 255) - 128
 
 # bfloat16 is the top 16 bits of a float32: 1 sign, 8 exponent, 7 fraction bits.
 pub float32 bf16_bits_to_f32(int bits):

@@ -20,17 +20,17 @@ def main() throws:
     if argv.length > 3:
         if let v = (argv[3] as int):
             iters = v
-    let is_iq = fmt.startsWith("iq")
-    let wide = fmt == "q5_k" or is_iq
+    let is_iq = fmt.startsWith("iq") and fmt != "iq4_nl" and fmt != "iq4_xs"
+    let wide = fmt == "q5_k" or is_iq or fmt == "iq4_xs"
     let d_model = if wide: 1024 else: 896
     let d_ffn = if wide: 5120 else: 4864
     let d_in = if shape == "down": d_ffn else: d_model
     let d_out = if shape == "gate": d_ffn else: d_model
 
     # (type id, bytes per block, elements per block)
-    let ty = if fmt == "q8": 8 elif fmt == "q4_0": 2 elif fmt == "q5_0": 6 elif fmt == "q5_1": 7 elif fmt == "q4_1": 3 elif fmt == "q5_k": 13 elif fmt == "iq2_xxs": 16 elif fmt == "iq2_xs": 17 elif fmt == "iq3_xxs": 18 elif fmt == "iq1_s": 19 elif fmt == "iq3_s": 21 elif fmt == "iq2_s": 22 elif fmt == "iq1_m": 29 else: 1
-    let blk_bytes = if fmt == "q8": 34 elif fmt == "q4_0": 18 elif fmt == "q5_0": 22 elif fmt == "q5_1": 24 elif fmt == "q4_1": 20 elif fmt == "q5_k": 176 elif is_iq: quantized_row_bytes(ty, 256) else: 2
-    let blk_elems = if fmt == "q5_k" or is_iq: 256 elif fmt == "f16": 1 else: 32
+    let ty = if fmt == "q8": 8 elif fmt == "q4_0": 2 elif fmt == "q5_0": 6 elif fmt == "q5_1": 7 elif fmt == "q4_1": 3 elif fmt == "q5_k": 13 elif fmt == "iq2_xxs": 16 elif fmt == "iq2_xs": 17 elif fmt == "iq3_xxs": 18 elif fmt == "iq1_s": 19 elif fmt == "iq3_s": 21 elif fmt == "iq2_s": 22 elif fmt == "iq1_m": 29 elif fmt == "iq4_nl": 20 elif fmt == "iq4_xs": 23 else: 1
+    let blk_bytes = if fmt == "q8": 34 elif fmt == "q4_0": 18 elif fmt == "q5_0": 22 elif fmt == "q5_1": 24 elif fmt == "q4_1": 20 elif fmt == "q5_k": 176 elif is_iq or fmt == "iq4_xs": quantized_row_bytes(ty, 256) elif fmt == "iq4_nl": 18 else: 2
+    let blk_elems = if fmt == "q5_k" or is_iq or fmt == "iq4_xs": 256 elif fmt == "f16": 1 else: 32
     guard d_in % blk_elems == 0 else throw "{fmt}: d_in {d_in} is not a multiple of {blk_elems}"
     let n_blocks = (d_out * d_in) / blk_elems
 

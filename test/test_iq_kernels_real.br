@@ -18,6 +18,38 @@ use math_gpu
 [float32] passthrough([float32] x):
     x
 
+# half_bits_of (the GPU float32 -> binary16 conversion) probed through a one-thread-per-value kernel
+pub req [float32]'kernel'unified half_bits_probe_gpu([float32]'kernel'global x) throws:
+    let int n = x.length
+    let int blocks = (n + 255) / 256
+    kernel(block = 256, grid = blocks):
+        mut [float32]'unified out = [0.0 as float32 for ..<n]
+        let i = .thread.x + .block.x * .block_dim.x
+        if i < n:
+            out[i] = half_bits_of(x[i]) as float32
+        out
+
+def check_half_bits() throws:
+    let tin = fs.readBytes("test/fixtures/quant-tof16.in.f32")
+    let tout = fs.readBytes("test/fixtures/quant-tof16.out.u16")
+    let n = tin.length / 4
+    mut [float32] xs = []
+    var int i = 0
+    while i < n:
+        xs.push(read_f32_le(tin, i * 4) as float32)
+        i += 1
+    let got_raw = half_bits_probe_gpu(xs)
+    let got = passthrough(got_raw)
+    i = 0
+    while i < n:
+        let want = read_u16_le(tout, i * 2)
+        assert((got[i] as int) == want, "half_bits_of({xs[i]}): GPU {got[i]}, numpy {want}")
+        i += 1
+    print "half_bits_of: OK ({n} values identical to numpy)"
+
+float32 f16_round(float32 v):
+    f16_bits_to_f32(f32_to_f16_bits(v))
+
 def assert_rel(float32 got, float32 want, float32 scale, string msg):
     let diff = if got > want: got - want else: want - got
     assert(diff <= scale * 0.0002, "{msg}: expected ~{want}, got {got}")
@@ -49,7 +81,13 @@ def check_format(string name, int ggml_type) throws:
                 x[k] = (((k * 7 + 3) % 17) as float32) * (0.1 as float32) - 0.8
                 k += 1
             let zero_bias = [0.0 for r in 0..<d_out]
-            let want = linear_bias(x, cpu_w, zero_bias, seq, d_in, d_out)
+            # a chunked prefill (>= 16 rows) multiplies binary16-rounded weights
+            mut [float32] w_used = [0.0 for r in 0..<n]
+            var int wi = 0
+            while wi < n:
+                w_used[wi] = if seq >= 16: f16_round(cpu_w[wi]) else: cpu_w[wi]
+                wi += 1
+            let want = linear_bias(x, w_used, zero_bias, seq, d_in, d_out)
             let got_raw = fused_linear_nobias_gpu(x, prefixed, ggml_type, seq, d_in, d_out)
             let got = passthrough(got_raw)
             var float32 scale = 0.0001
@@ -65,6 +103,7 @@ def check_format(string name, int ggml_type) throws:
     print "{name}: OK (dequantize bit-exact; warp, tiled and dequantize-then-matmul linear layers match the CPU)"
 
 def main() throws:
+    check_half_bits()
     check_format("iq2_xxs", 16)
     check_format("iq2_xs", 17)
     check_format("iq2_s", 22)

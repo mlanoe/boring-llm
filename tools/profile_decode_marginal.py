@@ -91,6 +91,7 @@ def main():
     ap.add_argument("--port", type=int, default=8790)
     ap.add_argument("--stages", default=",".join(STAGES), help="comma-separated subset including baseline")
     ap.add_argument("--max-load", type=float, default=4.0)
+    ap.add_argument("--ours-arg", action="append", default=[], help="extra argument for boring-llm (repeatable), e.g. --ours-arg=-ctk --ours-arg=q8_0")
     ap.add_argument("--paired-baseline", action="store_true",
                     help="measure an adjacent baseline for every stage (better under drifting load)")
     ap.add_argument("--json")
@@ -128,7 +129,7 @@ def main():
         if current_load > args.max_load:
             raise RuntimeError(
                 f"load average rose to {current_load:.1f} (> {args.max_load}) during the run")
-        ours_arg = [] if stage == "baseline" else ["--decode-profile-stage", stage]
+        ours_arg = list(args.ours_arg) + ([] if stage == "baseline" else ["--decode-profile-stage", stage])
         server_args = SimpleNamespace(**common, ours_arg=ours_arg)
         engine = bench.Ours(server_args)
         try:

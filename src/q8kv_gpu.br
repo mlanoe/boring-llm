@@ -123,6 +123,8 @@ pub req [float32]'kernel'unified q8kv_dequantize_gpu([uint8]'kernel'global qs,
 # Single-query grouped attention over a quantized main cache and a short
 # float32 tail; same structure and head-width limits as
 # FlashDecodeTailF16Kernel.
+# Block indices below use `>> 5`, not `/ 32`: `int` is 64 bits wide and a signed 64-bit division
+# is emulated on the GPU; the shift halved the attention time on a 3500-token context.
 kernel FlashDecodeTailQ8Kernel:
     let [float32]'global q
     let [uint8]'global kq
@@ -191,7 +193,7 @@ kernel FlashDecodeTailQ8Kernel:
                 if jg < main_len:
                     let base_k = jg * d_kv + k_off
                     for blk in 0..<(d_head / 32):
-                        let sck = ks[(base_k + blk * 32) / 32] as float32
+                        let sck = ks[(base_k + blk * 32) >> 5] as float32
                         var float32 bdot = 0.0
                         for d in 0..<32:
                             var int bk = int(kq[base_k + blk * 32 + d])
@@ -228,7 +230,7 @@ kernel FlashDecodeTailQ8Kernel:
                         var int bv = int(vq[vi])
                         if bv > 127:
                             bv = bv - 256
-                        nacc += pj * (bv as float32) * (vs[vi / 32] as float32)
+                        nacc += pj * (bv as float32) * (vs[vi >> 5] as float32)
                     else:
                         nacc += pj * tv[(j0 + j - main_len) * d_kv + k_off + t]
             l = l * alpha + psum

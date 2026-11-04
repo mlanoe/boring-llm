@@ -1,0 +1,68 @@
+# Resident single-query attention benchmark for the f16 and q8_0 KV caches (Qwen2.5-0.5B shapes:
+# 14 query heads, 2 KV heads, head size 64): inputs built once, N launches queued eight per command
+# buffer, only the last output read back. Time one run with the shell's `time`, minus a 1-iteration run.
+#
+#   boring build --target metal test/bench_kv_attention.br
+#   cd test/bench_kv_attention_metal && cargo build --release
+#   time ./target/release/bench_kv_attention <f16|q8> [context=3500] [iters=3000]
+
+use io
+use gguf
+use quant
+use math
+use float16_gpu
+use q8kv_gpu
+use math_gpu
+
+[float32] values(int n, int salt):
+    mut [float32] out = [0.0 as float32 for i in 0..<n]
+    var int i = 0
+    while i < n:
+        out[i] = (((i * 17 + salt * 29) % 127) as float32) / 63.5 - 1.0
+        i += 1
+    out
+
+def bench(int mode, int ctx, int iters) throws:
+    let n_head = 14
+    let n_kv_head = 2
+    let d_head = 64
+    let d_kv = n_kv_head * d_head
+    let tail_len = 3
+    let main_len = ctx - tail_len
+    let q = values(n_head * d_head, 1)
+    let tk = values(tail_len * d_kv, 4)
+    let tv = values(tail_len * d_kv, 5)
+    let k_host = values(main_len * d_kv, 2)
+    let v_host = values(main_len * d_kv, 3)
+    let kh = pack_float16_gpu(k_host)
+    let vh = pack_float16_gpu(v_host)
+    let ks = q8kv_scales_gpu(k_host)
+    let kq = q8kv_quantize_gpu(k_host, ks)
+    let vs = q8kv_scales_gpu(v_host)
+    let vq = q8kv_quantize_gpu(v_host, vs)
+    set_gpu_batch_limit(8)
+    var out = attention_gqa_tail_f16_gpu(q, kh, vh, tk, tv, main_len, ctx, n_head, n_kv_head, d_head)
+    var n = 0
+    while n < iters:
+        if mode == 1:
+            out = attention_gqa_tail_f16_gpu(q, kh, vh, tk, tv, main_len, ctx, n_head, n_kv_head, d_head)
+        else:
+            out = attention_gqa_tail_q8_gpu(q, kq, ks, vq, vs, tk, tv, main_len, ctx, n_head, n_kv_head, d_head)
+        n += 1
+    let host = download_floats_gpu(out, n_head * d_head)
+    print "mode {mode} ctx={ctx}: out[0]={host[0]}"
+
+def main() throws:
+    let [string] argv = args()
+    guard argv.length > 1 else throw "usage: bench_kv_attention <f16|q8> [context] [iters]"
+    let mode = argv[1]
+    var int ctx = 3500
+    var int iters = 3000
+    if argv.length > 2:
+        if let v = (argv[2] as int):
+            ctx = v
+    if argv.length > 3:
+        if let v = (argv[3] as int):
+            iters = v
+    let code = if mode == "f16": 1 else: 2
+    bench(code, ctx, iters)

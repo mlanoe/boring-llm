@@ -388,8 +388,8 @@ float32 wdec_q8([uint8]'global w_packed, int flat_idx):
     # logical weight matrix directly from the packed Q8_0
     # bytes — col*d_in+w_row is the same flat index the F32
     # case would use, just block-quantized in place.
-    let block_idx = flat_idx / 32
-    let offset_in_block = flat_idx % 32
+    let block_idx = (flat_idx >> 5)
+    let offset_in_block = (flat_idx & 31)
     let block_byte = block_idx * 34
     let scale_bits = int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8)
     let w_scale = f16_bits_to_f32(scale_bits)
@@ -407,8 +407,8 @@ float32 wdec_q8([uint8]'global w_packed, int flat_idx):
 # high-bit field + 16 bytes `qs` 4-bit-nibble low bits, 22 bytes/block,
 # QK5_0=32 — mirrors quant.br's CPU dequantize_q5_0 element-for-element).
 float32 wdec_q5([uint8]'global w_packed, int flat_idx):
-    let block_idx = flat_idx / 32
-    let offset_in_block = flat_idx % 32
+    let block_idx = (flat_idx >> 5)
+    let offset_in_block = (flat_idx & 31)
     let block_byte = block_idx * 22
     let scale_bits = int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8)
     let w_scale = f16_bits_to_f32(scale_bits)
@@ -435,14 +435,14 @@ float32 wdec_q5([uint8]'global w_packed, int flat_idx):
 # walks every element of a superblock in its own nested-loop order. Both
 # must agree element-for-element (verified in test/test_math_gpu_real.br).
 float32 wdec_q6k([uint8]'global w_packed, int flat_idx):
-    let sb = flat_idx / 256
-    let pos = flat_idx % 256
+    let sb = (flat_idx >> 8)
+    let pos = (flat_idx & 255)
     let sb_start = sb * 210
-    let n_iter = pos / 128
-    let pos_in_iter = pos % 128
-    let which4 = pos_in_iter / 32
-    let l = pos_in_iter % 32
-    let is0 = l / 16
+    let n_iter = (pos >> 7)
+    let pos_in_iter = (pos & 127)
+    let which4 = (pos_in_iter >> 5)
+    let l = (pos_in_iter & 31)
+    let is0 = (l >> 4)
 
     let ql_base = sb_start + n_iter * 64
     let qh_base = sb_start + 128 + n_iter * 32
@@ -490,13 +490,13 @@ float32 wdec_q6k([uint8]'global w_packed, int flat_idx):
 # `get_scale_min_k4` bit-for-bit for a single arbitrary sub-block index
 # `j` (0..7).
 float32 wdec_q4k([uint8]'global w_packed, int flat_idx):
-    let sb = flat_idx / 256
-    let pos = flat_idx % 256
+    let sb = (flat_idx >> 8)
+    let pos = (flat_idx & 255)
     let sb_start = sb * 144
-    let chunk = pos / 64
-    let pos_in_chunk = pos % 64
-    let half = pos_in_chunk / 32
-    let l = pos_in_chunk % 32
+    let chunk = (pos >> 6)
+    let pos_in_chunk = (pos & 63)
+    let half = (pos_in_chunk >> 5)
+    let l = (pos_in_chunk & 31)
     let j = chunk * 2 + half
 
     let d_bits = int(w_packed[sb_start]) | (int(w_packed[sb_start + 1]) << 8)
@@ -534,8 +534,8 @@ float32 wdec_q4k([uint8]'global w_packed, int flat_idx):
 # of the fused kernels here, same shape as Q5LinearKernel's own but with no
 # `qh` high-bit field to unpack.
 float32 wdec_q4([uint8]'global w_packed, int flat_idx):
-    let block_idx = flat_idx / 32
-    let offset_in_block = flat_idx % 32
+    let block_idx = (flat_idx >> 5)
+    let offset_in_block = (flat_idx & 31)
     let block_byte = block_idx * 18
     let scale_bits = int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8)
     let w_scale = f16_bits_to_f32(scale_bits)
@@ -560,18 +560,18 @@ float32 wdec_q4([uint8]'global w_packed, int flat_idx):
 # own nested-loop order (2 halves × 4 sub-block-pairs × 16 elements); both
 # must agree element-for-element (verified in test/test_math_gpu_real.br).
 float32 wdec_q2k([uint8]'global w_packed, int flat_idx):
-    let sb = flat_idx / 256
-    let pos = flat_idx % 256
+    let sb = (flat_idx >> 8)
+    let pos = (flat_idx & 255)
     let sb_start = sb * 84
     # (outer, j, sub, l) is the inverse of the CPU loop's
     # half/j/sub0-or-sub1/l nesting: pos == outer*128 + j*32 +
     # sub*16 + l.
-    let outer = pos / 128
-    let rem = pos % 128
-    let j = rem / 32
-    let l32 = rem % 32
-    let sub = l32 / 16
-    let l = l32 % 16
+    let outer = (pos >> 7)
+    let rem = (pos & 127)
+    let j = (rem >> 5)
+    let l32 = (rem & 31)
+    let sub = (l32 >> 4)
+    let l = (l32 & 15)
 
     let scales_base = sb_start
     let qs_base = sb_start + 16
@@ -608,15 +608,15 @@ float32 wdec_q2k([uint8]'global w_packed, int flat_idx):
 # element-for-element against quant.br's CPU dequantize_q3_k in
 # test/test_math_gpu_real.br.
 float32 wdec_q3k([uint8]'global w_packed, int flat_idx):
-    let sb = flat_idx / 256
-    let pos = flat_idx % 256
+    let sb = (flat_idx >> 8)
+    let pos = (flat_idx & 255)
     let sb_start = sb * 110
-    let outer = pos / 128
-    let rem = pos % 128
-    let j = rem / 32
-    let l32 = rem % 32
-    let sub = l32 / 16
-    let l = l32 % 16
+    let outer = (pos >> 7)
+    let rem = (pos & 127)
+    let j = (rem >> 5)
+    let l32 = (rem & 31)
+    let sub = (l32 >> 4)
+    let l = (l32 & 15)
 
     let hmask_base = sb_start
     let qs_base = sb_start + 32
@@ -643,8 +643,8 @@ float32 wdec_q3k([uint8]'global w_packed, int flat_idx):
     let kmask2 = 0x0f0f0f0f
 
     let scale_idx = outer * 8 + j * 2 + sub
-    let sw = scale_idx / 4
-    let sbp = scale_idx % 4
+    let sw = (scale_idx >> 2)
+    let sbp = (scale_idx & 3)
     let word = if sw == 0:
         (aux0_in & kmask2) | (((tmp >> 0) & kmask1) << 4)
     elif sw == 1:
@@ -690,8 +690,8 @@ float32 wdec_q3k([uint8]'global w_packed, int flat_idx):
 # values (ggml's own `kvalues_iq4nl` table) instead of computing
 # `nibble - 8`. The table lookup is `iq4nl_value` (io.br), shared with the CPU path.
 float32 wdec_q4nl([uint8]'global w_packed, int flat_idx):
-    let block_idx = flat_idx / 32
-    let offset_in_block = flat_idx % 32
+    let block_idx = (flat_idx >> 5)
+    let offset_in_block = (flat_idx & 31)
     let block_byte = block_idx * 18
     let scale_bits = int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8)
     let w_scale = f16_bits_to_f32(scale_bits)
@@ -702,8 +702,8 @@ float32 wdec_q4nl([uint8]'global w_packed, int flat_idx):
     (iq4nl_value(nib) as float32) * w_scale
 
 float32 wdec_q41([uint8]'global w_packed, int flat_idx):
-    let block_byte = (flat_idx / 32) * 20
-    let off = flat_idx % 32
+    let block_byte = ((flat_idx >> 5)) * 20
+    let off = (flat_idx & 31)
     let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
     let w_m = f16_bits_to_f32_fast(int(w_packed[block_byte + 2]) | (int(w_packed[block_byte + 3]) << 8))
     let j = if off < 16: off else: off - 16
@@ -713,8 +713,8 @@ float32 wdec_q41([uint8]'global w_packed, int flat_idx):
     wv
 
 float32 wdec_q51([uint8]'global w_packed, int flat_idx):
-    let block_byte = (flat_idx / 32) * 24
-    let off = flat_idx % 32
+    let block_byte = ((flat_idx >> 5)) * 24
+    let off = (flat_idx & 31)
     let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
     let w_m = f16_bits_to_f32_fast(int(w_packed[block_byte + 2]) | (int(w_packed[block_byte + 3]) << 8))
     let qh = int(w_packed[block_byte + 4]) | (int(w_packed[block_byte + 5]) << 8) | (int(w_packed[block_byte + 6]) << 16) | (int(w_packed[block_byte + 7]) << 24)
@@ -726,14 +726,14 @@ float32 wdec_q51([uint8]'global w_packed, int flat_idx):
     wv
 
 float32 wdec_q5k([uint8]'global w_packed, int flat_idx):
-    let block_byte = (flat_idx / 256) * 176
-    let off = flat_idx % 256
+    let block_byte = ((flat_idx >> 8)) * 176
+    let off = (flat_idx & 255)
     let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
     let w_dmin = f16_bits_to_f32_fast(int(w_packed[block_byte + 2]) | (int(w_packed[block_byte + 3]) << 8))
-    let chunk = off / 64
-    let within = off % 64
+    let chunk = (off >> 6)
+    let within = (off & 63)
     let high_half = if within >= 32: 1 else: 0
-    let l = within % 32
+    let l = (within & 31)
     let sub = chunk * 2 + high_half
     let sc_base = block_byte + 4
     var int sc = 0
@@ -759,19 +759,25 @@ float32 wdec_bf16([uint8]'global w_packed, int flat_idx):
     wv
 
 float32 wdec_iq4xs([uint8]'global w_packed, int flat_idx):
-    let block_byte = (flat_idx / 256) * 136
-    let off = flat_idx % 256
-    let ib = off / 32
-    let within = off % 32
+    let block_byte = ((flat_idx >> 8)) * 136
+    let off = (flat_idx & 255)
+    let ib = (off >> 5)
+    let within = (off & 31)
     let w_d = f16_bits_to_f32_fast(int(w_packed[block_byte]) | (int(w_packed[block_byte + 1]) << 8))
     let sh = int(w_packed[block_byte + 2]) | (int(w_packed[block_byte + 3]) << 8)
-    let low = (int(w_packed[block_byte + 4 + ib / 2]) >> (4 * (ib % 2))) & 0xF
+    let low = (int(w_packed[block_byte + 4 + (ib >> 1)]) >> (4 * ((ib & 1)))) & 0xF
     let high = (sh >> (2 * ib)) & 3
     let dl = w_d * (((low | (high << 4)) - 32) as float32)
-    let q = int(w_packed[block_byte + 8 + ib * 16 + (within % 16)])
+    let q = int(w_packed[block_byte + 8 + ib * 16 + ((within & 15))])
     let nib = if within < 16: q & 0xF else: (q >> 4) & 0xF
     let wv = dl * (iq4nl_value(nib) as float32)
     wv
+
+# Formats whose chunked prefill decodes the matrix to binary16 and uses the native f16 kernel: the
+# IQ1-IQ3 family and the two IQ4 codebook formats (the others have a native schedule of their own, or
+# keep the float32 route).
+bool prefill_via_f16(int t):
+    is_iq_grid_type(t) or t == 20 or t == 23
 
 # The IQ1/IQ2/IQ3 formats: their weight buffers start with lookup tables (see iq_decode.br).
 bool is_iq_grid_type(int t):
@@ -1208,11 +1214,11 @@ float32 wdot_q51([uint8]'global w_packed, [float32]'global x, int col, int row, 
 
 float32 wdot_q5k([uint8]'global w_packed, [float32]'global x, int col, int row, int d_in, int n_units, int unit):
     # one lane per 32-element sub-block of a 256-element superblock
-    let blocks_per_row = d_in / 256
-    let sblock = unit / 8
-    let sub = unit % 8
-    let chunk = sub / 2
-    let high_half = sub % 2
+    let blocks_per_row = (d_in >> 8)
+    let sblock = (unit >> 3)
+    let sub = (unit & 7)
+    let chunk = (sub >> 1)
+    let high_half = (sub & 1)
     let bb = (col * blocks_per_row + sblock) * 176
     let w_d = f16_bits_to_f32_fast(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
     let w_dmin = f16_bits_to_f32_fast(int(w_packed[bb + 2]) | (int(w_packed[bb + 3]) << 8))
@@ -1283,12 +1289,12 @@ float32 wdot_iq4nlu([uint8]'global w_packed, [float32]'global x, int col, int ro
 
 float32 wdot_iq4xs([uint8]'global w_packed, [float32]'global x, int col, int row, int d_in, int n_units, int unit):
     # one lane per 32-element sub-block of a 256-element superblock
-    let blocks_per_row = d_in / 256
-    let ib = unit % 8
-    let bb = (col * blocks_per_row + unit / 8) * 136
+    let blocks_per_row = (d_in >> 8)
+    let ib = (unit & 7)
+    let bb = (col * blocks_per_row + (unit >> 3)) * 136
     let w_d = f16_bits_to_f32_fast(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
     let sh = int(w_packed[bb + 2]) | (int(w_packed[bb + 3]) << 8)
-    let low = (int(w_packed[bb + 4 + ib / 2]) >> (4 * (ib % 2))) & 0xF
+    let low = (int(w_packed[bb + 4 + (ib >> 1)]) >> (4 * ((ib & 1)))) & 0xF
     let high = (sh >> (2 * ib)) & 3
     let dl = w_d * (((low | (high << 4)) - 32) as float32)
     let xb = row * d_in + unit * 32
@@ -1477,6 +1483,89 @@ pub req [float32]'kernel'unified dequantize_gpu([uint8]'kernel'global w_packed, 
     else:
         throw "dequantize_gpu: unsupported ggml type id {fmt}"
 
+# The IEEE binary16 bit pattern nearest to `v` (ties to even, overflow to infinity), by arithmetic
+# only (no bit casts in kernels): the exponent is found by a binary search over exact powers of two,
+# every scaling below is by a power of two and therefore exact, and the one rounding is done by hand.
+# Agrees with numpy's float16 cast on test/fixtures/quant-tof16.* (see test_iq_kernels_real.br).
+pub int half_bits_of(float32 v):
+    let neg = v < 0.0
+    let a = if neg: 0.0 - v else: v
+    let sign = if neg: 32768 else: 0
+    var int result = sign
+    if a >= 65520.0:
+        result = sign | 31744
+    elif a >= 6.103515625e-05:
+        var int e = -14
+        var float32 p = 6.103515625e-05
+        if p * 65536.0 <= a:
+            p = p * 65536.0
+            e += 16
+        if p * 256.0 <= a:
+            p = p * 256.0
+            e += 8
+        if p * 16.0 <= a:
+            p = p * 16.0
+            e += 4
+        if p * 4.0 <= a:
+            p = p * 4.0
+            e += 2
+        if p * 2.0 <= a:
+            p = p * 2.0
+            e += 1
+        let mant = ((a / p) - 1.0) * 1024.0
+        let f = mant.floor()
+        let d = mant - f
+        var int m = f as int
+        if d > 0.5 or (d == 0.5 and (m & 1) == 1):
+            m += 1
+        var int ex = e + 15
+        if m == 1024:
+            m = 0
+            ex += 1
+        result = sign | (ex << 10) | m
+    elif a > 2.9802322387695312e-08:
+        # subnormal: a multiple of 2^-24 (a quotient of 1024 is the smallest normal, bit-exact)
+        let scaled = a * 16777216.0
+        let f = scaled.floor()
+        let d = scaled - f
+        var int q = f as int
+        if d > 0.5 or (d == 0.5 and (q & 1) == 1):
+            q += 1
+        result = sign | q
+    result
+
+# Dequantization into binary16 bytes (two per value, little endian: the layout of the `f16` tensor
+# format), for the formats whose prefill runs on the compiler's native f16 kernel.
+kernel DequantF16Kernel<int FMT>:
+    let [uint8]'global    w_packed
+    mut [uint8]'unified   out
+    let int               n
+
+    init([uint8]'global wi, int count):
+        w_packed = wi
+        n        = count
+        out      = [0 as uint8 for ..<count * 2]
+
+    def ():
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let flat_idx = .thread.x + block_idx * .block_dim.x
+        if flat_idx < n:
+            let bits = half_bits_of(weight_at(w_packed, FMT, flat_idx))
+            out[flat_idx * 2] = (bits & 255) as uint8
+            out[flat_idx * 2 + 1] = (bits >> 8) as uint8
+
+pub req [uint8]'kernel'unified dequantize_f16_gpu([uint8]'kernel'global w_packed, int fmt, int n) throws:
+    let int blocks = (n + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    dispatch fmt in [20, 23, 16, 17, 22, 18, 21, 19, 29]:
+        mut k = DequantF16Kernel<fmt>(w_packed, n)
+        kernel:
+            k(block = 256, grid = (gx, gy))
+        return k.out
+    else:
+        throw "dequantize_f16_gpu: unsupported ggml type id {fmt}"
+
 # IQ4_XS and IQ4_NL (codebook formats): same kernel shapes as the Q4_x / Q5_x ones above.
 
 # `linear_gpu` over a freshly dequantized weight matrix, for prompts of at least this many rows.
@@ -1495,6 +1584,10 @@ pub req [float32]'kernel'unified fused_linear_gpu([float32]'kernel'global x, [ui
         q8_linear_warp_broadcast_gpu(x, w_packed, bv, seq, d_in, d_out)
     elif seq == 1 and has_warp:
         warp_linear_gpu(x, w_packed, w_type, bv, seq, d_in, d_out)
+    elif seq >= DEQUANT_PREFILL_MIN_ROWS and has_warp and prefill_via_f16(w_type):
+        # decode once to binary16 bytes, then the compiler's native f16 matrix kernel
+        let w_f16 = dequantize_f16_gpu(w_packed, w_type, d_out * d_in)
+        tensor_linear_schedule_gpu(x, w_f16, 1, bv, seq, d_in, d_out)
     elif seq >= DEQUANT_PREFILL_MIN_ROWS and has_warp:
         let [float32]'kernel'unified w_f32 = dequantize_gpu(w_packed, w_type, d_out * d_in)
         linear_gpu(x, w_f32, bv, seq, d_in, d_out)

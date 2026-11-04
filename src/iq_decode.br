@@ -27,11 +27,11 @@ float32 iq_sign(int sign_byte, int j):
         1.0 as float32
 
 float32 wdec_iq2xxs([uint8]'global w_packed, int flat_idx):
-    let base = 2176 + (flat_idx / 256) * 66
-    let off = flat_idx % 256
-    let ib = off / 32
-    let l = (off % 32) / 8
-    let j = off % 8
+    let base = 2176 + ((flat_idx >> 8)) * 66
+    let off = (flat_idx & 255)
+    let ib = (off >> 5)
+    let l = (((off & 31)) >> 3)
+    let j = (off & 7)
     let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
     let qp = base + 2 + ib * 8
     let aux0 = int(w_packed[qp]) | (int(w_packed[qp + 1]) << 8) | (int(w_packed[qp + 2]) << 16) | (int(w_packed[qp + 3]) << 24)
@@ -43,68 +43,68 @@ float32 wdec_iq2xxs([uint8]'global w_packed, int flat_idx):
     (db * g) * iq_sign(sb, j)
 
 float32 wdec_iq2xs([uint8]'global w_packed, int flat_idx):
-    let base = 4224 + (flat_idx / 256) * 74
-    let off = flat_idx % 256
-    let g = off / 8
-    let j = off % 8
+    let base = 4224 + ((flat_idx >> 8)) * 74
+    let off = (flat_idx & 255)
+    let g = (off >> 3)
+    let j = (off & 7)
     let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
     let q = int(w_packed[base + 2 + g * 2]) | (int(w_packed[base + 3 + g * 2]) << 8)
-    let s = (int(w_packed[base + 66 + g / 4]) >> (4 * ((g / 2) % 2))) & 15
+    let s = (int(w_packed[base + 66 + (g >> 2)]) >> (4 * (((g >> 1) & 1)))) & 15
     let db = (d * ((0.5 as float32) + (s as float32))) * (0.25 as float32)
     let sb = int(w_packed[4096 + (q >> 9)])
     let gv = int(w_packed[(q & 511) * 8 + j]) as float32
     (db * gv) * iq_sign(sb, j)
 
 float32 wdec_iq2s([uint8]'global w_packed, int flat_idx):
-    let base = 8192 + (flat_idx / 256) * 82
-    let off = flat_idx % 256
-    let g = off / 8
-    let j = off % 8
+    let base = 8192 + ((flat_idx >> 8)) * 82
+    let off = (flat_idx & 255)
+    let g = (off >> 3)
+    let j = (off & 7)
     let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
-    let high = (int(w_packed[base + 66 + g / 4]) >> (2 * (g % 4))) & 3
+    let high = (int(w_packed[base + 66 + (g >> 2)]) >> (2 * ((g & 3)))) & 3
     let gi = int(w_packed[base + 2 + g]) | (high << 8)
     let sb = int(w_packed[base + 34 + g])
-    let s = (int(w_packed[base + 74 + g / 4]) >> (4 * ((g / 2) % 2))) & 15
+    let s = (int(w_packed[base + 74 + (g >> 2)]) >> (4 * (((g >> 1) & 1)))) & 15
     let db = (d * ((0.5 as float32) + (s as float32))) * (0.25 as float32)
     let gv = int(w_packed[gi * 8 + j]) as float32
     (db * gv) * iq_sign(sb, j)
 
 float32 wdec_iq3xxs([uint8]'global w_packed, int flat_idx):
-    let base = 1152 + (flat_idx / 256) * 98
-    let off = flat_idx % 256
-    let ib = off / 32
-    let l = (off % 32) / 8
-    let j8 = off % 8
+    let base = 1152 + ((flat_idx >> 8)) * 98
+    let off = (flat_idx & 255)
+    let ib = (off >> 5)
+    let l = (((off & 31)) >> 3)
+    let j8 = (off & 7)
     let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
     let sp = base + 66 + ib * 4
     let aux = int(w_packed[sp]) | (int(w_packed[sp + 1]) << 8) | (int(w_packed[sp + 2]) << 16) | (int(w_packed[sp + 3]) << 24)
     let db = (d * ((0.5 as float32) + ((aux >> 28) as float32))) * (0.5 as float32)
     let sb = int(w_packed[1024 + ((aux >> (7 * l)) & 127)])
-    let entry = int(w_packed[base + 2 + ib * 8 + 2 * l + j8 / 4])
-    let v = int(w_packed[entry * 4 + (j8 % 4)]) as float32
+    let entry = int(w_packed[base + 2 + ib * 8 + 2 * l + (j8 >> 2)])
+    let v = int(w_packed[entry * 4 + ((j8 & 3))]) as float32
     (db * v) * iq_sign(sb, j8)
 
 float32 wdec_iq3s([uint8]'global w_packed, int flat_idx):
-    let base = 2048 + (flat_idx / 256) * 110
-    let off = flat_idx % 256
-    let gg = off / 8
-    let j8 = off % 8
-    let e = gg * 2 + j8 / 4
+    let base = 2048 + ((flat_idx >> 8)) * 110
+    let off = (flat_idx & 255)
+    let gg = (off >> 3)
+    let j8 = (off & 7)
+    let e = gg * 2 + (j8 >> 2)
     let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
-    let s = (int(w_packed[base + 106 + gg / 8]) >> (4 * ((gg / 4) % 2))) & 15
+    let s = (int(w_packed[base + 106 + (gg >> 3)]) >> (4 * (((gg >> 2) & 1)))) & 15
     let db = d * ((1 + 2 * s) as float32)
     let sb = int(w_packed[base + 74 + gg])
-    let high = (int(w_packed[base + 66 + e / 8]) >> (e % 8)) & 1
+    let high = (int(w_packed[base + 66 + (e >> 3)]) >> ((e & 7))) & 1
     let gi = int(w_packed[base + 2 + e]) | (high << 8)
-    let v = int(w_packed[gi * 4 + (j8 % 4)]) as float32
+    let v = int(w_packed[gi * 4 + ((j8 & 3))]) as float32
     (db * v) * iq_sign(sb, j8)
 
 float32 wdec_iq1s([uint8]'global w_packed, int flat_idx):
-    let base = 16384 + (flat_idx / 256) * 50
-    let off = flat_idx % 256
-    let ib = off / 32
-    let l = (off % 32) / 8
-    let j = off % 8
+    let base = 16384 + ((flat_idx >> 8)) * 50
+    let off = (flat_idx & 255)
+    let ib = (off >> 5)
+    let l = (((off & 31)) >> 3)
+    let j = (off & 7)
     let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
     let qh = int(w_packed[base + 34 + ib * 2]) | (int(w_packed[base + 35 + ib * 2]) << 8)
     let dl = d * ((2 * ((qh >> 12) & 7) + 1) as float32)
@@ -114,20 +114,20 @@ float32 wdec_iq1s([uint8]'global w_packed, int flat_idx):
     dl * (v + delta)
 
 float32 wdec_iq1m([uint8]'global w_packed, int flat_idx):
-    let base = 16384 + (flat_idx / 256) * 56
-    let off = flat_idx % 256
-    let g = off / 8
-    let j = off % 8
+    let base = 16384 + ((flat_idx >> 8)) * 56
+    let off = (flat_idx & 255)
+    let g = (off >> 3)
+    let j = (off & 7)
     let s0 = int(w_packed[base + 48]) | (int(w_packed[base + 49]) << 8)
     let s1 = int(w_packed[base + 50]) | (int(w_packed[base + 51]) << 8)
     let s2 = int(w_packed[base + 52]) | (int(w_packed[base + 53]) << 8)
     let s3 = int(w_packed[base + 54]) | (int(w_packed[base + 55]) << 8)
     let d = f16_bits_to_f32_fast((s0 >> 12) | ((s1 >> 12) << 4) | ((s2 >> 12) << 8) | ((s3 >> 12) << 12))
-    let slot = g / 2
-    let sword = if slot / 4 == 0: s0 elif slot / 4 == 1: s1 elif slot / 4 == 2: s2 else: s3
-    let sc = (sword >> (3 * (slot % 4))) & 7
+    let slot = (g >> 1)
+    let sword = if (slot >> 2) == 0: s0 elif (slot >> 2) == 1: s1 elif (slot >> 2) == 2: s2 else: s3
+    let sc = (sword >> (3 * ((slot & 3)))) & 7
     let dl = d * ((2 * sc + 1) as float32)
-    let nib = (int(w_packed[base + 32 + g / 2]) >> (4 * (g % 2))) & 15
+    let nib = (int(w_packed[base + 32 + (g >> 1)]) >> (4 * ((g & 1)))) & 15
     let gi = int(w_packed[base + g]) | ((nib & 7) << 8)
     let delta = if (nib & 8) == 0: 0.125 as float32 else: -0.125 as float32
     let v = (int(w_packed[gi * 8 + j]) - 1) as float32
@@ -138,8 +138,8 @@ float32 wdec_iq1m([uint8]'global w_packed, int flat_idx):
 
 float32 wdot_iq2xxs([uint8]'global w_packed, [float32]'global x, int col, int row, int d_in, int n_units, int unit):
     let u = col * n_units + unit
-    let base = 2176 + (u / 8) * 66
-    let ib = u % 8
+    let base = 2176 + ((u >> 3)) * 66
+    let ib = (u & 7)
     let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
     let qp = base + 2 + ib * 8
     let aux0 = int(w_packed[qp]) | (int(w_packed[qp + 1]) << 8) | (int(w_packed[qp + 2]) << 16) | (int(w_packed[qp + 3]) << 24)
@@ -157,15 +157,15 @@ float32 wdot_iq2xxs([uint8]'global w_packed, [float32]'global x, int col, int ro
 
 float32 wdot_iq2xs([uint8]'global w_packed, [float32]'global x, int col, int row, int d_in, int n_units, int unit):
     let u = col * n_units + unit
-    let base = 4224 + (u / 8) * 74
-    let ib = u % 8
+    let base = 4224 + ((u >> 3)) * 74
+    let ib = (u & 7)
     let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
     let xb = row * d_in + unit * 32
     var float32 dot = 0.0
     for gl in 0..<4:
         let g = ib * 4 + gl
         let q = int(w_packed[base + 2 + g * 2]) | (int(w_packed[base + 3 + g * 2]) << 8)
-        let s = (int(w_packed[base + 66 + g / 4]) >> (4 * ((g / 2) % 2))) & 15
+        let s = (int(w_packed[base + 66 + (g >> 2)]) >> (4 * (((g >> 1) & 1)))) & 15
         let db = (d * ((0.5 as float32) + (s as float32))) * (0.25 as float32)
         let sb = int(w_packed[4096 + (q >> 9)])
         for j in 0..<8:
@@ -175,17 +175,17 @@ float32 wdot_iq2xs([uint8]'global w_packed, [float32]'global x, int col, int row
 
 float32 wdot_iq2s([uint8]'global w_packed, [float32]'global x, int col, int row, int d_in, int n_units, int unit):
     let u = col * n_units + unit
-    let base = 8192 + (u / 8) * 82
-    let ib = u % 8
+    let base = 8192 + ((u >> 3)) * 82
+    let ib = (u & 7)
     let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
     let xb = row * d_in + unit * 32
     var float32 dot = 0.0
     for gl in 0..<4:
         let g = ib * 4 + gl
-        let high = (int(w_packed[base + 66 + g / 4]) >> (2 * (g % 4))) & 3
+        let high = (int(w_packed[base + 66 + (g >> 2)]) >> (2 * ((g & 3)))) & 3
         let gi = int(w_packed[base + 2 + g]) | (high << 8)
         let sb = int(w_packed[base + 34 + g])
-        let s = (int(w_packed[base + 74 + g / 4]) >> (4 * ((g / 2) % 2))) & 15
+        let s = (int(w_packed[base + 74 + (g >> 2)]) >> (4 * (((g >> 1) & 1)))) & 15
         let db = (d * ((0.5 as float32) + (s as float32))) * (0.25 as float32)
         for j in 0..<8:
             let gv = int(w_packed[gi * 8 + j]) as float32
@@ -194,8 +194,8 @@ float32 wdot_iq2s([uint8]'global w_packed, [float32]'global x, int col, int row,
 
 float32 wdot_iq3xxs([uint8]'global w_packed, [float32]'global x, int col, int row, int d_in, int n_units, int unit):
     let u = col * n_units + unit
-    let base = 1152 + (u / 8) * 98
-    let ib = u % 8
+    let base = 1152 + ((u >> 3)) * 98
+    let ib = (u & 7)
     let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
     let sp = base + 66 + ib * 4
     let aux = int(w_packed[sp]) | (int(w_packed[sp + 1]) << 8) | (int(w_packed[sp + 2]) << 16) | (int(w_packed[sp + 3]) << 24)
@@ -213,10 +213,10 @@ float32 wdot_iq3xxs([uint8]'global w_packed, [float32]'global x, int col, int ro
 
 float32 wdot_iq3s([uint8]'global w_packed, [float32]'global x, int col, int row, int d_in, int n_units, int unit):
     let u = col * n_units + unit
-    let base = 2048 + (u / 8) * 110
-    let ib = u % 8
+    let base = 2048 + ((u >> 3)) * 110
+    let ib = (u & 7)
     let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
-    let s = (int(w_packed[base + 106 + ib / 2]) >> (4 * (ib % 2))) & 15
+    let s = (int(w_packed[base + 106 + (ib >> 1)]) >> (4 * ((ib & 1)))) & 15
     let db = d * ((1 + 2 * s) as float32)
     let xb = row * d_in + unit * 32
     var float32 dot = 0.0
@@ -225,7 +225,7 @@ float32 wdot_iq3s([uint8]'global w_packed, [float32]'global x, int col, int row,
         let sb = int(w_packed[base + 74 + gg])
         for h in 0..<2:
             let e = gg * 2 + h
-            let high = (int(w_packed[base + 66 + e / 8]) >> (e % 8)) & 1
+            let high = (int(w_packed[base + 66 + (e >> 3)]) >> ((e & 7))) & 1
             let gi = int(w_packed[base + 2 + e]) | (high << 8)
             for j in 0..<4:
                 let v = int(w_packed[gi * 4 + j]) as float32
@@ -234,8 +234,8 @@ float32 wdot_iq3s([uint8]'global w_packed, [float32]'global x, int col, int row,
 
 float32 wdot_iq1s([uint8]'global w_packed, [float32]'global x, int col, int row, int d_in, int n_units, int unit):
     let u = col * n_units + unit
-    let base = 16384 + (u / 8) * 50
-    let ib = u % 8
+    let base = 16384 + ((u >> 3)) * 50
+    let ib = (u & 7)
     let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
     let qh = int(w_packed[base + 34 + ib * 2]) | (int(w_packed[base + 35 + ib * 2]) << 8)
     let dl = d * ((2 * ((qh >> 12) & 7) + 1) as float32)
@@ -251,8 +251,8 @@ float32 wdot_iq1s([uint8]'global w_packed, [float32]'global x, int col, int row,
 
 float32 wdot_iq1m([uint8]'global w_packed, [float32]'global x, int col, int row, int d_in, int n_units, int unit):
     let u = col * n_units + unit
-    let base = 16384 + (u / 8) * 56
-    let ib = u % 8
+    let base = 16384 + ((u >> 3)) * 56
+    let ib = (u & 7)
     let s0 = int(w_packed[base + 48]) | (int(w_packed[base + 49]) << 8)
     let s1 = int(w_packed[base + 50]) | (int(w_packed[base + 51]) << 8)
     let s2 = int(w_packed[base + 52]) | (int(w_packed[base + 53]) << 8)
@@ -262,11 +262,11 @@ float32 wdot_iq1m([uint8]'global w_packed, [float32]'global x, int col, int row,
     var float32 dot = 0.0
     for gl in 0..<4:
         let g = ib * 4 + gl
-        let slot = g / 2
-        let sword = if slot / 4 == 0: s0 elif slot / 4 == 1: s1 elif slot / 4 == 2: s2 else: s3
-        let sc = (sword >> (3 * (slot % 4))) & 7
+        let slot = (g >> 1)
+        let sword = if (slot >> 2) == 0: s0 elif (slot >> 2) == 1: s1 elif (slot >> 2) == 2: s2 else: s3
+        let sc = (sword >> (3 * ((slot & 3)))) & 7
         let dl = d * ((2 * sc + 1) as float32)
-        let nib = (int(w_packed[base + 32 + g / 2]) >> (4 * (g % 2))) & 15
+        let nib = (int(w_packed[base + 32 + (g >> 1)]) >> (4 * ((g & 1)))) & 15
         let gi = int(w_packed[base + g]) | ((nib & 7) << 8)
         let delta = if (nib & 8) == 0: 0.125 as float32 else: -0.125 as float32
         for j in 0..<8:
