@@ -87,8 +87,12 @@ def reference(W, c):
     for l in range(NL):
         L = W["layers"][l]
         h = rms(x, L["attn_norm"])
-        q = (h @ L["q"].T).reshape(seq, NH, dh)
-        k = (h @ L["k"].T).reshape(seq, NKV, dh)
+        q_flat = h @ L["q"].T
+        k_flat = h @ L["k"].T
+        if c.get("qk_norm_full"):
+            q_flat, k_flat = rms(q_flat, L["q_norm_full"]), rms(k_flat, L["k_norm_full"])
+        q = q_flat.reshape(seq, NH, dh)
+        k = k_flat.reshape(seq, NKV, dh)
         v = (h @ L["v"].T).reshape(seq, NKV, dh)
         if c.get("qk_norm"):
             q, k = rms(q, L["q_norm"]), rms(k, L["k_norm"])
@@ -115,15 +119,26 @@ def reference(W, c):
         x = x + (rms(proj, L["post_attn"]) if c.get("post_norms") else proj)
         h = rms(x, L["ffn_norm"])
         act = gelu if c["act"] == "gelu" else silu
-        if "router" in L:  # mixture of experts, as llama.cpp's build_moe_ffn: softmax gate, top-k, renormalized
+        if "router" in L:  # mixture of experts, as llama.cpp's build_moe_ffn: softmax gate, top-k, optionally renormalized + shared expert
             probs = np.exp(h @ L["router"].T)
             probs /= probs.sum(-1, keepdims=True)
             ffn = np.zeros_like(h)
+            norm_topk = c.get("moe_norm_weights", True)
+            w_scale = c.get("moe_weights_scale", 1.0)
             for t in range(seq):
                 top = np.argsort(-probs[t])[: c["n_used"]]
-                wts = probs[t, top] / probs[t, top].sum()
+                wts = probs[t, top]
+                if norm_topk:
+                    wts = wts / wts.sum()
+                wts = wts * w_scale
                 for e, wt in zip(top, wts):
                     ffn[t] += wt * ((act(h[t] @ L["eg"][e].T) * (h[t] @ L["eu"][e].T)) @ L["ed"][e].T)
+            if "sh_gate" in L:
+                sh = (act(h @ L["sh_gate"].T) * (h @ L["sh_up"].T)) @ L["sh_down"].T
+                if "sh_inp" in L:
+                    sh_g = 1.0 / (1.0 + np.exp(-(h @ L["sh_inp"])))
+                    sh = sh * sh_g[:, None]
+                ffn = ffn + sh
         else:
             ffn = (act(h @ L["gate"].T) * (h @ L["up"].T)) @ L["down"].T
         ffn = ffn * c.get("residual_scale", 1.0)
@@ -151,13 +166,19 @@ def make_weights(rng, d_head, tied):
     return W
 
 
-def add_moe(rng, W, n_expert, ffn_e):
-    """Replaces every layer's dense FFN by `n_expert` experts of width `ffn_e` and a router."""
-    for L in W["layers"]:
+def add_moe(rng, W, n_expert, ffn_e, sh_ffn=0, sh_gate=False, start_layer=0):
+    """Replaces layers[start_layer:]'s dense FFN by `n_expert` experts of width `ffn_e` and a router (plus optional shared expert)."""
+    for L in W["layers"][start_layer:]:
         L["router"] = rng.normal(0, 0.6, (n_expert, D))
         L["eg"] = rng.normal(0, 0.3, (n_expert, ffn_e, D))
         L["eu"] = rng.normal(0, 0.3, (n_expert, ffn_e, D))
         L["ed"] = rng.normal(0, 0.3, (n_expert, D, ffn_e))
+        if sh_ffn > 0:
+            L["sh_gate"] = rng.normal(0, 0.3, (sh_ffn, D))
+            L["sh_up"] = rng.normal(0, 0.3, (sh_ffn, D))
+            L["sh_down"] = rng.normal(0, 0.3, (D, sh_ffn))
+            if sh_gate:
+                L["sh_inp"] = rng.normal(0, 0.5, (D,))
 
 
 def requantize(W):
@@ -166,7 +187,7 @@ def requantize(W):
         a = np.asarray(a, dtype=np.float32)
         return gguf.quants.dequantize(gguf.quants.quantize(a, gguf.GGMLQuantizationType.Q8_0),
                                       gguf.GGMLQuantizationType.Q8_0).astype(np.float64)
-    out = {**W, "emb": rt(W["emb"]), "layers": [{k: (rt(v) if k in ("q", "k", "v", "o", "gate", "up", "down", "eg", "eu", "ed") else v)
+    out = {**W, "emb": rt(W["emb"]), "layers": [{k: (rt(v) if k in ("q", "k", "v", "o", "gate", "up", "down", "eg", "eu", "ed", "sh_gate", "sh_up", "sh_down") else v)
                                                  for k, v in L.items()} for L in W["layers"]]}
     out["out"] = out["emb"] if W["out"] is W["emb"] else rt(W["out"])
     return out
@@ -222,12 +243,21 @@ def write(name, arch, W, c, fused=False, tied=False, meta=None, extra_tensors=No
         if c.get("qk_norm"):
             w.add_tensor(f"{p}.attn_q_norm.weight", f32(L["q_norm"]))
             w.add_tensor(f"{p}.attn_k_norm.weight", f32(L["k_norm"]))
+        if c.get("qk_norm_full"):
+            w.add_tensor(f"{p}.attn_q_norm.weight", f32(L["q_norm_full"]))
+            w.add_tensor(f"{p}.attn_k_norm.weight", f32(L["k_norm_full"]))
         mat(f"{p}.attn_output.weight", L["o"])
         if "router" in L:
             w.add_tensor(f"{p}.ffn_gate_inp.weight", f32(L["router"]))
             mat(f"{p}.ffn_gate_exps.weight", L["eg"])
             mat(f"{p}.ffn_up_exps.weight", L["eu"])
             mat(f"{p}.ffn_down_exps.weight", L["ed"])
+            if "sh_gate" in L:
+                mat(f"{p}.ffn_gate_shexp.weight", L["sh_gate"])
+                mat(f"{p}.ffn_up_shexp.weight", L["sh_up"])
+                mat(f"{p}.ffn_down_shexp.weight", L["sh_down"])
+                if "sh_inp" in L:
+                    w.add_tensor(f"{p}.ffn_gate_inp_shexp.weight", f32(L["sh_inp"]))
             for n in ("q", "k", "v"):
                 mat(f"{p}.attn_{n}.weight", L[n])
             continue
@@ -264,7 +294,7 @@ def main():
 
 
 def run():
-    global NL
+    global NL, NKV
     rng = np.random.default_rng(7)
     dh = D // NH
     base = dict(d_head=dh, base=10000.0, neox=True, act="silu", embd_scale=1.0)
@@ -341,6 +371,47 @@ def run():
           meta={"attention.sliding_window": 3, "rope.freq_base_swa": 100.0,
                 "rope.scaling.type": "linear", "rope.scaling.factor": 2.0})
     NL = NL_saved
+
+    # Qwen2-MoE: NEOX RoPE, routed experts (unnormalized top-k) + sigmoid-gated shared expert
+    rng = np.random.default_rng(10)
+    Wq2m = make_weights(rng, dh, False)
+    add_moe(rng, Wq2m, 4, FFN // 2, sh_ffn=FFN // 2, sh_gate=True)
+    write("qwen2moe", "qwen2moe", Wq2m,
+          {**base, "rope": rope_table(dh, 10000.0), "n_used": 2, "moe_norm_weights": False},
+          meta={"expert_count": 4, "expert_used_count": 2,
+                "expert_feed_forward_length": FFN // 2, "expert_shared_feed_forward_length": FFN // 2})
+
+    # OLMoE: NEOX RoPE, MHA (n_kv_head == n_head in llama.cpp), full-projection Q/K RMSNorm (width D), unnormalized top-k routing
+    NKV_saved = NKV
+    NKV = NH
+    Wolm = make_weights(rng, dh, False)
+    for L in Wolm["layers"]:
+        L["q_norm_full"] = rng.uniform(0.5, 1.5, NH * dh)
+        L["k_norm_full"] = rng.uniform(0.5, 1.5, NKV * dh)
+    add_moe(rng, Wolm, 4, FFN)
+    write("olmoe", "olmoe", Wolm,
+          {**base, "qk_norm_full": True, "rope": rope_table(dh, 10000.0), "n_used": 2, "moe_norm_weights": False},
+          meta={"expert_count": 4, "expert_used_count": 2, "expert_feed_forward_length": FFN})
+    NKV = NKV_saved
+
+    # Granite-MoE: NORM RoPE, Granite scales, routed experts (normalized top-k) + ungated shared expert
+    Wgm = make_weights(rng, dh, False)
+    add_moe(rng, Wgm, 4, FFN, sh_ffn=FFN // 2, sh_gate=False)
+    write("granitemoe", "granitemoe", Wgm,
+          {**base, "neox": False, "rope": rope_table(dh, 10000.0), "n_used": 2, "moe_norm_weights": True,
+           "embd_scale": 2.0, "attn_scale": 0.31, "residual_scale": 0.6, "logit_mul": 1 / 4.0},
+          meta={"expert_count": 4, "expert_used_count": 2,
+                "expert_shared_feed_forward_length": FFN // 2,
+                "embedding_scale": 2.0, "attention.scale": 0.31, "residual_scale": 0.6, "logit_scale": 4.0})
+
+    # DeepSeek-MoE (v1): NORM RoPE, leading dense layer 0 + MoE layer 1 with shared experts, unnormalized top-k
+    rng = np.random.default_rng(12)
+    Wds = make_weights(rng, dh, False)
+    add_moe(rng, Wds, 4, FFN // 2, sh_ffn=FFN, sh_gate=False, start_layer=1)
+    write("deepseek", "deepseek", Wds,
+          {**base, "neox": False, "rope": rope_table(dh, 10000.0), "n_used": 2, "moe_norm_weights": False},
+          meta={"leading_dense_block_count": 1, "expert_count": 4, "expert_used_count": 2,
+                "expert_shared_count": 2, "expert_feed_forward_length": FFN // 2})
 
 
 def fmt_matrix(rng, qtype, a):

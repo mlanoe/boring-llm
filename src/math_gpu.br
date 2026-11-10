@@ -1940,8 +1940,10 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
         var q = q0
         var k = k0
         if qk_norm:
-            q = rms_norm_gpu(q, q_norm_w, n_head, d_head, eps)
-            k = rms_norm_gpu(k, k_norm_w, n_kv_head, d_head, eps)
+            let q_nd = q_norm_w.length
+            let k_nd = k_norm_w.length
+            q = rms_norm_gpu(q, q_norm_w, q_dim / q_nd, q_nd, eps)
+            k = rms_norm_gpu(k, k_norm_w, kv_dim / k_nd, k_nd, eps)
         q = rope_apply_at_gpu(q, 1, n_head, d_head, rope_freqs, pos, neox)
         k = rope_apply_at_gpu(k, 1, n_kv_head, d_head, rope_freqs, pos, neox)
         let tk = kv_tail_push(prev_tk, k, tail_len * kv_dim, kv_dim)
@@ -2036,6 +2038,19 @@ pub req [float32]'kernel'unified moe_accumulate_gpu([float32]'kernel'global acc,
             if p >= 0:
                 value = value + wts[p] * y[p * d + j]
             out[cell] = value
+        out
+
+# Scales each row r (d floats) of `x` by sigmoid(gate_logits[r]) (Qwen2-MoE shared-expert gate).
+pub req [float32]'kernel'unified sigmoid_gate_rows_gpu([float32]'kernel'global x, [float32]'kernel'global gate_logits, int n, int d) throws:
+    let int total = n * d
+    let int blocks = (total + 255) / 256
+    kernel(block = 256, grid = blocks):
+        mut [float32]'unified out = [0.0 for ..<total]
+        let cell = .thread.x + .block.x * .block_dim.x
+        if cell < total:
+            let r = cell / d
+            let g = 1.0 / (1.0 + (0.0 - gate_logits[r]).exp())
+            out[cell] = x[cell] * g
         out
 
 # ── Kernel: elementwise add (residual connection) ────────────────────────
