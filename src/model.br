@@ -38,7 +38,7 @@ pub struct Config:
     float32 rms_eps
     bool tied_embeddings
     int rope_neox   # 1 = NEOX/"rotate-half" (Qwen2), 0 = NORM/interleaved (Llama/Mistral)
-    int act         # gated-FFN activation: 0 = silu (SwiGLU), 1 = gelu tanh (GeGLU, Gemma)
+    int act         # FFN activation: 0 = silu (gated) / gelu (non-gated), 1 = gelu tanh (GeGLU), 2 = relu2 (non-gated), 3 = relu (ReGLU)
     float32 embd_scale   # token embeddings are multiplied by this (Gemma: sqrt(d_model)), 1 otherwise
     # Gemma 2/3 (all neutral for every other architecture)
     bool attn_ext          # use the general attention path (explicit scale, softcap, window)
@@ -49,13 +49,15 @@ pub struct Config:
     int swa_pattern        # layer l is sliding-window when l % swa_pattern < swa_pattern - 1
     [float32] rope_freqs_local   # RoPE table of the sliding-window layers
     bool post_norms        # RMS norms on the attention and FFN outputs before the residual add
+    bool no_pre_norm       # OLMo2 / EXAONE 4.0: no pre-attention or pre-FFN norm (only post-attention and post-FFN norms)
     int n_expert           # mixture of experts: experts per MoE layer (0 = dense model)
     int n_expert_used      # experts each token is routed to
     int expert_ffn         # width of one expert's FFN
     float32 residual_scale # branch outputs (attention, FFN) are multiplied by this before the residual add (Granite)
     float32 logit_mul      # the output logits are multiplied by this (Granite: 1 / logit_scale)
     int nope_step          # SmolLM3: every nope_step-th layer has no rotary embedding (0 = all layers have one)
-    bool qk_norm    # Qwen3/OLMoE: an RMS norm over Q and K (per-head d_head or full-row qkv_dim/kv_dim) before RoPE
+    bool qk_norm    # Qwen3/OLMoE/Hunyuan: an RMS norm over Q and K (per-head d_head or full-row qkv_dim/kv_dim)
+    bool qk_norm_post_rope # Hunyuan: apply attn_q_norm/attn_k_norm after RoPE instead of before
     int q_norm_heads
     int q_norm_dim
     int k_norm_heads
@@ -64,9 +66,18 @@ pub struct Config:
     bool moe_norm_weights  # whether routed top-k expert weights are renormalized to sum to 1
     float32 moe_weights_scale # scale factor applied to routed expert weights (default 1.0)
     int moe_gating_func    # 1 = softmax (default), 2 = sigmoid
+    bool use_layer_norm    # true = LayerNorm (subtract mean), false = RMSNorm
+    bool has_norm_bias     # true = norms use bias vectors (LayerNorm or RMSNorm + bias)
+    int residual_type      # 0 = sequential, 1 = single-norm parallel, 2 = dual-norm parallel
+    bool ffn_gated         # true = gated GLU FFN, false = non-gated FFN
+    bool has_linear_bias   # true = o_b / up_b / down_b / output_b may be non-zero
+    bool has_pos_embd      # GPT-2: learned position_embd.weight added to token embeddings
+    bool pre_attn_router   # SmallThinker: MoE router logits projected from pre-attention residual
+    bool swa_first_global  # SmallThinker: l % swa_pattern == 0 is full+NoPE (vs < swa_pattern - 1 SWA)
 
 pub struct Layer:
     [float32] attn_norm_w
+    [float32] attn_norm_b
     [float32] q_w
     [float32] q_b
     [float32] k_w
@@ -74,16 +85,21 @@ pub struct Layer:
     [float32] v_w
     [float32] v_b
     [float32] o_w
+    [float32] o_b
     [float32] ffn_norm_w
+    [float32] ffn_norm_b
     [float32] gate_w
     [float32] up_w
+    [float32] up_b
     [float32] down_w
+    [float32] down_b
     [float32] q_norm_w   # q_norm_dim floats; zeros and unused unless config.qk_norm
     [float32] k_norm_w
     [float32] attn_post_norm_w   # d_model floats; zeros and unused unless config.post_norms
     [float32] ffn_post_norm_w
     bool is_moe                  # this layer's FFN is a mixture of experts (router_w + exp_* instead of gate/up/down)
     [float32] router_w           # (n_expert x d_model)
+    [float32] exp_probs_b        # n_expert expert selection bias (zeros when absent)
     [[float32]] exp_gate         # per expert (expert_ffn x d_model)
     [[float32]] exp_up
     [[float32]] exp_down         # per expert (d_model x expert_ffn)
@@ -93,13 +109,18 @@ pub struct Layer:
     [float32] shexp_down_w
     bool has_shexp_gate
     [float32] shexp_gate_inp_w
+    bool has_attn_gate
+    [float32] attn_gate_w
 
 pub struct Model:
     Config config
     [float32] tok_embd
+    [float32] pos_embd
     [Layer] layers
     [float32] output_norm_w
+    [float32] output_norm_b
     [float32] output_w
+    [float32] output_b
 
 # Phase 2b: same shape as Layer, but every big matmul-heavy weight (Q/K/V/O
 # projections, FFN gate/up/down) stays as raw quantized-packed bytes
@@ -124,6 +145,7 @@ pub struct ExpertW:
 
 pub struct QuantLayer:
     [float32]'kernel'unified attn_norm_w
+    [float32]'kernel'unified attn_norm_b
     [uint8]'kernel'unified q_w_q8
     int q_w_type
     [float32]'kernel'unified q_b
@@ -138,13 +160,17 @@ pub struct QuantLayer:
     bool qkv_fused
     [uint8]'kernel'unified o_w_q8
     int o_w_type
+    [float32]'kernel'unified o_b
     [float32]'kernel'unified ffn_norm_w
+    [float32]'kernel'unified ffn_norm_b
     [uint8]'kernel'unified gate_w_q8
     int gate_w_type
     [uint8]'kernel'unified up_w_q8
     int up_w_type
+    [float32]'kernel'unified up_b
     [uint8]'kernel'unified down_w_q8
     int down_w_type
+    [float32]'kernel'unified down_b
     [float32]'kernel'unified q_norm_w   # d_head floats; zeros and unused unless config.qk_norm
     [float32]'kernel'unified k_norm_w
     [float32]'kernel'unified attn_post_norm_w
@@ -153,6 +179,7 @@ pub struct QuantLayer:
     bool is_moe
     [float32]'kernel'unified router_w     # (n_expert x d_model), float32
     [float32]'kernel'unified router_b     # n_expert zeros
+    [float32] exp_probs_b                 # n_expert expert selection bias (host-side, zeros when absent)
     [ExpertW] experts
     bool has_shexp
     [uint8]'kernel'unified shexp_gate_w_q8
@@ -164,15 +191,21 @@ pub struct QuantLayer:
     bool has_shexp_gate
     [float32]'kernel'unified shexp_gate_inp_w
     [float32]'kernel'unified shexp_gate_inp_b
+    bool has_attn_gate
+    [uint8]'kernel'unified attn_gate_w_q8
+    int attn_gate_w_type
 
 pub struct QuantModel:
     Config config
     [uint8] tok_embd_q8
     int tok_embd_type
+    [float32] pos_embd
     [QuantLayer] layers
     [float32]'kernel'unified output_norm_w
+    [float32]'kernel'unified output_norm_b
     [uint8]'kernel'unified output_w_q8
     int output_w_type
+    [float32]'kernel'unified output_b
 
 GgufTensorInfo find_tensor([GgufTensorInfo] tensors, string name) throws:
     for t in tensors:
@@ -193,10 +226,16 @@ bool tensor_exists([GgufTensorInfo] tensors, string name):
 # back to an all-zero bias vector of the expected width when absent, which
 # is a no-op added onto `linear_bias`'s output either way.
 pub [float32] load_tensor_f32_or_zero(GgufFile file, string name, int n) throws:
+    load_tensor_f32_or(file, name, n, 0.0 as float32)
+
+[float32] load_tensor_f32_or_one(GgufFile file, string name, int n) throws:
+    load_tensor_f32_or(file, name, n, 1.0 as float32)
+
+[float32] load_tensor_f32_or(GgufFile file, string name, int n, float32 fill) throws:
     if tensor_exists(file.tensors, name):
         load_tensor_f32(file, name)
     else:
-        [0.0 for i in 0..<n]
+        [fill for i in 0..<n]
 
 int tensor_n_elements(GgufTensorInfo t):
     var int n = 1
@@ -273,12 +312,12 @@ pub [float32] load_tensor_f32(GgufFile file, string name) throws:
 # on anything else rather than silently guessing (same "fail loud on an
 # unhandled case" convention as quant.br's unsupported-ggml-type error).
 int rope_style_for_arch(string arch) throws:
-    if arch == "qwen2" or arch == "qwen3" or arch == "phi3" or arch == "gemma" or arch == "gemma2" or arch == "gemma3" or arch == "qwen3moe" or arch == "qwen2moe" or arch == "olmoe":
+    if arch == "qwen2" or arch == "qwen3" or arch == "phi3" or arch == "phi2" or arch == "phimoe" or arch == "starcoder2" or arch == "gptneox" or arch == "falcon" or arch == "gemma" or arch == "gemma2" or arch == "gemma3" or arch == "qwen3moe" or arch == "qwen2moe" or arch == "olmoe" or arch == "olmo2" or arch == "exaone" or arch == "exaone4" or arch == "exaone-moe" or arch == "dots1" or arch == "hunyuan-dense" or arch == "hunyuan-moe" or arch == "glm4moe" or arch == "bailingmoe2" or arch == "seed_oss" or arch == "afmoe" or arch == "smallthinker" or arch == "stablelm":
         1
-    elif arch == "llama" or arch == "granite" or arch == "granitemoe" or arch == "smollm3" or arch == "deepseek":
+    elif arch == "llama" or arch == "granite" or arch == "granitemoe" or arch == "smollm3" or arch == "deepseek" or arch == "internlm2" or arch == "mistral3" or arch == "glm4" or arch == "minicpm" or arch == "command-r" or arch == "cohere2" or arch == "ernie4_5" or arch == "ernie4_5-moe" or arch == "arcee" or arch == "bailingmoe" or arch == "olmo" or arch == "gpt2":
         0
     else:
-        throw "config_from_gguf: unsupported architecture '{arch}' (supported: 'llama' (also Mistral and Mixtral), 'qwen2', 'qwen2moe', 'qwen3', 'qwen3moe', 'olmoe', 'granite', 'granitemoe', 'deepseek', 'smollm3', 'phi3', 'gemma', 'gemma2', 'gemma3'; check llama.cpp's llama_model_rope_type() and build_* graph before adding one)"
+        throw "config_from_gguf: unsupported architecture '{arch}' (supported: 'llama' (also Mistral and Mixtral), 'mistral3', 'qwen2', 'qwen2moe', 'qwen3', 'qwen3moe', 'olmo', 'olmo2', 'olmoe', 'exaone', 'exaone4', 'exaone-moe', 'internlm2', 'glm4', 'glm4moe', 'minicpm', 'granite', 'granitemoe', 'deepseek', 'smollm3', 'phi3', 'phi2', 'phimoe', 'starcoder2', 'gptneox', 'gpt2', 'stablelm', 'falcon', 'command-r', 'cohere2', 'gemma', 'gemma2', 'gemma3', 'dots1', 'ernie4_5', 'ernie4_5-moe', 'hunyuan-dense', 'hunyuan-moe', 'bailingmoe', 'bailingmoe2', 'arcee', 'seed_oss', 'afmoe', 'smallthinker'; check llama.cpp's llama_model_rope_type() and build_* graph before adding one)"
 
 # The context size the engine runs with (`--ctx-size`), set before the model is loaded:
 # Phi-3's LongRoPE picks its factor set from it.
@@ -338,7 +377,11 @@ pub Config config_from_gguf(GgufFile file) throws:
     guard ffn_dim > 0 else throw "GGUF: missing {arch}.feed_forward_length"
     let expert_ffn = if expert_ffn_key > 0: expert_ffn_key else: ffn_dim
     let rope_freq_base = gguf_get_f32(file.metadata, "{arch}.rope.freq_base") else (10000.0 as float32)
-    let rms_eps = gguf_get_f32(file.metadata, "{arch}.attention.layer_norm_rms_epsilon") else (1.0e-6 as float32)
+    let use_layer_norm = arch == "phi2" or arch == "starcoder2" or arch == "gptneox" or arch == "falcon" or arch == "command-r" or arch == "cohere2" or arch == "olmo" or arch == "stablelm" or arch == "gpt2"
+    let rms_eps = if use_layer_norm:
+        gguf_get_f32(file.metadata, "{arch}.attention.layer_norm_epsilon") else (1.0e-5 as float32)
+    else:
+        gguf_get_f32(file.metadata, "{arch}.attention.layer_norm_rms_epsilon") else (1.0e-6 as float32)
     let vocab_size = gguf_get_string_array(file.metadata, "tokenizer.ggml.tokens").length
     let rope_neox = rope_style_for_arch(arch)
 
@@ -354,6 +397,7 @@ pub Config config_from_gguf(GgufFile file) throws:
     let value_len = gguf_get_int(file.metadata, "{arch}.attention.value_length") else d_head
     guard value_len == d_head else throw "config_from_gguf: key_length {d_head} != value_length {value_len} is not supported"
     let qk_norm = tensor_exists(file.tensors, "blk.0.attn_q_norm.weight")
+    let qk_norm_post_rope = qk_norm and (arch == "hunyuan-dense" or arch == "hunyuan-moe")
     let q_norm_dim = if qk_norm: find_tensor(file.tensors, "blk.0.attn_q_norm.weight").dims[0] else: d_head
     let k_norm_dim = if qk_norm: find_tensor(file.tensors, "blk.0.attn_k_norm.weight").dims[0] else: d_head
     let q_norm_heads = (n_head * d_head) / q_norm_dim
@@ -361,24 +405,57 @@ pub Config config_from_gguf(GgufFile file) throws:
     let shexp_ffn_key = gguf_get_int(file.metadata, "{arch}.expert_shared_feed_forward_length") else 0
     let n_shexp = gguf_get_int(file.metadata, "{arch}.expert_shared_count") else 0
     let shexp_ffn = if shexp_ffn_key > 0: shexp_ffn_key else: n_shexp * expert_ffn
-    let default_moe_norm = not (arch == "qwen2moe" or arch == "olmoe" or arch == "deepseek")
-    let moe_norm_weights = gguf_get_bool(file.metadata, "{arch}.expert_weights_norm") else default_moe_norm
+    let default_moe_norm = if arch == "smallthinker":
+        true
+    else:
+        not (arch == "qwen2moe" or arch == "olmoe" or arch == "deepseek" or arch == "dots1" or arch == "glm4moe" or arch == "bailingmoe" or arch == "bailingmoe2" or arch == "afmoe")
+    let moe_norm_weights = if arch == "smallthinker": true else: (gguf_get_bool(file.metadata, "{arch}.expert_weights_norm") else default_moe_norm)
     let moe_weights_scale = gguf_get_f32(file.metadata, "{arch}.expert_weights_scale") else (1.0 as float32)
-    let moe_gating_func = gguf_get_int(file.metadata, "{arch}.expert_gating_func") else 1
+    let default_moe_gating = if arch == "exaone-moe" or arch == "glm4moe" or arch == "afmoe":
+        2
+    elif arch == "smallthinker":
+        3
+    else:
+        1
+    let moe_gating_func = gguf_get_int(file.metadata, "{arch}.expert_gating_func") else default_moe_gating
 
     let rope_freqs = rope_table_from_gguf(file, arch, d_head, rope_freq_base)
     # Gemma: GeGLU instead of SwiGLU, and token embeddings scaled by sqrt(d_model)
     # (its converter already stores the RMSNorm weights as w + 1).
     let is_gemma = arch == "gemma" or arch == "gemma2" or arch == "gemma3"
     let is_gemma_ext = arch == "gemma2" or arch == "gemma3"
-    # Granite: explicit scales instead of sqrt(d) / 1 / sqrt(d_head) / 1
+    let has_post_norms = tensor_exists(file.tensors, "blk.0.post_ffw_norm.weight") or (tensor_exists(file.tensors, "blk.0.post_attention_norm.weight") and tensor_exists(file.tensors, "blk.0.ffn_norm.weight"))
+    let no_pre_norm = not use_layer_norm and not tensor_exists(file.tensors, "blk.0.attn_norm.weight")
+    # Granite / MiniCPM: explicit scales instead of sqrt(d) / 1 / sqrt(d_head) / 1
     let granite_embd = gguf_get_f32(file.metadata, "{arch}.embedding_scale") else (0.0 as float32)
     let granite_attn = gguf_get_f32(file.metadata, "{arch}.attention.scale") else (0.0 as float32)
     let granite_resid = gguf_get_f32(file.metadata, "{arch}.residual_scale") else (0.0 as float32)
     let granite_logit = gguf_get_f32(file.metadata, "{arch}.logit_scale") else (0.0 as float32)
-    let nope_step = if arch == "smollm3": 4 else: 0
-    let act = if is_gemma: 1 else: 0
-    let embd_scale = if is_gemma: (d_model as float32).sqrt() elif granite_embd > 0.0: granite_embd else: (1.0 as float32)
+    let is_cohere = arch == "command-r" or arch == "cohere2"
+    let logit_mul = if granite_logit > 0.0: (if is_cohere: granite_logit else: (1.0 as float32) / granite_logit) else: (1.0 as float32)
+    let is_exaone_swa = (arch == "exaone4" and n_layer == 64) or arch == "exaone-moe"
+    let is_swa_arch = is_gemma_ext or arch == "olmo2" or is_exaone_swa or arch == "cohere2" or arch == "afmoe" or arch == "smallthinker"
+    let raw_swa_window = if is_swa_arch: (gguf_get_int(file.metadata, "{arch}.attention.sliding_window") else 0) else: 0
+    let swa_window = if arch == "smallthinker" and raw_swa_window > 0: 4096 else: raw_swa_window
+    let swa_pattern = if arch == "gemma3":
+        6
+    elif arch == "olmo2" or is_exaone_swa or arch == "cohere2" or arch == "afmoe" or arch == "smallthinker":
+        gguf_get_int(file.metadata, "{arch}.attention.sliding_window_pattern") else 4
+    else:
+        2
+    let swa_first_global = arch == "smallthinker"
+    let nope_step = if arch == "gpt2":
+        1
+    elif arch == "smollm3":
+        4
+    elif arch == "smallthinker":
+        if raw_swa_window > 0 and n_layer != 4: 4 else: 0
+    elif (is_exaone_swa or arch == "cohere2" or arch == "afmoe") and swa_window > 0:
+        swa_pattern
+    else:
+        0
+    let act = if is_gemma: 1 elif arch == "arcee": 2 elif arch == "smallthinker": 3 else: 0
+    let embd_scale = if is_gemma or arch == "afmoe": (d_model as float32).sqrt() elif granite_embd > 0.0: granite_embd else: (1.0 as float32)
 
     # Gemma 2/3 (mirrors llama.cpp's load_hparams / build_gemma2 / build_gemma3):
     # post-attention and post-FFN norms, a score scale of 1/sqrt(d_head) (the
@@ -390,19 +467,33 @@ pub Config config_from_gguf(GgufFile file) throws:
     let attn_scale = if granite_attn > 0.0: granite_attn elif big: 1.0 / ((d_model / n_head) as float32).sqrt() else: 1.0 / (d_head as float32).sqrt()
     let attn_softcap = if arch == "gemma2": (gguf_get_f32(file.metadata, "{arch}.attn_logit_softcapping") else (0.0 as float32)) else: (0.0 as float32)
     let final_softcap = if arch == "gemma2": (gguf_get_f32(file.metadata, "{arch}.final_logit_softcapping") else (0.0 as float32)) else: (0.0 as float32)
-    let swa_window = if is_gemma_ext: (gguf_get_int(file.metadata, "{arch}.attention.sliding_window") else 0) else: 0
-    let swa_pattern = if arch == "gemma3": 6 else: 2
     let rope_local_base = gguf_get_f32(file.metadata, "{arch}.rope.freq_base_swa") else (10000.0 as float32)
     let rope_freqs_local = if arch == "gemma3": rope_freqs_plain(d_head, rope_local_base) else: rope_freqs
+    let has_norm_bias = use_layer_norm or tensor_exists(file.tensors, "output_norm.bias") or tensor_exists(file.tensors, "blk.0.attn_norm.bias")
+    let gptneox_par = gguf_get_bool(file.metadata, "gptneox.use_parallel_residual") else true
+    let falcon_two_norms = tensor_exists(file.tensors, "blk.0.attn_norm_2.weight")
+    let stablelm_par = arch == "stablelm" and not tensor_exists(file.tensors, "blk.0.ffn_norm.weight")
+    let residual_type = if arch == "phi2" or is_cohere or (arch == "falcon" and not falcon_two_norms) or stablelm_par:
+        1
+    elif (arch == "gptneox" and gptneox_par) or (arch == "falcon" and falcon_two_norms):
+        2
+    else:
+        0
+    let ffn_gated = not (arch == "phi2" or arch == "starcoder2" or arch == "gptneox" or arch == "falcon" or arch == "arcee" or arch == "gpt2")
+    let has_linear_bias = tensor_exists(file.tensors, "blk.0.attn_output.bias") or tensor_exists(file.tensors, "blk.0.ffn_up.bias") or tensor_exists(file.tensors, "blk.0.ffn_down.bias") or tensor_exists(file.tensors, "output.bias")
+    let has_pos_embd = tensor_exists(file.tensors, "position_embd.weight")
+    let pre_attn_router = arch == "smallthinker"
 
     Config(vocab_size, d_model, n_layer, n_head, n_kv_head, d_head,
            ffn_dim, rope_freq_base, rope_freqs, rms_eps, not has_output, rope_neox, act, embd_scale,
-           is_gemma_ext or granite_attn > 0.0, attn_scale, attn_softcap, final_softcap, swa_window, swa_pattern, rope_freqs_local,
-           is_gemma_ext, n_expert, n_expert_used, expert_ffn,
+           is_gemma_ext or granite_attn > 0.0 or swa_window > 0, attn_scale, attn_softcap, final_softcap, swa_window, swa_pattern, rope_freqs_local,
+           has_post_norms, no_pre_norm, n_expert, n_expert_used, expert_ffn,
            if granite_resid > 0.0: granite_resid else: (1.0 as float32),
-           if granite_logit > 0.0: (1.0 as float32) / granite_logit else: (1.0 as float32), nope_step, qk_norm,
+           logit_mul, nope_step, qk_norm, qk_norm_post_rope,
            q_norm_heads, q_norm_dim, k_norm_heads, k_norm_dim,
-           shexp_ffn, moe_norm_weights, moe_weights_scale, moe_gating_func)
+           shexp_ffn, moe_norm_weights, moe_weights_scale, moe_gating_func,
+           use_layer_norm, has_norm_bias, residual_type, ffn_gated, has_linear_bias,
+           has_pos_embd, pre_attn_router, swa_first_global)
 
 # Phi-3 stores the attention projections as one `attn_qkv.weight` (rows: Q, then
 # K, then V) and the FFN as one `ffn_up.weight` holding gate then up (ggml's
@@ -438,7 +529,12 @@ pub Config config_from_gguf(GgufFile file) throws:
         load_tensor_quantized(file, "{prefix}.{names[which]}.weight")
 
 ([uint8], int) load_ffn_in_quantized(GgufFile file, Config c, string prefix, int which) throws:
-    if tensor_exists(file.tensors, "{prefix}.ffn_gate.weight"):
+    if not c.ffn_gated:
+        if which == 0:
+            ([0 as uint8], 8)
+        else:
+            load_tensor_quantized(file, "{prefix}.ffn_up.weight")
+    elif tensor_exists(file.tensors, "{prefix}.ffn_gate.weight"):
         let names = ["ffn_gate", "ffn_up"]
         load_tensor_quantized(file, "{prefix}.{names[which]}.weight")
     else:
@@ -459,8 +555,22 @@ pub Config config_from_gguf(GgufFile file) throws:
         let names = ["attn_q", "attn_k", "attn_v"]
         load_tensor_f32(file, "{prefix}.{names[which]}.weight")
 
+[float32] load_attn_bias_f32(GgufFile file, Config c, string prefix, int which) throws:
+    let (row_start, n_rows) = attn_rows(c, which)
+    if tensor_exists(file.tensors, "{prefix}.attn_qkv.bias"):
+        let all = load_tensor_f32(file, "{prefix}.attn_qkv.bias")
+        [all[row_start + i] for i in 0..<n_rows]
+    else:
+        let names = ["attn_q", "attn_k", "attn_v"]
+        load_tensor_f32_or_zero(file, "{prefix}.{names[which]}.bias", n_rows)
+
 [float32] load_ffn_in_f32(GgufFile file, Config c, string prefix, int which) throws:
-    if tensor_exists(file.tensors, "{prefix}.ffn_gate.weight"):
+    if not c.ffn_gated:
+        if which == 0:
+            [0.0 as float32]
+        else:
+            load_tensor_f32(file, "{prefix}.ffn_up.weight")
+    elif tensor_exists(file.tensors, "{prefix}.ffn_gate.weight"):
         let names = ["ffn_gate", "ffn_up"]
         load_tensor_f32(file, "{prefix}.{names[which]}.weight")
     else:
@@ -487,6 +597,8 @@ bool layer_is_moe(GgufFile file, string prefix):
 pub Model load_model(GgufFile file) throws:
     let config = config_from_gguf(file)
     let tok_embd = load_tensor_f32(file, "token_embd.weight")
+    let pos_embd = if config.has_pos_embd: load_tensor_f32(file, "position_embd.weight") else: [0.0 as float32]
+    let norm_fill = if config.use_layer_norm: (1.0 as float32) else: (0.0 as float32)
     let qkv_dim = config.n_head * config.d_head
     let kv_dim = config.n_kv_head * config.d_head
 
@@ -497,25 +609,36 @@ pub Model load_model(GgufFile file) throws:
         let moe = layer_is_moe(file, prefix)
         let has_shexp = tensor_exists(file.tensors, "{prefix}.ffn_gate_shexp.weight")
         let has_shexp_gate = tensor_exists(file.tensors, "{prefix}.ffn_gate_inp_shexp.weight")
+        let has_attn_gate = tensor_exists(file.tensors, "{prefix}.attn_gate.weight")
+        let has_norm_2 = tensor_exists(file.tensors, "{prefix}.attn_norm_2.weight")
+        let has_post_as_ffn = not tensor_exists(file.tensors, "{prefix}.ffn_norm.weight") and tensor_exists(file.tensors, "{prefix}.post_attention_norm.weight")
+        let attn_norm_name = if has_norm_2: "{prefix}.attn_norm_2" else: "{prefix}.attn_norm"
+        let ffn_norm_name = if has_norm_2: "{prefix}.attn_norm" elif has_post_as_ffn: "{prefix}.post_attention_norm" else: "{prefix}.ffn_norm"
         let layer = Layer(
-            load_tensor_f32(file, "{prefix}.attn_norm.weight"),
+            load_tensor_f32_or(file, "{attn_norm_name}.weight", config.d_model, norm_fill),
+            load_tensor_f32_or_zero(file, "{attn_norm_name}.bias", config.d_model),
             load_attn_f32(file, config, prefix, 0),
-            load_tensor_f32_or_zero(file, "{prefix}.attn_q.bias", qkv_dim),
+            load_attn_bias_f32(file, config, prefix, 0),
             load_attn_f32(file, config, prefix, 1),
-            load_tensor_f32_or_zero(file, "{prefix}.attn_k.bias", kv_dim),
+            load_attn_bias_f32(file, config, prefix, 1),
             load_attn_f32(file, config, prefix, 2),
-            load_tensor_f32_or_zero(file, "{prefix}.attn_v.bias", kv_dim),
+            load_attn_bias_f32(file, config, prefix, 2),
             load_tensor_f32(file, "{prefix}.attn_output.weight"),
-            load_tensor_f32(file, "{prefix}.ffn_norm.weight"),
+            load_tensor_f32_or_zero(file, "{prefix}.attn_output.bias", config.d_model),
+            load_tensor_f32_or(file, "{ffn_norm_name}.weight", config.d_model, norm_fill),
+            load_tensor_f32_or_zero(file, "{ffn_norm_name}.bias", config.d_model),
             if moe: [0.0 as float32] else: load_ffn_in_f32(file, config, prefix, 0),
             if moe: [0.0 as float32] else: load_ffn_in_f32(file, config, prefix, 1),
+            load_tensor_f32_or_zero(file, "{prefix}.ffn_up.bias", config.ffn_dim),
             if moe: [0.0 as float32] else: load_tensor_f32(file, "{prefix}.ffn_down.weight"),
+            load_tensor_f32_or_zero(file, "{prefix}.ffn_down.bias", config.d_model),
             load_tensor_f32_or_zero(file, "{prefix}.attn_q_norm.weight", config.q_norm_dim),
             load_tensor_f32_or_zero(file, "{prefix}.attn_k_norm.weight", config.k_norm_dim),
             load_tensor_f32_or_zero(file, "{prefix}.post_attention_norm.weight", config.d_model),
             load_tensor_f32_or_zero(file, "{prefix}.post_ffw_norm.weight", config.d_model),
             moe,
             if moe: load_tensor_f32(file, "{prefix}.ffn_gate_inp.weight") else: [0.0 as float32],
+            if moe: load_tensor_f32_or_zero(file, "{prefix}.exp_probs_b.bias", config.n_expert) else: [0.0 as float32],
             if moe: load_experts_f32(file, "{prefix}.ffn_gate_exps.weight", config.n_expert, config.expert_ffn) else: [],
             if moe: load_experts_f32(file, "{prefix}.ffn_up_exps.weight", config.n_expert, config.expert_ffn) else: [],
             if moe: load_experts_f32(file, "{prefix}.ffn_down_exps.weight", config.n_expert, config.d_model) else: [],
@@ -524,14 +647,18 @@ pub Model load_model(GgufFile file) throws:
             if has_shexp: load_tensor_f32(file, "{prefix}.ffn_up_shexp.weight") else: [0.0 as float32],
             if has_shexp: load_tensor_f32(file, "{prefix}.ffn_down_shexp.weight") else: [0.0 as float32],
             has_shexp_gate,
-            if has_shexp_gate: load_tensor_f32(file, "{prefix}.ffn_gate_inp_shexp.weight") else: [0.0 as float32])
+            if has_shexp_gate: load_tensor_f32(file, "{prefix}.ffn_gate_inp_shexp.weight") else: [0.0 as float32],
+            has_attn_gate,
+            if has_attn_gate: load_tensor_f32(file, "{prefix}.attn_gate.weight") else: [0.0 as float32])
         layers.push(layer)
         l += 1
 
-    let output_norm_w = load_tensor_f32(file, "output_norm.weight")
+    let output_norm_w = load_tensor_f32_or_one(file, "output_norm.weight", config.d_model)
+    let output_norm_b = load_tensor_f32_or_zero(file, "output_norm.bias", config.d_model)
     let output_w = resolve_output_weight(file, config, tok_embd)
+    let output_b = load_tensor_f32_or_zero(file, "output.bias", config.vocab_size)
 
-    Model(config, tok_embd, layers, output_norm_w, output_w)
+    Model(config, tok_embd, pos_embd, layers, output_norm_w, output_norm_b, output_w, output_b)
 
 # Split out of load_model as its own function specifically so `tok_embd` is
 # borrowed here (arrays are always passed by reference to functions) rather
@@ -554,6 +681,8 @@ pub Model load_model(GgufFile file) throws:
 pub QuantModel load_model_quantized(GgufFile file) throws:
     let config = config_from_gguf(file)
     let (tok_embd_q8, tok_embd_type) = load_tensor_quantized(file, "token_embd.weight")
+    let pos_embd = if config.has_pos_embd: load_tensor_f32(file, "position_embd.weight") else: [0.0 as float32]
+    let norm_fill = if config.use_layer_norm: (1.0 as float32) else: (0.0 as float32)
     let qkv_dim = config.n_head * config.d_head
     let kv_dim = config.n_kv_head * config.d_head
 
@@ -588,9 +717,15 @@ pub QuantModel load_model_quantized(GgufFile file) throws:
         let (sh_down_w, sh_down_ty) = if has_shexp: load_tensor_quantized(file, "{prefix}.ffn_down_shexp.weight") else: (placeholder, 8)
         let has_shexp_gate = tensor_exists(file.tensors, "{prefix}.ffn_gate_inp_shexp.weight")
         let shexp_gate_inp_host = if has_shexp_gate: load_tensor_f32(file, "{prefix}.ffn_gate_inp_shexp.weight") else: [0.0 as float32]
-        let q_b = load_tensor_f32_or_zero(file, "{prefix}.attn_q.bias", qkv_dim)
-        let k_b = load_tensor_f32_or_zero(file, "{prefix}.attn_k.bias", kv_dim)
-        let v_b = load_tensor_f32_or_zero(file, "{prefix}.attn_v.bias", kv_dim)
+        let has_attn_gate = tensor_exists(file.tensors, "{prefix}.attn_gate.weight")
+        let (attn_gate_w, attn_gate_ty) = if has_attn_gate: load_tensor_quantized(file, "{prefix}.attn_gate.weight") else: (placeholder, 8)
+        let q_b = load_attn_bias_f32(file, config, prefix, 0)
+        let k_b = load_attn_bias_f32(file, config, prefix, 1)
+        let v_b = load_attn_bias_f32(file, config, prefix, 2)
+        let has_norm_2 = tensor_exists(file.tensors, "{prefix}.attn_norm_2.weight")
+        let has_post_as_ffn = not tensor_exists(file.tensors, "{prefix}.ffn_norm.weight") and tensor_exists(file.tensors, "{prefix}.post_attention_norm.weight")
+        let attn_norm_name = if has_norm_2: "{prefix}.attn_norm_2" else: "{prefix}.attn_norm"
+        let ffn_norm_name = if has_norm_2: "{prefix}.attn_norm" elif has_post_as_ffn: "{prefix}.post_attention_norm" else: "{prefix}.ffn_norm"
         # Q/K/V have the same row-packed Q8_0 layout on the 0.5B model. Joining
         # their rows lets decode issue one native projection instead of three.
         # Keep a one-element placeholder elsewhere: duplicating hundreds of MB
@@ -610,7 +745,8 @@ pub QuantModel load_model_quantized(GgufFile file) throws:
         # Every weight and norm/bias is uploaded to the GPU exactly once, here,
         # and stays resident for the model's lifetime (see upload_bytes_gpu).
         let layer = QuantLayer(
-            upload_floats_gpu(load_tensor_f32(file, "{prefix}.attn_norm.weight")),
+            upload_floats_gpu(load_tensor_f32_or(file, "{attn_norm_name}.weight", config.d_model, norm_fill)),
+            upload_floats_gpu(load_tensor_f32_or_zero(file, "{attn_norm_name}.bias", config.d_model)),
             upload_bytes_gpu(with_iq_prefix(q_w, q_ty)), gpu_weight_type(q_ty),
             upload_floats_gpu(q_b),
             upload_bytes_gpu(with_iq_prefix(k_w, k_ty)), gpu_weight_type(k_ty),
@@ -619,28 +755,37 @@ pub QuantModel load_model_quantized(GgufFile file) throws:
             upload_floats_gpu(v_b),
             upload_bytes_gpu(qkv_w), upload_floats_gpu(qkv_b), qkv_fused,
             upload_bytes_gpu(with_iq_prefix(o_w, o_ty)), gpu_weight_type(o_ty),
-            upload_floats_gpu(load_tensor_f32(file, "{prefix}.ffn_norm.weight")),
+            upload_floats_gpu(load_tensor_f32_or_zero(file, "{prefix}.attn_output.bias", config.d_model)),
+            upload_floats_gpu(load_tensor_f32_or(file, "{ffn_norm_name}.weight", config.d_model, norm_fill)),
+            upload_floats_gpu(load_tensor_f32_or_zero(file, "{ffn_norm_name}.bias", config.d_model)),
             upload_bytes_gpu(with_iq_prefix(gate_w, gate_ty)), gpu_weight_type(gate_ty),
             upload_bytes_gpu(with_iq_prefix(up_w, up_ty)), gpu_weight_type(up_ty),
+            upload_floats_gpu(load_tensor_f32_or_zero(file, "{prefix}.ffn_up.bias", config.ffn_dim)),
             upload_bytes_gpu(with_iq_prefix(down_w, down_ty)), gpu_weight_type(down_ty),
+            upload_floats_gpu(load_tensor_f32_or_zero(file, "{prefix}.ffn_down.bias", config.d_model)),
             upload_floats_gpu(load_tensor_f32_or_zero(file, "{prefix}.attn_q_norm.weight", config.q_norm_dim)),
             upload_floats_gpu(load_tensor_f32_or_zero(file, "{prefix}.attn_k_norm.weight", config.k_norm_dim)),
             upload_floats_gpu(load_tensor_f32_or_zero(file, "{prefix}.post_attention_norm.weight", config.d_model)),
             upload_floats_gpu(load_tensor_f32_or_zero(file, "{prefix}.post_ffw_norm.weight", config.d_model)),
             upload_floats_gpu(layer_rope_freqs(config, l)),
-            moe, upload_floats_gpu(router_w_host), upload_floats_gpu([0.0 for i in 0..<(if moe: config.n_expert else: 1)]), experts,
+            moe, upload_floats_gpu(router_w_host), upload_floats_gpu([0.0 for i in 0..<(if moe: config.n_expert else: 1)]),
+            if moe: load_tensor_f32_or_zero(file, "{prefix}.exp_probs_b.bias", config.n_expert) else: [0.0 as float32],
+            experts,
             has_shexp,
             upload_bytes_gpu(with_iq_prefix(sh_gate_w, sh_gate_ty)), gpu_weight_type(sh_gate_ty),
             upload_bytes_gpu(with_iq_prefix(sh_up_w, sh_up_ty)), gpu_weight_type(sh_up_ty),
             upload_bytes_gpu(with_iq_prefix(sh_down_w, sh_down_ty)), gpu_weight_type(sh_down_ty),
-            has_shexp_gate, upload_floats_gpu(shexp_gate_inp_host), upload_floats_gpu([0.0 as float32]))
+            has_shexp_gate, upload_floats_gpu(shexp_gate_inp_host), upload_floats_gpu([0.0 as float32]),
+            has_attn_gate, upload_bytes_gpu(with_iq_prefix(attn_gate_w, attn_gate_ty)), gpu_weight_type(attn_gate_ty))
         layers.push(layer)
         l += 1
 
-    let output_norm_w = load_tensor_f32(file, "output_norm.weight")
+    let output_norm_w = load_tensor_f32_or_one(file, "output_norm.weight", config.d_model)
+    let output_norm_b = load_tensor_f32_or_zero(file, "output_norm.bias", config.d_model)
     let (output_w_q8, output_w_type) = resolve_output_weight_q8(file, config, tok_embd_q8, tok_embd_type)
+    let output_b = load_tensor_f32_or_zero(file, "output.bias", config.vocab_size)
 
-    QuantModel(config, tok_embd_q8, tok_embd_type, layers, upload_floats_gpu(output_norm_w), upload_bytes_gpu(with_iq_prefix(output_w_q8, output_w_type)), gpu_weight_type(output_w_type))
+    QuantModel(config, tok_embd_q8, tok_embd_type, pos_embd, layers, upload_floats_gpu(output_norm_w), upload_floats_gpu(output_norm_b), upload_bytes_gpu(with_iq_prefix(output_w_q8, output_w_type)), gpu_weight_type(output_w_type), upload_floats_gpu(output_b))
 
 ([uint8], int) resolve_output_weight_q8(GgufFile file, Config config, [uint8] tok_embd_q8, int tok_embd_type) throws:
     if config.tied_embeddings:
@@ -648,9 +793,16 @@ pub QuantModel load_model_quantized(GgufFile file) throws:
     else:
         load_tensor_quantized(file, "output.weight")
 
-# Gemma 2/3 sliding-window layers: layer l is local when l % swa_pattern < swa_pattern - 1.
+# Sliding-window layers: when `swa_first_global` (SmallThinker), layer l % pattern == 0 is global
+# and l % pattern > 0 is local; otherwise (Gemma 2/3, OLMo 2, EXAONE 4/MoE, Cohere 2, AfMoE),
+# l % pattern < pattern - 1 is local.
 bool layer_is_swa(Config c, int l):
-    c.swa_window > 0 and (l % c.swa_pattern) < c.swa_pattern - 1
+    if c.swa_window <= 0:
+        false
+    elif c.swa_first_global:
+        (l % c.swa_pattern) > 0
+    else:
+        (l % c.swa_pattern) < c.swa_pattern - 1
 
 int layer_window(Config c, int l):
     if layer_is_swa(c, l):
@@ -658,9 +810,18 @@ int layer_window(Config c, int l):
     else:
         0
 
-# SmolLM3's NoPE layers rotate by nothing: all angular frequencies zero, magnitude 1.
+# NoPE / GPT-2 (nope_step == 1) / SmallThinker (swa_first_global: l % nope_step == 0) /
+# SmolLM3, EXAONE4, Cohere2, AfMoE ((l + 1) % nope_step == 0): identity rotation.
 [float32] layer_rope_freqs(Config c, int l):
-    if c.nope_step > 0 and (l + 1) % c.nope_step == 0:
+    let is_nope = if c.nope_step <= 0:
+        false
+    elif c.nope_step == 1:
+        true
+    elif c.swa_first_global:
+        (l % c.nope_step) == 0
+    else:
+        (l + 1) % c.nope_step == 0
+    if is_nope:
         return [if i == c.rope_freqs.length - 1: (1.0 as float32) else: (0.0 as float32) for i in 0..<c.rope_freqs.length]
     if layer_is_swa(c, l):
         c.rope_freqs_local
@@ -689,10 +850,10 @@ int layer_window(Config c, int l):
     else:
         [row[i] * scale for i in 0..<row.length]
 
-# Routing of one token, as llama.cpp's build_moe_ffn: softmax (or sigmoid when gating_func == 2)
+# Routing of one token, as llama.cpp's build_moe_ffn: softmax (1 or 3 = softmax_weight) or sigmoid (2)
 # over the router logits, the n_used most probable experts, optionally renormalized to sum to 1
 # (`norm_weights`) and scaled by `weights_scale`. Returns (expert ids, weights).
-pub ([int], [float32]) moe_route_ext([float32] logits, int n_expert, int n_used, int gating_func, bool norm_weights, float32 weights_scale):
+pub ([int], [float32]) moe_route_ext([float32] logits, [float32] exp_probs_b, int n_expert, int n_used, int gating_func, bool norm_weights, float32 weights_scale):
     mut [float32] probs = [0.0 for k in 0..<n_expert]
     if gating_func == 2:
         var int i = 0
@@ -724,7 +885,9 @@ pub ([int], [float32]) moe_route_ext([float32] logits, int n_expert, int n_used,
         var int best = -1
         var int e = 0
         while e < n_expert:
-            if not chosen.contains(e) and (best < 0 or probs[e] > probs[best]):
+            let sel_e = probs[e] + exp_probs_b[e]
+            let sel_best = if best >= 0: probs[best] + exp_probs_b[best] else: (0.0 as float32)
+            if not chosen.contains(e) and (best < 0 or sel_e > sel_best):
                 best = e
             e += 1
         chosen.push(best)
@@ -738,17 +901,16 @@ pub ([int], [float32]) moe_route_ext([float32] logits, int n_expert, int n_used,
     (chosen, out_weights)
 
 pub ([int], [float32]) moe_route([float32] logits, int n_expert, int n_used):
-    moe_route_ext(logits, n_expert, n_used, 1, true, 1.0 as float32)
+    moe_route_ext(logits, [0.0 as float32 for k in 0..<n_expert], n_expert, n_used, 1, true, 1.0 as float32)
 
-# CPU mixture-of-experts FFN over `seq` rows of d_model floats.
-pub [float32] moe_ffn_cpu(Config config, Layer layer, [float32] x, int seq):
+# CPU mixture-of-experts FFN using precomputed `router_logits` (over `seq` rows of d_model floats).
+pub [float32] moe_ffn_with_logits_cpu(Config config, Layer layer, [float32] x, [float32] router_logits, int seq):
     let d = config.d_model
-    let router_logits = linear(x, layer.router_w, seq, d, config.n_expert)
     mut [float32] out = [0.0 for i in 0..<(seq * d)]
     var int t = 0
     while t < seq:
         let row = [x[t * d + i] for i in 0..<d]
-        let (chosen, weights) = moe_route_ext([router_logits[t * config.n_expert + e] for e in 0..<config.n_expert], config.n_expert, config.n_expert_used, config.moe_gating_func, config.moe_norm_weights, config.moe_weights_scale)
+        let (chosen, weights) = moe_route_ext([router_logits[t * config.n_expert + e] for e in 0..<config.n_expert], layer.exp_probs_b, config.n_expert, config.n_expert_used, config.moe_gating_func, config.moe_norm_weights, config.moe_weights_scale)
         var int k = 0
         while k < chosen.length:
             let e = chosen[k]
@@ -782,21 +944,26 @@ pub [float32] moe_ffn_cpu(Config config, Layer layer, [float32] x, int seq):
                 idx += 1
     out
 
-# GPU mixture-of-experts FFN over `n` rows (`normed2`: n x d_model, resident). The router runs on the GPU
-# and its logits come back to the host, which routes every row (moe_route); each expert that received
-# rows then runs on just those rows (gathered into a batch when n > 1) and its output, scaled by the
-# routing weights, is added into the accumulator. Returns the accumulated FFN output (n x d_model).
-([float32]'kernel'unified, int) moe_ffn_gpu(QuantModel model, QuantLayer layer, [float32]'kernel'unified normed2, int n) throws:
+# CPU mixture-of-experts FFN over `seq` rows of d_model floats.
+pub [float32] moe_ffn_cpu(Config config, Layer layer, [float32] x, int seq):
+    let router_logits = linear(x, layer.router_w, seq, config.d_model, config.n_expert)
+    moe_ffn_with_logits_cpu(config, layer, x, router_logits, seq)
+
+# GPU mixture-of-experts FFN over `n` rows (`normed2`: n x d_model, resident), with either
+# precomputed host router logits (when `pre_logits.length > 0`) or freshly projected ones.
+([float32]'kernel'unified, int) moe_ffn_gpu(QuantModel model, QuantLayer layer, [float32]'kernel'unified normed2, [float32] pre_logits, int n) throws:
     let d = model.config.d_model
     let n_expert = model.config.n_expert
     let ffn_e = model.config.expert_ffn
-    let router_logits = linear_gpu(normed2, layer.router_w, layer.router_b, n, d, n_expert)
-    let logits = passthrough(router_logits)
+    var [float32] logits = pre_logits
+    if pre_logits.length == 0:
+        let router_logits = linear_gpu(normed2, layer.router_w, layer.router_b, n, d, n_expert)
+        logits = passthrough(router_logits)
     mut [[int]] rows_of = [[] for e in 0..<n_expert]
     mut [[float32]] weights_of = [[] for e in 0..<n_expert]
     var int t = 0
     while t < n:
-        let (chosen, weights) = moe_route_ext([logits[t * n_expert + e] for e in 0..<n_expert], n_expert, model.config.n_expert_used, model.config.moe_gating_func, model.config.moe_norm_weights, model.config.moe_weights_scale)
+        let (chosen, weights) = moe_route_ext([logits[t * n_expert + e] for e in 0..<n_expert], layer.exp_probs_b, n_expert, model.config.n_expert_used, model.config.moe_gating_func, model.config.moe_norm_weights, model.config.moe_weights_scale)
         var int k = 0
         while k < chosen.length:
             rows_of[chosen[k]].push(t)
@@ -833,6 +1000,55 @@ pub [float32] moe_ffn_cpu(Config config, Layer layer, [float32] x, int seq):
         acc = add_gpu(acc, sh_out, n * d)
     (acc, 0)
 
+[float32] apply_qk_norm_cpu([float32] x, [float32] w, int rows, int dim, Config config):
+    if config.use_layer_norm:
+        norm_cpu(x, w, [0.0 as float32 for i in 0..<dim], rows, dim, config.rms_eps, true)
+    else:
+        rms_norm(x, w, rows, dim, config.rms_eps)
+
+[float32] with_pos_embd_host([float32] x, [float32] pos_embd, Config c, int seq, int start_pos):
+    if not c.has_pos_embd:
+        return x
+    let d = c.d_model
+    mut [float32] out = [x[i] for i in 0..<x.length]
+    var int p = 0
+    while p < seq:
+        let pos = start_pos + p
+        var int i = 0
+        while i < d:
+            out[p * d + i] = out[p * d + i] + pos_embd[pos * d + i]
+            i += 1
+        p += 1
+    out
+
+[float32] embed_tokens_q(QuantModel model, [int] tokens, int start_pos) throws:
+    let seq = tokens.length
+    let d = model.config.d_model
+    let tok_embd_row_bytes = quantized_row_bytes(model.tok_embd_type, d)
+    mut [float32] x = [0.0 for i in 0..<(seq * d)]
+    var int p = 0
+    while p < seq:
+        let tok = tokens[p]
+        let row_byte_offset = tok * tok_embd_row_bytes
+        let row = dequantize_row(model.tok_embd_type, model.tok_embd_q8, row_byte_offset, d)
+        var int i = 0
+        while i < d:
+            x[p * d + i] = row[i] * model.config.embd_scale
+            i += 1
+        p += 1
+    with_pos_embd_host(x, model.pos_embd, model.config, seq, start_pos)
+
+req [float32]'kernel'unified apply_nongated_ffn_gpu(Config config, QuantLayer layer, [float32]'kernel'unified normed2, int seq) throws:
+    let up = tensor_linear_gpu(normed2, layer.up_w_q8, layer.up_w_type, layer.up_b, seq, config.d_model, config.ffn_dim)
+    let hidden = nongated_act_gpu(up, seq * config.ffn_dim, config.act)
+    tensor_linear_gpu(hidden, layer.down_w_q8, layer.down_w_type, layer.down_b, seq, config.ffn_dim, config.d_model)
+
+[float32] compute_pre_router_logits(Config config, QuantLayer layer, [float32]'kernel'unified x, int seq) throws:
+    if layer.is_moe and config.pre_attn_router:
+        let raw = linear_gpu(x, layer.router_w, layer.router_b, seq, config.d_model, config.n_expert)
+        return passthrough(raw)
+    []
+
 # Full (uncached) forward pass over every position in `tokens`. Returns
 # logits for every position (seq * vocab_size), row-major — the caller
 # typically only needs the last position's row for greedy next-token
@@ -849,45 +1065,77 @@ pub [float32] forward(Model model, [int] tokens) throws:
         let tok = tokens[p]
         var int i = 0
         while i < d:
-            x[p * d + i] = model.tok_embd[tok * d + i] * model.config.embd_scale
+            let pos_add = if model.config.has_pos_embd: model.pos_embd[p * d + i] else: (0.0 as float32)
+            x[p * d + i] = model.tok_embd[tok * d + i] * model.config.embd_scale + pos_add
             i += 1
         p += 1
 
     var int l = 0
     while l < model.config.n_layer:
         let layer = model.layers[l]
+        let pre_router_logits = if layer.is_moe and model.config.pre_attn_router:
+            linear(x, layer.router_w, seq, d, model.config.n_expert)
+        else:
+            []
 
-        let normed = rms_norm(x, layer.attn_norm_w, seq, d, model.config.rms_eps)
+        let normed = if model.config.no_pre_norm:
+            x
+        elif model.config.has_norm_bias:
+            norm_cpu(x, layer.attn_norm_w, layer.attn_norm_b, seq, d, model.config.rms_eps, model.config.use_layer_norm)
+        else:
+            rms_norm(x, layer.attn_norm_w, seq, d, model.config.rms_eps)
         var q = linear_bias(normed, layer.q_w, layer.q_b, seq, d, qkv_dim)
         var k = linear_bias(normed, layer.k_w, layer.k_b, seq, d, kv_dim)
         let v = linear_bias(normed, layer.v_w, layer.v_b, seq, d, kv_dim)
-        if model.config.qk_norm:
-            q = rms_norm(q, layer.q_norm_w, seq * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps)
-            k = rms_norm(k, layer.k_norm_w, seq * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps)
+        if model.config.qk_norm and not model.config.qk_norm_post_rope:
+            q = apply_qk_norm_cpu(q, layer.q_norm_w, seq * model.config.q_norm_heads, model.config.q_norm_dim, model.config)
+            k = apply_qk_norm_cpu(k, layer.k_norm_w, seq * model.config.k_norm_heads, model.config.k_norm_dim, model.config)
         let rope_t = layer_rope_freqs(model.config, l)
         q = rope_apply(q, seq, model.config.n_head, model.config.d_head, rope_t, model.config.rope_neox)
         k = rope_apply(k, seq, model.config.n_kv_head, model.config.d_head, rope_t, model.config.rope_neox)
-        let attn_out = gqa_attention_ext(q, k, v, seq, model.config.n_head, model.config.n_kv_head, model.config.d_head,
+        if model.config.qk_norm_post_rope:
+            q = apply_qk_norm_cpu(q, layer.q_norm_w, seq * model.config.q_norm_heads, model.config.q_norm_dim, model.config)
+            k = apply_qk_norm_cpu(k, layer.k_norm_w, seq * model.config.k_norm_heads, model.config.k_norm_dim, model.config)
+        var attn_out = gqa_attention_ext(q, k, v, seq, model.config.n_head, model.config.n_kv_head, model.config.d_head,
                                          model.config.attn_scale, model.config.attn_softcap, layer_window(model.config, l))
-        var attn_proj = linear(attn_out, layer.o_w, seq, qkv_dim, d)
+        if layer.has_attn_gate:
+            let gate_proj = linear(normed, layer.attn_gate_w, seq, d, qkv_dim)
+            attn_out = mul_sigmoid_cpu(attn_out, gate_proj)
+        var attn_proj = if model.config.has_linear_bias: linear_bias(attn_out, layer.o_w, layer.o_b, seq, qkv_dim, d) else: linear(attn_out, layer.o_w, seq, qkv_dim, d)
         if model.config.post_norms:
             attn_proj = rms_norm(attn_proj, layer.attn_post_norm_w, seq, d, model.config.rms_eps)
         if model.config.residual_scale != 1.0:
             attn_proj = [attn_proj[i] * model.config.residual_scale for i in 0..<attn_proj.length]
-        x = vec_add(x, attn_proj)
-
-        let normed2 = rms_norm(x, layer.ffn_norm_w, seq, d, model.config.rms_eps)
-        var ffn_out = if layer.is_moe: moe_ffn_cpu(model.config, layer, normed2, seq) else: swiglu_ffn(normed2, layer.gate_w, layer.up_w, layer.down_w, seq, d, model.config.ffn_dim, model.config.act)
+        if model.config.residual_type == 0:
+            x = vec_add(x, attn_proj)
+        let normed2 = if model.config.residual_type == 1:
+            normed
+        elif model.config.residual_type == 2:
+            if model.config.has_norm_bias: norm_cpu(x, layer.ffn_norm_w, layer.ffn_norm_b, seq, d, model.config.rms_eps, model.config.use_layer_norm) else: rms_norm(x, layer.ffn_norm_w, seq, d, model.config.rms_eps)
+        else:
+            if model.config.no_pre_norm: x elif model.config.has_norm_bias: norm_cpu(x, layer.ffn_norm_w, layer.ffn_norm_b, seq, d, model.config.rms_eps, model.config.use_layer_norm) else: rms_norm(x, layer.ffn_norm_w, seq, d, model.config.rms_eps)
+        var ffn_out = if layer.is_moe and model.config.pre_attn_router:
+            moe_ffn_with_logits_cpu(model.config, layer, normed2, pre_router_logits, seq)
+        elif layer.is_moe:
+            moe_ffn_cpu(model.config, layer, normed2, seq)
+        elif model.config.ffn_gated:
+            swiglu_ffn(normed2, layer.gate_w, layer.up_w, layer.down_w, seq, d, model.config.ffn_dim, model.config.act)
+        else:
+            nongated_ffn(normed2, layer.up_w, layer.up_b, layer.down_w, layer.down_b, seq, d, model.config.ffn_dim, model.config.act)
         if model.config.post_norms:
             ffn_out = rms_norm(ffn_out, layer.ffn_post_norm_w, seq, d, model.config.rms_eps)
         if model.config.residual_scale != 1.0:
             ffn_out = [ffn_out[i] * model.config.residual_scale for i in 0..<ffn_out.length]
-        x = vec_add(x, ffn_out)
+        if model.config.residual_type != 0:
+            x = vec_add(x, vec_add(attn_proj, ffn_out))
+        else:
+            x = vec_add(x, ffn_out)
 
         l += 1
 
-    let final_normed = rms_norm(x, model.output_norm_w, seq, d, model.config.rms_eps)
-    finish_logits(linear(final_normed, model.output_w, seq, d, model.config.vocab_size), model.config)
+    let final_normed = if model.config.has_norm_bias: norm_cpu(x, model.output_norm_w, model.output_norm_b, seq, d, model.config.rms_eps, model.config.use_layer_norm) else: rms_norm(x, model.output_norm_w, seq, d, model.config.rms_eps)
+    let raw_logits = if model.config.has_linear_bias: linear_bias(final_normed, model.output_w, model.output_b, seq, d, model.config.vocab_size) else: linear(final_normed, model.output_w, seq, d, model.config.vocab_size)
+    finish_logits(raw_logits, model.config)
 
 # Phase 2a: same forward pass, but every matmul/norm/RoPE/attention op runs
 # as a real GPU kernel (math_gpu.br) instead of a CPU loop. Still no
@@ -924,11 +1172,14 @@ pub [float32] forward_gpu(Model model, [int] tokens) throws:
         var q = linear_gpu(normed, layer.q_w, layer.q_b, seq, d, qkv_dim)
         var k = linear_gpu(normed, layer.k_w, layer.k_b, seq, d, kv_dim)
         let v = linear_gpu(normed, layer.v_w, layer.v_b, seq, d, kv_dim)
-        if model.config.qk_norm:
+        if model.config.qk_norm and not model.config.qk_norm_post_rope:
             q = rms_norm_gpu(q, layer.q_norm_w, seq * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps)
             k = rms_norm_gpu(k, layer.k_norm_w, seq * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps)
         q = rope_apply_gpu(q, seq, model.config.n_head, model.config.d_head, model.config.rope_freqs, model.config.rope_neox)
         k = rope_apply_gpu(k, seq, model.config.n_kv_head, model.config.d_head, model.config.rope_freqs, model.config.rope_neox)
+        if model.config.qk_norm_post_rope:
+            q = rms_norm_gpu(q, layer.q_norm_w, seq * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps)
+            k = rms_norm_gpu(k, layer.k_norm_w, seq * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps)
         let attn_out = attention_gqa_gpu(q, k, v, seq, seq, model.config.n_head, model.config.n_kv_head, model.config.d_head, true, 0)
         let attn_proj = linear_nobias_gpu(attn_out, layer.o_w, seq, qkv_dim, d)
         x = vec_add(x, attn_proj)
@@ -952,144 +1203,109 @@ pub [float32] forward_gpu(Model model, [int] tokens) throws:
 # Q8LinearKernel doc comment for the memory-savings rationale). Token
 # embedding lookup dequantizes just the one needed row per position (cheap,
 # CPU-side, quant.br's dequantize_q8_0) rather than the whole vocab table.
+req [float32]'kernel'unified apply_norm_gpu([float32]'kernel'unified x, [float32] w, [float32] b, int seq, int d, Config config) throws:
+    if config.has_norm_bias:
+        return norm_gpu(x, w, b, seq, d, config.rms_eps, config.use_layer_norm)
+    rms_norm_gpu(x, w, seq, d, config.rms_eps)
+
+req [float32]'kernel'unified apply_pre_norm_gpu([float32]'kernel'unified x, [float32] w, [float32] b, int seq, int d, Config config) throws:
+    if config.no_pre_norm:
+        return x
+    if config.has_norm_bias:
+        return norm_gpu(x, w, b, seq, d, config.rms_eps, config.use_layer_norm)
+    rms_norm_gpu(x, w, seq, d, config.rms_eps)
+
+req [float32]'kernel'unified apply_linear_gpu([float32]'kernel'unified x, [uint8]'kernel'unified w_q8, int w_type, [float32]'kernel'unified b, int seq, int d_in, int d_out, bool has_bias) throws:
+    if has_bias:
+        return tensor_linear_gpu(x, w_q8, w_type, b, seq, d_in, d_out)
+    tensor_linear_nobias_gpu(x, w_q8, w_type, seq, d_in, d_out)
+
+req [float32]'kernel'unified forward_hidden_gpu_quantized(QuantModel model, [int] tokens) throws:
+    let seq = tokens.length
+    let d = model.config.d_model
+    let qkv_dim = model.config.n_head * model.config.d_head
+    let kv_dim = model.config.n_kv_head * model.config.d_head
+    let x0 = embed_tokens_q(model, tokens, 0)
+    var [float32]'kernel'unified x = upload_floats_gpu(x0)
+
+    var int l = 0
+    while l < model.config.n_layer:
+        let layer = model.layers[l]
+
+        let pre_router_logits = compute_pre_router_logits(model.config, layer, x, seq)
+        let normed = apply_pre_norm_gpu(x, layer.attn_norm_w, layer.attn_norm_b, seq, d, model.config)
+        var q = tensor_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, seq, d, qkv_dim)
+        var k = tensor_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, seq, d, kv_dim)
+        let v = tensor_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, seq, d, kv_dim)
+        if model.config.qk_norm and not model.config.qk_norm_post_rope:
+            q = apply_qk_norm_gpu(q, layer.q_norm_w, seq * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
+            k = apply_qk_norm_gpu(k, layer.k_norm_w, seq * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
+        let rope_t = layer_rope_freqs(model.config, l)
+        q = rope_apply_gpu(q, seq, model.config.n_head, model.config.d_head, rope_t, model.config.rope_neox)
+        k = rope_apply_gpu(k, seq, model.config.n_kv_head, model.config.d_head, rope_t, model.config.rope_neox)
+        if model.config.qk_norm_post_rope:
+            q = apply_qk_norm_gpu(q, layer.q_norm_w, seq * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
+            k = apply_qk_norm_gpu(k, layer.k_norm_w, seq * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
+        var attn_out = attention_layer_gpu(q, k, v, seq, seq, model.config.n_head, model.config.n_kv_head, model.config.d_head, 0,
+            model.config.attn_ext, model.config.attn_scale, model.config.attn_softcap, layer_window(model.config, l))
+        if layer.has_attn_gate:
+            let gate_proj = tensor_linear_nobias_gpu(normed, layer.attn_gate_w_q8, layer.attn_gate_w_type, seq, d, qkv_dim)
+            attn_out = mul_sigmoid_gpu(attn_out, gate_proj, seq * qkv_dim)
+        let attn_proj = apply_linear_gpu(attn_out, layer.o_w_q8, layer.o_w_type, layer.o_b, seq, qkv_dim, d, model.config.has_linear_bias)
+        mut [float32]'kernel'unified attn_res = attn_proj
+        if model.config.post_norms:
+            attn_res = rms_norm_gpu(attn_proj, layer.attn_post_norm_w, seq, d, model.config.rms_eps)
+        if model.config.residual_scale != 1.0:
+            attn_res = scale_gpu(attn_res, model.config.residual_scale, seq * d)
+        if model.config.residual_type == 0:
+            x = add_gpu(x, attn_res, seq * d)
+        mut [float32]'kernel'unified normed2 = []
+        if model.config.residual_type == 1:
+            normed2 = normed
+        elif model.config.residual_type == 2:
+            normed2 = apply_norm_gpu(x, layer.ffn_norm_w, layer.ffn_norm_b, seq, d, model.config)
+        else:
+            normed2 = apply_pre_norm_gpu(x, layer.ffn_norm_w, layer.ffn_norm_b, seq, d, model.config)
+        mut [float32]'kernel'unified ffn_out = []
+        if layer.is_moe:
+            let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, pre_router_logits, seq)
+            ffn_out = moe_out
+        elif model.config.ffn_gated:
+            let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, seq, d, model.config.ffn_dim)
+            let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, seq, d, model.config.ffn_dim)
+            let hidden = glu_combine_gpu(gate, up, model.config.act)
+            ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, seq, model.config.ffn_dim, d)
+        else:
+            ffn_out = apply_nongated_ffn_gpu(model.config, layer, normed2, seq)
+        mut [float32]'kernel'unified ffn_res = []
+        if model.config.post_norms:
+            ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, seq, d, model.config.rms_eps)
+        else:
+            ffn_res = ffn_out
+        if model.config.residual_scale != 1.0:
+            ffn_res = scale_gpu(ffn_res, model.config.residual_scale, seq * d)
+        if model.config.residual_type != 0:
+            let both_res = add_gpu(attn_res, ffn_res, seq * d)
+            x = add_gpu(x, both_res, seq * d)
+        else:
+            x = add_gpu(x, ffn_res, seq * d)
+
+        l += 1
+
+    apply_norm_gpu(x, model.output_norm_w, model.output_norm_b, seq, d, model.config)
+
 pub [float32] forward_gpu_quantized(QuantModel model, [int] tokens) throws:
     let seq = tokens.length
     let d = model.config.d_model
-    let qkv_dim = model.config.n_head * model.config.d_head
-    let kv_dim = model.config.n_kv_head * model.config.d_head
-    let tok_embd_row_bytes = quantized_row_bytes(model.tok_embd_type, d)
-
-    var mut [float32] x = [0.0 for i in 0..<(seq * d)]
-    var int p = 0
-    while p < seq:
-        let tok = tokens[p]
-        let row_byte_offset = tok * tok_embd_row_bytes
-        let row = dequantize_row(model.tok_embd_type, model.tok_embd_q8, row_byte_offset, d)
-        var int i = 0
-        while i < d:
-            x[p * d + i] = row[i] * model.config.embd_scale
-            i += 1
-        p += 1
-
-    var int l = 0
-    while l < model.config.n_layer:
-        let layer = model.layers[l]
-
-        let normed = rms_norm_gpu(x, layer.attn_norm_w, seq, d, model.config.rms_eps)
-        var q = tensor_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, seq, d, qkv_dim)
-        var k = tensor_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, seq, d, kv_dim)
-        let v = tensor_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, seq, d, kv_dim)
-        if model.config.qk_norm:
-            q = rms_norm_gpu(q, layer.q_norm_w, seq * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps)
-            k = rms_norm_gpu(k, layer.k_norm_w, seq * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps)
-        let rope_t = layer_rope_freqs(model.config, l)
-        q = rope_apply_gpu(q, seq, model.config.n_head, model.config.d_head, rope_t, model.config.rope_neox)
-        k = rope_apply_gpu(k, seq, model.config.n_kv_head, model.config.d_head, rope_t, model.config.rope_neox)
-        let attn_out = attention_layer_gpu(q, k, v, seq, seq, model.config.n_head, model.config.n_kv_head, model.config.d_head, 0,
-            model.config.attn_ext, model.config.attn_scale, model.config.attn_softcap, layer_window(model.config, l))
-        let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, seq, qkv_dim, d)
-        mut [float32]'kernel'unified attn_res = attn_proj
-        if model.config.post_norms:
-            attn_res = rms_norm_gpu(attn_proj, layer.attn_post_norm_w, seq, d, model.config.rms_eps)
-        if model.config.residual_scale != 1.0:
-            attn_res = scale_gpu(attn_res, model.config.residual_scale, seq * d)
-        x = vec_add(x, attn_res)
-
-        let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, seq, d, model.config.rms_eps)
-        mut [float32]'kernel'unified ffn_out = []
-        if layer.is_moe:
-            let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, seq)
-            ffn_out = moe_out
-        else:
-            let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, seq, d, model.config.ffn_dim)
-            let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, seq, d, model.config.ffn_dim)
-            let hidden = glu_combine_gpu(gate, up, model.config.act)
-            ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, seq, model.config.ffn_dim, d)
-        mut [float32]'kernel'unified ffn_res = []
-        if model.config.post_norms:
-            ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, seq, d, model.config.rms_eps)
-        else:
-            ffn_res = ffn_out
-        if model.config.residual_scale != 1.0:
-            ffn_res = scale_gpu(ffn_res, model.config.residual_scale, seq * d)
-        x = vec_add(x, ffn_res)
-
-        l += 1
-
-    let final_normed = rms_norm_gpu(x, model.output_norm_w, seq, d, model.config.rms_eps)
-    let logits_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, seq, d, model.config.vocab_size)
+    let final_normed = forward_hidden_gpu_quantized(model, tokens)
+    let logits_raw = apply_linear_gpu(final_normed, model.output_w_q8, model.output_w_type, model.output_b, seq, d, model.config.vocab_size, model.config.has_linear_bias)
     finish_logits(passthrough(logits_raw), model.config)
-
 
 # The embedding forward pass: the same layers as forward_gpu_quantized, but it returns the
 # final-norm hidden state of every position (seq rows of d_model floats, no output head), which
-# embedding.br pools. Kept as a copy of that function's body so the validated logits path stays
-# untouched.
+# embedding.br pools.
 pub [float32] hidden_states_gpu_quantized(QuantModel model, [int] tokens) throws:
-    let seq = tokens.length
-    let d = model.config.d_model
-    let qkv_dim = model.config.n_head * model.config.d_head
-    let kv_dim = model.config.n_kv_head * model.config.d_head
-    let tok_embd_row_bytes = quantized_row_bytes(model.tok_embd_type, d)
-
-    var mut [float32] x = [0.0 for i in 0..<(seq * d)]
-    var int p = 0
-    while p < seq:
-        let tok = tokens[p]
-        let row_byte_offset = tok * tok_embd_row_bytes
-        let row = dequantize_row(model.tok_embd_type, model.tok_embd_q8, row_byte_offset, d)
-        var int i = 0
-        while i < d:
-            x[p * d + i] = row[i] * model.config.embd_scale
-            i += 1
-        p += 1
-
-    var int l = 0
-    while l < model.config.n_layer:
-        let layer = model.layers[l]
-
-        let normed = rms_norm_gpu(x, layer.attn_norm_w, seq, d, model.config.rms_eps)
-        var q = tensor_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, seq, d, qkv_dim)
-        var k = tensor_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, seq, d, kv_dim)
-        let v = tensor_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, seq, d, kv_dim)
-        if model.config.qk_norm:
-            q = rms_norm_gpu(q, layer.q_norm_w, seq * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps)
-            k = rms_norm_gpu(k, layer.k_norm_w, seq * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps)
-        let rope_t = layer_rope_freqs(model.config, l)
-        q = rope_apply_gpu(q, seq, model.config.n_head, model.config.d_head, rope_t, model.config.rope_neox)
-        k = rope_apply_gpu(k, seq, model.config.n_kv_head, model.config.d_head, rope_t, model.config.rope_neox)
-        let attn_out = attention_layer_gpu(q, k, v, seq, seq, model.config.n_head, model.config.n_kv_head, model.config.d_head, 0,
-            model.config.attn_ext, model.config.attn_scale, model.config.attn_softcap, layer_window(model.config, l))
-        let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, seq, qkv_dim, d)
-        mut [float32]'kernel'unified attn_res = attn_proj
-        if model.config.post_norms:
-            attn_res = rms_norm_gpu(attn_proj, layer.attn_post_norm_w, seq, d, model.config.rms_eps)
-        if model.config.residual_scale != 1.0:
-            attn_res = scale_gpu(attn_res, model.config.residual_scale, seq * d)
-        x = vec_add(x, attn_res)
-
-        let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, seq, d, model.config.rms_eps)
-        mut [float32]'kernel'unified ffn_out = []
-        if layer.is_moe:
-            let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, seq)
-            ffn_out = moe_out
-        else:
-            let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, seq, d, model.config.ffn_dim)
-            let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, seq, d, model.config.ffn_dim)
-            let hidden = glu_combine_gpu(gate, up, model.config.act)
-            ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, seq, model.config.ffn_dim, d)
-        mut [float32]'kernel'unified ffn_res = []
-        if model.config.post_norms:
-            ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, seq, d, model.config.rms_eps)
-        else:
-            ffn_res = ffn_out
-        if model.config.residual_scale != 1.0:
-            ffn_res = scale_gpu(ffn_res, model.config.residual_scale, seq * d)
-        x = vec_add(x, ffn_res)
-
-        l += 1
-
-    let final_normed = rms_norm_gpu(x, model.output_norm_w, seq, d, model.config.rms_eps)
+    let final_normed = forward_hidden_gpu_quantized(model, tokens)
     passthrough(final_normed)
 
 # Phase 3: greedy decoding — repeatedly calls forward_gpu_quantized on the
@@ -1278,58 +1494,59 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
     let d = model.config.d_model
     let qkv_dim = model.config.n_head * model.config.d_head
     let kv_dim = model.config.n_kv_head * model.config.d_head
-    let tok_embd_row_bytes = quantized_row_bytes(model.tok_embd_type, d)
-
-    mut [float32] x_host = [0.0 for i in 0..<(seq * d)]
-    var int p = 0
-    while p < seq:
-        let tok = tokens[p]
-        let row_byte_offset = tok * tok_embd_row_bytes
-        let row = dequantize_row(model.tok_embd_type, model.tok_embd_q8, row_byte_offset, d)
-        var int i = 0
-        while i < d:
-            x_host[p * d + i] = row[i] * model.config.embd_scale
-            i += 1
-        p += 1
 
     # Residual stream: uploaded once, then kept on the device across layers.
-    var x = upload_floats_gpu(x_host)
+    var x = upload_floats_gpu(embed_tokens_q(model, tokens, 0))
 
     mut [LayerCache] new_layers = []
     var int l = 0
     while l < model.config.n_layer:
         let layer = model.layers[l]
 
-        let normed = rms_norm_gpu(x, layer.attn_norm_w, seq, d, model.config.rms_eps)
+        let pre_router_logits = compute_pre_router_logits(model.config, layer, x, seq)
+        let normed = apply_pre_norm_gpu(x, layer.attn_norm_w, layer.attn_norm_b, seq, d, model.config)
         var q = tensor_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, seq, d, qkv_dim)
         var k = tensor_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, seq, d, kv_dim)
         let v = tensor_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, seq, d, kv_dim)
-        if model.config.qk_norm:
-            q = rms_norm_gpu(q, layer.q_norm_w, seq * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps)
-            k = rms_norm_gpu(k, layer.k_norm_w, seq * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps)
+        if model.config.qk_norm and not model.config.qk_norm_post_rope:
+            q = apply_qk_norm_gpu(q, layer.q_norm_w, seq * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
+            k = apply_qk_norm_gpu(k, layer.k_norm_w, seq * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
         let rope_t = layer_rope_freqs(model.config, l)
         q = rope_apply_gpu(q, seq, model.config.n_head, model.config.d_head, rope_t, model.config.rope_neox)
-        let k_rope_raw = rope_apply_gpu(k, seq, model.config.n_kv_head, model.config.d_head, rope_t, model.config.rope_neox)
-        let attn_out = attention_layer_gpu(q, k_rope_raw, v, seq, seq, model.config.n_head, model.config.n_kv_head, model.config.d_head, 0,
+        var k_rope_raw = rope_apply_gpu(k, seq, model.config.n_kv_head, model.config.d_head, rope_t, model.config.rope_neox)
+        if model.config.qk_norm_post_rope:
+            q = apply_qk_norm_gpu(q, layer.q_norm_w, seq * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
+            k_rope_raw = apply_qk_norm_gpu(k_rope_raw, layer.k_norm_w, seq * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
+        var attn_out = attention_layer_gpu(q, k_rope_raw, v, seq, seq, model.config.n_head, model.config.n_kv_head, model.config.d_head, 0,
             model.config.attn_ext, model.config.attn_scale, model.config.attn_softcap, layer_window(model.config, l))
-        let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, seq, qkv_dim, d)
+        if layer.has_attn_gate:
+            let gate_proj = tensor_linear_nobias_gpu(normed, layer.attn_gate_w_q8, layer.attn_gate_w_type, seq, d, qkv_dim)
+            attn_out = mul_sigmoid_gpu(attn_out, gate_proj, seq * qkv_dim)
+        let attn_proj = apply_linear_gpu(attn_out, layer.o_w_q8, layer.o_w_type, layer.o_b, seq, qkv_dim, d, model.config.has_linear_bias)
         mut [float32]'kernel'unified attn_res = attn_proj
         if model.config.post_norms:
             attn_res = rms_norm_gpu(attn_proj, layer.attn_post_norm_w, seq, d, model.config.rms_eps)
         if model.config.residual_scale != 1.0:
             attn_res = scale_gpu(attn_res, model.config.residual_scale, seq * d)
-        x = add_gpu(x, attn_res, seq * d)
-
-        let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, seq, d, model.config.rms_eps)
+        mut [float32]'kernel'unified normed2 = []
+        if model.config.residual_type == 1:
+            normed2 = normed
+        elif model.config.residual_type == 2:
+            normed2 = apply_norm_gpu(x, layer.ffn_norm_w, layer.ffn_norm_b, seq, d, model.config)
+        else:
+            x = add_gpu(x, attn_res, seq * d)
+            normed2 = apply_pre_norm_gpu(x, layer.ffn_norm_w, layer.ffn_norm_b, seq, d, model.config)
         mut [float32]'kernel'unified ffn_out = []
         if layer.is_moe:
-            let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, seq)
+            let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, pre_router_logits, seq)
             ffn_out = moe_out
-        else:
+        elif model.config.ffn_gated:
             let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, seq, d, model.config.ffn_dim)
             let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, seq, d, model.config.ffn_dim)
             let hidden = glu_combine_gpu(gate, up, model.config.act)
             ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, seq, model.config.ffn_dim, d)
+        else:
+            ffn_out = apply_nongated_ffn_gpu(model.config, layer, normed2, seq)
         mut [float32]'kernel'unified ffn_res = []
         if model.config.post_norms:
             ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, seq, d, model.config.rms_eps)
@@ -1337,7 +1554,11 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
             ffn_res = ffn_out
         if model.config.residual_scale != 1.0:
             ffn_res = scale_gpu(ffn_res, model.config.residual_scale, seq * d)
-        x = add_gpu(x, ffn_res, seq * d)
+        if model.config.residual_type != 0:
+            let both_res = add_gpu(attn_res, ffn_res, seq * d)
+            x = add_gpu(x, both_res, seq * d)
+        else:
+            x = add_gpu(x, ffn_res, seq * d)
 
         # `k_rope_raw`/`v` already ARE the whole prompt's post-RoPE cache for
         # this layer (seq positions, 0..seq-1) — nothing to grow, and they
@@ -1354,9 +1575,9 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
     # RMSNorm is row-independent, so the last row's logits are the same
     # math; as a seq=1 projection it also takes fused_linear_gpu's
     # decode-shape (warp-broadcast) kernel.
-    let x_last = extract_row(x, seq - 1, d)
-    let final_normed = rms_norm_gpu(x_last, model.output_norm_w, 1, d, model.config.rms_eps)
-    let logits_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
+    let x_last = upload_floats_gpu(extract_row(x, seq - 1, d))
+    let final_normed = apply_norm_gpu(x_last, model.output_norm_w, model.output_norm_b, 1, d, model.config)
+    let logits_raw = apply_linear_gpu(final_normed, model.output_w_q8, model.output_w_type, model.output_b, 1, d, model.config.vocab_size, model.config.has_linear_bias)
     # returned inside a tuple below, which — like a struct constructor —
     # doesn't trigger the GPU-result-to-array conversion automatically.
     let last_logits = finish_logits(passthrough(logits_raw), model.config)
@@ -1384,22 +1605,9 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
     let d = model.config.d_model
     let qkv_dim = model.config.n_head * model.config.d_head
     let kv_dim = model.config.n_kv_head * model.config.d_head
-    let tok_embd_row_bytes = quantized_row_bytes(model.tok_embd_type, d)
-
-    mut [float32] x_host = [0.0 for i in 0..<(n * d)]
-    var int p = 0
-    while p < n:
-        let tok = tokens[p]
-        let row_byte_offset = tok * tok_embd_row_bytes
-        let row = dequantize_row(model.tok_embd_type, model.tok_embd_q8, row_byte_offset, d)
-        var int i = 0
-        while i < d:
-            x_host[p * d + i] = row[i] * model.config.embd_scale
-            i += 1
-        p += 1
 
     # Residual stream: uploaded once, then kept on the device across layers.
-    var x = upload_floats_gpu(x_host)
+    var x = upload_floats_gpu(embed_tokens_q(model, tokens, base_pos))
 
     mut [LayerCache] new_layers = []
     var int l = 0
@@ -1407,19 +1615,23 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
         let layer = model.layers[l]
         let lc = cache.layers[l]
 
-        let normed = rms_norm_gpu(x, layer.attn_norm_w, n, d, model.config.rms_eps)
+        let pre_router_logits = compute_pre_router_logits(model.config, layer, x, n)
+        let normed = apply_pre_norm_gpu(x, layer.attn_norm_w, layer.attn_norm_b, n, d, model.config)
         var q = tensor_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, n, d, qkv_dim)
         var k = tensor_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, n, d, kv_dim)
         let v = tensor_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, n, d, kv_dim)
-        if model.config.qk_norm:
-            q = rms_norm_gpu(q, layer.q_norm_w, n * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps)
-            k = rms_norm_gpu(k, layer.k_norm_w, n * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps)
+        if model.config.qk_norm and not model.config.qk_norm_post_rope:
+            q = apply_qk_norm_gpu(q, layer.q_norm_w, n * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
+            k = apply_qk_norm_gpu(k, layer.k_norm_w, n * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
         # RoPE positions for this batch start at `base_pos` (the number of
         # positions already in the cache), not 0 — same rope_apply_at_gpu
         # forward_step already uses for a single new token, just batched.
         let rope_t = layer_rope_freqs(model.config, l)
         q = rope_apply_at_gpu(q, n, model.config.n_head, model.config.d_head, rope_t, base_pos, model.config.rope_neox)
-        let k_rope_raw = rope_apply_at_gpu(k, n, model.config.n_kv_head, model.config.d_head, rope_t, base_pos, model.config.rope_neox)
+        var k_rope_raw = rope_apply_at_gpu(k, n, model.config.n_kv_head, model.config.d_head, rope_t, base_pos, model.config.rope_neox)
+        if model.config.qk_norm_post_rope:
+            q = apply_qk_norm_gpu(q, layer.q_norm_w, n * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
+            k_rope_raw = apply_qk_norm_gpu(k_rope_raw, layer.k_norm_w, n * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
         let seq_k = base_pos + n
         mut [float32]'kernel'unified full_k = []
         mut [float32]'kernel'unified full_v = []
@@ -1438,24 +1650,34 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
             full_v = kv_append_gpu(old_v, v, base_pos * kv_dim, n * kv_dim)
         attn_out = attention_layer_gpu(q, full_k, full_v, n, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head, base_pos,
             model.config.attn_ext, model.config.attn_scale, model.config.attn_softcap, layer_window(model.config, l))
-        let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, n, qkv_dim, d)
+        if layer.has_attn_gate:
+            let gate_proj = tensor_linear_nobias_gpu(normed, layer.attn_gate_w_q8, layer.attn_gate_w_type, n, d, qkv_dim)
+            attn_out = mul_sigmoid_gpu(attn_out, gate_proj, n * qkv_dim)
+        let attn_proj = apply_linear_gpu(attn_out, layer.o_w_q8, layer.o_w_type, layer.o_b, n, qkv_dim, d, model.config.has_linear_bias)
         mut [float32]'kernel'unified attn_res = attn_proj
         if model.config.post_norms:
             attn_res = rms_norm_gpu(attn_proj, layer.attn_post_norm_w, n, d, model.config.rms_eps)
         if model.config.residual_scale != 1.0:
             attn_res = scale_gpu(attn_res, model.config.residual_scale, n * d)
-        x = add_gpu(x, attn_res, n * d)
-
-        let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, n, d, model.config.rms_eps)
+        mut [float32]'kernel'unified normed2 = []
+        if model.config.residual_type == 1:
+            normed2 = normed
+        elif model.config.residual_type == 2:
+            normed2 = apply_norm_gpu(x, layer.ffn_norm_w, layer.ffn_norm_b, n, d, model.config)
+        else:
+            x = add_gpu(x, attn_res, n * d)
+            normed2 = apply_pre_norm_gpu(x, layer.ffn_norm_w, layer.ffn_norm_b, n, d, model.config)
         mut [float32]'kernel'unified ffn_out = []
         if layer.is_moe:
-            let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, n)
+            let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, pre_router_logits, n)
             ffn_out = moe_out
-        else:
+        elif model.config.ffn_gated:
             let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, n, d, model.config.ffn_dim)
             let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, n, d, model.config.ffn_dim)
             let hidden = glu_combine_gpu(gate, up, model.config.act)
             ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, n, model.config.ffn_dim, d)
+        else:
+            ffn_out = apply_nongated_ffn_gpu(model.config, layer, normed2, n)
         mut [float32]'kernel'unified ffn_res = []
         if model.config.post_norms:
             ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, n, d, model.config.rms_eps)
@@ -1463,15 +1685,19 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
             ffn_res = ffn_out
         if model.config.residual_scale != 1.0:
             ffn_res = scale_gpu(ffn_res, model.config.residual_scale, n * d)
-        x = add_gpu(x, ffn_res, n * d)
+        if model.config.residual_type != 0:
+            let both_res = add_gpu(attn_res, ffn_res, n * d)
+            x = add_gpu(x, both_res, n * d)
+        else:
+            x = add_gpu(x, ffn_res, n * d)
 
         new_layers.push(LayerCache(plane_pack(full_k, cache.kt), plane_pack(full_v, cache.vt), [], []))
         l += 1
 
     # Last row only — see prefill_gpu_quantized's identical tail for why.
-    let x_last = extract_row(x, n - 1, d)
-    let final_normed = rms_norm_gpu(x_last, model.output_norm_w, 1, d, model.config.rms_eps)
-    let logits_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
+    let x_last = upload_floats_gpu(extract_row(x, n - 1, d))
+    let final_normed = apply_norm_gpu(x_last, model.output_norm_w, model.output_norm_b, 1, d, model.config)
+    let logits_raw = apply_linear_gpu(final_normed, model.output_w_q8, model.output_w_type, model.output_b, 1, d, model.config.vocab_size, model.config.has_linear_bias)
     let last_logits = finish_logits(passthrough(logits_raw), model.config)
 
     (last_logits, GenCache(new_layers, base_pos + n, 0, cache.kt, cache.vt))
@@ -1487,22 +1713,9 @@ pub ([float32], GenCache) forward_batch_gpu_quantized(QuantModel model, GenCache
     let d = model.config.d_model
     let qkv_dim = model.config.n_head * model.config.d_head
     let kv_dim = model.config.n_kv_head * model.config.d_head
-    let tok_embd_row_bytes = quantized_row_bytes(model.tok_embd_type, d)
-
-    mut [float32] x_host = [0.0 for i in 0..<(n * d)]
-    var int p = 0
-    while p < n:
-        let tok = tokens[p]
-        let row_byte_offset = tok * tok_embd_row_bytes
-        let row = dequantize_row(model.tok_embd_type, model.tok_embd_q8, row_byte_offset, d)
-        var int i = 0
-        while i < d:
-            x_host[p * d + i] = row[i] * model.config.embd_scale
-            i += 1
-        p += 1
 
     # Residual stream: uploaded once, then kept on the device across layers.
-    var x = upload_floats_gpu(x_host)
+    var x = upload_floats_gpu(embed_tokens_q(model, tokens, base_pos))
 
     mut [LayerCache] new_layers = []
     var int l = 0
@@ -1510,19 +1723,23 @@ pub ([float32], GenCache) forward_batch_gpu_quantized(QuantModel model, GenCache
         let layer = model.layers[l]
         let lc = cache.layers[l]
 
-        let normed = rms_norm_gpu(x, layer.attn_norm_w, n, d, model.config.rms_eps)
+        let pre_router_logits = compute_pre_router_logits(model.config, layer, x, n)
+        let normed = apply_pre_norm_gpu(x, layer.attn_norm_w, layer.attn_norm_b, n, d, model.config)
         var q = tensor_linear_gpu(normed, layer.q_w_q8, layer.q_w_type, layer.q_b, n, d, qkv_dim)
         var k = tensor_linear_gpu(normed, layer.k_w_q8, layer.k_w_type, layer.k_b, n, d, kv_dim)
         let v = tensor_linear_gpu(normed, layer.v_w_q8, layer.v_w_type, layer.v_b, n, d, kv_dim)
-        if model.config.qk_norm:
-            q = rms_norm_gpu(q, layer.q_norm_w, n * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps)
-            k = rms_norm_gpu(k, layer.k_norm_w, n * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps)
+        if model.config.qk_norm and not model.config.qk_norm_post_rope:
+            q = apply_qk_norm_gpu(q, layer.q_norm_w, n * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
+            k = apply_qk_norm_gpu(k, layer.k_norm_w, n * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
         # RoPE positions for this batch start at `base_pos` (the number of
         # positions already in the cache), not 0 — same rope_apply_at_gpu
         # forward_step already uses for a single new token, just batched.
         let rope_t = layer_rope_freqs(model.config, l)
         q = rope_apply_at_gpu(q, n, model.config.n_head, model.config.d_head, rope_t, base_pos, model.config.rope_neox)
-        let k_rope_raw = rope_apply_at_gpu(k, n, model.config.n_kv_head, model.config.d_head, rope_t, base_pos, model.config.rope_neox)
+        var k_rope_raw = rope_apply_at_gpu(k, n, model.config.n_kv_head, model.config.d_head, rope_t, base_pos, model.config.rope_neox)
+        if model.config.qk_norm_post_rope:
+            q = apply_qk_norm_gpu(q, layer.q_norm_w, n * model.config.q_norm_heads, model.config.q_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
+            k_rope_raw = apply_qk_norm_gpu(k_rope_raw, layer.k_norm_w, n * model.config.k_norm_heads, model.config.k_norm_dim, model.config.rms_eps, model.config.use_layer_norm)
         let seq_k = base_pos + n
         mut [float32]'kernel'unified full_k = []
         mut [float32]'kernel'unified full_v = []
@@ -1541,24 +1758,34 @@ pub ([float32], GenCache) forward_batch_gpu_quantized(QuantModel model, GenCache
             full_v = kv_append_gpu(old_v, v, base_pos * kv_dim, n * kv_dim)
         attn_out = attention_layer_gpu(q, full_k, full_v, n, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head, base_pos,
             model.config.attn_ext, model.config.attn_scale, model.config.attn_softcap, layer_window(model.config, l))
-        let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, n, qkv_dim, d)
+        if layer.has_attn_gate:
+            let gate_proj = tensor_linear_nobias_gpu(normed, layer.attn_gate_w_q8, layer.attn_gate_w_type, n, d, qkv_dim)
+            attn_out = mul_sigmoid_gpu(attn_out, gate_proj, n * qkv_dim)
+        let attn_proj = apply_linear_gpu(attn_out, layer.o_w_q8, layer.o_w_type, layer.o_b, n, qkv_dim, d, model.config.has_linear_bias)
         mut [float32]'kernel'unified attn_res = attn_proj
         if model.config.post_norms:
             attn_res = rms_norm_gpu(attn_proj, layer.attn_post_norm_w, n, d, model.config.rms_eps)
         if model.config.residual_scale != 1.0:
             attn_res = scale_gpu(attn_res, model.config.residual_scale, n * d)
-        x = add_gpu(x, attn_res, n * d)
-
-        let normed2 = rms_norm_gpu(x, layer.ffn_norm_w, n, d, model.config.rms_eps)
+        mut [float32]'kernel'unified normed2 = []
+        if model.config.residual_type == 1:
+            normed2 = normed
+        elif model.config.residual_type == 2:
+            normed2 = apply_norm_gpu(x, layer.ffn_norm_w, layer.ffn_norm_b, n, d, model.config)
+        else:
+            x = add_gpu(x, attn_res, n * d)
+            normed2 = apply_pre_norm_gpu(x, layer.ffn_norm_w, layer.ffn_norm_b, n, d, model.config)
         mut [float32]'kernel'unified ffn_out = []
         if layer.is_moe:
-            let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, n)
+            let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, pre_router_logits, n)
             ffn_out = moe_out
-        else:
+        elif model.config.ffn_gated:
             let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, n, d, model.config.ffn_dim)
             let up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, n, d, model.config.ffn_dim)
             let hidden = glu_combine_gpu(gate, up, model.config.act)
             ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, n, model.config.ffn_dim, d)
+        else:
+            ffn_out = apply_nongated_ffn_gpu(model.config, layer, normed2, n)
         mut [float32]'kernel'unified ffn_res = []
         if model.config.post_norms:
             ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, n, d, model.config.rms_eps)
@@ -1566,14 +1793,18 @@ pub ([float32], GenCache) forward_batch_gpu_quantized(QuantModel model, GenCache
             ffn_res = ffn_out
         if model.config.residual_scale != 1.0:
             ffn_res = scale_gpu(ffn_res, model.config.residual_scale, n * d)
-        x = add_gpu(x, ffn_res, n * d)
+        if model.config.residual_type != 0:
+            let both_res = add_gpu(attn_res, ffn_res, n * d)
+            x = add_gpu(x, both_res, n * d)
+        else:
+            x = add_gpu(x, ffn_res, n * d)
 
         new_layers.push(LayerCache(plane_pack(full_k, cache.kt), plane_pack(full_v, cache.vt), [], []))
         l += 1
 
     # Every row's logits (n * vocab_size floats): row j is the distribution after tokens[j].
-    let final_normed = rms_norm_gpu(x, model.output_norm_w, n, d, model.config.rms_eps)
-    let logits_raw = tensor_linear_nobias_gpu(final_normed, model.output_w_q8, model.output_w_type, n, d, model.config.vocab_size)
+    let final_normed = apply_norm_gpu(x, model.output_norm_w, model.output_norm_b, n, d, model.config)
+    let logits_raw = apply_linear_gpu(final_normed, model.output_w_q8, model.output_w_type, model.output_b, n, d, model.config.vocab_size, model.config.has_linear_bias)
     let rows = finish_logits(passthrough(logits_raw), model.config)
 
     (rows, GenCache(new_layers, base_pos + n, 0, cache.kt, cache.vt))
@@ -1615,20 +1846,20 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
     let d = model.config.d_model
     let qkv_dim = model.config.n_head * model.config.d_head
     let kv_dim = model.config.n_kv_head * model.config.d_head
-    let tok_embd_row_bytes = quantized_row_bytes(model.tok_embd_type, d)
     let pos = cache.pos
 
-    let row_byte_offset = token * tok_embd_row_bytes
     # Residual stream: uploaded once, then it stays on the device — every
     # `add_gpu` below consumes and produces a resident buffer.
-    var x = upload_floats_gpu(scale_row(dequantize_row(model.tok_embd_type, model.tok_embd_q8, row_byte_offset, d), model.config.embd_scale))
-    var normed = rms_norm_gpu(x, model.layers[0].attn_norm_w, 1, d, model.config.rms_eps)
+    var x = upload_floats_gpu(embed_tokens_q(model, [token], pos))
+    var normed = apply_pre_norm_gpu(x, model.layers[0].attn_norm_w, model.layers[0].attn_norm_b, 1, d, model.config)
 
     mut [LayerCache] new_layers = []
     var int l = 0
     while l < model.config.n_layer:
         let layer = model.layers[l]
         let lc = cache.layers[l]
+
+        let pre_router_logits = compute_pre_router_logits(model.config, layer, x, 1)
 
         # Project and prepare Q/K/V as one resident pipeline. On the fused
         # Q8_0 path this consumes slices of the joined projection directly,
@@ -1639,7 +1870,8 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
             layer.k_w_q8, layer.k_w_type, layer.k_b,
             layer.v_w_q8, layer.v_w_type, layer.v_b,
             layer.qkv_w_q8, layer.qkv_b, layer.qkv_fused,
-            layer.q_norm_w, layer.k_norm_w, model.config.qk_norm,
+            layer.q_norm_w, layer.k_norm_w, model.config.qk_norm, model.config.qk_norm_post_rope, model.config.use_layer_norm,
+            model.config.q_norm_dim, model.config.k_norm_dim,
             lc.tk, lc.tv, tail_len,
             d, qkv_dim, kv_dim, model.config.n_head, model.config.n_kv_head, model.config.d_head,
             model.config.rms_eps, layer.rope_freqs, pos, model.config.rope_neox)
@@ -1649,7 +1881,8 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
                 layer.k_w_q8, layer.k_w_type, layer.k_b,
                 layer.v_w_q8, layer.v_w_type, layer.v_b,
                 layer.qkv_w_q8, layer.qkv_b, layer.qkv_fused,
-                layer.q_norm_w, layer.k_norm_w, model.config.qk_norm,
+                layer.q_norm_w, layer.k_norm_w, model.config.qk_norm, model.config.qk_norm_post_rope, model.config.use_layer_norm,
+                model.config.q_norm_dim, model.config.k_norm_dim,
                 lc.tk, lc.tv, tail_len,
                 d, qkv_dim, kv_dim, model.config.n_head, model.config.n_kv_head, model.config.d_head,
                 model.config.rms_eps, layer.rope_freqs, pos, model.config.rope_neox)
@@ -1673,7 +1906,7 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
         if model.config.attn_ext and packed:
             wide_k = plane_widen(lc.kp, cache.kt)
             wide_v = plane_widen(lc.vp, cache.vt)
-        let attn_out = if model.config.attn_ext and packed:
+        var attn_out = if model.config.attn_ext and packed:
             attention_tail_ext_gpu(q, wide_k, wide_v, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head,
                 model.config.attn_scale, model.config.attn_softcap, layer_window(model.config, l))
         elif model.config.attn_ext:
@@ -1692,7 +1925,10 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
                 let _ = attention_gqa_tail_gpu(q, lc.kp.f, lc.vp.f, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
             else:
                 let _ = attention_gqa_tail_mix_gpu(q, lc.kp, lc.vp, cache.kt, cache.vt, tk_new, tv_new, main_len, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head)
-        let attn_proj = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, 1, qkv_dim, d)
+        if layer.has_attn_gate:
+            let gate_proj = tensor_linear_nobias_gpu(normed, layer.attn_gate_w_q8, layer.attn_gate_w_type, 1, d, qkv_dim)
+            attn_out = mul_sigmoid_gpu(attn_out, gate_proj, qkv_dim)
+        let attn_proj = apply_linear_gpu(attn_out, layer.o_w_q8, layer.o_w_type, layer.o_b, 1, qkv_dim, d, model.config.has_linear_bias)
         if decode_profile_stage == 3:
             let _ = tensor_linear_nobias_gpu(attn_out, layer.o_w_q8, layer.o_w_type, 1, qkv_dim, d)
         mut [float32]'kernel'unified attn_res = attn_proj
@@ -1700,16 +1936,31 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
             attn_res = rms_norm_gpu(attn_proj, layer.attn_post_norm_w, 1, d, model.config.rms_eps)
         if model.config.residual_scale != 1.0:
             attn_res = scale_gpu(attn_res, model.config.residual_scale, 1 * d)
-        let ([float32]'kernel'unified x_after_attn, [float32]'kernel'unified normed2) = add_rms_norm_decode_gpu(
-            x, attn_res, layer.ffn_norm_w, d, model.config.rms_eps)
-        if decode_profile_stage == 4:
-            let (_, _) = add_rms_norm_decode_gpu(x, attn_proj, layer.ffn_norm_w, d, model.config.rms_eps)
-        x = x_after_attn
+        mut [float32]'kernel'unified normed2 = []
+        if model.config.residual_type == 1:
+            normed2 = normed
+        elif model.config.residual_type == 2:
+            normed2 = apply_norm_gpu(x, layer.ffn_norm_w, layer.ffn_norm_b, 1, d, model.config)
+        elif model.config.no_pre_norm:
+            x = add_gpu(x, attn_res, d)
+            normed2 = x
+        elif model.config.has_norm_bias:
+            let ([float32]'kernel'unified x_after_attn, [float32]'kernel'unified n2) = add_norm_decode_gpu(
+                x, attn_res, layer.ffn_norm_w, layer.ffn_norm_b, d, model.config.rms_eps, model.config.use_layer_norm)
+            x = x_after_attn
+            normed2 = n2
+        else:
+            let ([float32]'kernel'unified x_after_attn, [float32]'kernel'unified n2) = add_rms_norm_decode_gpu(
+                x, attn_res, layer.ffn_norm_w, d, model.config.rms_eps)
+            if decode_profile_stage == 4:
+                let (_, _) = add_rms_norm_decode_gpu(x, attn_proj, layer.ffn_norm_w, d, model.config.rms_eps)
+            x = x_after_attn
+            normed2 = n2
         mut [float32]'kernel'unified ffn_out = []
         if layer.is_moe:
-            let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, 1)
+            let ([float32]'kernel'unified moe_out, int moe_pad) = moe_ffn_gpu(model, layer, normed2, pre_router_logits, 1)
             ffn_out = moe_out
-        else:
+        elif model.config.ffn_gated:
             let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, 1, d, model.config.ffn_dim)
             if decode_profile_stage == 7:
                 let _ = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, 1, d, model.config.ffn_dim)
@@ -1727,6 +1978,8 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
                 let profile_up = tensor_linear_nobias_gpu(normed2, layer.up_w_q8, layer.up_w_type, 1, d, model.config.ffn_dim)
                 let profile_hidden = glu_combine_gpu(profile_gate, profile_up, model.config.act)
                 let _ = tensor_linear_nobias_gpu(profile_hidden, layer.down_w_q8, layer.down_w_type, 1, model.config.ffn_dim, d)
+        else:
+            ffn_out = apply_nongated_ffn_gpu(model.config, layer, normed2, 1)
         mut [float32]'kernel'unified ffn_res = []
         if model.config.post_norms:
             ffn_res = rms_norm_gpu(ffn_out, layer.ffn_post_norm_w, 1, d, model.config.rms_eps)
@@ -1734,16 +1987,34 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
             ffn_res = ffn_out
         if model.config.residual_scale != 1.0:
             ffn_res = scale_gpu(ffn_res, model.config.residual_scale, 1 * d)
+        mut [float32]'kernel'unified step_res = ffn_res
+        if model.config.residual_type != 0:
+            step_res = add_gpu(attn_res, ffn_res, d)
         if l + 1 < model.config.n_layer:
-            let ([float32]'kernel'unified x_next, [float32]'kernel'unified normed_next) = add_rms_norm_decode_gpu(
-                x, ffn_res, model.layers[l + 1].attn_norm_w, d, model.config.rms_eps)
-            x = x_next
-            normed = normed_next
+            if model.config.no_pre_norm:
+                x = add_gpu(x, step_res, d)
+                normed = x
+            elif model.config.has_norm_bias:
+                let ([float32]'kernel'unified x_next, [float32]'kernel'unified normed_next) = add_norm_decode_gpu(
+                    x, step_res, model.layers[l + 1].attn_norm_w, model.layers[l + 1].attn_norm_b, d, model.config.rms_eps, model.config.use_layer_norm)
+                x = x_next
+                normed = normed_next
+            else:
+                let ([float32]'kernel'unified x_next, [float32]'kernel'unified normed_next) = add_rms_norm_decode_gpu(
+                    x, step_res, model.layers[l + 1].attn_norm_w, d, model.config.rms_eps)
+                x = x_next
+                normed = normed_next
         else:
-            let ([float32]'kernel'unified x_final, [float32]'kernel'unified normed_final) = add_rms_norm_decode_gpu(
-                x, ffn_res, model.output_norm_w, d, model.config.rms_eps)
-            x = x_final
-            normed = normed_final
+            if model.config.has_norm_bias:
+                let ([float32]'kernel'unified x_final, [float32]'kernel'unified normed_final) = add_norm_decode_gpu(
+                    x, step_res, model.output_norm_w, model.output_norm_b, d, model.config.rms_eps, model.config.use_layer_norm)
+                x = x_final
+                normed = normed_final
+            else:
+                let ([float32]'kernel'unified x_final, [float32]'kernel'unified normed_final) = add_rms_norm_decode_gpu(
+                    x, step_res, model.output_norm_w, d, model.config.rms_eps)
+                x = x_final
+                normed = normed_final
 
         if tail_len + 1 >= TAIL_MAX:
             let kp2 = plane_append(lc.kp, tk_new, main_len * kv_dim, (tail_len + 1) * kv_dim, cache.kt)
@@ -1754,7 +2025,7 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
         l += 1
 
     let new_tail = if cache.tail + 1 >= TAIL_MAX: 0 else: cache.tail + 1
-    let logits_raw = tensor_linear_nobias_gpu(normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
+    let logits_raw = apply_linear_gpu(normed, model.output_w_q8, model.output_w_type, model.output_b, 1, d, model.config.vocab_size, model.config.has_linear_bias)
     if decode_profile_stage == 6:
         let _ = tensor_linear_nobias_gpu(normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
     set_gpu_batch_limit(1)

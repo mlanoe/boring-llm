@@ -1753,6 +1753,7 @@ req [float32]'kernel'unified tensor_linear_nobias_schedule_gpu([float32]'kernel'
 pub req [float32]'kernel'unified rms_norm_gpu([float32]'kernel'global x, [float32]'kernel'global w,
                        int seq, int d, float32 eps) throws:
     let int blocks = (seq + 7) / 8
+    let int w_rows = if d > 0 and w.length > d: w.length / d else: 1
     kernel(block = (32, 8), grid = blocks):
         mut [float32]'unified out = [0.0 for ..<seq * d]
         let lane = .warp.lane
@@ -1772,11 +1773,103 @@ pub req [float32]'kernel'unified rms_norm_gpu([float32]'kernel'global x, [float3
                 offset = offset / 2
             let mean_sq = ss / (d as float32)
             let inv_rms = 1.0 / (mean_sq + eps).sqrt()
+            let w_row = if w_rows > 1: (row % w_rows) * d else: 0
             j = lane
             while j < d:
-                out[base + j] = x[base + j] * inv_rms * w[j]
+                out[base + j] = x[base + j] * inv_rms * w[w_row + j]
                 j += .warp.size
         out
+
+# Row-wise RMSNorm or LayerNorm with bias `b`. When `use_layer_norm` is true,
+# subtracts the row mean before computing the variance.
+pub req [float32]'kernel'unified norm_gpu([float32]'kernel'global x, [float32]'kernel'global w,
+                       [float32]'kernel'global b, int seq, int d, float32 eps, bool use_layer_norm) throws:
+    let int blocks = (seq + 7) / 8
+    let int ln_flag = if use_layer_norm: 1 else: 0
+    kernel(block = (32, 8), grid = blocks):
+        mut [float32]'unified out = [0.0 for ..<seq * d]
+        let lane = .warp.lane
+        let warp_in_block = .thread.y
+        let row = .block.x * 8 + warp_in_block
+        if row < seq:
+            let base = row * d
+            var float32 mean = 0.0
+            if ln_flag == 1:
+                var float32 s = 0.0
+                var int jm = lane
+                while jm < d:
+                    s += x[base + jm]
+                    jm += .warp.size
+                var int om = .warp.size / 2
+                while om > 0:
+                    s += .warp.shuffle_xor(s, om)
+                    om = om / 2
+                mean = s / (d as float32)
+            var float32 ss = 0.0
+            var int j = lane
+            while j < d:
+                let v = x[base + j] - mean
+                ss += v * v
+                j += .warp.size
+            var int offset = .warp.size / 2
+            while offset > 0:
+                ss += .warp.shuffle_xor(ss, offset)
+                offset = offset / 2
+            let mean_sq = ss / (d as float32)
+            let inv_std = 1.0 / (mean_sq + eps).sqrt()
+            j = lane
+            while j < d:
+                out[base + j] = (x[base + j] - mean) * inv_std * w[j] + b[j]
+                j += .warp.size
+        out
+
+# Row-wise LayerNorm without bias (command-r Q/K norm when present).
+pub req [float32]'kernel'unified layer_norm_nobias_gpu([float32]'kernel'global x, [float32]'kernel'global w,
+                       int seq, int d, float32 eps) throws:
+    let int blocks = (seq + 7) / 8
+    let int w_rows = if d > 0 and w.length > d: w.length / d else: 1
+    kernel(block = (32, 8), grid = blocks):
+        mut [float32]'unified out = [0.0 for ..<seq * d]
+        let lane = .warp.lane
+        let warp_in_block = .thread.y
+        let row = .block.x * 8 + warp_in_block
+        if row < seq:
+            let base = row * d
+            var float32 s = 0.0
+            var int jm = lane
+            while jm < d:
+                s += x[base + jm]
+                jm += .warp.size
+            var int om = .warp.size / 2
+            while om > 0:
+                s += .warp.shuffle_xor(s, om)
+                om = om / 2
+            let mean = s / (d as float32)
+            var float32 ss = 0.0
+            var int j = lane
+            while j < d:
+                let v = x[base + j] - mean
+                ss += v * v
+                j += .warp.size
+            var int offset = .warp.size / 2
+            while offset > 0:
+                ss += .warp.shuffle_xor(ss, offset)
+                offset = offset / 2
+            let mean_sq = ss / (d as float32)
+            let inv_std = 1.0 / (mean_sq + eps).sqrt()
+            let w_row = if w_rows > 1: (row % w_rows) * d else: 0
+            j = lane
+            while j < d:
+                out[base + j] = (x[base + j] - mean) * inv_std * w[w_row + j]
+                j += .warp.size
+        out
+
+# Dispatches Q/K normalization to bias-free LayerNorm (stablelm / command-r) or RMSNorm.
+pub req [float32]'kernel'unified apply_qk_norm_gpu([float32]'kernel'unified x, [float32]'kernel'global w,
+                       int seq_heads, int d, float32 eps, bool use_layer_norm) throws:
+    if use_layer_norm:
+        return layer_norm_nobias_gpu(x, w, seq_heads, d, eps)
+    rms_norm_gpu(x, w, seq_heads, d, eps)
 
 # ── Kernel: RoPE (NEOX "rotate-half" or NORM "interleaved") ──────────────
 # One thread per (position, head, half-dim-pair) cell — see math.br's
@@ -1919,7 +2012,8 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
         [uint8]'kernel'global kw, int kt, [float32]'kernel'global kb,
         [uint8]'kernel'global vw, int vt, [float32]'kernel'global vb,
         [uint8]'kernel'global qkvw, [float32]'kernel'global qkvb, bool fused,
-        [float32]'kernel'global q_norm_w, [float32]'kernel'global k_norm_w, bool qk_norm,
+        [float32]'kernel'global q_norm_w, [float32]'kernel'global k_norm_w, bool qk_norm, bool qk_norm_post_rope, bool use_layer_norm,
+        int q_norm_dim, int k_norm_dim,
         [float32]'kernel'global prev_tk, [float32]'kernel'global prev_tv, int tail_len,
         int d_in, int q_dim, int kv_dim, int n_head, int n_kv_head, int d_head,
         float32 eps, [float32]'kernel'global rope_freqs, int pos, int neox) throws:
@@ -1939,13 +2033,14 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
             d_in, q_dim, kv_dim)
         var q = q0
         var k = k0
-        if qk_norm:
-            let q_nd = q_norm_w.length
-            let k_nd = k_norm_w.length
-            q = rms_norm_gpu(q, q_norm_w, q_dim / q_nd, q_nd, eps)
-            k = rms_norm_gpu(k, k_norm_w, kv_dim / k_nd, k_nd, eps)
+        if qk_norm and not qk_norm_post_rope:
+            q = apply_qk_norm_gpu(q, q_norm_w, q_dim / q_norm_dim, q_norm_dim, eps, use_layer_norm)
+            k = apply_qk_norm_gpu(k, k_norm_w, kv_dim / k_norm_dim, k_norm_dim, eps, use_layer_norm)
         q = rope_apply_at_gpu(q, 1, n_head, d_head, rope_freqs, pos, neox)
         k = rope_apply_at_gpu(k, 1, n_kv_head, d_head, rope_freqs, pos, neox)
+        if qk_norm and qk_norm_post_rope:
+            q = apply_qk_norm_gpu(q, q_norm_w, q_dim / q_norm_dim, q_norm_dim, eps, use_layer_norm)
+            k = apply_qk_norm_gpu(k, k_norm_w, kv_dim / k_norm_dim, k_norm_dim, eps, use_layer_norm)
         let tk = kv_tail_push(prev_tk, k, tail_len * kv_dim, kv_dim)
         let tv = kv_tail_push(prev_tv, v, tail_len * kv_dim, kv_dim)
         (q, tk, tv)
@@ -1980,7 +2075,7 @@ pub req [float32]'kernel'unified swiglu_combine_gpu([float32]'kernel'global gate
         out
 
 # Gated-FFN combine with a selectable activation: `act` 0 = silu (SwiGLU),
-# 1 = gelu, tanh approximation (GeGLU, Gemma). Same shape as swiglu_combine_gpu.
+# 1 = gelu tanh (GeGLU, Gemma), 3 = relu (ReGLU, smallthinker). Same shape as swiglu_combine_gpu.
 pub req [float32]'kernel'unified glu_combine_gpu([float32]'kernel'global gate, [float32]'kernel'global up, int act) throws:
     let int n = gate.length
     let int blocks = (n + 255) / 256
@@ -1993,7 +2088,41 @@ pub req [float32]'kernel'unified glu_combine_gpu([float32]'kernel'global gate, [
             if act == 1:
                 let inner = 0.7978845608 * (g + 0.044715 * g * g * g)
                 activated = 0.5 * g * (1.0 + inner.tanh())
+            elif act == 3:
+                activated = if g > 0.0: g else: 0.0
             out[i] = activated * up[i]
+        out
+
+# Elementwise non-gated activation: `act == 2` is relu(x)^2 (arcee); otherwise GELU (phi2, starcoder2, gptneox, falcon, gpt2).
+pub req [float32]'kernel'unified nongated_act_gpu([float32]'kernel'global x, int n, int act) throws:
+    let int blocks = (n + 255) / 256
+    kernel(block = 256, grid = blocks):
+        mut [float32]'unified out = [0.0 for ..<n]
+        let i = .thread.x + .block.x * .block_dim.x
+        if i < n:
+            let v = x[i]
+            if act == 2:
+                let r = if v > 0.0: v else: 0.0
+                out[i] = r * r
+            else:
+                let inner = 0.7978845608 * (v + 0.044715 * v * v * v)
+                out[i] = 0.5 * v * (1.0 + inner.tanh())
+        out
+
+# Elementwise GELU (tanh approximation) for non-gated FFN.
+pub req [float32]'kernel'unified gelu_gpu([float32]'kernel'global x, int n) throws:
+    nongated_act_gpu(x, n, 0)
+
+# Elementwise x * sigmoid(gate_logits) (afmoe attention output gating).
+pub req [float32]'kernel'unified mul_sigmoid_gpu([float32]'kernel'global x, [float32]'kernel'global gate_logits, int n) throws:
+    let int blocks = (n + 255) / 256
+    kernel(block = 256, grid = blocks):
+        mut [float32]'unified out = [0.0 for ..<n]
+        let i = .thread.x + .block.x * .block_dim.x
+        if i < n:
+            let g = gate_logits[i]
+            let s = 1.0 / (1.0 + (0.0 - g).exp())
+            out[i] = x[i] * s
         out
 
 # x * factor, elementwise (Granite's residual scale).
@@ -2093,6 +2222,47 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified) add_rms_norm_decode
             let v = a[j] + b[j]
             residual[j] = v
             normed[j] = v * inv_rms * w[j]
+            j += .warp.size
+        (residual, normed)
+
+# Decode-only residual add followed by RMSNorm or LayerNorm with bias `bias`.
+pub req ([float32]'kernel'unified, [float32]'kernel'unified) add_norm_decode_gpu(
+        [float32]'kernel'global a, [float32]'kernel'global b,
+        [float32]'kernel'global w, [float32]'kernel'global bias,
+        int d, float32 eps, bool use_layer_norm) throws:
+    let int ln_flag = if use_layer_norm: 1 else: 0
+    kernel(block = 32, grid = 1):
+        mut [float32]'unified residual = [0.0 for ..<d]
+        mut [float32]'unified normed = [0.0 for ..<d]
+        let lane = .warp.lane
+        var float32 mean = 0.0
+        if ln_flag == 1:
+            var float32 s = 0.0
+            var int jm = lane
+            while jm < d:
+                s += a[jm] + b[jm]
+                jm += .warp.size
+            var int om = .warp.size / 2
+            while om > 0:
+                s += .warp.shuffle_xor(s, om)
+                om = om / 2
+            mean = s / (d as float32)
+        var float32 ss = 0.0
+        var int j = lane
+        while j < d:
+            let v = (a[j] + b[j]) - mean
+            ss += v * v
+            j += .warp.size
+        var int offset = .warp.size / 2
+        while offset > 0:
+            ss += .warp.shuffle_xor(ss, offset)
+            offset = offset / 2
+        let inv_std = 1.0 / (ss / (d as float32) + eps).sqrt()
+        j = lane
+        while j < d:
+            let v = a[j] + b[j]
+            residual[j] = v
+            normed[j] = (v - mean) * inv_std * w[j] + bias[j]
             j += .warp.size
         (residual, normed)
 

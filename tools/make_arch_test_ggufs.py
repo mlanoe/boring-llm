@@ -31,12 +31,35 @@ def rms(x, w):
     return x / np.sqrt((x * x).mean(-1, keepdims=True) + EPS) * w
 
 
+def lnorm(x, w, b=None):
+    m = x.mean(-1, keepdims=True)
+    v = ((x - m) ** 2).mean(-1, keepdims=True)
+    out = (x - m) / np.sqrt(v + EPS) * w
+    return out + b if b is not None else out
+
+
+def norm_apply(x, w, b, use_ln):
+    if use_ln:
+        return lnorm(x, w, b)
+    out = rms(x, w)
+    return out + b if b is not None else out
+
+
 def gelu(x):
     return 0.5 * x * (1 + np.tanh(0.7978845608028654 * (x + 0.044715 * x ** 3)))
 
 
 def silu(x):
     return x / (1 + np.exp(-x))
+
+
+def relu(x):
+    return np.maximum(0.0, x)
+
+
+def relu2(x):
+    r = relu(x)
+    return r * r
 
 
 def corr_dim(d, orig, n_rot, base):
@@ -83,24 +106,33 @@ def reference(W, c):
     seq = len(TOKENS)
     pos = np.arange(seq, dtype=np.float64)
     x = W["emb"][TOKENS] * c["embd_scale"]
+    if "pos_embd" in W:
+        x = x + W["pos_embd"][np.arange(seq)]
     dh = c["d_head"]
+    use_ln = c.get("layernorm", False)
+    res_type = c.get("residual_type", 0)
     for l in range(NL):
         L = W["layers"][l]
-        h = rms(x, L["attn_norm"])
-        q_flat = h @ L["q"].T
-        k_flat = h @ L["k"].T
+        pre_router_logits = x @ L["router"].T if ("router" in L and c.get("pre_attn_router")) else None
+        h = x if c.get("no_pre_norm") else norm_apply(x, L["attn_norm"], L.get("attn_norm_b"), use_ln)
+        q_flat = h @ L["q"].T + L.get("q_b", 0.0)
+        k_flat = h @ L["k"].T + L.get("k_b", 0.0)
         if c.get("qk_norm_full"):
             q_flat, k_flat = rms(q_flat, L["q_norm_full"]), rms(k_flat, L["k_norm_full"])
         q = q_flat.reshape(seq, NH, dh)
         k = k_flat.reshape(seq, NKV, dh)
-        v = (h @ L["v"].T).reshape(seq, NKV, dh)
-        if c.get("qk_norm"):
-            q, k = rms(q, L["q_norm"]), rms(k, L["k_norm"])
+        v = (h @ L["v"].T + L.get("v_b", 0.0)).reshape(seq, NKV, dh)
+        if c.get("qk_norm") and not c.get("qk_norm_post_rope"):
+            q, k = norm_apply(q, L["q_norm"], None, use_ln), norm_apply(k, L["k_norm"], None, use_ln)
         win = c.get("window", 0)
-        swa = win > 0 and (c.get("all_swa") or (l % c["pattern"]) < c["pattern"] - 1)
+        pat = c.get("pattern", 4)
+        swa = win > 0 and (c.get("all_swa") or ((l % pat) > 0 if c.get("swa_first_global") else (l % pat) < pat - 1))
         tab = c["rope_local"] if swa and "rope_local" in c else c["rope"]
-        if not (c.get("nope") and (l + 1) % 4 == 0):
+        is_nope = c.get("no_rope_all") or (c.get("nope") and ((l % pat == 0) if c.get("swa_first_global") else (l + 1) % 4 == 0))
+        if not is_nope:
             q, k = rope(q, pos, *tab, c["neox"]), rope(k, pos, *tab, c["neox"])
+        if c.get("qk_norm") and c.get("qk_norm_post_rope"):
+            q, k = norm_apply(q, L["q_norm"], None, use_ln), norm_apply(k, L["k_norm"], None, use_ln)
         out = np.zeros((seq, NH, dh))
         for hd in range(NH):
             kv = hd // (NH // NKV)
@@ -115,36 +147,61 @@ def reference(W, c):
             p = np.exp(sc - sc.max(-1, keepdims=True))
             p /= p.sum(-1, keepdims=True)
             out[:, hd] = p @ v[:, kv]
-        proj = out.reshape(seq, NH * dh) @ L["o"].T * c.get("residual_scale", 1.0)
-        x = x + (rms(proj, L["post_attn"]) if c.get("post_norms") else proj)
-        h = rms(x, L["ffn_norm"])
-        act = gelu if c["act"] == "gelu" else silu
-        if "router" in L:  # mixture of experts, as llama.cpp's build_moe_ffn: softmax gate, top-k, optionally renormalized + shared expert
-            probs = np.exp(h @ L["router"].T)
-            probs /= probs.sum(-1, keepdims=True)
-            ffn = np.zeros_like(h)
+        out_flat = out.reshape(seq, NH * dh)
+        if "attn_gate" in L:
+            ag = 1.0 / (1.0 + np.exp(-(h @ L["attn_gate"].T)))
+            out_flat = out_flat * ag
+        proj = (out_flat @ L["o"].T + L.get("o_b", 0.0)) * c.get("residual_scale", 1.0)
+        attn_res = rms(proj, L["post_attn"]) if c.get("post_norms") else proj
+        if res_type == 1:
+            h2 = h
+        elif res_type == 2:
+            h2 = norm_apply(x, L["ffn_norm"], L.get("ffn_norm_b"), use_ln)
+        else:
+            x = x + attn_res
+            h2 = x if c.get("no_pre_norm") else norm_apply(x, L["ffn_norm"], L.get("ffn_norm_b"), use_ln)
+        act_name = c["act"]
+        act = gelu if act_name == "gelu" else relu2 if act_name == "relu2" else relu if act_name == "relu" else silu
+        if "router" in L:  # mixture of experts, as llama.cpp's build_moe_ffn: softmax/sigmoid/identity gate, top-k, optionally renormalized + shared expert
+            gate_logits = pre_router_logits if pre_router_logits is not None else (h2 @ L["router"].T + L.get("router_b", 0.0))
+            gf = c.get("moe_gating_func")
+            if gf == 2:
+                probs = 1.0 / (1.0 + np.exp(-gate_logits))
+            elif gf == 3:
+                probs = gate_logits
+            else:
+                probs = np.exp(gate_logits - gate_logits.max(-1, keepdims=True))
+                probs /= probs.sum(-1, keepdims=True)
+            sel_probs = probs + L["exp_probs_b"] if "exp_probs_b" in L else probs
+            ffn = np.zeros_like(h2)
             norm_topk = c.get("moe_norm_weights", True)
             w_scale = c.get("moe_weights_scale", 1.0)
             for t in range(seq):
-                top = np.argsort(-probs[t])[: c["n_used"]]
+                top = np.argsort(-sel_probs[t])[: c["n_used"]]
                 wts = probs[t, top]
                 if norm_topk:
                     wts = wts / wts.sum()
                 wts = wts * w_scale
                 for e, wt in zip(top, wts):
-                    ffn[t] += wt * ((act(h[t] @ L["eg"][e].T) * (h[t] @ L["eu"][e].T)) @ L["ed"][e].T)
+                    ffn[t] += wt * ((act(h2[t] @ L["eg"][e].T) * (h2[t] @ L["eu"][e].T)) @ L["ed"][e].T)
             if "sh_gate" in L:
-                sh = (act(h @ L["sh_gate"].T) * (h @ L["sh_up"].T)) @ L["sh_down"].T
+                sh = (act(h2 @ L["sh_gate"].T) * (h2 @ L["sh_up"].T)) @ L["sh_down"].T
                 if "sh_inp" in L:
-                    sh_g = 1.0 / (1.0 + np.exp(-(h @ L["sh_inp"])))
+                    sh_g = 1.0 / (1.0 + np.exp(-(h2 @ L["sh_inp"])))
                     sh = sh * sh_g[:, None]
                 ffn = ffn + sh
+        elif c.get("ffn_gated", True):
+            ffn = (act(h2 @ L["gate"].T) * (h2 @ L["up"].T)) @ L["down"].T
         else:
-            ffn = (act(h @ L["gate"].T) * (h @ L["up"].T)) @ L["down"].T
+            ffn = act(h2 @ L["up"].T + L.get("up_b", 0.0)) @ L["down"].T + L.get("down_b", 0.0)
         ffn = ffn * c.get("residual_scale", 1.0)
-        x = x + (rms(ffn, L["post_ffn"]) if c.get("post_norms") else ffn)
-    x = rms(x, W["out_norm"])
-    logits = x @ W["out"].T * c.get("logit_mul", 1.0)
+        ffn_res = rms(ffn, L["post_ffn"]) if c.get("post_norms") else ffn
+        if res_type != 0:
+            x = x + attn_res + ffn_res
+        else:
+            x = x + ffn_res
+    x = norm_apply(x, W["out_norm"], W.get("out_norm_b"), use_ln)
+    logits = (x @ W["out"].T + W.get("out_b", 0.0)) * c.get("logit_mul", 1.0)
     if c.get("final_softcap"):
         logits = c["final_softcap"] * np.tanh(logits / c["final_softcap"])
     return logits
@@ -166,13 +223,15 @@ def make_weights(rng, d_head, tied):
     return W
 
 
-def add_moe(rng, W, n_expert, ffn_e, sh_ffn=0, sh_gate=False, start_layer=0):
+def add_moe(rng, W, n_expert, ffn_e, sh_ffn=0, sh_gate=False, start_layer=0, exp_bias=False):
     """Replaces layers[start_layer:]'s dense FFN by `n_expert` experts of width `ffn_e` and a router (plus optional shared expert)."""
     for L in W["layers"][start_layer:]:
         L["router"] = rng.normal(0, 0.6, (n_expert, D))
         L["eg"] = rng.normal(0, 0.3, (n_expert, ffn_e, D))
         L["eu"] = rng.normal(0, 0.3, (n_expert, ffn_e, D))
         L["ed"] = rng.normal(0, 0.3, (n_expert, D, ffn_e))
+        if exp_bias:
+            L["exp_probs_b"] = rng.normal(0, 0.1, (n_expert,))
         if sh_ffn > 0:
             L["sh_gate"] = rng.normal(0, 0.3, (sh_ffn, D))
             L["sh_up"] = rng.normal(0, 0.3, (sh_ffn, D))
@@ -187,7 +246,7 @@ def requantize(W):
         a = np.asarray(a, dtype=np.float32)
         return gguf.quants.dequantize(gguf.quants.quantize(a, gguf.GGMLQuantizationType.Q8_0),
                                       gguf.GGMLQuantizationType.Q8_0).astype(np.float64)
-    out = {**W, "emb": rt(W["emb"]), "layers": [{k: (rt(v) if k in ("q", "k", "v", "o", "gate", "up", "down", "eg", "eu", "ed", "sh_gate", "sh_up", "sh_down") else v)
+    out = {**W, "emb": rt(W["emb"]), "layers": [{k: (rt(v) if k in ("q", "k", "v", "o", "attn_gate", "gate", "up", "down", "eg", "eu", "ed", "sh_gate", "sh_up", "sh_down") else v)
                                                  for k, v in L.items()} for L in W["layers"]]}
     out["out"] = out["emb"] if W["out"] is W["emb"] else rt(W["out"])
     return out
@@ -204,7 +263,28 @@ def add_vocab(w):
     w.add_eos_token_id(2)
 
 
-def write(name, arch, W, c, fused=False, tied=False, meta=None, extra_tensors=None):
+def add_biases(rng, W, d_head, norm_b=True, qkv_b=True, o_b=True, ffn_b=True, out_b=False):
+    s = 0.08
+    if norm_b:
+        W["out_norm_b"] = rng.normal(0, s, D)
+    if out_b:
+        W["out_b"] = rng.normal(0, s, VOCAB)
+    for L in W["layers"]:
+        if norm_b:
+            L["attn_norm_b"] = rng.normal(0, s, D)
+            L["ffn_norm_b"] = rng.normal(0, s, D)
+        if qkv_b:
+            L["q_b"] = rng.normal(0, s, NH * d_head)
+            L["k_b"] = rng.normal(0, s, NKV * d_head)
+            L["v_b"] = rng.normal(0, s, NKV * d_head)
+        if o_b:
+            L["o_b"] = rng.normal(0, s, D)
+        if ffn_b:
+            L["up_b"] = rng.normal(0, s, FFN)
+            L["down_b"] = rng.normal(0, s, D)
+
+
+def write(name, arch, W, c, fused=False, fused_qkv_only=False, tied=False, meta=None, extra_tensors=None):
     if Q8:
         W = requantize(W)
     w = gguf.GGUFWriter(f"{OUT}/{PREFIX}{name}.gguf", arch=arch)
@@ -219,9 +299,11 @@ def write(name, arch, W, c, fused=False, tied=False, meta=None, extra_tensors=No
     w.add_uint32(f"{arch}.feed_forward_length", FFN)
     w.add_float32(f"{arch}.rope.freq_base", c["base"])
     w.add_float32(f"{arch}.attention.layer_norm_rms_epsilon", EPS)
+    if c.get("layernorm"):
+        w.add_float32(f"{arch}.attention.layer_norm_epsilon", EPS)
     add_vocab(w)
     for k, v in (meta or {}).items():
-        (w.add_float32 if isinstance(v, float) else w.add_uint32 if isinstance(v, int) else w.add_string)(f"{arch}.{k}", v)
+        (w.add_bool if isinstance(v, bool) else w.add_float32 if isinstance(v, float) else w.add_uint32 if isinstance(v, int) else w.add_string)(f"{arch}.{k}", v)
     f32 = lambda a: np.asarray(a, dtype=np.float32)
     def mat(name, a):  # matrices are Q8_0 in the quantized set, F32 otherwise
         if Q8:
@@ -230,13 +312,35 @@ def write(name, arch, W, c, fused=False, tied=False, meta=None, extra_tensors=No
         else:
             w.add_tensor(name, f32(a))
     mat("token_embd.weight", W["emb"])
-    w.add_tensor("output_norm.weight", f32(W["out_norm"]))
+    if "pos_embd" in W:
+        w.add_tensor("position_embd.weight", f32(W["pos_embd"]))
+    if not c.get("weightless_norm"):
+        w.add_tensor("output_norm.weight", f32(W["out_norm"]))
+    if "out_norm_b" in W:
+        w.add_tensor("output_norm.bias", f32(W["out_norm_b"]))
     if not tied:
         mat("output.weight", W["out"])
+    if "out_b" in W:
+        w.add_tensor("output.bias", f32(W["out_b"]))
     for l, L in enumerate(W["layers"]):
         p = f"blk.{l}"
-        w.add_tensor(f"{p}.attn_norm.weight", f32(L["attn_norm"]))
-        w.add_tensor(f"{p}.ffn_norm.weight", f32(L["ffn_norm"]))
+        if not c.get("no_pre_norm") and not c.get("weightless_norm"):
+            if c.get("falcon_norm2"):
+                w.add_tensor(f"{p}.attn_norm_2.weight", f32(L["attn_norm"]))
+                if "attn_norm_b" in L:
+                    w.add_tensor(f"{p}.attn_norm_2.bias", f32(L["attn_norm_b"]))
+                w.add_tensor(f"{p}.attn_norm.weight", f32(L["ffn_norm"]))
+                if "ffn_norm_b" in L:
+                    w.add_tensor(f"{p}.attn_norm.bias", f32(L["ffn_norm_b"]))
+            else:
+                w.add_tensor(f"{p}.attn_norm.weight", f32(L["attn_norm"]))
+                if "attn_norm_b" in L:
+                    w.add_tensor(f"{p}.attn_norm.bias", f32(L["attn_norm_b"]))
+                if c.get("residual_type", 0) != 1:
+                    ffn_norm_tname = f"{p}.post_attention_norm" if c.get("post_as_ffn") else f"{p}.ffn_norm"
+                    w.add_tensor(f"{ffn_norm_tname}.weight", f32(L["ffn_norm"]))
+                    if "ffn_norm_b" in L:
+                        w.add_tensor(f"{ffn_norm_tname}.bias", f32(L["ffn_norm_b"]))
         if c.get("post_norms"):
             w.add_tensor(f"{p}.post_attention_norm.weight", f32(L["post_attn"]))
             w.add_tensor(f"{p}.post_ffw_norm.weight", f32(L["post_ffn"]))
@@ -246,9 +350,15 @@ def write(name, arch, W, c, fused=False, tied=False, meta=None, extra_tensors=No
         if c.get("qk_norm_full"):
             w.add_tensor(f"{p}.attn_q_norm.weight", f32(L["q_norm_full"]))
             w.add_tensor(f"{p}.attn_k_norm.weight", f32(L["k_norm_full"]))
+        if "attn_gate" in L:
+            mat(f"{p}.attn_gate.weight", L["attn_gate"])
         mat(f"{p}.attn_output.weight", L["o"])
+        if "o_b" in L:
+            w.add_tensor(f"{p}.attn_output.bias", f32(L["o_b"]))
         if "router" in L:
             w.add_tensor(f"{p}.ffn_gate_inp.weight", f32(L["router"]))
+            if "exp_probs_b" in L:
+                w.add_tensor(f"{p}.exp_probs_b.bias", f32(L["exp_probs_b"]))
             mat(f"{p}.ffn_gate_exps.weight", L["eg"])
             mat(f"{p}.ffn_up_exps.weight", L["eu"])
             mat(f"{p}.ffn_down_exps.weight", L["ed"])
@@ -258,18 +368,43 @@ def write(name, arch, W, c, fused=False, tied=False, meta=None, extra_tensors=No
                 mat(f"{p}.ffn_down_shexp.weight", L["sh_down"])
                 if "sh_inp" in L:
                     w.add_tensor(f"{p}.ffn_gate_inp_shexp.weight", f32(L["sh_inp"]))
-            for n in ("q", "k", "v"):
-                mat(f"{p}.attn_{n}.weight", L[n])
+            if fused_qkv_only:
+                mat(f"{p}.attn_qkv.weight", np.concatenate([L["q"], L["k"], L["v"]]))
+                if "q_b" in L:
+                    w.add_tensor(f"{p}.attn_qkv.bias", f32(np.concatenate([L["q_b"], L["k_b"], L["v_b"]])))
+            else:
+                for n in ("q", "k", "v"):
+                    mat(f"{p}.attn_{n}.weight", L[n])
+                    if f"{n}_b" in L:
+                        w.add_tensor(f"{p}.attn_{n}.bias", f32(L[f"{n}_b"]))
             continue
         mat(f"{p}.ffn_down.weight", L["down"])
+        if "down_b" in L:
+            w.add_tensor(f"{p}.ffn_down.bias", f32(L["down_b"]))
         if fused:
             mat(f"{p}.attn_qkv.weight", np.concatenate([L["q"], L["k"], L["v"]]))
+            if "q_b" in L:
+                w.add_tensor(f"{p}.attn_qkv.bias", f32(np.concatenate([L["q_b"], L["k_b"], L["v_b"]])))
             mat(f"{p}.ffn_up.weight", np.concatenate([L["gate"], L["up"]]))
+        elif fused_qkv_only:
+            mat(f"{p}.attn_qkv.weight", np.concatenate([L["q"], L["k"], L["v"]]))
+            if "q_b" in L:
+                w.add_tensor(f"{p}.attn_qkv.bias", f32(np.concatenate([L["q_b"], L["k_b"], L["v_b"]])))
+            if c.get("ffn_gated", True):
+                mat(f"{p}.ffn_gate.weight", L["gate"])
+            mat(f"{p}.ffn_up.weight", L["up"])
+            if "up_b" in L:
+                w.add_tensor(f"{p}.ffn_up.bias", f32(L["up_b"]))
         else:
             for n in ("q", "k", "v"):
                 mat(f"{p}.attn_{n}.weight", L[n])
-            mat(f"{p}.ffn_gate.weight", L["gate"])
+                if f"{n}_b" in L:
+                    w.add_tensor(f"{p}.attn_{n}.bias", f32(L[f"{n}_b"]))
+            if c.get("ffn_gated", True):
+                mat(f"{p}.ffn_gate.weight", L["gate"])
             mat(f"{p}.ffn_up.weight", L["up"])
+            if "up_b" in L:
+                w.add_tensor(f"{p}.ffn_up.bias", f32(L["up_b"]))
     for n, a in (extra_tensors or {}).items():
         w.add_tensor(n, f32(a))
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
@@ -412,6 +547,246 @@ def run():
           {**base, "neox": False, "rope": rope_table(dh, 10000.0), "n_used": 2, "moe_norm_weights": False},
           meta={"leading_dense_block_count": 1, "expert_count": 4, "expert_used_count": 2,
                 "expert_shared_count": 2, "expert_feed_forward_length": FFN // 2})
+
+    # OLMo 2: NEOX RoPE, full-row Q/K RMSNorm (width n_head*d_head / n_kv_head*d_head), post-norms only (no pre-norms)
+    rng = np.random.default_rng(14)
+    Wol2 = make_weights(rng, dh, False)
+    for L in Wol2["layers"]:
+        L["q_norm_full"] = rng.uniform(0.5, 1.5, NH * dh)
+        L["k_norm_full"] = rng.uniform(0.5, 1.5, NKV * dh)
+    write("olmo2", "olmo2", Wol2,
+          {**base, "qk_norm_full": True, "post_norms": True, "no_pre_norm": True, "rope": rope_table(dh, 10000.0)})
+
+    # EXAONE 3.0 / 3.5: NEOX RoPE, standard pre-norm RMSNorm + SwiGLU
+    Wex = make_weights(rng, dh, False)
+    write("exaone", "exaone", Wex, {**base, "rope": rope_table(dh, 10000.0)})
+
+    # EXAONE 4.0: NEOX RoPE, per-head Q/K RMSNorm, post-norms only (no pre-norms)
+    Wex4 = make_weights(rng, dh, False)
+    write("exaone4", "exaone4", Wex4,
+          {**base, "qk_norm": True, "post_norms": True, "no_pre_norm": True, "rope": rope_table(dh, 10000.0)})
+
+    # InternLM2, Mistral3: NORM RoPE, standard pre-norm RMSNorm + SwiGLU
+    Win = make_weights(rng, dh, False)
+    write("internlm2", "internlm2", Win, {**base, "neox": False, "rope": rope_table(dh, 10000.0)})
+    write("mistral3", "mistral3", Win, {**base, "neox": False, "rope": rope_table(dh, 10000.0)})
+
+    # GLM-4 (0414): NORM RoPE, both pre-norms and post-norms, fused QKV + gate/up
+    rng = np.random.default_rng(16)
+    Wglm = make_weights(rng, dh, False)
+    write("glm4", "glm4", Wglm, {**base, "neox": False, "post_norms": True, "rope": rope_table(dh, 10000.0)},
+          fused=True)
+
+    # MiniCPM: NORM RoPE, Granite-like scaling (embedding_scale, residual_scale, logit_scale)
+    Wmc = make_weights(rng, dh, False)
+    write("minicpm", "minicpm", Wmc,
+          {**base, "neox": False, "rope": rope_table(dh, 10000.0),
+           "embd_scale": 3.0, "residual_scale": 0.7, "logit_mul": 1.0 / 2.0},
+          meta={"embedding_scale": 3.0, "residual_scale": 0.7, "logit_scale": 2.0})
+
+    # EXAONE-MoE: NEOX RoPE, per-head Q/K RMSNorm, leading dense block + sigmoid-gated MoE with expert bias & shared expert
+    Wexm = make_weights(rng, dh, False)
+    add_moe(rng, Wexm, 4, FFN // 2, sh_ffn=FFN // 2, sh_gate=False, start_layer=1, exp_bias=True)
+    write("exaone-moe", "exaone-moe", Wexm,
+          {**base, "qk_norm": True, "rope": rope_table(dh, 10000.0), "n_used": 2,
+           "moe_gating_func": 2, "moe_norm_weights": True, "moe_weights_scale": 1.5},
+          meta={"leading_dense_block_count": 1, "expert_count": 4, "expert_used_count": 2,
+                "expert_shared_count": 1, "expert_feed_forward_length": FFN // 2,
+                "expert_shared_feed_forward_length": FFN // 2, "expert_gating_func": 2,
+                "expert_weights_norm": True, "expert_weights_scale": 1.5,
+                "attention.sliding_window": 16, "attention.sliding_window_pattern": 4})
+
+    # Phi-2: LayerNorm with bias, single-norm parallel residual, non-gated GELU FFN, full linear biases
+    rng = np.random.default_rng(18)
+    Wphi2 = make_weights(rng, dh, False)
+    add_biases(rng, Wphi2, dh, norm_b=True, qkv_b=True, o_b=True, ffn_b=True, out_b=True)
+    write("phi2", "phi2", Wphi2,
+          {**base, "act": "gelu", "layernorm": True, "residual_type": 1, "ffn_gated": False,
+           "rope": rope_table(dh, 10000.0)})
+
+    # StarCoder2: LayerNorm with bias, sequential residual, non-gated GELU FFN, linear biases
+    Wsc2 = make_weights(rng, dh, False)
+    add_biases(rng, Wsc2, dh, norm_b=True, qkv_b=True, o_b=True, ffn_b=True, out_b=False)
+    write("starcoder2", "starcoder2", Wsc2,
+          {**base, "act": "gelu", "layernorm": True, "residual_type": 0, "ffn_gated": False,
+           "rope": rope_table(dh, 10000.0)})
+
+    # GPT-NeoX: LayerNorm with bias, dual-norm parallel residual, fused QKV + bias, non-gated GELU FFN
+    Wnx = make_weights(rng, dh, False)
+    add_biases(rng, Wnx, dh, norm_b=True, qkv_b=True, o_b=True, ffn_b=True, out_b=False)
+    write("gptneox", "gptneox", Wnx,
+          {**base, "act": "gelu", "layernorm": True, "residual_type": 2, "ffn_gated": False,
+           "rope": rope_table(dh, 10000.0)},
+          fused_qkv_only=True, meta={"use_parallel_residual": True})
+
+    # Falcon: LayerNorm with bias, dual-norm parallel residual via attn_norm_2, fused QKV, non-gated GELU FFN (no linear bias)
+    Wfal = make_weights(rng, dh, False)
+    add_biases(rng, Wfal, dh, norm_b=True, qkv_b=False, o_b=False, ffn_b=False, out_b=False)
+    write("falcon", "falcon", Wfal,
+          {**base, "act": "gelu", "layernorm": True, "residual_type": 2, "falcon_norm2": True,
+           "ffn_gated": False, "rope": rope_table(dh, 10000.0)},
+          fused_qkv_only=True)
+
+    # Command-R: LayerNorm without bias, single-norm parallel residual, NORM RoPE, SwiGLU, logit_scale
+    Wcr = make_weights(rng, dh, True)
+    write("command-r", "command-r", Wcr,
+          {**base, "neox": False, "layernorm": True, "residual_type": 1, "logit_mul": 0.5,
+           "rope": rope_table(dh, 10000.0)},
+          tied=True, meta={"logit_scale": 0.5})
+
+    # Cohere2 (Command R7B / Command A): LayerNorm without bias, single-norm parallel residual, SWA on 3/4 layers + NoPE on 4th
+    NL_c = NL
+    NL = 4
+    Wch2 = make_weights(rng, dh, True)
+    write("cohere2", "cohere2", Wch2,
+          {**base, "neox": False, "layernorm": True, "residual_type": 1, "logit_mul": 0.5,
+           "window": 3, "pattern": 4, "nope": True, "rope": rope_table(dh, 10000.0)},
+          tied=True, meta={"attention.sliding_window": 3, "logit_scale": 0.5})
+    NL = NL_c
+
+    # PhiMoE: RMSNorm with bias, sequential residual, attention + output linear biases, routed MoE experts
+    Wpm = make_weights(rng, dh, False)
+    add_biases(rng, Wpm, dh, norm_b=True, qkv_b=True, o_b=True, ffn_b=False, out_b=True)
+    add_moe(rng, Wpm, 4, FFN)
+    write("phimoe", "phimoe", Wpm,
+          {**base, "layernorm": False, "residual_type": 0, "n_used": 2, "moe_norm_weights": True,
+           "rope": rope_table(dh, 10000.0)},
+          meta={"expert_count": 4, "expert_used_count": 2, "expert_feed_forward_length": FFN})
+
+    # DOTS1: NEOX RoPE, per-head Q/K RMSNorm, leading dense layer, routed MoE + exp_probs_b + shared expert
+    # (llama.cpp's dots1 loader checks MHA Q/K/V dimensions n_head * d_head for all three)
+    NKV_d1 = NKV
+    NKV = NH
+    Wd1 = make_weights(rng, dh, False)
+    add_moe(rng, Wd1, 4, FFN // 2, sh_ffn=FFN // 2, start_layer=1, exp_bias=True)
+    write("dots1", "dots1", Wd1,
+          {**base, "qk_norm": True, "n_used": 2, "moe_gating_func": 2, "moe_norm_weights": False,
+           "moe_weights_scale": 1.0, "rope": rope_table(dh, 10000.0)},
+          meta={"expert_count": 4, "expert_used_count": 2, "expert_feed_forward_length": FFN // 2,
+                "expert_shared_count": 1, "leading_dense_block_count": 1, "expert_gating_func": 2})
+    NKV = NKV_d1
+
+    # ERNIE 4.5 (dense): NORM RoPE, RMSNorm + SwiGLU
+    We45 = make_weights(rng, dh, False)
+    write("ernie4_5", "ernie4_5", We45,
+          {**base, "neox": False, "rope": rope_table(dh, 10000.0)})
+
+    # ERNIE 4.5 MoE: NORM RoPE, leading dense layer, routed MoE + exp_probs_b + shared expert (hardcoded norm_w=True, softmax)
+    We45m = make_weights(rng, dh, False)
+    add_moe(rng, We45m, 4, FFN // 2, sh_ffn=FFN // 2, start_layer=1, exp_bias=True)
+    write("ernie4_5-moe", "ernie4_5-moe", We45m,
+          {**base, "neox": False, "n_used": 2, "moe_gating_func": 1, "moe_norm_weights": True,
+           "rope": rope_table(dh, 10000.0)},
+          meta={"expert_count": 4, "expert_used_count": 2, "expert_feed_forward_length": FFN // 2,
+                "expert_shared_feed_forward_length": FFN // 2, "leading_dense_block_count": 1,
+                "interleave_moe_layer_step": 1})
+
+    # Hunyuan Dense: NEOX RoPE, per-head Q/K RMSNorm applied AFTER RoPE
+    Whd = make_weights(rng, dh, False)
+    write("hunyuan-dense", "hunyuan-dense", Whd,
+          {**base, "qk_norm": True, "qk_norm_post_rope": True, "rope": rope_table(dh, 10000.0)})
+
+    # Hunyuan MoE: NEOX RoPE, post-RoPE Q/K RMSNorm, routed MoE + shared expert (norm_w=True, softmax)
+    Whm = make_weights(rng, dh, False)
+    add_moe(rng, Whm, 4, FFN, sh_ffn=FFN // 2)
+    write("hunyuan-moe", "hunyuan-moe", Whm,
+          {**base, "qk_norm": True, "qk_norm_post_rope": True, "n_used": 2,
+           "moe_gating_func": 1, "moe_norm_weights": True, "rope": rope_table(dh, 10000.0)},
+          meta={"expert_count": 4, "expert_used_count": 2, "expert_feed_forward_length": FFN,
+                "expert_shared_feed_forward_length": FFN // 2})
+
+    # GLM-4 MoE: NEOX RoPE, Q/K RMSNorm, post_attention_norm as pre-FFN norm, leading dense layer, sigmoid MoE + exp_probs_b + shared expert
+    Wgm = make_weights(rng, dh, False)
+    add_moe(rng, Wgm, 4, FFN // 2, sh_ffn=FFN // 2, start_layer=1, exp_bias=True)
+    write("glm4moe", "glm4moe", Wgm,
+          {**base, "qk_norm": True, "post_as_ffn": True, "n_used": 2, "moe_gating_func": 2,
+           "moe_norm_weights": False, "rope": rope_table(dh, 10000.0)},
+          meta={"expert_count": 4, "expert_used_count": 2, "expert_feed_forward_length": FFN // 2,
+                "expert_shared_count": 1, "leading_dense_block_count": 1,
+                "expert_group_count": 1, "expert_group_used_count": 1})
+
+    # BailingMoE2: NEOX RoPE, fused attn_qkv, Q/K RMSNorm, leading dense layer, routed MoE + exp_probs_b + shared expert
+    Wbm2 = make_weights(rng, dh, False)
+    add_moe(rng, Wbm2, 4, FFN // 2, sh_ffn=FFN // 2, start_layer=1, exp_bias=True)
+    write("bailingmoe2", "bailingmoe2", Wbm2,
+          {**base, "qk_norm": True, "n_used": 2, "moe_gating_func": 2, "moe_norm_weights": False,
+           "rope": rope_table(dh, 10000.0)},
+          fused_qkv_only=True,
+          meta={"expert_count": 4, "expert_used_count": 2, "expert_feed_forward_length": FFN // 2,
+                "expert_shared_count": 1, "leading_dense_block_count": 1, "expert_gating_func": 2})
+
+    # Arcee: NORM RoPE, RMSNorm, non-gated relu(x)^2 FFN (ffn_up + ffn_down, no gate)
+    Warc = make_weights(rng, dh, False)
+    write("arcee", "arcee", Warc,
+          {**base, "neox": False, "ffn_gated": False, "act": "relu2", "rope": rope_table(dh, 10000.0)})
+
+    # Seed-OSS: NEOX RoPE, RMSNorm, post_attention_norm as pre-FFN norm, SwiGLU
+    Wsoss = make_weights(rng, dh, False)
+    write("seed_oss", "seed_oss", Wsoss,
+          {**base, "post_as_ffn": True, "rope": rope_table(dh, 10000.0)})
+
+    # BailingMoE (v1): NORM RoPE, RMSNorm, softmax routed MoE (norm_w=False) + shared expert
+    Wbm1 = make_weights(rng, dh, False)
+    add_moe(rng, Wbm1, 4, FFN // 2, sh_ffn=FFN // 2)
+    write("bailingmoe", "bailingmoe", Wbm1,
+          {**base, "neox": False, "n_used": 2, "moe_gating_func": 1, "moe_norm_weights": False,
+           "rope": rope_table(dh, 10000.0)},
+          meta={"expert_count": 4, "expert_used_count": 2, "expert_feed_forward_length": FFN // 2,
+                "expert_shared_count": 1, "expert_shared_feed_forward_length": FFN // 2})
+
+    # OLMo: NORM RoPE, weightless non-parametric LayerNorm (no norm weights/biases), SwiGLU
+    Wol1 = make_weights(rng, dh, False)
+    Wol1["out_norm"] = np.ones(D)
+    for L in Wol1["layers"]:
+        L["attn_norm"] = np.ones(D)
+        L["ffn_norm"] = np.ones(D)
+    write("olmo", "olmo", Wol1,
+          {**base, "neox": False, "layernorm": True, "weightless_norm": True, "rope": rope_table(dh, 10000.0)})
+
+    # StableLM: NEOX RoPE, LayerNorm + bias, optional per-head 2D Q/K LayerNorm (no bias), SwiGLU
+    Wslm = make_weights(rng, dh, False)
+    for L in Wslm["layers"]:
+        L["q_norm"] = rng.uniform(0.5, 1.5, (NH, dh))
+        L["k_norm"] = rng.uniform(0.5, 1.5, (NKV, dh))
+    add_biases(rng, Wslm, dh, norm_b=True, qkv_b=False, o_b=False, ffn_b=False, out_b=False)
+    write("stablelm", "stablelm", Wslm,
+          {**base, "layernorm": True, "qk_norm": True, "rope": rope_table(dh, 10000.0)})
+
+    # GPT-2: learned position_embd (no RoPE), LayerNorm + bias, fused attn_qkv + bias, output biases, non-gated GELU FFN + bias
+    Wgp2 = make_weights(rng, dh, False)
+    Wgp2["pos_embd"] = rng.normal(0, 0.2, (512, D))
+    add_biases(rng, Wgp2, dh, norm_b=True, qkv_b=True, o_b=True, ffn_b=True, out_b=False)
+    write("gpt2", "gpt2", Wgp2,
+          {**base, "neox": False, "layernorm": True, "no_rope_all": True, "ffn_gated": False, "act": "gelu",
+           "rope": rope_table(dh, 10000.0)},
+          fused_qkv_only=True)
+
+    # AfMoE (4 layers): NEOX RoPE, sqrt(d_model) embd scaling, ISWA + NoPE every 4th layer, Q/K RMSNorm, attn_gate * sigmoid, post_attention/ffw norms, leading dense + sigmoid MoE + exp_probs_b + shexp
+    NL_af = NL
+    NL = 4
+    Waf = make_weights(rng, dh, False)
+    for L in Waf["layers"]:
+        L["attn_gate"] = rng.normal(0, 0.3, (NH * dh, D))
+    add_moe(rng, Waf, 4, FFN // 2, sh_ffn=FFN // 2, start_layer=1, exp_bias=True)
+    write("afmoe", "afmoe", Waf,
+          {**base, "embd_scale": math.sqrt(D), "qk_norm": True, "post_norms": True, "window": 3, "pattern": 4, "nope": True,
+           "n_used": 2, "moe_gating_func": 2, "moe_norm_weights": False, "rope": rope_table(dh, 10000.0)},
+          meta={"expert_count": 4, "expert_used_count": 2, "expert_feed_forward_length": FFN // 2,
+                "expert_shared_count": 1, "leading_dense_block_count": 1, "expert_gating_func": 2,
+                "attention.sliding_window": 3})
+
+    # SmallThinker (5 layers): NEOX RoPE, ISWA (window=4096 when > 0) + NoPE at l % 4 == 0, pre-attention router logits, softmax_weight (norm_w=True), ReGLU experts
+    NL = 5
+    rng_st = np.random.default_rng(7)
+    Wst = make_weights(rng_st, dh, False)
+    add_moe(rng_st, Wst, 4, FFN)
+    write("smallthinker", "smallthinker", Wst,
+          {**base, "act": "relu", "window": 4096, "pattern": 4, "swa_first_global": True, "nope": True,
+           "pre_attn_router": True, "n_used": 2, "moe_gating_func": 1, "moe_norm_weights": True,
+           "rope": rope_table(dh, 10000.0)},
+          meta={"expert_count": 4, "expert_used_count": 2, "expert_feed_forward_length": FFN,
+                "expert_gating_func": 3, "attention.sliding_window": 3})
+    NL = NL_af
 
 
 def fmt_matrix(rng, qtype, a):

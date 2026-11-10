@@ -27,9 +27,38 @@ pub [float32] rms_norm([float32] x, [float32] weight, int seq, int d, float32 ep
             i += 1
         let mean_sq = ss / (d as float32)
         let inv_rms = 1.0 / (mean_sq + eps).sqrt()
+        let w_row = if weight.length > d: (p % (weight.length / d)) * d else: 0
         i = 0
         while i < d:
-            result[p * d + i] = x[p * d + i] * inv_rms * weight[i]
+            result[p * d + i] = x[p * d + i] * inv_rms * weight[w_row + i]
+            i += 1
+        p += 1
+    result
+
+pub [float32] norm_cpu([float32] x, [float32] weight, [float32] bias, int seq, int d, float32 eps, bool use_layer_norm):
+    mut [float32] result = [0.0 for i in 0..<(seq * d)]
+    var int p = 0
+    while p < seq:
+        var float32 mean = 0.0
+        if use_layer_norm:
+            var float32 sum = 0.0
+            var int i = 0
+            while i < d:
+                sum = sum + x[p * d + i]
+                i += 1
+            mean = sum / (d as float32)
+        var float32 ss = 0.0
+        var int i = 0
+        while i < d:
+            let v = x[p * d + i] - mean
+            ss = ss + v * v
+            i += 1
+        let mean_sq = ss / (d as float32)
+        let inv_std = 1.0 / (mean_sq + eps).sqrt()
+        let w_row = if weight.length > d: (p % (weight.length / d)) * d else: 0
+        i = 0
+        while i < d:
+            result[p * d + i] = (x[p * d + i] - mean) * inv_std * weight[w_row + i] + bias[i]
             i += 1
         p += 1
     result
@@ -192,7 +221,12 @@ pub float32 gelu(float32 x):
     let inner = 0.7978845608 * (x + 0.044715 * x * x * x)
     0.5 * x * (1.0 + inner.tanh())
 
-# Gated FFN: `act` 0 = SwiGLU (silu(gate) * up), 1 = GeGLU (gelu(gate) * up).
+# ReLU squared (arcee non-gated FFN): max(0, x)^2.
+pub float32 relu2(float32 x):
+    let r = if x > 0.0: x else: (0.0 as float32)
+    r * r
+
+# Gated FFN: `act` 0 = SwiGLU (silu(gate) * up), 1 = GeGLU (gelu(gate) * up), 3 = ReGLU (relu(gate) * up).
 pub [float32] swiglu_ffn([float32] x, [float32] gate_w, [float32] up_w, [float32] down_w,
                           int seq, int d_model, int ffn_dim, int act):
     let gate = linear(x, gate_w, seq, d_model, ffn_dim)
@@ -202,10 +236,44 @@ pub [float32] swiglu_ffn([float32] x, [float32] gate_w, [float32] up_w, [float32
     while idx < seq * ffn_dim:
         if act == 1:
             hidden[idx] = gelu(gate[idx]) * up[idx]
+        elif act == 3:
+            let r = if gate[idx] > 0.0: gate[idx] else: (0.0 as float32)
+            hidden[idx] = r * up[idx]
         else:
             hidden[idx] = silu(gate[idx]) * up[idx]
         idx += 1
     linear(hidden, down_w, seq, ffn_dim, d_model)
+
+# Non-gated FFN: down(act(up(x) + up_b)) + down_b, where `act == 2` is relu^2 (arcee) and 0 is GELU.
+pub [float32] nongated_ffn([float32] x, [float32] up_w, [float32] up_b,
+                            [float32] down_w, [float32] down_b,
+                            int seq, int d_model, int ffn_dim, int act):
+    let up = linear_bias(x, up_w, up_b, seq, d_model, ffn_dim)
+    mut [float32] hidden = [0.0 for i in 0..<(seq * ffn_dim)]
+    var int idx = 0
+    while idx < seq * ffn_dim:
+        if act == 2:
+            hidden[idx] = relu2(up[idx])
+        else:
+            hidden[idx] = gelu(up[idx])
+        idx += 1
+    linear_bias(hidden, down_w, down_b, seq, ffn_dim, d_model)
+
+# Non-gated GELU FFN (phi2, starcoder2, gptneox, falcon, gpt2).
+pub [float32] gelu_ffn([float32] x, [float32] up_w, [float32] up_b,
+                        [float32] down_w, [float32] down_b,
+                        int seq, int d_model, int ffn_dim):
+    nongated_ffn(x, up_w, up_b, down_w, down_b, seq, d_model, ffn_dim, 0)
+
+# Elementwise x * sigmoid(gate_logits) (afmoe attention output gating).
+pub [float32] mul_sigmoid_cpu([float32] x, [float32] gate_logits):
+    mut [float32] out = [0.0 for i in 0..<x.length]
+    var int i = 0
+    while i < x.length:
+        let s = 1.0 / (1.0 + (0.0 - gate_logits[i]).exp())
+        out[i] = x[i] * s
+        i += 1
+    out
 
 # Naive O(seq^2) causal grouped-query attention. q is (seq x n_head*d_head);
 # k/v are (seq x n_kv_head*d_head) — n_head query heads share n_kv_head
