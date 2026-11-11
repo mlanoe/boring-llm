@@ -20,6 +20,7 @@ use server
 use json
 use openai
 use cli_config
+use std.time.Instant
 
 def print_metadata(GgufFile file):
     print "GGUF version: {file.version}"
@@ -172,9 +173,44 @@ def run_forward_debug_quantized(GgufFile file, [int] tokens) throws:
 # (prefill_chunked + forward_step), printing only the generated ids. tools/decode_vs_llamacpp.py
 # compares them with llama.cpp's continuation of the same ids: the logits check (--tokens)
 # never runs forward_step, so a decode-only bug is invisible to it.
-def run_generate_tokens(GgufFile file, [int] prompt_tokens, int max_new_tokens, SamplingParams params) throws:
+def run_generate_tokens(GgufFile file, [int] prompt_tokens, int max_new_tokens, int bench_iters, SamplingParams params) throws:
     let tok = load_tokenizer(file)
     let m = load_model_quantized(file)
+    let vocab = m.config.vocab_size
+    if bench_iters > 0:
+        let (w_lg, w_cache0) = prefill_chunked(m, empty_cache(m.config.n_layer), prompt_tokens)
+        var w_rng = seed_rng(params.seed)
+        let (w_t0, w_r0) = sample(w_rng, w_lg, vocab, params.temperature, params.dynatemp_range, params.dynatemp_exponent, params.top_n_sigma, params.top_k, params.typical_p, params.top_p, params.min_p, params.xtc_probability, params.xtc_threshold, params.min_keep, prompt_tokens, params.repeat_penalty, params.repeat_last_n, params.dry_multiplier, params.dry_base, params.dry_allowed_length, params.dry_penalty_last_n, params.dry_breakers)
+        var w_c = w_cache0
+        var w_tok = w_t0
+        var int wi = 0
+        while wi < 4:
+            let (_, next_wc) = forward_step(m, w_c, w_tok)
+            w_c = next_wc
+            wi += 1
+        var int rep = 0
+        while rep < bench_iters:
+            let tp = Instant.now()
+            let (first_lg, cache0) = prefill_chunked(m, empty_cache(m.config.n_layer), prompt_tokens)
+            let prefill_us = tp.elapsed().asMicros() as int
+            mut [int] toks = [prompt_tokens[idx] for idx in 0..<prompt_tokens.length]
+            var rng = seed_rng(params.seed)
+            let (first_tok, rng1) = sample(rng, first_lg, vocab, params.temperature, params.dynatemp_range, params.dynatemp_exponent, params.top_n_sigma, params.top_k, params.typical_p, params.top_p, params.min_p, params.xtc_probability, params.xtc_threshold, params.min_keep, toks, params.repeat_penalty, params.repeat_last_n, params.dry_multiplier, params.dry_base, params.dry_allowed_length, params.dry_penalty_last_n, params.dry_breakers)
+            rng = rng1
+            toks.push(first_tok)
+            var cache = cache0
+            var int gen_n = 1
+            let td = Instant.now()
+            while gen_n < max_new_tokens:
+                let (step_lg, next_c) = forward_step(m, cache, toks[toks.length - 1])
+                cache = next_c
+                let (nt, next_r) = sample(rng, step_lg, vocab, params.temperature, params.dynatemp_range, params.dynatemp_exponent, params.top_n_sigma, params.top_k, params.typical_p, params.top_p, params.min_p, params.xtc_probability, params.xtc_threshold, params.min_keep, toks, params.repeat_penalty, params.repeat_last_n, params.dry_multiplier, params.dry_base, params.dry_allowed_length, params.dry_penalty_last_n, params.dry_breakers)
+                rng = next_r
+                toks.push(nt)
+                gen_n += 1
+            let decode_us = td.elapsed().asMicros() as int
+            print "[diag] bench rep {rep}: prompt={prompt_tokens.length} prefill_us={prefill_us} gen={gen_n - 1} decode_us={decode_us}"
+            rep += 1
     let all_tokens = generate_kv(m, prompt_tokens, max_new_tokens, tok.eos_token_id, params)
     var string ids = ""
     var int i = prompt_tokens.length
@@ -603,6 +639,8 @@ def main() throws:
     var int prompt_cache_files = 2
     var int prompt_cache_max_mb = 4096
     var int requested_profile_stage = 0
+    var int requested_batch_limit = 3
+    var int bench_iters = 0
     let metrics_env = environment_default(argv, ["--metrics"], "LLAMA_ARG_ENDPOINT_METRICS", "false")
     var bool metrics_enabled = parse_bool_arg("LLAMA_ARG_ENDPOINT_METRICS", metrics_env)
     let slots_env = environment_default(argv, ["--slots", "--no-slots"], "LLAMA_ARG_ENDPOINT_SLOTS", "true")
@@ -1129,6 +1167,12 @@ def main() throws:
                 JDict(fields, keys): chat_template_kwargs_default = parsed_kwargs
                 _: throw "--chat-template-kwargs expects a JSON object"
             i += 2
+        elif a == "--bench-iters" and i + 1 < argv.length:
+            bench_iters = parse_int_arg("--bench-iters", argv[i + 1])
+            i += 2
+        elif a == "--gpu-batch-limit" and i + 1 < argv.length:
+            requested_batch_limit = parse_int_arg("--gpu-batch-limit", argv[i + 1])
+            i += 2
         elif a == "--decode-profile-stage" and i + 1 < argv.length:
             let stage = argv[i + 1]
             if stage == "qkv": requested_profile_stage = 1
@@ -1162,6 +1206,7 @@ def main() throws:
         let checked = try? parse_gbnf(grammar_default)
         guard checked != nil else throw "--grammar is not a valid GBNF grammar"
     set_decode_profile_stage(requested_profile_stage)
+    set_decode_gpu_batch_limit(requested_batch_limit)
     set_kv_cache_types(cache_type_k, cache_type_v)
     set_rope_context_size(ctx_size)
     set_prefill_chunk_len(effective_prefill_chunk(batch_size, ubatch_size))
@@ -1191,7 +1236,7 @@ def main() throws:
             run_forward_debug(file, parse_token_ids(tokens_csv), use_gpu)
 
     if generate_tokens_csv != "":
-        run_generate_tokens(file, parse_token_ids(generate_tokens_csv), max_tokens, SamplingParams(temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, []))
+        run_generate_tokens(file, parse_token_ids(generate_tokens_csv), max_tokens, bench_iters, SamplingParams(temperature, dynatemp_range, dynatemp_exponent, top_n_sigma, top_k, typical_p, top_p, min_p, xtc_probability, xtc_threshold, min_keep, seed, repeat_penalty, repeat_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, []))
 
     if encode_file_path != "":
         run_encode_file(file, encode_file_path)

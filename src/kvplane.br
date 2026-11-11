@@ -68,24 +68,15 @@ pub req [float32]'kernel'unified plane_widen(Plane p, int t) throws:
 
 # `p` plus `new_n` fresh float32 values behind its first `old_n` ones.
 pub Plane plane_append(Plane p, [float32]'kernel'global fresh, int old_n, int new_n, int t) throws:
-    let zeros = [0.0 as float32 for i in 0..<32]
     if t == 0:
-        let dh = pack_float16_gpu(zeros)
-        let dsc = q8kv_scales_gpu(zeros)
-        let dq = q8kv_quantize_gpu(zeros, dsc)
-        Plane(kv_append_gpu(p.f, fresh, old_n, new_n), dh, dq, dsc)
+        Plane(kv_append_gpu(p.f, fresh, old_n, new_n), p.h, p.q, p.s)
     elif t == 1:
-        let df = upload_floats_gpu(zeros)
-        let dsc = q8kv_scales_gpu(zeros)
-        let dq = q8kv_quantize_gpu(zeros, dsc)
-        Plane(df, append_float16_gpu(p.h, fresh, old_n, new_n), dq, dsc)
+        Plane(p.f, append_float16_gpu(p.h, fresh, old_n, new_n), p.q, p.s)
     else:
-        let df = upload_floats_gpu(zeros)
-        let dh = pack_float16_gpu(zeros)
         let fsc = q8kv_scales_gpu(fresh)
         let nq = q8kv_append_gpu(p.q, fresh, fsc, old_n, new_n)
         let ns = q8kv_append_scales_gpu(p.s, fsc, old_n / 32, new_n / 32)
-        Plane(df, dh, nq, ns)
+        Plane(p.f, p.h, nq, ns)
 
 # ── single-query attention over planes of any types ────────────────────────
 
