@@ -186,7 +186,15 @@ pub struct QuantLayer:
     [float32]'kernel'unified router_w     # (n_expert x d_model), float32
     [float32]'kernel'unified router_b     # n_expert zeros
     [float32] exp_probs_b                 # n_expert expert selection bias (host-side, zeros when absent)
+    [float32]'kernel'unified exp_probs_b_gpu
     [ExpertW] experts
+    bool has_stacked_experts
+    [uint8]'kernel'unified moe_gate_w
+    int moe_gate_type
+    [uint8]'kernel'unified moe_up_w
+    int moe_up_type
+    [uint8]'kernel'unified moe_down_w
+    int moe_down_type
     bool has_shexp
     [uint8]'kernel'unified shexp_gate_w_q8
     int shexp_gate_w_type
@@ -795,20 +803,43 @@ pub QuantModel load_model_quantized(GgufFile file) throws:
             up_w = ru
             up_ty = rut
         let (down_w, down_ty) = if moe: (placeholder, 8) else: load_tensor_quantized(file, "{prefix}.ffn_down.weight")
-        # Every expert's three projections become their own resident buffers (row ranges of the stacked tensors).
+        # Stacked contiguous experts when all three projections have native tensor schedules;
+        # otherwise fall back to per-expert GPU buffers (e.g. IQ grid formats).
         mut [ExpertW] experts = []
+        var bool has_stacked_experts = false
+        var [uint8]'kernel'unified moe_gate_w = placeholder_u8
+        var int moe_gate_type = 8
+        var [uint8]'kernel'unified moe_up_w = placeholder_u8
+        var int moe_up_type = 8
+        var [uint8]'kernel'unified moe_down_w = placeholder_u8
+        var int moe_down_type = 8
         if moe:
-            var int e = 0
-            while e < config.n_expert:
-                let (eg, eg_ty) = load_rows_quantized(file, "{prefix}.ffn_gate_exps.weight", e * config.expert_ffn, config.expert_ffn)
-                let (eu, eu_ty) = load_rows_quantized(file, "{prefix}.ffn_up_exps.weight", e * config.expert_ffn, config.expert_ffn)
-                let (ed, ed_ty) = load_rows_quantized(file, "{prefix}.ffn_down_exps.weight", e * config.d_model, config.d_model)
-                if eg_ty == eu_ty:
-                    let egu_gpu = upload_bytes_gpu(with_iq_prefix(concat_raw_bytes2(eg, eu), eg_ty))
-                    experts.push(ExpertW(placeholder_u8, gpu_weight_type(eg_ty), placeholder_u8, gpu_weight_type(eu_ty), egu_gpu, true, upload_bytes_gpu(with_iq_prefix(ed, ed_ty)), gpu_weight_type(ed_ty)))
-                else:
-                    experts.push(ExpertW(upload_bytes_gpu(with_iq_prefix(eg, eg_ty)), gpu_weight_type(eg_ty), upload_bytes_gpu(with_iq_prefix(eu, eu_ty)), gpu_weight_type(eu_ty), placeholder_u8, false, upload_bytes_gpu(with_iq_prefix(ed, ed_ty)), gpu_weight_type(ed_ty)))
-                e += 1
+            let (mg_w, mg_ty) = load_tensor_quantized(file, "{prefix}.ffn_gate_exps.weight")
+            let (mu_w, mu_ty) = load_tensor_quantized(file, "{prefix}.ffn_up_exps.weight")
+            let (md_w, md_ty) = load_tensor_quantized(file, "{prefix}.ffn_down_exps.weight")
+            let mg_gty = gpu_weight_type(mg_ty)
+            let mu_gty = gpu_weight_type(mu_ty)
+            let md_gty = gpu_weight_type(md_ty)
+            if supports_moe_tensor_schedule(mg_gty) and supports_moe_tensor_schedule(mu_gty) and supports_moe_tensor_schedule(md_gty):
+                has_stacked_experts = true
+                moe_gate_w = upload_bytes_gpu(mg_w)
+                moe_gate_type = mg_gty
+                moe_up_w = upload_bytes_gpu(mu_w)
+                moe_up_type = mu_gty
+                moe_down_w = upload_bytes_gpu(md_w)
+                moe_down_type = md_gty
+            else:
+                var int e = 0
+                while e < config.n_expert:
+                    let (eg, eg_ty) = load_rows_quantized(file, "{prefix}.ffn_gate_exps.weight", e * config.expert_ffn, config.expert_ffn)
+                    let (eu, eu_ty) = load_rows_quantized(file, "{prefix}.ffn_up_exps.weight", e * config.expert_ffn, config.expert_ffn)
+                    let (ed, ed_ty) = load_rows_quantized(file, "{prefix}.ffn_down_exps.weight", e * config.d_model, config.d_model)
+                    if eg_ty == eu_ty:
+                        let egu_gpu = upload_bytes_gpu(with_iq_prefix(concat_raw_bytes2(eg, eu), eg_ty))
+                        experts.push(ExpertW(placeholder_u8, gpu_weight_type(eg_ty), placeholder_u8, gpu_weight_type(eu_ty), egu_gpu, true, upload_bytes_gpu(with_iq_prefix(ed, ed_ty)), gpu_weight_type(ed_ty)))
+                    else:
+                        experts.push(ExpertW(upload_bytes_gpu(with_iq_prefix(eg, eg_ty)), gpu_weight_type(eg_ty), upload_bytes_gpu(with_iq_prefix(eu, eu_ty)), gpu_weight_type(eu_ty), placeholder_u8, false, upload_bytes_gpu(with_iq_prefix(ed, ed_ty)), gpu_weight_type(ed_ty)))
+                    e += 1
         let router_w_host = if moe: load_tensor_f32(file, "{prefix}.ffn_gate_inp.weight") else: [0.0 as float32]
         let has_shexp = tensor_exists(file.tensors, "{prefix}.ffn_gate_shexp.weight")
         let (sh_gate_w, sh_gate_ty) = if has_shexp: load_tensor_quantized(file, "{prefix}.ffn_gate_shexp.weight") else: (placeholder, 8)
@@ -845,6 +876,8 @@ pub QuantModel load_model_quantized(GgufFile file) throws:
         let gate_up_w_gpu = if not moe and gate_up_fused: upload_bytes_gpu(gate_up_w) else: placeholder_u8
         # Every weight and norm/bias is uploaded to the GPU exactly once, here,
         # and stays resident for the model's lifetime (see upload_bytes_gpu).
+        let exp_probs_b_host = if moe: load_tensor_f32_or_zero(file, "{prefix}.exp_probs_b.bias", config.n_expert) else: [0.0 as float32]
+        let exp_probs_b_gpu = upload_floats_gpu(exp_probs_b_host)
         let layer = QuantLayer(
             upload_floats_gpu(load_tensor_f32_or(file, "{attn_norm_name}.weight", config.d_model, norm_fill)),
             upload_floats_gpu(load_tensor_f32_or_zero(file, "{attn_norm_name}.bias", config.d_model)),
@@ -868,8 +901,13 @@ pub QuantModel load_model_quantized(GgufFile file) throws:
             upload_floats_gpu(load_tensor_f32_or_zero(file, "{prefix}.post_ffw_norm.weight", config.d_model)),
             upload_floats_gpu(layer_rope_freqs(config, l)),
             moe, upload_floats_gpu(router_w_host), upload_floats_gpu([0.0 for i in 0..<(if moe: config.n_expert else: 1)]),
-            if moe: load_tensor_f32_or_zero(file, "{prefix}.exp_probs_b.bias", config.n_expert) else: [0.0 as float32],
+            exp_probs_b_host,
+            exp_probs_b_gpu,
             experts,
+            has_stacked_experts,
+            moe_gate_w, moe_gate_type,
+            moe_up_w, moe_up_type,
+            moe_down_w, moe_down_type,
             has_shexp,
             upload_bytes_gpu(with_iq_prefix(sh_gate_w, sh_gate_ty)), gpu_weight_type(sh_gate_ty),
             upload_bytes_gpu(with_iq_prefix(sh_up_w, sh_up_ty)), gpu_weight_type(sh_up_ty),
@@ -1100,54 +1138,67 @@ req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'unifie
     let d = model.config.d_model
     let n_expert = model.config.n_expert
     let ffn_e = model.config.expert_ffn
-    var [float32] logits = pre_logits
-    if pre_logits.length == 0:
-        let router_logits = linear_gpu(normed2, layer.router_w, layer.router_b, n, d, n_expert)
-        logits = passthrough(router_logits)
-    mut [[int]] rows_of = [[] for e in 0..<n_expert]
-    mut [[float32]] weights_of = [[] for e in 0..<n_expert]
-    var int t = 0
-    while t < n:
-        let (chosen, weights) = moe_route_ext([logits[t * n_expert + e] for e in 0..<n_expert], layer.exp_probs_b, n_expert, model.config.n_expert_used, model.config.moe_gating_func, model.config.moe_norm_weights, model.config.moe_weights_scale)
-        var int k = 0
-        while k < chosen.length:
-            rows_of[chosen[k]].push(t)
-            weights_of[chosen[k]].push(weights[k])
-            k += 1
-        t += 1
     mut [float32]'kernel'unified acc = []
-    if n == 1:
-        var bool has_acc = false
-        var int e = 0
-        while e < n_expert:
-            if rows_of[e].length > 0:
-                let ex = layer.experts[e]
-                let y = apply_glu_ffn_gpu(normed2, ex.gate_w, ex.gate_type, ex.up_w, ex.up_type, ex.gate_up_w, ex.gate_up_fused, ex.down_w, ex.down_type, 1, d, ffn_e, model.config.act)
-                let w = weights_of[e][0]
-                if not has_acc:
-                    acc = scale_gpu(y, w, d)
-                    has_acc = true
-                else:
-                    acc = add_scaled_gpu(acc, y, w, d)
-            e += 1
-        if not has_acc:
-            acc = scale_gpu(normed2, 0.0 as float32, d)
+    if layer.has_stacked_experts:
+        let [float32]'kernel'unified r_logits = if pre_logits.length == 0:
+            linear_gpu(normed2, layer.router_w, layer.router_b, n, d, n_expert)
+        else:
+            upload_floats_gpu(pre_logits)
+        let ([int32]'kernel'unified chosen_ids, [float32]'kernel'unified weights) = moe_route_gpu(r_logits, layer.exp_probs_b_gpu, n, n_expert, model.config.n_expert_used, model.config.moe_gating_func, model.config.moe_norm_weights, model.config.moe_weights_scale)
+        let int count = n * model.config.n_expert_used
+        let gate = tensor_moe_linear_gpu(normed2, layer.moe_gate_w, layer.moe_gate_type, chosen_ids, n, d, ffn_e, count)
+        let up = tensor_moe_linear_gpu(normed2, layer.moe_up_w, layer.moe_up_type, chosen_ids, n, d, ffn_e, count)
+        let hidden = glu_combine_gpu(gate, up, model.config.act)
+        let down = tensor_moe_linear_gpu(hidden, layer.moe_down_w, layer.moe_down_type, chosen_ids, count, ffn_e, d, count)
+        acc = moe_reduce_weighted_gpu(down, weights, n, model.config.n_expert_used, d)
     else:
-        acc = upload_floats_gpu([0.0 for i in 0..<(n * d)])
-        var int e = 0
-        while e < n_expert:
-            let m = rows_of[e].length
-            if m > 0:
-                let ex = layer.experts[e]
-                let xin = gather_rows_gpu(normed2, [rows_of[e][i] as float32 for i in 0..<m], m, d)
-                let y = apply_glu_ffn_gpu(xin, ex.gate_w, ex.gate_type, ex.up_w, ex.up_type, ex.gate_up_w, ex.gate_up_fused, ex.down_w, ex.down_type, m, d, ffn_e, model.config.act)
-                mut [float32] pos = [-1.0 as float32 for r in 0..<n]
-                var int i = 0
-                while i < m:
-                    pos[rows_of[e][i]] = i as float32
-                    i += 1
-                acc = moe_accumulate_gpu(acc, y, pos, weights_of[e], n, d)
-            e += 1
+        var [float32] logits = pre_logits
+        if pre_logits.length == 0:
+            let router_logits = linear_gpu(normed2, layer.router_w, layer.router_b, n, d, n_expert)
+            logits = passthrough(router_logits)
+        mut [[int]] rows_of = [[] for e in 0..<n_expert]
+        mut [[float32]] weights_of = [[] for e in 0..<n_expert]
+        var int t = 0
+        while t < n:
+            let (chosen, weights) = moe_route_ext([logits[t * n_expert + e] for e in 0..<n_expert], layer.exp_probs_b, n_expert, model.config.n_expert_used, model.config.moe_gating_func, model.config.moe_norm_weights, model.config.moe_weights_scale)
+            var int k = 0
+            while k < chosen.length:
+                rows_of[chosen[k]].push(t)
+                weights_of[chosen[k]].push(weights[k])
+                k += 1
+            t += 1
+        if n == 1:
+            var bool has_acc = false
+            var int e = 0
+            while e < n_expert:
+                if rows_of[e].length > 0:
+                    let ex = layer.experts[e]
+                    let y = apply_glu_ffn_gpu(normed2, ex.gate_w, ex.gate_type, ex.up_w, ex.up_type, ex.gate_up_w, ex.gate_up_fused, ex.down_w, ex.down_type, 1, d, ffn_e, model.config.act)
+                    let w = weights_of[e][0]
+                    if not has_acc:
+                        acc = scale_gpu(y, w, d)
+                        has_acc = true
+                    else:
+                        acc = add_scaled_gpu(acc, y, w, d)
+                e += 1
+            if not has_acc:
+                acc = scale_gpu(normed2, 0.0 as float32, d)
+        else:
+            acc = upload_floats_gpu([0.0 for i in 0..<(n * d)])
+            var int e = 0
+            while e < n_expert:
+                let m = rows_of[e].length
+                if m > 0:
+                    let ex = layer.experts[e]
+                    let xin = gather_rows_gpu(normed2, [rows_of[e][i] as float32 for i in 0..<m], m, d)
+                    let y = apply_glu_ffn_gpu(xin, ex.gate_w, ex.gate_type, ex.up_w, ex.up_type, ex.gate_up_w, ex.gate_up_fused, ex.down_w, ex.down_type, m, d, ffn_e, model.config.act)
+                    mut [float32] pos = [-1.0 as float32 for r in 0..<n]
+                    var int i = 0
+                    while i < m:
+                        pos[rows_of[e][i]] = i as float32
+                        i += 1
+                    acc = moe_accumulate_gpu(acc, y, pos, weights_of[e], n, d)
+                e += 1
     if layer.has_shexp:
         let ffn_sh = model.config.shexp_ffn
         let sh_gate = tensor_linear_nobias_gpu(normed2, layer.shexp_gate_w_q8, layer.shexp_gate_w_type, n, d, ffn_sh)
@@ -1956,22 +2007,7 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
         # Launches per command buffer. Not monotonic: on the 3B Q4_K_M the old value 8
     # decoded at ~105 ms/token, 6 at ~149, and 1-4 or 12+ at ~55-60 (paired A/B,
     # same outputs); 3 is the one that never lost on the 0.5B models either.
-    if decode_gpu_batch_limit == 1:
-        set_gpu_batch_limit(1)
-    elif decode_gpu_batch_limit == 2:
-        set_gpu_batch_limit(2)
-    elif decode_gpu_batch_limit == 4:
-        set_gpu_batch_limit(4)
-    elif decode_gpu_batch_limit == 6:
-        set_gpu_batch_limit(6)
-    elif decode_gpu_batch_limit == 8:
-        set_gpu_batch_limit(8)
-    elif decode_gpu_batch_limit == 12:
-        set_gpu_batch_limit(12)
-    elif decode_gpu_batch_limit == 16:
-        set_gpu_batch_limit(16)
-    else:
-        set_gpu_batch_limit(3)
+    set_gpu_batch_limit(decode_gpu_batch_limit)
     let d = model.config.d_model
     let qkv_dim = model.config.n_head * model.config.d_head
     let kv_dim = model.config.n_kv_head * model.config.d_head

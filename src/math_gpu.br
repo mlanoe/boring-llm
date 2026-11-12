@@ -1693,34 +1693,32 @@ pub int half_bits_of(float32 v):
 # Dequantization into binary16 bytes (two per value, little endian: the layout of the `f16` tensor
 # format), for the formats whose prefill runs on the compiler's native f16 kernel.
 kernel DequantF16Kernel<int FMT>:
-    let [uint8]'global    w_packed
-    mut [uint8]'unified   out
-    let int               n
+    let [uint8]'global     w_packed
+    mut [float16]'unified  out
+    let int                n
 
     init([uint8]'global wi, int count):
         w_packed = wi
         n        = count
-        out      = [0 as uint8 for ..<count * 2]
+        out      = [float16(0.0) for ..<count]
 
     def ():
         let block_idx = .block.x + .block.y * .grid_dim.x
         let flat_idx = .thread.x + block_idx * .block_dim.x
         if flat_idx < n:
-            let bits = half_bits_of(weight_at(w_packed, FMT, flat_idx))
-            out[flat_idx * 2] = (bits & 255) as uint8
-            out[flat_idx * 2 + 1] = (bits >> 8) as uint8
+            out[flat_idx] = float16(weight_at(w_packed, FMT, flat_idx))
 
 # Block-amortized f16 dequantizer for codebook formats IQ4_NL_T (120) and IQ4_XS_T (123):
 # each thread decodes 8 packed bytes = 16 weights (low + high nibbles), reading each scale once.
 kernel DequantF16Pair16Kernel<int FMT>:
-    let [uint8]'global    w_packed
-    mut [uint8]'unified   out
-    let int               n_pairs
+    let [uint8]'global     w_packed
+    mut [float16]'unified  out
+    let int                n_pairs
 
     init([uint8]'global wi, int count, int np):
         w_packed = wi
         n_pairs  = np
-        out      = [0 as uint8 for ..<count * 2]
+        out      = [float16(0.0) for ..<count]
 
     def ():
         let block_idx = .block.x + .block.y * .grid_dim.x
@@ -1744,30 +1742,24 @@ kernel DequantF16Pair16Kernel<int FMT>:
                 let high = (sh >> (2 * ib)) & 3
                 w_scale = w_d * (((low | (high << 4)) - 32) as float32)
                 qb = bb + 8 + ib * 16 + qhalf * 8
-            let out_lo = (blk * 32 + qhalf * 8) * 2
-            let out_hi = out_lo + 32
+            let out_lo = blk * 32 + qhalf * 8
+            let out_hi = out_lo + 16
             for j in 0..<8:
                 let byte_val = int(w_packed[qb + j])
-                let b0 = half_bits_of(((int(w_packed[byte_val & 15]) - 128) as float32) * w_scale)
-                let b1 = half_bits_of(((int(w_packed[(byte_val >> 4) & 15]) - 128) as float32) * w_scale)
-                let o0 = out_lo + j * 2
-                let o1 = out_hi + j * 2
-                out[o0] = (b0 & 255) as uint8
-                out[o0 + 1] = (b0 >> 8) as uint8
-                out[o1] = (b1 & 255) as uint8
-                out[o1 + 1] = (b1 >> 8) as uint8
+                out[out_lo + j] = float16(((int(w_packed[byte_val & 15]) - 128) as float32) * w_scale)
+                out[out_hi + j] = float16(((int(w_packed[(byte_val >> 4) & 15]) - 128) as float32) * w_scale)
 
 # Group-amortized f16 dequantizer for 8-weight IQ grid formats (IQ2_S=22, IQ3_S=21, IQ2_XXS=16):
 # each thread decodes one 8-weight grid group, parsing superblock `d`, scale, grid id, and sign once.
 kernel DequantF16Group8Kernel<int FMT>:
-    let [uint8]'global    w_packed
-    mut [uint8]'unified   out
-    let int               n_groups
+    let [uint8]'global     w_packed
+    mut [float16]'unified  out
+    let int                n_groups
 
     init([uint8]'global wi, int count, int ng):
         w_packed = wi
         n_groups = ng
-        out      = [0 as uint8 for ..<count * 2]
+        out      = [float16(0.0) for ..<count]
 
     def ():
         let block_idx = .block.x + .block.y * .grid_dim.x
@@ -1775,7 +1767,7 @@ kernel DequantF16Group8Kernel<int FMT>:
         if gid < n_groups:
             let sblk = gid >> 5
             let gg = gid & 31
-            let out_b = gid * 16
+            let out_b = gid * 8
             if FMT == 22:
                 let base = 8192 + sblk * 82
                 let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
@@ -1788,9 +1780,7 @@ kernel DequantF16Group8Kernel<int FMT>:
                     let gv = int(w_packed[gi * 8 + j]) as float32
                     let v = db * gv
                     let signed_v = if ((sb >> j) & 1) != 0: 0.0 - v else: v
-                    let bits = half_bits_of(signed_v)
-                    out[out_b + j * 2] = (bits & 255) as uint8
-                    out[out_b + j * 2 + 1] = (bits >> 8) as uint8
+                    out[out_b + j] = float16(signed_v)
             elif FMT == 21:
                 let base = 2048 + sblk * 110
                 let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
@@ -1806,14 +1796,10 @@ kernel DequantF16Group8Kernel<int FMT>:
                 for j in 0..<4:
                     let v0 = db * (int(w_packed[gi0 * 4 + j]) as float32)
                     let sv0 = if ((sb >> j) & 1) != 0: 0.0 - v0 else: v0
-                    let b0 = half_bits_of(sv0)
-                    out[out_b + j * 2] = (b0 & 255) as uint8
-                    out[out_b + j * 2 + 1] = (b0 >> 8) as uint8
+                    out[out_b + j] = float16(sv0)
                     let v1 = db * (int(w_packed[gi1 * 4 + j]) as float32)
                     let sv1 = if ((sb >> (4 + j)) & 1) != 0: 0.0 - v1 else: v1
-                    let b1 = half_bits_of(sv1)
-                    out[out_b + 8 + j * 2] = (b1 & 255) as uint8
-                    out[out_b + 8 + j * 2 + 1] = (b1 >> 8) as uint8
+                    out[out_b + 4 + j] = float16(sv1)
             else:
                 let base = 2176 + sblk * 66
                 let ib = gg >> 2
@@ -1828,11 +1814,9 @@ kernel DequantF16Group8Kernel<int FMT>:
                 for j in 0..<8:
                     let v = db * (int(w_packed[gi * 8 + j]) as float32)
                     let sv = if ((sb >> j) & 1) != 0: 0.0 - v else: v
-                    let bits = half_bits_of(sv)
-                    out[out_b + j * 2] = (bits & 255) as uint8
-                    out[out_b + j * 2 + 1] = (bits >> 8) as uint8
+                    out[out_b + j] = float16(sv)
 
-pub req [uint8]'kernel'unified dequantize_f16_gpu([uint8]'kernel'global w_packed, int fmt, int n) throws:
+pub req [float16]'kernel'unified dequantize_f16_gpu([uint8]'kernel'global w_packed, int fmt, int n) throws:
     if (fmt == 120 or fmt == 123) and n % 32 == 0:
         let int n_pairs = n / 16
         let int blocks = (n_pairs + 255) / 256
@@ -1876,6 +1860,13 @@ let int DEQUANT_PREFILL_MIN_ROWS = 16
 # Q4_0 / Q5_0 single-row kernels in the same lane-per-block shape (the older warp-broadcast kernels
 # above are ~6x slower at decode shapes, see test/bench_decode_formats.br).
 
+req [float32]'kernel'unified tensor_linear_f16_gpu([float32]'kernel'global x,
+                       [float16]'kernel'global w_f16,
+                       [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
+    mut [float32]'kernel'unified y = [0.0 as float32 for ..<seq * d_out]
+    kernel.tensors.linear(x, w_f16, bv, y, m = seq, n = d_out, k = d_in, format = "f16")
+    y
+
 pub req [float32]'kernel'unified fused_linear_gpu([float32]'kernel'global x, [uint8]'kernel'global w_packed, int w_type,
                        [float32]'kernel'global bv, int seq, int d_in, int d_out) throws:
     guard w_type == 1 or w_type == 2 or w_type == 3 or w_type == 6 or w_type == 7 or w_type == 8 or w_type == 10 or w_type == 11 or w_type == 12 or w_type == 13 or w_type == 14 or w_type == 20 or w_type == 23 or w_type == 30 or is_iq_grid_type(w_type) or w_type == 120 or w_type == 123 else throw "fused_linear_gpu: unsupported ggml type id {w_type} (supported: F16=1, Q4_0=2, Q4_1=3, Q5_0=6, Q5_1=7, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q5_K=13, Q6_K=14, IQ4_NL=20, IQ4_XS=23, BF16=30, IQ2_XXS=16, IQ2_XS=17, IQ3_XXS=18, IQ1_S=19, IQ3_S=21, IQ2_S=22, IQ1_M=29)"
@@ -1887,9 +1878,9 @@ pub req [float32]'kernel'unified fused_linear_gpu([float32]'kernel'global x, [ui
     elif seq == 1 and has_warp:
         warp_linear_gpu(x, w_packed, w_type, bv, seq, d_in, d_out)
     elif seq >= DEQUANT_PREFILL_MIN_ROWS and has_warp and prefill_via_f16(w_type):
-        # decode once to binary16 bytes, then the compiler's native f16 matrix kernel
-        let w_f16 = dequantize_f16_gpu(w_packed, w_type, d_out * d_in)
-        tensor_linear_schedule_gpu(x, w_f16, 1, bv, seq, d_in, d_out)
+        # decode directly to hardware float16, then the compiler's native f16 matrix kernel
+        let [float16]'kernel'unified w_f16 = dequantize_f16_gpu(w_packed, w_type, d_out * d_in)
+        tensor_linear_f16_gpu(x, w_f16, bv, seq, d_in, d_out)
     elif seq >= DEQUANT_PREFILL_MIN_ROWS and has_warp:
         let [float32]'kernel'unified w_f32 = dequantize_gpu(w_packed, w_type, d_out * d_in)
         linear_gpu(x, w_f32, bv, seq, d_in, d_out)
@@ -1978,6 +1969,9 @@ pub def set_kquant_prefill_handwritten(bool v):
 # (test/bench_decode_formats.br). F16/BF16 need d_in % 32 == 0 (the kernels' K tile).
 bool has_tensor_schedule(int w_type, int d_in):
     w_type == 2 or w_type == 3 or w_type == 6 or w_type == 7 or w_type == 8 or w_type == 10 or w_type == 11 or w_type == 12 or w_type == 13 or w_type == 14 or ((w_type == 1 or w_type == 30) and d_in % 32 == 0)
+
+pub bool supports_moe_tensor_schedule(int w_type):
+    w_type == 1 or w_type == 2 or w_type == 3 or w_type == 6 or w_type == 7 or w_type == 8 or w_type == 10 or w_type == 11 or w_type == 12 or w_type == 13 or w_type == 14 or w_type == 20 or w_type == 30
 
 # Prefill (seq > 1) on the compiler's SIMD-group kernels: Q8_0, Q4_0/Q4_1/Q5_0/Q5_1, F16/BF16 always (3-5x
 # faster than the hand-written tiled kernels on Metal); the K-quants unless `--kquant-prefill handwritten`.
@@ -2607,6 +2601,129 @@ pub req [float32]'kernel'unified moe_accumulate_gpu([float32]'kernel'global acc,
                 value = value + wts[p] * y[p * d + j]
             out[cell] = value
         out
+
+kernel MoeRouteKernel:
+    let [float32]'global router_logits
+    let [float32]'global exp_probs_b
+    mut [int32]'unified ids
+    mut [float32]'unified wts
+    let int n
+    let int n_expert
+    let int n_used
+    let int gating_func
+    let bool norm_weights
+    let float32 weights_scale
+
+    init([float32]'global ri, [float32]'global ebi, int ni, int nei, int nui, int gfi, bool nwi, float32 wsi):
+        router_logits = ri
+        exp_probs_b   = ebi
+        ids           = [0 as int32 for ..<ni * nui]
+        wts           = [0.0 as float32 for ..<ni * nui]
+        n             = ni
+        n_expert      = nei
+        n_used        = nui
+        gating_func   = gfi
+        norm_weights  = nwi
+        weights_scale = wsi
+
+    def ():
+        let t = .thread.x + .block.x * .block_dim.x
+        if t < n:
+            let base = t * n_expert
+            let out_base = t * n_used
+            var float32 max_logit = router_logits[base]
+            var float32 sum_exp = 0.0
+            if gating_func != 2:
+                for e in 1..<n_expert:
+                    let v = router_logits[base + e]
+                    if v > max_logit:
+                        max_logit = v
+                for e in 0..<n_expert:
+                    sum_exp += (router_logits[base + e] - max_logit).exp()
+            var float32 kept = 0.0
+            for pick in 0..<n_used:
+                var int best = -1
+                var float32 best_sel = 0.0
+                var float32 best_prob = 0.0
+                for e in 0..<n_expert:
+                    var bool already = false
+                    for p in 0..<pick:
+                        if (ids[out_base + p] as int) == e:
+                            already = true
+                    if not already:
+                        let logit = router_logits[base + e]
+                        let prob = if gating_func == 2: 1.0 / (1.0 + (0.0 - logit).exp()) else: (logit - max_logit).exp() / sum_exp
+                        let sel = prob + exp_probs_b[e]
+                        if best < 0 or sel > best_sel:
+                            best = e
+                            best_sel = sel
+                            best_prob = prob
+                ids[out_base + pick] = best as int32
+                wts[out_base + pick] = best_prob
+                kept += best_prob
+            for pick in 0..<n_used:
+                let w = wts[out_base + pick]
+                let nw = if norm_weights and kept > 0.0: w / kept else: w
+                wts[out_base + pick] = nw * weights_scale
+
+pub req ([int32]'kernel'unified, [float32]'kernel'unified) moe_route_gpu([float32]'kernel'global router_logits,
+                        [float32]'kernel'global exp_probs_b, int n, int n_expert, int n_used,
+                        int gating_func, bool norm_weights, float32 weights_scale) throws:
+    mut k = MoeRouteKernel(router_logits, exp_probs_b, n, n_expert, n_used, gating_func, norm_weights, weights_scale)
+    kernel:
+        k(block = 64, grid = (n + 63) / 64)
+    (k.ids, k.wts)
+
+pub req [float32]'kernel'unified moe_reduce_weighted_gpu([float32]'kernel'global down, [float32]'kernel'global weights,
+                        int n, int n_used, int d) throws:
+    let int total = n * d
+    let int blocks = (total + 255) / 256
+    kernel(block = 256, grid = blocks):
+        mut [float32]'unified out = [0.0 for ..<total]
+        let cell = .thread.x + .block.x * .block_dim.x
+        if cell < total:
+            let t = cell / d
+            let col = cell % d
+            var float32 sum = 0.0
+            for k in 0..<n_used:
+                let slot = t * n_used + k
+                sum += down[slot * d + col] * weights[slot]
+            out[cell] = sum
+        out
+
+pub req [float32]'kernel'unified tensor_moe_linear_gpu([float32]'kernel'global x,
+                        [uint8]'kernel'global w_packed, int w_type, [int32]'kernel'global ids,
+                        int m, int d_in, int d_out, int count) throws:
+    mut [float32]'kernel'unified y = [0.0 as float32 for ..<count * d_out]
+    if w_type == 8:
+        kernel.tensors.moe_linear(x, w_packed, ids, y, m = m, n = d_out, k = d_in, count = count, format = "q8_0")
+    elif w_type == 6:
+        kernel.tensors.moe_linear(x, w_packed, ids, y, m = m, n = d_out, k = d_in, count = count, format = "q5_0")
+    elif w_type == 12:
+        kernel.tensors.moe_linear(x, w_packed, ids, y, m = m, n = d_out, k = d_in, count = count, format = "q4_k")
+    elif w_type == 14:
+        kernel.tensors.moe_linear(x, w_packed, ids, y, m = m, n = d_out, k = d_in, count = count, format = "q6_k")
+    elif w_type == 2:
+        kernel.tensors.moe_linear(x, w_packed, ids, y, m = m, n = d_out, k = d_in, count = count, format = "q4_0")
+    elif w_type == 10:
+        kernel.tensors.moe_linear(x, w_packed, ids, y, m = m, n = d_out, k = d_in, count = count, format = "q2_k")
+    elif w_type == 11:
+        kernel.tensors.moe_linear(x, w_packed, ids, y, m = m, n = d_out, k = d_in, count = count, format = "q3_k")
+    elif w_type == 20:
+        kernel.tensors.moe_linear(x, w_packed, ids, y, m = m, n = d_out, k = d_in, count = count, format = "iq4_nl")
+    elif w_type == 3:
+        kernel.tensors.moe_linear(x, w_packed, ids, y, m = m, n = d_out, k = d_in, count = count, format = "q4_1")
+    elif w_type == 7:
+        kernel.tensors.moe_linear(x, w_packed, ids, y, m = m, n = d_out, k = d_in, count = count, format = "q5_1")
+    elif w_type == 13:
+        kernel.tensors.moe_linear(x, w_packed, ids, y, m = m, n = d_out, k = d_in, count = count, format = "q5_k")
+    elif w_type == 1:
+        kernel.tensors.moe_linear(x, w_packed, ids, y, m = m, n = d_out, k = d_in, count = count, format = "f16")
+    elif w_type == 30:
+        kernel.tensors.moe_linear(x, w_packed, ids, y, m = m, n = d_out, k = d_in, count = count, format = "bf16")
+    else:
+        throw "tensor_moe_linear_gpu: unsupported ggml type id {w_type}"
+    y
 
 # Scales each row r (d floats) of `x` by sigmoid(gate_logits[r]) (Qwen2-MoE shared-expert gate).
 pub req [float32]'kernel'unified sigmoid_gate_rows_gpu([float32]'kernel'global x, [float32]'kernel'global gate_logits, int n, int d) throws:
