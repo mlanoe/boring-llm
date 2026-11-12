@@ -39,13 +39,13 @@ pub int kv_block_floats():
 
 # ── building and growing planes ─────────────────────────────────────────────
 
-pub Plane plane_pack([float32]'kernel'global x, int t) throws:
+pub Plane plane_pack([float32]'kernel'unified x, int t) throws:
     let zeros = [0.0 as float32 for i in 0..<32]
     if t == 0:
         let dh = pack_float16_gpu(zeros)
         let dsc = q8kv_scales_gpu(zeros)
         let dq = q8kv_quantize_gpu(zeros, dsc)
-        Plane(x, dh, dq, dsc)
+        Plane(upload_floats_gpu(x), dh, dq, dsc)
     elif t == 1:
         let df = upload_floats_gpu(zeros)
         let dsc = q8kv_scales_gpu(zeros)

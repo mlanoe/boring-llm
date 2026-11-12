@@ -1139,7 +1139,7 @@ req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'unifie
     let n_expert = model.config.n_expert
     let ffn_e = model.config.expert_ffn
     mut [float32]'kernel'unified acc = []
-    if layer.has_stacked_experts:
+    if layer.has_stacked_experts and n == 1:
         let [float32]'kernel'unified r_logits = if pre_logits.length == 0:
             linear_gpu(normed2, layer.router_w, layer.router_b, n, d, n_expert)
         else:
@@ -1185,13 +1185,22 @@ req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'unifie
                 acc = scale_gpu(normed2, 0.0 as float32, d)
         else:
             acc = upload_floats_gpu([0.0 for i in 0..<(n * d)])
+            let gate_stride = if layer.has_stacked_experts: quantized_row_bytes(layer.moe_gate_type, d) * ffn_e else: 0
+            let up_stride = if layer.has_stacked_experts: quantized_row_bytes(layer.moe_up_type, d) * ffn_e else: 0
+            let down_stride = if layer.has_stacked_experts: quantized_row_bytes(layer.moe_down_type, ffn_e) * d else: 0
             var int e = 0
             while e < n_expert:
                 let m = rows_of[e].length
                 if m > 0:
-                    let ex = layer.experts[e]
                     let xin = gather_rows_gpu(normed2, [rows_of[e][i] as float32 for i in 0..<m], m, d)
-                    let y = apply_glu_ffn_gpu(xin, ex.gate_w, ex.gate_type, ex.up_w, ex.up_type, ex.gate_up_w, ex.gate_up_fused, ex.down_w, ex.down_type, m, d, ffn_e, model.config.act)
+                    let y = if layer.has_stacked_experts:
+                        let eg = tensor_linear_nobias_offset_gpu(xin, layer.moe_gate_w, layer.moe_gate_type, e * gate_stride, m, d, ffn_e)
+                        let eu = tensor_linear_nobias_offset_gpu(xin, layer.moe_up_w, layer.moe_up_type, e * up_stride, m, d, ffn_e)
+                        let eh = glu_combine_gpu(eg, eu, model.config.act)
+                        tensor_linear_nobias_offset_gpu(eh, layer.moe_down_w, layer.moe_down_type, e * down_stride, m, ffn_e, d)
+                    else:
+                        let ex = layer.experts[e]
+                        apply_glu_ffn_gpu(xin, ex.gate_w, ex.gate_type, ex.up_w, ex.up_type, ex.gate_up_w, ex.gate_up_fused, ex.down_w, ex.down_type, m, d, ffn_e, model.config.act)
                     mut [float32] pos = [-1.0 as float32 for r in 0..<n]
                     var int i = 0
                     while i < m:
@@ -2130,14 +2139,15 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
                 ffn_out = apply_glu_ffn_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, layer.up_w_q8, layer.up_w_type,
                     layer.gate_up_w_q8, layer.gate_up_fused, layer.down_w_q8, layer.down_w_type, 1, d, model.config.ffn_dim, model.config.act)
             else:
-                let hidden = if layer.gate_up_fused:
+                mut [float32]'kernel'unified hidden = []
+                if layer.gate_up_fused:
                     let joined = tensor_linear_nobias_gpu(normed2, layer.gate_up_w_q8, layer.gate_w_type, 1, d, 2 * model.config.ffn_dim)
                     if decode_profile_stage == 7 or decode_profile_stage == 8:
                         let _ = tensor_linear_nobias_gpu(normed2, layer.gate_up_w_q8, layer.gate_w_type, 1, d, 2 * model.config.ffn_dim)
                     let h = glu_joined_combine_gpu(joined, 1, model.config.ffn_dim, model.config.act)
                     if decode_profile_stage == 9:
                         let _ = glu_joined_combine_gpu(joined, 1, model.config.ffn_dim, model.config.act)
-                    h
+                    hidden = h
                 else:
                     let gate = tensor_linear_nobias_gpu(normed2, layer.gate_w_q8, layer.gate_w_type, 1, d, model.config.ffn_dim)
                     if decode_profile_stage == 7:
@@ -2148,7 +2158,7 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
                     let h = glu_combine_gpu(gate, up, model.config.act)
                     if decode_profile_stage == 9:
                         let _ = glu_combine_gpu(gate, up, model.config.act)
-                    h
+                    hidden = h
                 ffn_out = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, 1, model.config.ffn_dim, d)
                 if decode_profile_stage == 10:
                     let _ = tensor_linear_nobias_gpu(hidden, layer.down_w_q8, layer.down_w_type, 1, model.config.ffn_dim, d)
