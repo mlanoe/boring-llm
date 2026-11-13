@@ -1709,7 +1709,7 @@ kernel DequantF16Kernel<int FMT>:
             out[flat_idx] = float16(weight_at(w_packed, FMT, flat_idx))
 
 # Block-amortized f16 dequantizer for codebook formats IQ4_NL_T (120) and IQ4_XS_T (123):
-# each thread decodes 8 packed bytes = 16 weights (low + high nibbles), reading each scale once.
+# each thread decodes 8 packed bytes = 16 weights (low + high nibbles), sharing superblock scale reads.
 kernel DequantF16Pair16Kernel<int FMT>:
     let [uint8]'global     w_packed
     mut [float16]'unified  out
@@ -1723,6 +1723,7 @@ kernel DequantF16Pair16Kernel<int FMT>:
     def ():
         let block_idx = .block.x + .block.y * .grid_dim.x
         let pid = .thread.x + block_idx * .block_dim.x
+        let lane = .warp.lane
         if pid < n_pairs:
             let blk = pid >> 1
             let qhalf = pid & 1
@@ -1730,14 +1731,22 @@ kernel DequantF16Pair16Kernel<int FMT>:
             var int qb = 0
             if FMT == 120:
                 let bb = 16 + blk * 18
-                w_scale = f16_bits_to_f32(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
+                if qhalf == 0:
+                    w_scale = f16_bits_to_f32(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
+                w_scale = .warp.shuffle(w_scale, lane & ~1)
                 qb = bb + 2 + qhalf * 8
             else:
                 let sblk = blk >> 3
                 let ib = blk & 7
                 let bb = 16 + sblk * 136
-                let w_d = f16_bits_to_f32_fast(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
-                let sh = int(w_packed[bb + 2]) | (int(w_packed[bb + 3]) << 8)
+                let sblk_lane = lane & ~15
+                var float32 w_d = 0.0
+                var int sh = 0
+                if lane == sblk_lane:
+                    w_d = f16_bits_to_f32_fast(int(w_packed[bb]) | (int(w_packed[bb + 1]) << 8))
+                    sh = int(w_packed[bb + 2]) | (int(w_packed[bb + 3]) << 8)
+                w_d = .warp.shuffle(w_d, sblk_lane)
+                sh = .warp.shuffle(sh, sblk_lane)
                 let low = (int(w_packed[bb + 4 + (ib >> 1)]) >> (4 * (ib & 1))) & 15
                 let high = (sh >> (2 * ib)) & 3
                 w_scale = w_d * (((low | (high << 4)) - 32) as float32)
@@ -1749,8 +1758,8 @@ kernel DequantF16Pair16Kernel<int FMT>:
                 out[out_lo + j] = float16(((int(w_packed[byte_val & 15]) - 128) as float32) * w_scale)
                 out[out_hi + j] = float16(((int(w_packed[(byte_val >> 4) & 15]) - 128) as float32) * w_scale)
 
-# Group-amortized f16 dequantizer for 8-weight IQ grid formats (IQ2_S=22, IQ3_S=21, IQ2_XXS=16):
-# each thread decodes one 8-weight grid group, parsing superblock `d`, scale, grid id, and sign once.
+# Group-amortized f16 dequantizer for 8-weight IQ grid formats:
+# each warp (32 lanes) cooperates on one 256-weight superblock, sharing `d` across all lanes via warp shuffle.
 kernel DequantF16Group8Kernel<int FMT>:
     let [uint8]'global     w_packed
     mut [float16]'unified  out
@@ -1764,13 +1773,17 @@ kernel DequantF16Group8Kernel<int FMT>:
     def ():
         let block_idx = .block.x + .block.y * .grid_dim.x
         let gid = .thread.x + block_idx * .block_dim.x
+        let lane = .warp.lane
         if gid < n_groups:
             let sblk = gid >> 5
-            let gg = gid & 31
+            let gg = lane
             let out_b = gid * 8
             if FMT == 22:
                 let base = 8192 + sblk * 82
-                let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
+                var float32 d = 0.0
+                if lane == 0:
+                    d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
+                d = .warp.shuffle(d, 0)
                 let high = (int(w_packed[base + 66 + (gg >> 2)]) >> (2 * (gg & 3))) & 3
                 let gi = int(w_packed[base + 2 + gg]) | (high << 8)
                 let sb = int(w_packed[base + 34 + gg])
@@ -1783,7 +1796,10 @@ kernel DequantF16Group8Kernel<int FMT>:
                     out[out_b + j] = float16(signed_v)
             elif FMT == 21:
                 let base = 2048 + sblk * 110
-                let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
+                var float32 d = 0.0
+                if lane == 0:
+                    d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
+                d = .warp.shuffle(d, 0)
                 let s = (int(w_packed[base + 106 + (gg >> 3)]) >> (4 * ((gg >> 2) & 1))) & 15
                 let db = d * ((1 + 2 * s) as float32)
                 let sb = int(w_packed[base + 74 + gg])
@@ -1800,11 +1816,14 @@ kernel DequantF16Group8Kernel<int FMT>:
                     let v1 = db * (int(w_packed[gi1 * 4 + j]) as float32)
                     let sv1 = if ((sb >> (4 + j)) & 1) != 0: 0.0 - v1 else: v1
                     out[out_b + 4 + j] = float16(sv1)
-            else:
+            elif FMT == 16:
                 let base = 2176 + sblk * 66
+                var float32 d = 0.0
+                if lane == 0:
+                    d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
+                d = .warp.shuffle(d, 0)
                 let ib = gg >> 2
                 let l = gg & 3
-                let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
                 let qp = base + 2 + ib * 8
                 let aux0 = int(w_packed[qp]) | (int(w_packed[qp + 1]) << 8) | (int(w_packed[qp + 2]) << 16) | (int(w_packed[qp + 3]) << 24)
                 let aux1 = int(w_packed[qp + 4]) | (int(w_packed[qp + 5]) << 8) | (int(w_packed[qp + 6]) << 16) | (int(w_packed[qp + 7]) << 24)
@@ -1815,6 +1834,86 @@ kernel DequantF16Group8Kernel<int FMT>:
                     let v = db * (int(w_packed[gi * 8 + j]) as float32)
                     let sv = if ((sb >> j) & 1) != 0: 0.0 - v else: v
                     out[out_b + j] = float16(sv)
+            elif FMT == 17:
+                let base = 4224 + sblk * 74
+                var float32 d = 0.0
+                if lane == 0:
+                    d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
+                d = .warp.shuffle(d, 0)
+                let q = int(w_packed[base + 2 + gg * 2]) | (int(w_packed[base + 3 + gg * 2]) << 8)
+                let s = (int(w_packed[base + 66 + (gg >> 2)]) >> (4 * ((gg >> 1) & 1))) & 15
+                let db = (d * ((0.5 as float32) + (s as float32))) * (0.25 as float32)
+                let sb = int(w_packed[4096 + (q >> 9)])
+                let gi = q & 511
+                for j in 0..<8:
+                    let gv = int(w_packed[gi * 8 + j]) as float32
+                    let v = db * gv
+                    let signed_v = if ((sb >> j) & 1) != 0: 0.0 - v else: v
+                    out[out_b + j] = float16(signed_v)
+            elif FMT == 18:
+                let base = 1152 + sblk * 98
+                var float32 d = 0.0
+                if lane == 0:
+                    d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
+                d = .warp.shuffle(d, 0)
+                let ib = gg >> 2
+                let l = gg & 3
+                let sp = base + 66 + ib * 4
+                let aux = int(w_packed[sp]) | (int(w_packed[sp + 1]) << 8) | (int(w_packed[sp + 2]) << 16) | (int(w_packed[sp + 3]) << 24)
+                let db = (d * ((0.5 as float32) + ((aux >> 28) as float32))) * (0.5 as float32)
+                let sb = int(w_packed[1024 + ((aux >> (7 * l)) & 127)])
+                let entry0 = int(w_packed[base + 2 + ib * 8 + 2 * l])
+                let entry1 = int(w_packed[base + 2 + ib * 8 + 2 * l + 1])
+                for j in 0..<4:
+                    let v0 = db * (int(w_packed[entry0 * 4 + j]) as float32)
+                    let sv0 = if ((sb >> j) & 1) != 0: 0.0 - v0 else: v0
+                    out[out_b + j] = float16(sv0)
+                    let v1 = db * (int(w_packed[entry1 * 4 + j]) as float32)
+                    let sv1 = if ((sb >> (4 + j)) & 1) != 0: 0.0 - v1 else: v1
+                    out[out_b + 4 + j] = float16(sv1)
+            elif FMT == 19:
+                let base = 16384 + sblk * 50
+                var float32 d = 0.0
+                if lane == 0:
+                    d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
+                d = .warp.shuffle(d, 0)
+                let ib = gg >> 2
+                let l = gg & 3
+                let qh = int(w_packed[base + 34 + ib * 2]) | (int(w_packed[base + 35 + ib * 2]) << 8)
+                let dl = d * ((2 * ((qh >> 12) & 7) + 1) as float32)
+                let delta = if (qh & 32768) == 0: 0.125 as float32 else: -0.125 as float32
+                let gi = int(w_packed[base + 2 + ib * 4 + l]) | (((qh >> (3 * l)) & 7) << 8)
+                for j in 0..<8:
+                    let v = (int(w_packed[gi * 8 + j]) - 1) as float32
+                    out[out_b + j] = float16(dl * (v + delta))
+            else:
+                let base = 16384 + sblk * 56
+                var float32 d = 0.0
+                var int s0 = 0
+                var int s1 = 0
+                var int s2 = 0
+                var int s3 = 0
+                if lane == 0:
+                    s0 = int(w_packed[base + 48]) | (int(w_packed[base + 49]) << 8)
+                    s1 = int(w_packed[base + 50]) | (int(w_packed[base + 51]) << 8)
+                    s2 = int(w_packed[base + 52]) | (int(w_packed[base + 53]) << 8)
+                    s3 = int(w_packed[base + 54]) | (int(w_packed[base + 55]) << 8)
+                    d = f16_bits_to_f32_fast((s0 >> 12) | ((s1 >> 12) << 4) | ((s2 >> 12) << 8) | ((s3 >> 12) << 12))
+                d = .warp.shuffle(d, 0)
+                s0 = .warp.shuffle(s0, 0)
+                s1 = .warp.shuffle(s1, 0)
+                s2 = .warp.shuffle(s2, 0)
+                s3 = .warp.shuffle(s3, 0)
+                let slot = gg >> 1
+                let sword = if (slot >> 2) == 0: s0 elif (slot >> 2) == 1: s1 elif (slot >> 2) == 2: s2 else: s3
+                let sc = (sword >> (3 * (slot & 3))) & 7
+                let dl = d * ((2 * sc + 1) as float32)
+                let nib = (int(w_packed[base + 32 + (gg >> 1)]) >> (4 * (gg & 1))) & 15
+                let gi = int(w_packed[base + gg]) | ((nib & 7) << 8)
+                let delta = if (nib & 8) == 0: 0.125 as float32 else: -0.125 as float32
+                for j in 0..<8:
+                    let v = (int(w_packed[gi * 8 + j]) - 1) as float32
+                    out[out_b + j] = float16(dl * (v + delta))
 
 pub req [float16]'kernel'unified dequantize_f16_gpu([uint8]'kernel'global w_packed, int fmt, int n) throws:
     if (fmt == 120 or fmt == 123) and n % 32 == 0:
@@ -1829,12 +1928,12 @@ pub req [float16]'kernel'unified dequantize_f16_gpu([uint8]'kernel'global w_pack
             return k.out
         else:
             throw "dequantize_f16_gpu: unreachable"
-    elif (fmt == 22 or fmt == 21 or fmt == 16) and n % 256 == 0:
+    elif (fmt == 22 or fmt == 21 or fmt == 16 or fmt == 17 or fmt == 18 or fmt == 19 or fmt == 29) and n % 256 == 0:
         let int n_groups = n / 8
         let int blocks = (n_groups + 255) / 256
         let int gx = if blocks > 65535: 65535 else: blocks
         let int gy = (blocks + gx - 1) / gx
-        dispatch fmt in [22, 21, 16]:
+        dispatch fmt in [22, 21, 16, 17, 18, 19, 29]:
             mut k = DequantF16Group8Kernel<fmt>(w_packed, n, n_groups)
             kernel:
                 k(block = 256, grid = (gx, gy))
