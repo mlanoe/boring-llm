@@ -2430,8 +2430,8 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
         let pos = base_pos + row
         let qkv_base = row * stride
         if i < q_pairs:
-            let h = i / half_dim
-            let pair = i % half_dim
+            let h = if half_dim == 64: (i >> 6) else: (if half_dim == 32: (i >> 5) else: (i / half_dim))
+            let pair = if half_dim == 64: (i & 63) else: (if half_dim == 32: (i & 31) else: (i % half_dim))
             let head_base = h * d_head
             var int first = head_base + pair
             var int second = first + half_dim
@@ -2450,8 +2450,8 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
             out_q[q_base + first] = x0 * cos_a - x1 * sin_a
             out_q[q_base + second] = x0 * sin_a + x1 * cos_a
         if i < kv_pairs:
-            let h = i / half_dim
-            let pair = i % half_dim
+            let h = if half_dim == 64: (i >> 6) else: (if half_dim == 32: (i >> 5) else: (i / half_dim))
+            let pair = if half_dim == 64: (i & 63) else: (if half_dim == 32: (i & 31) else: (i % half_dim))
             let head_base = h * d_head
             var int first = head_base + pair
             var int second = first + half_dim
@@ -3264,9 +3264,8 @@ kernel FlashAttnRegKernel<int D>:
     let int             causal
     let int             causal_offset
     mut [float32, width = 33, height = 32]'actor rq_s     # query chunk: 32 rows x 32 dimensions
-    mut [float32, width = 33, height = 64]'actor rk_s     # key chunk: 64 keys x 32 dimensions
+    mut [float32, 2112]'actor rkv_s                       # shared buffer reused for K (64x33) and V (16x(D+1))
     mut [float32, width = 65, height = 32]'actor rp_s     # probabilities: 32 rows x 64 keys
-    mut [float32, width = D + 1, height = 16]'actor rv_s    # value sub-tile: 16 keys x D dimensions
     mut [float32, 8] rs         # thread-private: scores of 2 rows x 4 keys
     mut [float32, D / 8] racc   # thread-private: 2 rows x D/16 output dimensions
     mut [float32, 2] rm         # running row maxima
@@ -3312,26 +3311,26 @@ kernel FlashAttnRegKernel<int D>:
                 sync
                 for r in 0..<4:
                     let idx = lin + r * 256
-                    let rr = idx / 32
-                    let cc = idx % 32
+                    let rr = idx >> 5
+                    let cc = idx & 31
                     if row0 + rr < seq_q:
                         rq_s[width = cc, height = rr] = q[col = q_off + dc * 32 + cc, row = row0 + rr]
                     else:
                         rq_s[width = cc, height = rr] = 0.0
                 for r in 0..<8:
                     let idx = lin + r * 256
-                    let rr = idx / 32
-                    let cc = idx % 32
+                    let rr = idx >> 5
+                    let cc = idx & 31
                     if j0 + rr < seq_k:
-                        rk_s[width = cc, height = rr] = k[col = k_off + dc * 32 + cc, row = j0 + rr]
+                        rkv_s[rr * 33 + cc] = k[col = k_off + dc * 32 + cc, row = j0 + rr]
                     else:
-                        rk_s[width = cc, height = rr] = 0.0
+                        rkv_s[rr * 33 + cc] = 0.0
                 sync
                 for d in 0..<32:
                     let qa0 = rq_s[width = d, height = ty]
                     let qa1 = rq_s[width = d, height = ty + 16]
                     for j in 0..<4:
-                        let kb = rk_s[width = d, height = tx + 16 * j]
+                        let kb = rkv_s[(tx + 16 * j) * 33 + d]
                         rs[j] = rs[j] + qa0 * kb
                         rs[4 + j] = rs[4 + j] + qa1 * kb
             for i in 0..<2:
@@ -3371,22 +3370,25 @@ kernel FlashAttnRegKernel<int D>:
                 rm[i] = mx
                 for e in 0..<D / 16:
                     racc[i * (D / 16) + e] = racc[i * (D / 16) + e] * alpha
+            let int v_stride = D + 1
+            let int d_shift = if D == 128: 7 else: 6
+            let int d_mask  = if D == 128: 127 else: 63
             for vs in 0..<4:
                 sync
                 for r in 0..<D / 16:
                     let idx = lin + r * 256
-                    let rr = idx / D
-                    let cc = idx % D
+                    let rr = idx >> d_shift
+                    let cc = idx & d_mask
                     if j0 + vs * 16 + rr < seq_k:
-                        rv_s[width = cc, height = rr] = v[col = k_off + cc, row = j0 + vs * 16 + rr]
+                        rkv_s[rr * v_stride + cc] = v[col = k_off + cc, row = j0 + vs * 16 + rr]
                     else:
-                        rv_s[width = cc, height = rr] = 0.0
+                        rkv_s[rr * v_stride + cc] = 0.0
                 sync
                 for jl in 0..<16:
                     let pj0 = rp_s[width = vs * 16 + jl, height = ty]
                     let pj1 = rp_s[width = vs * 16 + jl, height = ty + 16]
                     for e in 0..<D / 16:
-                        let ve = rv_s[width = tx + 16 * e, height = jl]
+                        let ve = rkv_s[jl * v_stride + tx + 16 * e]
                         racc[e] = racc[e] + pj0 * ve
                         racc[D / 16 + e] = racc[D / 16 + e] + pj1 * ve
         for i in 0..<2:
@@ -3960,8 +3962,8 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
         # One thread owns both elements of a Q pair, so angle/sin/cos are
         # evaluated once rather than once per output element.
         if i < q_pairs:
-            let h = i / half_dim
-            let pair = i % half_dim
+            let h = if half_dim == 64: (i >> 6) else: (if half_dim == 32: (i >> 5) else: (i / half_dim))
+            let pair = if half_dim == 64: (i & 63) else: (if half_dim == 32: (i & 31) else: (i % half_dim))
             let head_base = h * d_head
             var int first = head_base + pair
             var int second = first + half_dim
@@ -3981,8 +3983,8 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
         # K uses the same pair-wise rotation. V has no RoPE, so the owner of
         # the pair copies its two adjacent/logically-paired values as well.
         if i < kv_pairs:
-            let h = i / half_dim
-            let pair = i % half_dim
+            let h = if half_dim == 64: (i >> 6) else: (if half_dim == 32: (i >> 5) else: (i / half_dim))
+            let pair = if half_dim == 64: (i & 63) else: (if half_dim == 32: (i & 31) else: (i % half_dim))
             let head_base = h * d_head
             var int first = head_base + pair
             var int second = first + half_dim
@@ -4030,8 +4032,8 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
             out_k[i] = prev_k[i]
             out_v[i] = prev_v[i]
         if i < q_pairs:
-            let h = i / half_dim
-            let pair = i % half_dim
+            let h = if half_dim == 64: (i >> 6) else: (if half_dim == 32: (i >> 5) else: (i / half_dim))
+            let pair = if half_dim == 64: (i & 63) else: (if half_dim == 32: (i & 31) else: (i % half_dim))
             let head_base = h * d_head
             var int first = head_base + pair
             var int second = first + half_dim
@@ -4049,8 +4051,8 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
             out_q[first] = x0 * cos_a - x1 * sin_a
             out_q[second] = x0 * sin_a + x1 * cos_a
         if i < kv_pairs:
-            let h = i / half_dim
-            let pair = i % half_dim
+            let h = if half_dim == 64: (i >> 6) else: (if half_dim == 32: (i >> 5) else: (i / half_dim))
+            let pair = if half_dim == 64: (i & 63) else: (if half_dim == 32: (i & 31) else: (i % half_dim))
             let head_base = h * d_head
             var int first = head_base + pair
             var int second = first + half_dim

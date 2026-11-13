@@ -6,6 +6,11 @@ All notable user-visible changes to boring-llm. The format follows [Keep a Chang
 
 ### Changed
 
+- **Metal prefill FlashAttention threadgroup memory uncoupling and division-free RoPE** (`src/math_gpu.br`):
+  - Unified `rk_s` (key chunk, 64 keys x 33 dims) and `rv_s` (value sub-tile, 16 keys x (D+1) dims) into a single 2112-float shared `'actor` buffer `rkv_s` in `FlashAttnRegKernel<D>`, cutting threadgroup memory allocation from 29.2 KB to 20.5 KB (for `d_head=128`) and from 25.1 KB to 20.5 KB (for `d_head=64`), well below Apple Silicon's 32 KB threshold.
+  - Replaced non-constant 64-bit integer division and modulo (`/ 32`, `% 32`, `/ D`, `% D`) in `FlashAttnRegKernel` inner score/value loops with fast bitwise shifts and masks (`>> 5`, `& 31`, `>> 6/7`, `& 63/127`).
+  - Optimized RoPE kernels (`split_and_rope_qkv_gpu`, `prepare_qkv_decode_slice`, `prepare_qkv_separate_decode_gpu`) with power-of-two head dimension dispatch (`half_dim == 32/64`), removing shader integer division instructions.
+  - Microbenchmarked via `test/bench_prefill_attention`: `d_head=128` (seq_q=512, seq_k=4096, 16 heads) improved from `30.41 ms/call` (0.530 TFLOP/s) to `25.14 ms/call` (0.641 TFLOP/s, **+17.3%** speedup) with bit-exact checksum `-20964.2765`; `d_head=64` (seq_q=512, seq_k=2048, 14 heads) improved from `5.44 ms/call` to `5.20 ms/call` with bit-exact checksum `-9646.3529`. End-to-end token generation on `qwen2.5-0.5b-instruct-q8_0` verified with exact `[MATCH]`.
 - **Warp-cooperative float16 IQ prefill dequantization** (`src/math_gpu.br`):
   - Superblock scales `d` and block headers in `DequantF16Group8Kernel` and `DequantF16Pair16Kernel` are now read once per warp and broadcast across all 32 lanes via `.warp.shuffle(d, 0)`, eliminating redundant global memory reads across threads.
   - Expanded `DequantF16Group8Kernel` to cover all 7 IQ grid formats (`IQ2_XXS`=16, `IQ2_XS`=17, `IQ3_XXS`=18, `IQ1_S`=19, `IQ3_S`=21, `IQ2_S`=22, `IQ1_M`=29), eliminating scalar dequantization fallback during chunked prefill (`seq >= 16`).
