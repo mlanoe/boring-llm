@@ -176,6 +176,8 @@ string object_rule(mut SchemaGrammar& g, JValue schema, string name) throws:
             inner = "{inner} (\",\" space {extra_kv})*"
         body = "{body}{inner} "
     elif opt_kv.length > 0 or extra:
+        # one alternative per first property, each listing the ones after it: quadratic text
+        guard opt_kv.length <= 128 else throw "an object with more than 128 optional properties and no required one is not supported"
         var [string] alts = []
         var int i = 0
         while i < opt_kv.length:

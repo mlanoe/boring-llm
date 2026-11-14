@@ -1524,6 +1524,9 @@ JValue call_macro(JValue m, [JValue] args, [string] kwnames, [JValue] kwvals, {s
         JDict(fields, keys):
             let id = jv_int_arg(fields["__macro__"] else JValue.JInt(0), 0)
             let pnames = fields["__params__"] else JValue.JList([])
+            # A macro value is a plain dict, so a dict that came from outside the
+            # template (request data) can look like one: never index with its id unchecked.
+            guard id >= 0 and id < macro_bodies.length and id < macro_defaults.length else throw "jinja: broken macro value"
             var {string=JValue} call_env = env.clone()
             match pnames:
                 JList(names):
@@ -1542,6 +1545,7 @@ JValue call_macro(JValue m, [JValue] args, [string] kwnames, [JValue] kwvals, {s
                                 given = true
                             k += 1
                         if not given:
+                            guard i < macro_defaults[id].length else throw "jinja: broken macro value"
                             val = eval_expr(macro_defaults[id][i], call_env)
                         call_env[pname] = val
                         i += 1

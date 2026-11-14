@@ -178,4 +178,13 @@ def main() throws:
     assert_eq(render_jinja("{ob}% macro hi(who, p='!') %{cb}Hi {ob}{ob} who {cb}{cb}{ob}{ob} p {cb}{cb}{ob}% endmacro %{cb}{ob}{ob} hi('A') {cb}{cb}|{ob}{ob} hi('B', p='?') {cb}{cb}", st), "Hi A!|Hi B?" as string)
     assert_eq(render_jinja("a{ob}# hidden #{cb}b{ob}% raw %{cb}{ob}{ob} x {cb}{cb}{ob}% endraw %{cb}", st), "ab{ob}{ob} x {cb}{cb}" as string)
 
+    # a dict from request data that only looks like a macro must throw, not index out of range
+    mut {string=JValue} fake_fields = {=}
+    fake_fields["__macro__"] = JValue.JInt(99)
+    fake_fields["__params__"] = JValue.JList([])
+    mut {string=JValue} hostile = {=}
+    hostile["namespace"] = JValue.JDict(fake_fields, ["__macro__", "__params__"])
+    let spoofed = try? render_jinja("{ob}{ob} namespace() {cb}{cb}", hostile)
+    assert(spoofed == nil, "fake macro value is rejected")
+
     print "test_jinja: all assertions passed"

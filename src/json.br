@@ -149,7 +149,13 @@ bool json_has_literal([string] cs, int pos, string lit):
         i += 1
     true
 
-(JValue, int) json_parse_value([string] cs, int pos) throws:
+# Deepest object/array nesting json_parse accepts. The parser (and every walker
+# over its result) recurses once per level, so an unbounded depth lets a body of
+# nothing but `[` overflow the stack — which is fatal, not a catchable throw.
+let int JSON_MAX_DEPTH = 128
+
+(JValue, int) json_parse_value([string] cs, int pos, int depth) throws:
+    guard depth <= JSON_MAX_DEPTH else throw "json: nesting is deeper than {JSON_MAX_DEPTH} levels"
     let p = json_skip_ws(cs, pos)
     guard p < cs.length else throw "json: unexpected end of input"
     let ch = cs[p]
@@ -165,7 +171,7 @@ bool json_has_literal([string] cs, int pos, string lit):
             let (key, after_key) = json_parse_string(cs, q)
             q = json_skip_ws(cs, after_key)
             guard q < cs.length and cs[q] == ":" else throw "json: expected ':' after key '{key}'"
-            let (child, after_val) = json_parse_value(cs, q + 1)
+            let (child, after_val) = json_parse_value(cs, q + 1, depth + 1)
             if not fields.contains(key):
                 keys.push(key.clone())
             fields[key] = child
@@ -184,7 +190,7 @@ bool json_has_literal([string] cs, int pos, string lit):
         if q < cs.length and cs[q] == "]":
             return (JValue.JList(items), q + 1)
         while true:
-            let (child, after_val) = json_parse_value(cs, q)
+            let (child, after_val) = json_parse_value(cs, q, depth + 1)
             items.push(child)
             q = json_skip_ws(cs, after_val)
             guard q < cs.length else throw "json: unterminated array"
@@ -209,7 +215,7 @@ bool json_has_literal([string] cs, int pos, string lit):
 
 pub JValue json_parse(string src) throws:
     let cs = src.chars()
-    let (v, end) = json_parse_value(cs, 0)
+    let (v, end) = json_parse_value(cs, 0, 0)
     let tail = json_skip_ws(cs, end)
     guard tail == cs.length else throw "json: trailing characters at {tail}"
     v

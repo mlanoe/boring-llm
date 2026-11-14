@@ -778,6 +778,9 @@ pub [int] render_chat_prompt_messages_kw(GgufFile file, Tokenizer tok, [JValue] 
     let prompt_text = render_chat_prompt_text_messages_kw(file, tok, messages, tools, add_generation_prompt, kwargs)
     tok.encode_with_specials(prompt_text)
 
+bool chat_kwarg_is_reserved(string key):
+    key == "messages" or key == "tools" or key == "bos_token" or key == "eos_token" or key.startsWith("__")
+
 # Text form used by llama-server's `/apply-template` compatibility endpoint.
 # Keeping it beside the token-returning function guarantees that applying a
 # template and counting/generating from it use the identical environment.
@@ -791,6 +794,9 @@ pub string render_chat_prompt_text_messages_kw(GgufFile file, Tokenizer tok, [JV
     match kwargs:
         JDict(fields, keys):
             for key in keys:
-                env[key] = fields[key] else JValue.JUndefined
+                # kwargs come straight from the request: they add template variables,
+                # they never replace the conversation the request was validated on.
+                if not chat_kwarg_is_reserved(key):
+                    env[key] = fields[key] else JValue.JUndefined
         _: env["tools"] = JValue.JList(tools)
     render_jinja(template, env)

@@ -30,6 +30,15 @@ struct GParser:
     var [string] rule_names
     var [bool] defined
     var [[[GElem]]] rules
+    var int depth        # open `( … )` groups at the current position
+    var int elems        # elements produced by repetitions so far
+
+# Limits on what a grammar may ask of the parser. Grammars arrive in requests, and
+# both an unbounded group nesting (a stack overflow) and an unbounded repetition
+# count (`"a"{2000000000}` is two billion elements) would take the process down.
+let int GRAMMAR_MAX_DEPTH = 64
+let int GRAMMAR_MAX_REPEAT = 2000
+let int GRAMMAR_MAX_REPEAT_ELEMS = 200000
 
 # ── Parser ───────────────────────────────────────────────────────────────
 
@@ -117,7 +126,11 @@ int anonymous_rule(mut GParser& p):
 
 # x{min,max} (max = -1: unbounded) as elements: `min` copies, then an unbounded loop or
 # right-nested optional copies, each optional step being its own rule.
-[GElem] repeat_symbol(mut GParser& p, [GElem] sym, int min, int max):
+[GElem] repeat_symbol(mut GParser& p, [GElem] sym, int min, int max) throws:
+    let copies = if max > min: max else: min
+    guard copies <= GRAMMAR_MAX_REPEAT else throw "grammar: a repetition count above {GRAMMAR_MAX_REPEAT} is not supported"
+    p.elems += copies * (sym.length + 1)
+    guard p.elems <= GRAMMAR_MAX_REPEAT_ELEMS else throw "grammar: repetitions expand to more than {GRAMMAR_MAX_REPEAT_ELEMS} elements"
     mut [GElem] out = []
     var int i = 0
     while i < min:
@@ -156,6 +169,7 @@ int parse_int(mut GParser& p) throws:
         value = value * 10 + (p.src[p.pos] - 48)
         p.pos += 1
         digits += 1
+        guard digits <= 9 else throw "grammar: a repetition count above {GRAMMAR_MAX_REPEAT} is not supported"
     guard digits > 0 else throw "grammar: expected a number in a repetition at offset {p.pos}"
     value
 
@@ -203,7 +217,10 @@ int parse_int(mut GParser& p) throws:
             p.pos += 1
             skip_space(p, true)
             let sub = anonymous_rule(p)
+            guard p.depth < GRAMMAR_MAX_DEPTH else throw "grammar: groups are nested deeper than {GRAMMAR_MAX_DEPTH} levels"
+            p.depth += 1
             parse_alternates(p, sub, true)
+            p.depth -= 1
             guard p.pos < p.src.length and p.src[p.pos] == 41 else throw "grammar: expected ')' at offset {p.pos}"
             p.pos += 1
             skip_space(p, nested)
@@ -293,7 +310,7 @@ pub Grammar parse_gbnf(string text) throws:
     mut [int] src = []
     for ch in text.chars():
         src.push(ord(ch))
-    mut GParser p = GParser(src, 0, {=}, [], [], [])
+    mut GParser p = GParser(src, 0, {=}, [], [], [], 0, 0)
     skip_space(p, true)
     while p.pos < p.src.length:
         parse_rule(p)

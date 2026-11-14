@@ -97,4 +97,21 @@ def main() throws:
     assert_eq(json_object_decoded_candidate_allowed('''{"x": "caf�''', '''{"x": "café''', false), true)
     assert_eq(json_object_decoded_candidate_allowed('''{"x": 1}''', "", true), true)
     assert_eq(json_object_decoded_candidate_allowed('''{"x": 1''', "", true), false)
+    # nesting is bounded: a body of nothing but `[` must throw, not overflow the stack
+    var string deep_ok = ""
+    var string deep_close = ""
+    var int level = 0
+    while level < 100:
+        deep_ok = "{deep_ok}["
+        deep_close = "{deep_close}]"
+        level += 1
+    let nested_ok = try? json_parse("{deep_ok}{deep_close}")
+    assert(nested_ok != nil, "100 nested arrays parse")
+    var string deep_bad = ""
+    level = 0
+    while level < 5000:
+        deep_bad = "{deep_bad}["
+        level += 1
+    let nested_bad = try? json_parse(deep_bad)
+    assert(nested_bad == nil, "unbounded nesting is rejected")
     print "test_json: ok"

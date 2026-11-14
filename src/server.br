@@ -28,7 +28,7 @@ use schema_grammar
 use speculative
 use std.net.TcpListener, TcpStream
 use std.io.Read, Write
-use std.time.Instant
+use std.time.Duration, Instant
 
 pub struct ServerSamplingDefaults:
     float32 presence_penalty
@@ -405,6 +405,10 @@ pub (int, Rng) sample_tool_choice_token(Tokenizer tok, Rng rng, [float32] logits
         guard k < vocab else throw "tool_choice grammar rejected every vocabulary token"
         k = if k * 4 < vocab: k * 4 else: vocab
 
+# Longest a single socket read or write may block, and longest a whole request
+# may take to arrive (a peer trickling one byte per read never trips the first).
+let int SOCKET_TIMEOUT_SECS = 30
+
 int read_some(var TcpStream sock, mut [uint8] b) throws:
     let n = try? sock.read(b)
     guard let n else throw "socket read failed"
@@ -473,10 +477,13 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     var int header_end = -1
     var int content_length = 0
     var string head = ""
+    let started = Instant.now()
     while true:
         let n = read_some(sock, chunk)
         if n == 0:
             break
+        if (started.elapsed().asSecs() as int) > SOCKET_TIMEOUT_SECS:
+            throw "http_400:request was not received within {SOCKET_TIMEOUT_SECS} seconds"
         var int k = 0
         while k < n:
             data.push(chunk[k])
@@ -1741,6 +1748,13 @@ string grammar_error(string text):
         message = "{error}"
     message
 
+# The JSON body of a `/slots/N?action=…` request. A body that is not JSON is the
+# client's mistake (400), not a server failure.
+JValue slot_action_body(string body_text) throws:
+    let parsed = try? json_parse(body_text)
+    guard let parsed else throw "http_400:slot action body is not valid JSON"
+    parsed
+
 [CacheSlot] dispatch_request(ServerCtx& ctx, mut ServerMetrics& metrics, mut ResponseState& response,
                              var TcpStream sock, int counter, HttpRequest& r,
                              [CacheSlot] slots, [DiskSnap] disk) throws:
@@ -1839,12 +1853,13 @@ string grammar_error(string text):
                 if ctx.slot_save_dir == "":
                     respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("slots save"))
                 else:
-                    let action_body = json_parse(r.body)
+                    let action_body = slot_action_body(r.body)
                     let filename = json_get_str(action_body, "filename", "")
                     let filename_error = slot_filename_validation_error(filename)
                     if filename_error != "":
                         respond_json(response, sock, 400, "Bad Request", error_json(filename_error, "invalid_request_error", "invalid_filename"))
-                    elif slots[id_slot].tokens.length == 0:
+                    elif id_slot >= slots.length or slots[id_slot].tokens.length == 0:
+                        # `slots` only grows as requests fill it: an id below --cache-slots can still be past its end
                         respond_json(response, sock, 400, "Bad Request", error_json("slot {id_slot} has no prompt cache to save", "invalid_request_error", "empty_slot"))
                     else:
                         let operation_started = Instant.now()
@@ -1857,7 +1872,7 @@ string grammar_error(string text):
                 if ctx.slot_save_dir == "":
                     respond_json(response, sock, 501, "Not Implemented", endpoint_not_supported_json("slots restore"))
                 else:
-                    let action_body = json_parse(r.body)
+                    let action_body = slot_action_body(r.body)
                     let filename = json_get_str(action_body, "filename", "")
                     let filename_error = slot_filename_validation_error(filename)
                     if filename_error != "":
@@ -1878,6 +1893,13 @@ string grammar_error(string text):
                                     restored.push(CacheSlot(restored_cache, snap.tokens, counter))
                                 else:
                                     restored.push(slot)
+                                slot_idx += 1
+                            # the target slot may not exist yet: pad up to it with empty ones
+                            while slot_idx <= id_slot:
+                                if slot_idx == id_slot:
+                                    restored.push(CacheSlot(restored_cache, snap.tokens, counter))
+                                else:
+                                    restored.push(CacheSlot(empty_cache(ctx.model.config.n_layer), [], 0))
                                 slot_idx += 1
                             let n_restored = snap.tokens.length
                             respond_json(response, sock, 200, "OK", slot_restored_json(id_slot, filename, n_restored,
@@ -2019,6 +2041,11 @@ pub def serve(ServerCtx& ctx, string host, int port, [DiskSnap] disk0) throws:
             print "[serve] accept failed"
             continue
         var sock = c
+        # One connection is served at a time, so a peer that connects and sends
+        # nothing, or stops reading its stream, must not hold the loop forever.
+        let Duration? io_limit = Duration.fromSecs(SOCKET_TIMEOUT_SECS as uint64)
+        let read_limited = try? sock.setReadTimeout(io_limit)
+        let write_limited = try? sock.setWriteTimeout(io_limit)
         server.counter += 1
         serve_conn(ctx, server, sock)
         if ctx.cache_dir != "":

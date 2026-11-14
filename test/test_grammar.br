@@ -52,4 +52,23 @@ def main() throws:
     assert(bad2 == nil, "no root")
     let bad3 = try? parse_gbnf('root ::= "x')
     assert(bad3 == nil, "unterminated literal")
+    # limits: none of these may exhaust memory or the stack
+    let bad4 = try? parse_gbnf('root ::= "a"{2000000000}')
+    assert(bad4 == nil, "huge repetition count")
+    let bad5 = try? parse_gbnf('root ::= "a"{0,2000000000}')
+    assert(bad5 == nil, "huge repetition maximum")
+    let bad6 = try? parse_gbnf('root ::= "a"{99999999999999999999999999}')
+    assert(bad6 == nil, "repetition count that overflows")
+    let bad7 = try? parse_gbnf('root ::= (("ab"{2000}){2000}){2000}')
+    assert(bad7 != nil, "nested repetitions stay small: each level repeats one reference")
+    var string opens = ""
+    var string closes = ""
+    var int depth = 0
+    while depth < 5000:
+        opens = "{opens}("
+        closes = "{closes})"
+        depth += 1
+    let bad8 = try? parse_gbnf("root ::= {opens}[a]{closes}")
+    assert(bad8 == nil, "unbounded group nesting")
+    assert(accepts(parse_gbnf('root ::= ((("a"{3})))'), "aaa"), "ordinary nesting and counts still work")
     print "test_grammar: all assertions passed"

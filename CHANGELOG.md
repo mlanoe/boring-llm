@@ -4,6 +4,16 @@ All notable user-visible changes to boring-llm. The format follows [Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--serve` no longer dies or hangs on a single hostile request** (`src/json.br`, `src/grammar.br`, `src/schema_grammar.br`, `src/jinja.br`, `src/tokenizer.br`, `src/server.br`):
+  - JSON nesting is limited to 128 levels and GBNF group nesting to 64; deeper input is a 400 instead of a stack overflow.
+  - GBNF repetition counts are limited to 2000 and their total expansion to 200000 elements, so `"a"{2000000000}` or a schema with `minItems`/`minLength`/`maxLength` in the billions is a 400 instead of exhausting memory. A JSON schema bound above 2000 is now rejected. An object with no required property accepts at most 128 optional ones.
+  - `chat_template_kwargs` can no longer replace `messages`, `tools`, `bos_token`, `eos_token` or any `__`-prefixed variable (those keys are ignored), and a dict that only looks like a macro value throws instead of indexing out of range.
+  - `POST /slots/N?action=save` on a slot that does not exist yet answers 400 instead of panicking; `action=restore` into such a slot creates it; a body that is not JSON is a 400 instead of a 500.
+  - Sockets get 30 s read and write timeouts and a request must arrive within 30 s, so an idle connection or a stalled stream reader no longer blocks the single-threaded accept loop forever.
+  - Checked against a release Metal build serving `qwen2.5-0.5b-instruct-q8_0.gguf`: each of these requests gets an error and the next request is answered normally.
+
 ### Changed
 
 - **Native Metal SIMDgroup blocked prefill for Q2_K, Q3_K, and IQ4_NL & dead GLU activation bypass** (`boring.toml`, `src/math_gpu.br`):
