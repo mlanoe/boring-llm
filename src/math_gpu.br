@@ -3305,8 +3305,14 @@ kernel FlashAttnRegKernel<int D>:
         let ntiles = (kmax + 63) / 64
         for t in 0..<ntiles:
             let j0 = t * 64
-            for e in 0..<8:
-                rs[e] = 0.0
+            rs[0] = 0.0
+            rs[1] = 0.0
+            rs[2] = 0.0
+            rs[3] = 0.0
+            rs[4] = 0.0
+            rs[5] = 0.0
+            rs[6] = 0.0
+            rs[7] = 0.0
             for dc in 0..<D / 32:
                 sync
                 for r in 0..<4:
@@ -3329,16 +3335,25 @@ kernel FlashAttnRegKernel<int D>:
                 for d in 0..<32:
                     let qa0 = rq_s[width = d, height = ty]
                     let qa1 = rq_s[width = d, height = ty + 16]
-                    for j in 0..<4:
-                        let kb = rkv_s[(tx + 16 * j) * 33 + d]
-                        rs[j] = rs[j] + qa0 * kb
-                        rs[4 + j] = rs[4 + j] + qa1 * kb
+                    let kb0 = rkv_s[tx * 33 + d]
+                    let kb1 = rkv_s[(tx + 16) * 33 + d]
+                    let kb2 = rkv_s[(tx + 32) * 33 + d]
+                    let kb3 = rkv_s[(tx + 48) * 33 + d]
+                    rs[0] = rs[0] + qa0 * kb0
+                    rs[1] = rs[1] + qa0 * kb1
+                    rs[2] = rs[2] + qa0 * kb2
+                    rs[3] = rs[3] + qa0 * kb3
+                    rs[4] = rs[4] + qa1 * kb0
+                    rs[5] = rs[5] + qa1 * kb1
+                    rs[6] = rs[6] + qa1 * kb2
+                    rs[7] = rs[7] + qa1 * kb3
             for i in 0..<2:
                 let row = row0 + ty + 16 * i
                 var float32 lmax = -1.0e30
+                let base_s = i * 4
                 for j in 0..<4:
                     let key = j0 + tx + 16 * j
-                    var float32 sv = rs[i * 4 + j] * scale
+                    var float32 sv = rs[base_s + j] * scale
                     var int ok = 1
                     if key >= seq_k:
                         ok = 0
@@ -3346,7 +3361,7 @@ kernel FlashAttnRegKernel<int D>:
                         ok = 0
                     if ok == 0:
                         sv = -1.0e30 as float32
-                    rs[i * 4 + j] = sv
+                    rs[base_s + j] = sv
                     if sv > lmax:
                         lmax = sv
                 var int off = 8
@@ -3362,8 +3377,8 @@ kernel FlashAttnRegKernel<int D>:
                 var float32 psum = 0.0
                 for j in 0..<4:
                     var float32 pv = 0.0
-                    if rs[i * 4 + j] > -1.0e29:
-                        pv = (rs[i * 4 + j] - mx).exp()
+                    if rs[base_s + j] > -1.0e29:
+                        pv = (rs[base_s + j] - mx).exp()
                     psum += pv
                     rp_s[width = tx + 16 * j, height = ty + 16 * i] = pv
                 rl[i] = rl[i] * alpha + psum
@@ -3373,20 +3388,22 @@ kernel FlashAttnRegKernel<int D>:
             let int v_stride = D + 1
             let int d_shift = if D == 128: 7 else: 6
             let int d_mask  = if D == 128: 127 else: 63
-            for vs in 0..<4:
+            let int vs_count = if D == 64: 2 else: 4
+            let int vs_keys  = if D == 64: 32 else: 16
+            for vs in 0..<vs_count:
                 sync
-                for r in 0..<D / 16:
+                for r in 0..<8:
                     let idx = lin + r * 256
                     let rr = idx >> d_shift
                     let cc = idx & d_mask
-                    if j0 + vs * 16 + rr < seq_k:
-                        rkv_s[rr * v_stride + cc] = v[col = k_off + cc, row = j0 + vs * 16 + rr]
+                    if j0 + vs * vs_keys + rr < seq_k:
+                        rkv_s[rr * v_stride + cc] = v[col = k_off + cc, row = j0 + vs * vs_keys + rr]
                     else:
                         rkv_s[rr * v_stride + cc] = 0.0
                 sync
-                for jl in 0..<16:
-                    let pj0 = rp_s[width = vs * 16 + jl, height = ty]
-                    let pj1 = rp_s[width = vs * 16 + jl, height = ty + 16]
+                for jl in 0..<vs_keys:
+                    let pj0 = rp_s[width = vs * vs_keys + jl, height = ty]
+                    let pj1 = rp_s[width = vs * vs_keys + jl, height = ty + 16]
                     for e in 0..<D / 16:
                         let ve = rkv_s[jl * v_stride + tx + 16 * e]
                         racc[e] = racc[e] + pj0 * ve
