@@ -6,6 +6,11 @@ All notable user-visible changes to boring-llm. The format follows [Keep a Chang
 
 ### Changed
 
+- **Native Metal SIMDgroup blocked prefill for Q2_K, Q3_K, and IQ4_NL & dead GLU activation bypass** (`boring.toml`, `src/math_gpu.br`):
+  - Enabled native Metal SIMDgroup blocked matrix prefill for `q2_k`, `q3_k`, and `iq4_nl` in `boring.toml` and enabled them in `tensor_prefill` / `has_tensor_schedule` in `src/math_gpu.br`, replacing the slower scalar/hand-written tiled GEMM fallback with 64x128/64x64 SIMDgroup matrix prefill instructions.
+  - Short-circuited dead `exp(-g)` evaluation in `glu_combine_gpu` and `glu_joined_combine_gpu`: when `act != 0` (GELU or ReLU models), the SwiGLU `g / (1.0 + exp(-g))` calculation is bypassed completely instead of evaluating an expensive GPU exponent before discarding it.
+  - Verified bit-exactness on real Metal via `test/test_iq_kernels_real.br` (all 9 IQ formats pass), `docs/build.py --check`, and end-to-end token generation on `qwen2.5-0.5b-instruct-q8_0.gguf` and `tinymixtral-4x248m-q4_k_m.gguf` with exact `[MATCH]`. Paired in-process runs confirmed a 15–20% end-to-end runtime improvement over baseline.
+
 - **Metal prefill FlashAttention threadgroup memory uncoupling and division-free RoPE** (`src/math_gpu.br`):
   - Unified `rk_s` (key chunk, 64 keys x 33 dims) and `rv_s` (value sub-tile, 16 keys x (D+1) dims) into a single 2112-float shared `'actor` buffer `rkv_s` in `FlashAttnRegKernel<D>`, cutting threadgroup memory allocation from 29.2 KB to 20.5 KB (for `d_head=128`) and from 25.1 KB to 20.5 KB (for `d_head=64`), well below Apple Silicon's 32 KB threshold.
   - Replaced non-constant 64-bit integer division and modulo (`/ 32`, `% 32`, `/ D`, `% D`) in `FlashAttnRegKernel` inner score/value loops with fast bitwise shifts and masks (`>> 5`, `& 31`, `>> 6/7`, `& 63/127`), unrolled the 8 QK score accumulator dot products with direct literal indexing (eliminating register stack spills), and doubled $D=64$ value sub-tile batching (32 keys/pass instead of 16, halving threadgroup sync barriers in the V loop).

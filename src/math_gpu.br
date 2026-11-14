@@ -2067,16 +2067,15 @@ pub def set_kquant_prefill_handwritten(bool v):
 # native Q4_1/Q5_1/Q5_K/F16/BF16 ones, every format below decodes at Q8_0 speed on Metal
 # (test/bench_decode_formats.br). F16/BF16 need d_in % 32 == 0 (the kernels' K tile).
 bool has_tensor_schedule(int w_type, int d_in):
-    w_type == 2 or w_type == 3 or w_type == 6 or w_type == 7 or w_type == 8 or w_type == 10 or w_type == 11 or w_type == 12 or w_type == 13 or w_type == 14 or ((w_type == 1 or w_type == 30) and d_in % 32 == 0)
+    w_type == 2 or w_type == 3 or w_type == 6 or w_type == 7 or w_type == 8 or w_type == 10 or w_type == 11 or w_type == 12 or w_type == 13 or w_type == 14 or w_type == 20 or ((w_type == 1 or w_type == 30) and d_in % 32 == 0)
 
 pub bool supports_moe_tensor_schedule(int w_type):
     w_type == 1 or w_type == 2 or w_type == 3 or w_type == 6 or w_type == 7 or w_type == 12 or w_type == 13 or w_type == 14 or w_type == 30
 
-# Prefill (seq > 1) on the compiler's SIMD-group kernels: Q8_0, Q4_0/Q4_1/Q5_0/Q5_1, F16/BF16 always (3-5x
-# faster than the hand-written tiled kernels on Metal); the K-quants unless `--kquant-prefill handwritten`.
-# Q2_K/Q3_K/IQ4_NL prefill stays on `fused_linear_gpu`.
+# Prefill (seq > 1) on the compiler's SIMD-group kernels: Q8_0, Q4_0/Q4_1/Q5_0/Q5_1, F16/BF16, IQ4_NL,
+# and K-quants (Q2_K..Q6_K) via native Metal SIMD-group blocked kernels unless `--kquant-prefill handwritten`.
 bool tensor_prefill(int w_type):
-    w_type == 8 or w_type == 2 or w_type == 3 or w_type == 6 or w_type == 7 or w_type == 1 or w_type == 30 or ((w_type == 12 or w_type == 13 or w_type == 14) and not kquant_prefill_handwritten)
+    w_type == 8 or w_type == 2 or w_type == 3 or w_type == 6 or w_type == 7 or w_type == 1 or w_type == 30 or w_type == 20 or ((w_type == 10 or w_type == 11 or w_type == 12 or w_type == 13 or w_type == 14) and not kquant_prefill_handwritten)
 
 pub req [float32]'kernel'unified tensor_linear_gpu([float32]'kernel'global x,
                        [uint8]'kernel'global w_packed, int w_type,
@@ -2589,8 +2588,10 @@ pub req [float32]'kernel'unified glu_combine_gpu([float32]'kernel'global gate, [
         let i = .thread.x + .block.x * .block_dim.x
         if i < n:
             let g = gate[i]
-            var float32 activated = g / (1.0 + (0.0 - g).exp())
-            if act == 1:
+            var float32 activated = 0.0
+            if act == 0:
+                activated = g / (1.0 + (0.0 - g).exp())
+            elif act == 1:
                 let inner = 0.7978845608 * (g + 0.044715 * g * g * g)
                 activated = 0.5 * g * (1.0 + inner.tanh())
             elif act == 3:
@@ -2652,8 +2653,10 @@ pub req [float32]'kernel'unified glu_joined_combine_gpu([float32]'kernel'global 
         if col < ffn_dim:
             let base = row * stride + col
             let g = gate_up[base]
-            var float32 activated = g / (1.0 + (0.0 - g).exp())
-            if act == 1:
+            var float32 activated = 0.0
+            if act == 0:
+                activated = g / (1.0 + (0.0 - g).exp())
+            elif act == 1:
                 let inner = 0.7978845608 * (g + 0.044715 * g * g * g)
                 activated = 0.5 * g * (1.0 + inner.tanh())
             elif act == 3:
