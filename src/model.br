@@ -1710,6 +1710,12 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
     # Residual stream: uploaded once, then kept on the device across layers.
     var x = upload_floats_gpu(embed_tokens_q(model, tokens, 0))
 
+    let zeros = [0.0 as float32 for i in 0..<32]
+    let dummy_f = upload_floats_gpu(zeros)
+    let dummy_h = pack_float16_gpu(zeros)
+    let dummy_sc = q8kv_scales_gpu(zeros)
+    let dummy_q = q8kv_quantize_gpu(zeros, dummy_sc)
+
     mut [LayerCache] new_layers = []
     var int l = 0
     while l < model.config.n_layer:
@@ -1763,7 +1769,10 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
         # `k_rope_raw`/`v` already ARE the whole prompt's post-RoPE cache for
         # this layer (seq positions, 0..seq-1) — nothing to grow, and they
         # stay on the device as the resident cache.
-        new_layers.push(LayerCache(plane_pack(k_rope_raw, kv_type_k), plane_pack(v, kv_type_v), [], []))
+        new_layers.push(LayerCache(
+            plane_pack_fast(k_rope_raw, kv_type_k, dummy_f, dummy_h, dummy_q, dummy_sc),
+            plane_pack_fast(v, kv_type_v, dummy_f, dummy_h, dummy_q, dummy_sc),
+            [], []))
         l += 1
 
     # Only the LAST position's logits are ever used (they pick the first
@@ -1820,22 +1829,9 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
         let ([float32]'kernel'unified q, [float32]'kernel'unified k_rope_raw, [float32]'kernel'unified v) = project_qkv_rope_gpu(
             layer, model.config, normed, n, d, qkv_dim, kv_dim, layer.rope_freqs, base_pos)
         let seq_k = base_pos + n
-        mut [float32]'kernel'unified full_k = []
-        mut [float32]'kernel'unified full_v = []
-        mut [float32]'kernel'unified attn_out = []
-        # Batched prefill uses the general float32 attention path: widen the old
-        # main cache when it is packed, then repack the result.
-        if cache.kt == 0:
-            full_k = kv_append_gpu(lc.kp.f, k_rope_raw, base_pos * kv_dim, n * kv_dim)
-        else:
-            let old_k = plane_widen(lc.kp, cache.kt)
-            full_k = kv_append_gpu(old_k, k_rope_raw, base_pos * kv_dim, n * kv_dim)
-        if cache.vt == 0:
-            full_v = kv_append_gpu(lc.vp.f, v, base_pos * kv_dim, n * kv_dim)
-        else:
-            let old_v = plane_widen(lc.vp, cache.vt)
-            full_v = kv_append_gpu(old_v, v, base_pos * kv_dim, n * kv_dim)
-        attn_out = attention_layer_gpu(q, full_k, full_v, n, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head, base_pos,
+        let full_k = plane_widen_append(lc.kp, k_rope_raw, base_pos * kv_dim, n * kv_dim, cache.kt)
+        let full_v = plane_widen_append(lc.vp, v, base_pos * kv_dim, n * kv_dim, cache.vt)
+        var attn_out = attention_layer_gpu(q, full_k, full_v, n, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head, base_pos,
             model.config.attn_ext, model.config.attn_scale, model.config.attn_softcap, layer_window(model.config, l))
         if layer.has_attn_gate:
             let gate_proj = tensor_linear_nobias_gpu(normed, layer.attn_gate_w_q8, layer.attn_gate_w_type, n, d, qkv_dim)
@@ -1915,22 +1911,9 @@ pub ([float32], GenCache) forward_batch_gpu_quantized(QuantModel model, GenCache
         let ([float32]'kernel'unified q, [float32]'kernel'unified k_rope_raw, [float32]'kernel'unified v) = project_qkv_rope_gpu(
             layer, model.config, normed, n, d, qkv_dim, kv_dim, layer.rope_freqs, base_pos)
         let seq_k = base_pos + n
-        mut [float32]'kernel'unified full_k = []
-        mut [float32]'kernel'unified full_v = []
-        mut [float32]'kernel'unified attn_out = []
-        # Batched prefill uses the general float32 attention path: widen the old
-        # main cache when it is packed, then repack the result.
-        if cache.kt == 0:
-            full_k = kv_append_gpu(lc.kp.f, k_rope_raw, base_pos * kv_dim, n * kv_dim)
-        else:
-            let old_k = plane_widen(lc.kp, cache.kt)
-            full_k = kv_append_gpu(old_k, k_rope_raw, base_pos * kv_dim, n * kv_dim)
-        if cache.vt == 0:
-            full_v = kv_append_gpu(lc.vp.f, v, base_pos * kv_dim, n * kv_dim)
-        else:
-            let old_v = plane_widen(lc.vp, cache.vt)
-            full_v = kv_append_gpu(old_v, v, base_pos * kv_dim, n * kv_dim)
-        attn_out = attention_layer_gpu(q, full_k, full_v, n, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head, base_pos,
+        let full_k = plane_widen_append(lc.kp, k_rope_raw, base_pos * kv_dim, n * kv_dim, cache.kt)
+        let full_v = plane_widen_append(lc.vp, v, base_pos * kv_dim, n * kv_dim, cache.vt)
+        var attn_out = attention_layer_gpu(q, full_k, full_v, n, seq_k, model.config.n_head, model.config.n_kv_head, model.config.d_head, base_pos,
             model.config.attn_ext, model.config.attn_scale, model.config.attn_softcap, layer_window(model.config, l))
         if layer.has_attn_gate:
             let gate_proj = tensor_linear_nobias_gpu(normed, layer.attn_gate_w_q8, layer.attn_gate_w_type, n, d, qkv_dim)

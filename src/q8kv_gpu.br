@@ -43,7 +43,7 @@ pub req [uint8]'kernel'unified q8kv_quantize_gpu([float32]'kernel'global src,
         let block_idx = .block.x + .block.y * .grid_dim.x
         let i = .thread.x + block_idx * .block_dim.x
         if i < n:
-            let s = scales[i / 32] as float32
+            let s = scales[i >> 5] as float32
             var int q = 0
             if s > 0.0:
                 let r = src[i] / s
@@ -73,7 +73,7 @@ pub req [uint8]'kernel'unified q8kv_append_gpu([uint8]'kernel'global old,
             out[i] = old[i]
         elif i < n:
             let j = i - old_n
-            let s = fresh_scales[j / 32] as float32
+            let s = fresh_scales[j >> 5] as float32
             var int q = 0
             if s > 0.0:
                 let r = fresh[j] / s
@@ -117,7 +117,7 @@ pub req [float32]'kernel'unified q8kv_dequantize_gpu([uint8]'kernel'global qs,
             var int b = int(qs[i])
             if b > 127:
                 b = b - 256
-            out[i] = (b as float32) * (scales[i / 32] as float32)
+            out[i] = (b as float32) * (scales[i >> 5] as float32)
         out
 
 # Single-query grouped attention over a quantized main cache and a short

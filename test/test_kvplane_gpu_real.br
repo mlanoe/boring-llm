@@ -120,10 +120,29 @@ def check_append(int t) throws:
         i += 1
     print "plane append type {t}: OK"
 
+def check_widen_append(int t) throws:
+    let first = values(96, 7)
+    let fresh = values(64, 9)
+    let p0 = plane_pack(first, t)
+    let wide_append_raw = plane_widen_append(p0, fresh, 96, 64, t)
+    let wide = passthrough(wide_append_raw)
+    var i = 0
+    let tol = if t == 0: 0.0 else: 0.01
+    while i < 96:
+        assert_close(wide[i], first[i], tol as float32, "plane widen append type {t} old[{i}]")
+        i += 1
+    while i < 160:
+        assert_close(wide[i], fresh[i - 96], tol as float32, "plane widen append type {t} new[{i}]")
+        i += 1
+    print "plane widen append type {t}: OK"
+
 def main() throws:
     check_append(0)
     check_append(1)
     check_append(2)
+    check_widen_append(0)
+    check_widen_append(1)
+    check_widen_append(2)
     var int kt = 0
     while kt < 3:
         var int vt = 0

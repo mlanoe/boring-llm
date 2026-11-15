@@ -45,7 +45,7 @@ pub Plane plane_pack([float32]'kernel'unified x, int t) throws:
         let dh = pack_float16_gpu(zeros)
         let dsc = q8kv_scales_gpu(zeros)
         let dq = q8kv_quantize_gpu(zeros, dsc)
-        Plane(upload_floats_gpu(x), dh, dq, dsc)
+        Plane(x, dh, dq, dsc)
     elif t == 1:
         let df = upload_floats_gpu(zeros)
         let dsc = q8kv_scales_gpu(zeros)
@@ -57,6 +57,20 @@ pub Plane plane_pack([float32]'kernel'unified x, int t) throws:
         let sc = q8kv_scales_gpu(x)
         Plane(df, dh, q8kv_quantize_gpu(x, sc), sc)
 
+# Fast variant reusing pre-allocated dummy buffers across layers during prefill.
+pub Plane plane_pack_fast([float32]'kernel'unified x, int t,
+        [float32]'kernel'unified dummy_f,
+        [float16]'kernel'unified dummy_h,
+        [uint8]'kernel'unified dummy_q,
+        [float16]'kernel'unified dummy_s) throws:
+    if t == 0:
+        Plane(x, dummy_h, dummy_q, dummy_s)
+    elif t == 1:
+        Plane(dummy_f, pack_float16_gpu(x), dummy_q, dummy_s)
+    else:
+        let sc = q8kv_scales_gpu(x)
+        Plane(dummy_f, dummy_h, q8kv_quantize_gpu(x, sc), sc)
+
 # The plane's main rows as float32 (for the general attention path and snapshots).
 pub req [float32]'kernel'unified plane_widen(Plane p, int t) throws:
     if t == 0:
@@ -65,6 +79,51 @@ pub req [float32]'kernel'unified plane_widen(Plane p, int t) throws:
         unpack_float16_gpu(p.h)
     else:
         q8kv_dequantize_gpu(p.q, p.s)
+
+# Widen an existing packed buffer and append fresh float32 rows in a single GPU pass,
+# avoiding intermediate float32 old-buffer allocations and redundant DRAM transfers.
+pub req [float32]'kernel'unified plane_widen_append_f16_gpu([float16]'kernel'global old, [float32]'kernel'global fresh, int old_n, int new_n) throws:
+    let int total = old_n + new_n
+    let int blocks = (total + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    kernel(block = 256, grid = (gx, gy)):
+        mut [float32]'unified out = [0.0 as float32 for ..<total]
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let i = .thread.x + block_idx * .block_dim.x
+        if i < total:
+            if i < old_n:
+                out[i] = old[i] as float32
+            else:
+                out[i] = fresh[i - old_n]
+        out
+
+pub req [float32]'kernel'unified plane_widen_append_q8_gpu([uint8]'kernel'global old_q, [float16]'kernel'global old_s, [float32]'kernel'global fresh, int old_n, int new_n) throws:
+    let int total = old_n + new_n
+    let int blocks = (total + 255) / 256
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    kernel(block = 256, grid = (gx, gy)):
+        mut [float32]'unified out = [0.0 as float32 for ..<total]
+        let block_idx = .block.x + .block.y * .grid_dim.x
+        let i = .thread.x + block_idx * .block_dim.x
+        if i < total:
+            if i < old_n:
+                var int b = int(old_q[i])
+                if b > 127:
+                    b = b - 256
+                out[i] = (b as float32) * (old_s[i >> 5] as float32)
+            else:
+                out[i] = fresh[i - old_n]
+        out
+
+pub req [float32]'kernel'unified plane_widen_append(Plane p, [float32]'kernel'global fresh, int old_n, int new_n, int t) throws:
+    if t == 0:
+        kv_append_gpu(p.f, fresh, old_n, new_n)
+    elif t == 1:
+        plane_widen_append_f16_gpu(p.h, fresh, old_n, new_n)
+    else:
+        plane_widen_append_q8_gpu(p.q, p.s, fresh, old_n, new_n)
 
 # `p` plus `new_n` fresh float32 values behind its first `old_n` ones.
 pub Plane plane_append(Plane p, [float32]'kernel'global fresh, int old_n, int new_n, int t) throws:
@@ -169,7 +228,7 @@ kernel FlashDecodeTailMixKernel:
                         for d in 0..<d_head:
                             dot += q_s[width = d, height = 0] * (k16[base_k + d] as float32)
                     else:
-                        for blk in 0..<(d_head / 32):
+                        for blk in 0..<(d_head >> 5):
                             let sck = ks[(base_k + blk * 32) >> 5] as float32
                             var float32 bdot = 0.0
                             for d in 0..<32:

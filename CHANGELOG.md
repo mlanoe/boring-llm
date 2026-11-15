@@ -23,6 +23,12 @@ All notable user-visible changes to boring-llm. The format follows [Keep a Chang
 
 ### Changed
 
+- **Quantized KV-cache prefill & single-pass widen-append** (`src/kvplane.br`, `src/q8kv_gpu.br`, `src/model.br`, `test/test_kvplane_gpu_real.br`):
+  - Fused cache widening and chunk appending into single-pass kernels (`plane_widen_append_f16_gpu`, `plane_widen_append_q8_gpu`, `plane_widen_append`), eliminating intermediate float32 old-buffer allocations and redundant GPU memory transfers during chunked prefill (`prefill_step_gpu_quantized`) and speculative verification (`forward_batch_gpu_quantized`).
+  - Added `plane_pack_fast` reusing pre-allocated dummy buffers across layers during prefill, eliminating 48-144 redundant dummy kernel launches and buffer copies per prefill invocation.
+  - Replaced emulated 64-bit integer divisions `/ 32` with fast bitwise shifts `>> 5` in `q8kv_quantize_gpu`, `q8kv_append_gpu`, and `q8kv_dequantize_gpu`.
+  - Verified on real Metal via `test/test_kvplane_gpu_real.br` (100% pass on all 9 mixed pairs + widen-append) and `test/test_q8kv_gpu_real.br`. Paired in-process runs on `qwen2.5-0.5b-instruct-q8_0.gguf` confirmed bit-exact token generation (`Match: True`) across standard f32, quantized q8_0 KV-cache, and chunked prefill (`-ub 8`).
+
 - **Native Metal SIMDgroup blocked prefill for Q2_K, Q3_K, and IQ4_NL & dead GLU activation bypass** (`boring.toml`, `src/math_gpu.br`):
   - Enabled native Metal SIMDgroup blocked matrix prefill for `q2_k`, `q3_k`, and `iq4_nl` in `boring.toml` and enabled them in `tensor_prefill` / `has_tensor_schedule` in `src/math_gpu.br`, replacing the slower scalar/hand-written tiled GEMM fallback with 64x128/64x64 SIMDgroup matrix prefill instructions.
   - Short-circuited dead `exp(-g)` evaluation in `glu_combine_gpu` and `glu_joined_combine_gpu`: when `act != 0` (GELU or ReLU models), the SwiGLU `g / (1.0 + exp(-g))` calculation is bypassed completely instead of evaluating an expensive GPU exponent before discarding it.
