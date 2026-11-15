@@ -820,7 +820,8 @@ pub QuantModel load_model_quantized(GgufFile file) throws:
             let mg_gty = gpu_weight_type(mg_ty)
             let mu_gty = gpu_weight_type(mu_ty)
             let md_gty = gpu_weight_type(md_ty)
-            if supports_moe_tensor_schedule(mg_gty) and supports_moe_tensor_schedule(mu_gty) and supports_moe_tensor_schedule(md_gty):
+            # gate/up read d_model inputs, down reads expert_ffn: each must be addressable inside its stack
+            if supports_stacked_expert(mg_gty, config.d_model) and supports_stacked_expert(mu_gty, config.d_model) and supports_stacked_expert(md_gty, config.expert_ffn):
                 has_stacked_experts = true
                 moe_gate_w = upload_bytes_gpu(mg_w)
                 moe_gate_type = mg_gty
@@ -1362,9 +1363,43 @@ pub [float32] forward(Model model, [int] tokens) throws:
 # KV-cache — full re-forward every position, same as forward() above — the
 # goal here is proving the kernel architecture matches Phase 1's CPU output
 # bit-for-bit-ish (float32 rounding aside), not decode performance yet.
+# What forward_gpu below does not implement, "" when it can run `model`. It is the
+# original Llama/Qwen-shaped layer (RMS pre-norms, gated FFN, rotary embedding on
+# every layer, sequential residuals) and nothing else: every other architecture
+# has to be refused here, because running it anyway produces plausible-looking
+# wrong logits rather than an error.
+pub string forward_gpu_unsupported(Model model):
+    let c = model.config
+    if c.attn_ext:
+        return "a general attention path (explicit scale, soft-capping or a sliding window)"
+    if c.n_expert != 0:
+        return "a mixture of experts"
+    if c.use_layer_norm or c.has_norm_bias:
+        return "LayerNorm or biased norms"
+    if c.no_pre_norm or c.post_norms:
+        return "post-norms"
+    if c.residual_type != 0:
+        return "parallel residual branches"
+    if not c.ffn_gated:
+        return "a non-gated FFN"
+    if c.has_linear_bias:
+        return "biased output, FFN or head projections"
+    if c.has_pos_embd:
+        return "learned position embeddings"
+    if c.nope_step != 0:
+        return "layers without rotary embedding"
+    if c.residual_scale != 1.0 or c.logit_mul != 1.0:
+        return "residual or logit scaling"
+    if c.final_softcap > 0.0 or c.attn_softcap > 0.0 or c.swa_window > 0:
+        return "soft-capping or a sliding window"
+    for layer in model.layers:
+        if layer.has_attn_gate or layer.is_moe or layer.has_shexp:
+            return "gated attention or expert layers"
+    ""
+
 pub [float32] forward_gpu(Model model, [int] tokens) throws:
-    guard not model.config.attn_ext else throw "forward_gpu: Gemma 2/3 need the quantized GPU path (--quantized)"
-    guard model.config.n_expert == 0 else throw "forward_gpu: mixture-of-experts models need the quantized GPU path (--quantized)"
+    let unsupported = forward_gpu_unsupported(model)
+    guard unsupported == "" else throw "forward_gpu: this model uses {unsupported}, which the fp32 GPU path does not implement — use the quantized GPU path (--quantized)"
     let seq = tokens.length
     let d = model.config.d_model
     let qkv_dim = model.config.n_head * model.config.d_head

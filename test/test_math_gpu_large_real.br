@@ -1,0 +1,104 @@
+# Real (compiled GPU) test: elementwise kernels launched over more than
+# 65535 * 256 = 16,776,960 cells.
+#
+# A kernel launched with a 1-D grid cannot cover more than 65535 workgroups on
+# wgpu (its per-dimension dispatch limit), so any such kernel silently leaves the
+# cells past that point unwritten (zeros) or fails to dispatch. The sizes that
+# reach it are ordinary: a prefill chunk of seq x ffn_dim, a KV cache of
+# 4096 positions x 4096 values, a non-chunked embedding batch. Every kernel
+# below must therefore be launched on a 2-D grid, and this file checks each one
+# over 17M+ cells against exact host-computed values.
+#
+# Build + run (wgpu is where the limit is enforced; Metal must agree):
+#   boring build --target wgpu test/test_math_gpu_large_real.br
+#   cd test/test_math_gpu_large_real_wgpu && cargo build --release
+#   ./target/release/test_math_gpu_large_real
+#   (same with --target metal)
+
+use math_gpu
+
+let int BIG = 17000000          # > 16,776,960
+
+# Asserts `got` equals `want` everywhere (reports the first bad cell and how many).
+def check(string name, [float32] got, [float32] want):
+    assert_eq(got.length, want.length)
+    var int bad = 0
+    var int first = -1
+    var int i = 0
+    while i < got.length:
+        let diff = if got[i] > want[i]: got[i] - want[i] else: want[i] - got[i]
+        if diff > 0.0001 as float32:
+            bad += 1
+            if first < 0:
+                first = i
+        i += 1
+    let at = if first >= 0: first else: 0
+    assert(bad == 0, "{name}: {bad} of {got.length} cells wrong, first at {first} (got {got[at]}, want {want[at]})")
+    print "{name}: OK ({got.length} cells)"
+
+def main() throws:
+    let n = BIG
+    let a_host = [((i % 5) as float32) for i in 0..<n]
+    let a = upload_floats_gpu(a_host)
+
+    # add_gpu / scale_gpu / add_scaled_gpu
+    let ones = upload_floats_gpu([1.0 as float32 for i in 0..<n])
+    check("add_gpu", download_floats_gpu(add_gpu(a, ones, n), n), [((i % 5) as float32) + 1.0 for i in 0..<n])
+    check("scale_gpu", download_floats_gpu(scale_gpu(a, 2.0 as float32, n), n), [((i % 5) as float32) * 2.0 for i in 0..<n])
+    check("add_scaled_gpu", download_floats_gpu(add_scaled_gpu(a, ones, 0.5 as float32, n), n), [((i % 5) as float32) + 0.5 for i in 0..<n])
+
+    # glu_combine_gpu: silu(1) * 2
+    let g1 = upload_floats_gpu([1.0 as float32 for i in 0..<n])
+    let u2 = upload_floats_gpu([2.0 as float32 for i in 0..<n])
+    check("glu_combine_gpu", download_floats_gpu(glu_combine_gpu(g1, u2, 0), n), [1.4621172 as float32 for i in 0..<n])
+
+    # nongated_act_gpu (relu^2): values -1, 0, 1, 2 -> 0, 0, 1, 4
+    let r_host = [(((i % 4) as float32) - 1.0) for i in 0..<n]
+    let r4 = [(if (i % 4) == 3: 4.0 else: (if (i % 4) == 2: 1.0 else: 0.0)) as float32 for i in 0..<n]
+    check("nongated_act_gpu", download_floats_gpu(nongated_act_gpu(upload_floats_gpu(r_host), n, 2), n), r4)
+
+    # mul_sigmoid_gpu: 4 * sigmoid(0)
+    let z = upload_floats_gpu([0.0 as float32 for i in 0..<n])
+    let four = upload_floats_gpu([4.0 as float32 for i in 0..<n])
+    check("mul_sigmoid_gpu", download_floats_gpu(mul_sigmoid_gpu(four, z, n), n), [2.0 as float32 for i in 0..<n])
+
+    # kv_append_gpu: the two halves meet in the middle of the grid
+    let old_n = 9000000
+    let new_n = n - old_n
+    let prev = upload_floats_gpu([((i % 1000) as float32) for i in 0..<old_n])
+    let fresh = upload_floats_gpu([(0.0 - ((i % 1000) as float32) - 1.0) for i in 0..<new_n])
+    let appended_want = [(if i < old_n: ((i % 1000) as float32) else: (0.0 - (((i - old_n) % 1000) as float32) - 1.0)) for i in 0..<n]
+    check("kv_append_gpu", download_floats_gpu(kv_append_gpu(prev, fresh, old_n, new_n), n), appended_want)
+
+    # rope_apply_slice_at_gpu with a zero angle and unit scale is the identity: every
+    # cell of the output must have been written, none left at 0
+    let half = 64
+    let seq = 262141                       # seq * 1 head * 64 = 16,777,024 > 16,776,960
+    let rope_n = seq * 2 * half
+    let rx_host = [(((i % 7) as float32) + 1.0) for i in 0..<rope_n]
+    let freqs = upload_floats_gpu([(if i == half: 1.0 else: 0.0) as float32 for i in 0..<(half + 1)])
+    let rx = upload_floats_gpu(rx_host)
+    check("rope_apply_slice_at_gpu", download_floats_gpu(rope_apply_slice_at_gpu(rx, 0, seq, 1, 2 * half, freqs, 0, 1), rope_n), rx_host)
+
+    # row-structured MoE helpers: m rows of d floats, m * d > 16,776,960
+    let m = 17000
+    let d = 1030
+    let md = m * d
+    let src = upload_floats_gpu([((i / d) as float32) for i in 0..<md])
+    let idx = upload_floats_gpu([((m - 1 - i) as float32) for i in 0..<m])
+    check("gather_rows_gpu", download_floats_gpu(gather_rows_gpu(src, idx, m, d), md), [(((m - 1) - (i / d)) as float32) for i in 0..<md])
+
+    let acc1 = upload_floats_gpu([1.0 as float32 for i in 0..<md])
+    let y2 = upload_floats_gpu([2.0 as float32 for i in 0..<md])
+    let pos = upload_floats_gpu([(i as float32) for i in 0..<m])
+    let wts = upload_floats_gpu([0.5 as float32 for i in 0..<m])
+    check("moe_accumulate_gpu", download_floats_gpu(moe_accumulate_gpu(acc1, y2, pos, wts, m, d), md), [2.0 as float32 for i in 0..<md])
+
+    let down = upload_floats_gpu([1.0 as float32 for i in 0..<md])
+    let slot_w = upload_floats_gpu([0.25 as float32 for i in 0..<m])
+    check("moe_reduce_weighted_gpu", download_floats_gpu(moe_reduce_weighted_gpu(down, slot_w, m, 1, d), md), [0.25 as float32 for i in 0..<md])
+
+    let row_gate = upload_floats_gpu([0.0 as float32 for i in 0..<m])
+    check("sigmoid_gate_rows_gpu", download_floats_gpu(sigmoid_gate_rows_gpu(y2, row_gate, m, d), md), [1.0 as float32 for i in 0..<md])
+
+    print "test_math_gpu_large_real: all assertions passed"

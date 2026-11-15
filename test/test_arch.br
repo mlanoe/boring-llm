@@ -32,7 +32,18 @@ def check_case_ctx(string name, string fixture, int n_ctx) throws:
             worst = err
         i += 1
     assert(worst < 0.002 as float32, "{name}: max |logit - reference| = {worst}")
+    check_fp32_gpu_gate(name, forward_gpu_unsupported(m))
     print "{name}: OK (max logit error {worst})"
+
+# forward_gpu implements the plain Llama-shaped layer only: it must refuse the
+# architectures it would otherwise run to plausible-looking wrong logits.
+def check_fp32_gpu_gate(string name, string unsupported):
+    if ["plain", "yarn", "linear-llama"].contains(name):
+        assert(unsupported == "", "{name}: the fp32 GPU path should accept it, got: {unsupported}")
+    if ["gemma2", "gemma3", "mixtral", "granite", "smollm3", "olmo2", "gpt2", "phi2", "falcon", "starcoder2", "stablelm", "command-r"].contains(name):
+        assert(unsupported != "", "{name}: the fp32 GPU path must refuse it")
+    if unsupported != "":
+        print "{name}: fp32 GPU path refused ({unsupported})"
 
 def main() throws:
     check_case("plain")
