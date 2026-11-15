@@ -7,6 +7,87 @@
 use io
 use gguf
 
+# Little-endian bytes of `v`, `n` of them (hand-built hostile headers below).
+[uint8] le([uint8] out, int v, int n):
+    mut [uint8] grown = []
+    for b in out:
+        grown.push(b)
+    var int rest = v
+    var int i = 0
+    while i < n:
+        grown.push((rest & 255) as uint8)
+        rest = rest >> 8
+        i += 1
+    grown
+
+[uint8] text([uint8] out, string s):
+    mut [uint8] grown = le(out, s.asBytes().length, 8)
+    for b in s.asBytes():
+        grown.push(b)
+    grown
+
+[uint8] header(int tensor_count, int kv_count):
+    le(le(le([0x47 as uint8, 0x47 as uint8, 0x55 as uint8, 0x46 as uint8], 3, 4), tensor_count, 8), kv_count, 8)
+
+# One tensor named "t" of type F32 with the given dims and data offset.
+[uint8] tensor_file([int] dims, int offset):
+    var [uint8] b = le(text(header(1, 0), "t"), dims.length, 4)
+    for d in dims:
+        b = le(b, d, 8)
+    le(le(b, 0, 4), offset, 8)
+
+# The message parse_gguf throws on `bytes`, "" when it parses.
+string parse_error([uint8] bytes):
+    var string message = ""
+    try:
+        let parsed = parse_gguf(bytes)
+    catch:
+        message = "{error}"
+    message
+
+# A corrupt header must throw an error that is not a truncation (the path loader
+# re-reads a longer prefix on truncations only).
+def assert_rejected([uint8] bytes, string what):
+    let message = parse_error(bytes)
+    assert(message != "", "{what}: should be rejected")
+    assert(not gguf_error_is_truncation(message), "{what}: is not a truncation, got {message}")
+
+def hostile_headers() throws:
+    # string length with the top bit set (negative once read into an int)
+    assert_rejected(le(le(header(0, 1), -1, 8), 0, 8), "negative string length")
+    # array of array of array …, 12 bytes a level
+    mut [uint8] nested = le(text(header(0, 1), "k"), 9, 4)
+    let one_level = le(le([], 9, 4), 1, 8)
+    var int level = 0
+    while level < 5000:
+        for b in one_level:
+            nested.push(b)
+        level += 1
+    assert_rejected(nested, "nested arrays")
+    assert_rejected(le(le(le(text(header(0, 1), "k"), 9, 4), 4, 4), -1, 8), "negative array length")
+    # general.alignment: zero, not a power of two, and a legal non-u32 encoding
+    assert_rejected(le(le(text(header(0, 1), "general.alignment"), 4, 4), 0, 4), "alignment 0")
+    assert_rejected(le(le(text(header(0, 1), "general.alignment"), 4, 4), 48, 4), "alignment 48")
+    let aligned = parse_gguf(le(le(text(header(0, 1), "general.alignment"), 0, 4), 64, 1))
+    assert_eq(aligned.data_offset, 64)
+    # tensor table
+    assert_rejected(le(text(header(1, 0), "t"), 100000, 4), "too many dimensions")
+    assert_rejected(tensor_file([4, 0], 0), "zero dimension")
+    assert_rejected(tensor_file([4, -1], 0), "negative dimension")
+    assert_rejected(tensor_file([1099511627776, 1099511627776], 0), "element count overflow")
+    assert_rejected(tensor_file([4, 4], -32), "negative data offset")
+    assert_eq(parse_gguf(tensor_file([4, 4], 0)).tensors[0].dims, [4, 4])
+    # a header cut short is the one error a longer read can fix
+    let whole = tensor_file([4, 4], 0)
+    mut [uint8] cut = []
+    var int i = 0
+    while i < whole.length - 3:
+        cut.push(whole[i])
+        i += 1
+    assert(gguf_error_is_truncation(parse_error(cut)), "cut header is a truncation")
+    assert(gguf_error_is_truncation(parse_error([0x47 as uint8])), "one byte is a truncation")
+    assert(not gguf_error_is_truncation(parse_error(le([0x41 as uint8, 0x41 as uint8, 0x41 as uint8, 0x41 as uint8], 0, 20))), "bad magic is final")
+
 def main() throws:
     assert_eq(split_shard_path("models/model-00001-of-00003.gguf", 0), "models/model-00001-of-00003.gguf")
     assert_eq(split_shard_path("models/model-00001-of-00003.gguf", 1), "models/model-00002-of-00003.gguf")
@@ -26,6 +107,7 @@ def main() throws:
     assert_eq(virtual_shard_index(merged.shard_starts, 999), 0)
     assert_eq(virtual_shard_index(merged.shard_starts, 1000), 1)
     assert_eq(virtual_shard_index(merged.shard_starts, 2999), 1)
+    hostile_headers()
     let [uint8] bytes = fs.readBytes("test/fixtures/tiny.gguf")
     let file = parse_gguf(bytes)
 

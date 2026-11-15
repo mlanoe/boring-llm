@@ -20,6 +20,7 @@ use std.os.unix.fs.FileExt
 
 # `n` bytes at absolute offset `off`, read from the file into a fresh exact-size buffer.
 pub [uint8] read_at(string path, int off, int n) throws:
+    guard off >= 0 and n >= 0 else throw "invalid read: {n} bytes at offset {off} of {path}"
     let f = try? File.open(path)
     guard let f else throw "cannot open {path}"
     mut [uint8] buf = [0 as uint8 for i in 0..<n]
@@ -34,19 +35,30 @@ pub int file_len(string path) throws:
     guard let m else throw "cannot stat {path}"
     m.len() as int
 
+# A header (metadata + tensor table) larger than this is not a model: stop
+# rather than read a multi-gigabyte file into memory looking for its end.
+let int GGUF_MAX_HEADER_BYTES = 1073741824
+
 # Parses the header of the GGUF at `path`. The header is read as a prefix of the
-# file, doubled (x4) until parse_gguf stops reporting a truncation.
+# file, grown (x4) only while parse_gguf reports that the prefix was cut short:
+# any other error (bad magic, corrupt table) is final at the first read.
 GgufFile parse_gguf_single_path(string path) throws:
     let size = file_len(path)
     var int prefix = 16777216
     while true:
         let n = if prefix < size: prefix else: size
         let head = read_at(path, 0, n)
-        let parsed = try? parse_gguf(head)
-        if let g = parsed:
+        var string failure = ""
+        var [GgufFile] parsed = []
+        try:
+            parsed.push(parse_gguf(head))
+        catch:
+            failure = "{error}"
+        if parsed.length > 0:
+            let g = parsed[0]
             return GgufFile(g.version, g.metadata, g.tensors, g.data_offset, [], path, size, [], [])
-        if n >= size:
-            parse_gguf(head)    # the whole file and still not parseable: surface the real error
+        guard n < size and gguf_error_is_truncation(failure) else throw "{failure}"
+        guard n < GGUF_MAX_HEADER_BYTES else throw "GGUF: header of {path} is larger than {GGUF_MAX_HEADER_BYTES} bytes"
         prefix = prefix * 4
     throw "unreachable"
 
@@ -76,8 +88,9 @@ pub GgufFile parse_gguf_path(string path) throws:
 # `n` bytes of tensor data at absolute file offset `start`: from disk when the
 # file was opened by path, from the in-memory copy otherwise.
 pub [uint8] file_bytes(GgufFile file, int start, int n) throws:
+    # a tensor table is only as trustworthy as its file: never allocate or read past the end
+    guard n >= 0 and start >= 0 and n <= file.file_size and start <= file.file_size - n else throw "GGUF: tensor data ({n} bytes at offset {start}) lies outside the file ({file.file_size} bytes)"
     if file.shard_paths.length > 0:
-        guard n >= 0 and start >= 0 and start + n <= file.file_size else throw "GGUF split: read outside virtual file"
         mut [uint8] out = []
         var int position = start
         var int remaining = n

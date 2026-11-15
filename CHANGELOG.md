@@ -6,6 +6,13 @@ All notable user-visible changes to boring-llm. The format follows [Keep a Chang
 
 ### Fixed
 
+- **A corrupt or hostile GGUF is rejected with an error instead of a panic, a stack overflow or an out-of-memory** (`src/gguf.br`, `src/gguf_file.br`, `src/tokenizer.br`):
+  - Header: string and array lengths with the top bit set, arrays nested more than 4 deep, a `general.alignment` that is zero or not a power of two (any integer encoding is now read), tensors with more than 4 dimensions, a zero or negative dimension, more than 2^40 elements, or a negative data offset all throw.
+  - Tensor data is bounds-checked against the file size before it is allocated or read, for single files as well as split ones.
+  - The path loader re-reads a longer header prefix only when the prefix was cut short, and never beyond 1 GiB: a file that is not a GGUF fails on its magic at the first read instead of being read whole into memory.
+  - Tokenizer: `bos_token_id`/`eos_token_id` outside the vocabulary, a `token_type` array longer than the vocabulary, and a SentencePiece vocabulary with fewer scores than tokens are load errors.
+  - Checked on the release Metal build against hand-made corrupt files and a real model truncated at 60 MB; the intact model still loads and generates.
+
 - **`--serve` no longer dies or hangs on a single hostile request** (`src/json.br`, `src/grammar.br`, `src/schema_grammar.br`, `src/jinja.br`, `src/tokenizer.br`, `src/server.br`):
   - JSON nesting is limited to 128 levels and GBNF group nesting to 64; deeper input is a 400 instead of a stack overflow.
   - GBNF repetition counts are limited to 2000 and their total expansion to 200000 elements, so `"a"{2000000000}` or a schema with `minItems`/`minLength`/`maxLength` in the billions is a 400 instead of exhausting memory. A JSON schema bound above 2000 is now rejected. An object with no required property accepts at most 128 optional ones.

@@ -33,6 +33,12 @@ let int GGUF_TYPE_UINT64  = 10
 let int GGUF_TYPE_INT64   = 11
 let int GGUF_TYPE_FLOAT64 = 12
 
+# Limits on what a header may declare (ggml's own: 4 dimensions).
+let int GGUF_MAX_ARRAY_DEPTH = 4
+let int GGUF_MAX_DIMS = 4
+let int GGUF_MAX_ELEMENTS = 1099511627776    # 2^40 elements in one tensor
+let int GGUF_MAX_ALIGNMENT = 1048576
+
 pub enum GgufValue:
     U8(int)
     I8(int)
@@ -72,7 +78,9 @@ pub struct GgufFile:
 (string, int) read_gguf_string([uint8] bytes, int offset) throws:
     guard offset + 8 <= bytes.length else throw "GGUF: truncated string length at offset {offset}"
     let len = read_u64_le(bytes, offset)
-    guard offset + 8 + len <= bytes.length else throw "GGUF: truncated string data at offset {offset} (len {len})"
+    # the u64 length lands in a signed int: 2^63 and above read as negative
+    guard len >= 0 else throw "GGUF: invalid string length at offset {offset}"
+    guard len <= bytes.length - offset - 8 else throw "GGUF: truncated string data at offset {offset} (len {len})"
     let s = read_utf8(bytes, offset + 8, len)
     (s, offset + 8 + len)
 
@@ -175,16 +183,19 @@ float f64_bits_to_float(int bits):
 # handles GGUF_TYPE_ARRAY (element type:u32 + length:u64 + that many values
 # of the element type, read recursively — GGUF arrays are flat in practice,
 # but nothing here assumes that).
-(GgufValue, int) read_gguf_value([uint8] bytes, int offset, int value_type) throws:
+(GgufValue, int) read_gguf_value([uint8] bytes, int offset, int value_type, int depth) throws:
     if value_type == GGUF_TYPE_ARRAY:
+        # an array of arrays costs 12 bytes a level: without a limit a small header recurses until the stack overflows
+        guard depth < GGUF_MAX_ARRAY_DEPTH else throw "GGUF: arrays nested deeper than {GGUF_MAX_ARRAY_DEPTH} levels at offset {offset}"
         guard offset + 12 <= bytes.length else throw "GGUF: truncated array header at offset {offset}"
         let elem_type = read_u32_le(bytes, offset)
         let count = read_u64_le(bytes, offset + 4)
+        guard count >= 0 else throw "GGUF: invalid array length at offset {offset}"
         mut [GgufValue] items = []
         var int cur = offset + 12
         var int i = 0
         while i < count:
-            let (item, new_offset) = read_gguf_value(bytes, cur, elem_type)
+            let (item, new_offset) = read_gguf_value(bytes, cur, elem_type, depth + 1)
             items.push(item)
             cur = new_offset
             i += 1
@@ -192,16 +203,21 @@ float f64_bits_to_float(int bits):
     else:
         read_gguf_scalar(bytes, offset, value_type)
 
-int alignment_from_metadata({string=GgufValue} metadata):
-    if metadata.contains("general.alignment"):
-        match metadata["general.alignment"]:
-            GgufValue.U32(v): v
-            GgufValue.I32(v): v
-            _: 32
-    else:
-        32
+# `general.alignment` (default 32) in any integer encoding. Zero would divide by
+# zero in align_up, and anything but a power of two is not a GGUF alignment.
+int alignment_from_metadata({string=GgufValue} metadata) throws:
+    if not metadata.contains("general.alignment"):
+        return 32
+    guard let alignment = gguf_get_int(metadata, "general.alignment") else throw "GGUF: general.alignment is not an integer"
+    guard alignment >= 1 and alignment <= GGUF_MAX_ALIGNMENT and (alignment & (alignment - 1)) == 0 else throw "GGUF: general.alignment {alignment} is not a power of two up to {GGUF_MAX_ALIGNMENT}"
+    alignment
 
 # --- top-level parse --------------------------------------------------------
+
+# True for the errors parse_gguf throws because `bytes` ended too early: the
+# only ones reading a longer prefix of the file can fix.
+pub bool gguf_error_is_truncation(string message):
+    message.contains("GGUF: truncated") or message.contains("GGUF: file too short")
 
 pub GgufFile parse_gguf([uint8] bytes) throws:
     guard bytes.length >= 24 else throw "GGUF: file too short for header ({bytes.length} bytes)"
@@ -218,7 +234,7 @@ pub GgufFile parse_gguf([uint8] bytes) throws:
         let (key, o1) = read_gguf_string(bytes, offset)
         guard o1 + 4 <= bytes.length else throw "GGUF: truncated value type for key '{key}'"
         let value_type = read_u32_le(bytes, o1)
-        let (value, o2) = read_gguf_value(bytes, o1 + 4, value_type)
+        let (value, o2) = read_gguf_value(bytes, o1 + 4, value_type, 0)
         metadata[key] = value
         offset = o2
         i += 1
@@ -229,12 +245,18 @@ pub GgufFile parse_gguf([uint8] bytes) throws:
         let (name, o1) = read_gguf_string(bytes, offset)
         guard o1 + 4 <= bytes.length else throw "GGUF: truncated tensor info for '{name}'"
         let n_dims = read_u32_le(bytes, o1)
+        guard n_dims <= GGUF_MAX_DIMS else throw "GGUF: tensor '{name}' has {n_dims} dimensions (at most {GGUF_MAX_DIMS})"
         mut [int] dims = []
         var int cur = o1 + 4
         var int d = 0
+        var int elements = 1
         while d < n_dims:
             guard cur + 8 <= bytes.length else throw "GGUF: truncated tensor dims for '{name}'"
-            dims.push(read_u64_le(bytes, cur))
+            let dim = read_u64_le(bytes, cur)
+            # every loader multiplies the dims together: keep the product positive and far from overflow
+            guard dim >= 1 and dim <= GGUF_MAX_ELEMENTS / elements else throw "GGUF: tensor '{name}' has an invalid shape"
+            elements = elements * dim
+            dims.push(dim)
             cur += 8
             d += 1
         guard cur + 12 <= bytes.length else throw "GGUF: truncated tensor type/offset for '{name}'"
@@ -242,6 +264,7 @@ pub GgufFile parse_gguf([uint8] bytes) throws:
         cur += 4
         let tensor_offset = read_u64_le(bytes, cur)
         cur += 8
+        guard tensor_offset >= 0 else throw "GGUF: tensor '{name}' has an invalid data offset"
         tensors.push(GgufTensorInfo(name, dims, ggml_type, tensor_offset))
         offset = cur
         i += 1

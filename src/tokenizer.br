@@ -678,6 +678,10 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
             if not merge_rank.contains(key):
                 merge_rank[key] = merge_rank.length
 
+    # Ids a file declares are used as indices everywhere downstream: check them once, here.
+    for id_key in ["tokenizer.ggml.bos_token_id", "tokenizer.ggml.eos_token_id"]:
+        if let declared = gguf_get_int(file.metadata, id_key):
+            guard declared >= 0 and declared < tokens.length else throw "tokenizer: {id_key} {declared} is outside the {tokens.length}-token vocabulary"
     let bos = gguf_get_int(file.metadata, "tokenizer.ggml.bos_token_id") else 0
     let eos = gguf_get_int(file.metadata, "tokenizer.ggml.eos_token_id") else 0
     let add_bos = gguf_get_bool(file.metadata, "tokenizer.ggml.add_bos_token") else false
@@ -693,6 +697,8 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
     let scores = gguf_get_f32_array(file.metadata, "tokenizer.ggml.scores")
     var [int] byte_token_id = []
     if is_spm:
+        # SentencePiece merging reads one score per token id
+        guard scores.length >= tokens.length else throw "tokenizer: tokenizer.ggml.scores has {scores.length} entries for {tokens.length} tokens"
         byte_token_id = build_byte_token_id(vocab)
 
     # "special" tokens (llama.cpp's GGUF token_type == 3, CONTROL — e.g.
@@ -701,6 +707,7 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
     # but that must be encoded as a single atomic vocab id rather than run
     # through ordinary BPE/SPM merging — see encode_with_specials.
     let token_types = gguf_get_int_array(file.metadata, "tokenizer.ggml.token_type")
+    guard token_types.length <= tokens.length else throw "tokenizer: tokenizer.ggml.token_type has {token_types.length} entries for {tokens.length} tokens"
     mut {string=int} special_tokens = {=}
     var int ti = 0
     while ti < token_types.length:
@@ -727,7 +734,7 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
     var int close_id = eos
     for name in ["<end_of_turn>", "<|eot_id|>"]:
         if let id = vocab[name]:
-            if eog.contains(id) and tokens.length > eos and tokens[eos] != name:
+            if eog.contains(id) and eos >= 0 and eos < tokens.length and tokens[eos] != name:
                 close_id = id
     set_eog_tokens(eog, close_id)
 
