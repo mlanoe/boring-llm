@@ -178,9 +178,9 @@ For `--serve`, the sampling flags set server defaults. Alongside `temperature`, 
 | `--host HOST` | `127.0.0.1` | listening host or IP address; IPv6 literals such as `::1` are bracketed automatically |
 | `--port N` | `8080` | listening port, from 1 through 65535 |
 | `--api-prefix PATH` | disabled | serve every route below a prefix such as `/llm`; it must start with `/` and have no trailing slash |
-| `--cors-origins ORIGINS` | `*` | comma-separated allowed browser origins; `localhost` accepts HTTP(S) loopback origins only |
-| `--cors-methods METHODS`, `--cors-headers HEADERS` | `GET, POST, DELETE, OPTIONS`; `*` | values returned in CORS preflight and normal response headers |
-| `--cors-credentials`, `--no-cors-credentials` | enabled | emit `Access-Control-Allow-Credentials`; with wildcard origins enabled, reflect the request origin as required by browsers |
+| `--cors-origins ORIGINS` | `localhost` | comma-separated allowed browser origins; `localhost` accepts HTTP(S) loopback origins only, `*` accepts every page. A request that carries an `Origin` header outside the list is refused with `403 origin_not_allowed`, not just served without CORS headers: a browser sends `Origin` on every cross-origin POST (a `text/plain` one needs no preflight), so otherwise a web page could still trigger model calls and slot writes it cannot read the answer to. Clients that send no `Origin` (curl, SDKs, editors) are never affected |
+| `--cors-methods METHODS`, `--cors-headers HEADERS` | `GET, POST, DELETE, OPTIONS`; `Content-Type, Authorization, X-Api-Key, Anthropic-Version, Anthropic-Beta` | values returned in CORS preflight and normal response headers; a wildcard `*` in `Access-Control-Allow-Headers` does not cover `Authorization`, so the default names the headers the supported clients send |
+| `--cors-credentials`, `--no-cors-credentials` | disabled | emit `Access-Control-Allow-Credentials` (the server uses no cookies, so browsers have nothing to send as credentials); with wildcard origins enabled, reflect the request origin as required by browsers |
 | `--api-key KEY` | disabled | require `Authorization: Bearer KEY` or Anthropic's `x-api-key: KEY`; comma-separated keys are accepted; health and model-list routes remain public like llama-server |
 | `--api-key-file FILE` | disabled | read accepted API keys one per UTF-8 line; blank lines and `#` comments are ignored |
 | `-c`, `--ctx-size N` | `4096` | prompt plus reply tokens one request may use; must be at least 2 |

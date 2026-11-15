@@ -2053,6 +2053,15 @@ pub string cors_allow_origin(string configured, string origin, bool credentials)
         if allowed.trim() == origin: return origin
     ""
 
+# Whether the server must refuse a request outright because of its Origin header.
+# A browser sends Origin on every cross-origin POST, including the "simple" ones
+# (text/plain bodies) it sends without a preflight, so leaving the CORS headers
+# off the reply only stops the page from reading it: the request still runs, and
+# a model call, a slot erase or a slot snapshot write has already happened. Only
+# requests that carry an Origin are concerned: curl and the SDKs send none.
+pub bool cors_origin_refused(string configured, string origin, bool credentials):
+    origin != "" and cors_allow_origin(configured, origin, credentials) == ""
+
 pub [string] api_keys_from_file_text(string text):
     mut [string] keys = []
     for line in text.split("\n"):

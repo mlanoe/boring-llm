@@ -96,8 +96,8 @@ The first request of a session is the slow one, because the ~7.5k-token prompt h
 | `-m`, `--model`, `--gguf PATH` | | model file (required) |
 | `--serve`, `--host HOST`, `--port N` | `127.0.0.1:8080` | HTTP listening address; IPv6 literals are bracketed automatically |
 | `--api-prefix PATH` | disabled | serve every route below a prefix such as `/llm`, without a trailing slash |
-| `--cors-origins`, `--cors-methods`, `--cors-headers` | llama-server defaults | configure browser CORS allowlists; origin `localhost` accepts loopback origins only |
-| `--cors-credentials`, `--no-cors-credentials` | enabled | allow browser credentials; wildcard origins are reflected when enabled |
+| `--cors-origins`, `--cors-methods`, `--cors-headers` | `localhost`; `GET, POST, DELETE, OPTIONS`; `Content-Type, Authorization, X-Api-Key, Anthropic-Version, Anthropic-Beta` | configure browser CORS allowlists; origin `localhost` accepts loopback pages only. A request carrying an `Origin` the list does not allow is refused with `403` (curl and the SDKs send no `Origin`). `--cors-origins '*'` opens the server to every web page |
+| `--cors-credentials`, `--no-cors-credentials` | disabled | allow browser credentials (the server uses no cookies); with a wildcard origin enabled, the request origin is reflected |
 | `--api-key KEY` | disabled | require `Authorization: Bearer KEY` or Anthropic's `x-api-key: KEY`; comma-separated keys are accepted |
 | `--api-key-file FILE` | disabled | read accepted API keys one per line; blank lines and `#` comments are ignored |
 | `-c`, `--ctx-size N` | `4096` | prompt + reply tokens a request may use; a longer prompt gets `context_length_exceeded` |

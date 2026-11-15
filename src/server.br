@@ -1767,7 +1767,9 @@ JValue slot_action_body(string body_text) throws:
     let unsupported_router = unsupported_router_endpoint(r.method, path)
     response.request_is_anthropic = anthropic_api_path(path)
     let action = http_query_value(r.path, "action")
-    if r.method == "OPTIONS":
+    if cors_origin_refused(ctx.cors_origins, r.origin, ctx.cors_credentials):
+        respond_json(response, sock, 403, "Forbidden", error_json("this request's origin is not allowed (see --cors-origins)", "invalid_request_error", "origin_not_allowed"))
+    elif r.method == "OPTIONS":
         respond(response, sock, 204, "No Content", "text/plain", "")
     elif not api_key_public_path(path) and not api_key_authorized(ctx.api_keys, r.authorization, r.api_key):
         respond_json(response, sock, 401, "Unauthorized", provider_error_json(response.request_is_anthropic, "{counter}", "Invalid API Key", "authentication_error", "invalid_api_key"))
