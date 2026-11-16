@@ -34,7 +34,7 @@ pub struct Config:
     int d_head
     int ffn_dim
     float32 rope_freq_base
-    [float32] rope_freqs   # per-pair RoPE table incl. scaling, d_head/2 + 1 floats (see math.br rope_apply_at)
+    [float32] rope_freqs   # per-pair RoPE table incl. scaling, d_head/2 + 2 floats: freqs, mscale, n_rot/2 (see math.br rope_apply_at)
     float32 rms_eps
     bool tied_embeddings
     int rope_neox   # 1 = NEOX/"rotate-half" (Qwen2), 0 = NORM/interleaved (Llama/Mistral)
@@ -349,10 +349,10 @@ pub def set_rope_context_size(int n):
 #   - `{arch}.rope.scaling.type` = `linear` divides every frequency by `factor`;
 #   - `yarn` uses `factor`, `original_context_length`, `yarn_beta_fast`/`slow`
 #     (llama.cpp defaults 32 / 1) and `attn_factor` (default 1).
-[float32] rope_table_from_gguf(GgufFile file, string arch, int d_head, float32 base) throws:
+[float32] rope_table_from_gguf(GgufFile file, string arch, int d_head, int n_rot, float32 base) throws:
     let attn_factor = gguf_get_f32(file.metadata, "{arch}.rope.scaling.attn_factor") else (1.0 as float32)
     if tensor_exists(file.tensors, "rope_freqs.weight"):
-        rope_freqs_factors(d_head, base, load_tensor_f32(file, "rope_freqs.weight"), 1.0)
+        rope_freqs_factors(d_head, n_rot, base, load_tensor_f32(file, "rope_freqs.weight"), 1.0)
     elif tensor_exists(file.tensors, "rope_factors_short.weight"):
         # Phi-3 LongRoPE: like llama.cpp, the long factors apply once the context the engine
         # runs with (n_ctx, padded to a multiple of 256) exceeds the original training context.
@@ -361,19 +361,19 @@ pub def set_rope_context_size(int n):
         let n_ctx = ((rope_context_size + 255) / 256) * 256
         let use_long = tensor_exists(file.tensors, "rope_factors_long.weight") and n_ctx > orig_ctx
         let factors_name = if use_long: "rope_factors_long.weight" else: "rope_factors_short.weight"
-        rope_freqs_factors(d_head, base, load_tensor_f32(file, factors_name), attn_factor)
+        rope_freqs_factors(d_head, n_rot, base, load_tensor_f32(file, factors_name), attn_factor)
     else:
         let kind = gguf_get_string(file.metadata, "{arch}.rope.scaling.type") else "none"
         let factor = gguf_get_f32(file.metadata, "{arch}.rope.scaling.factor") else (1.0 as float32)
         if kind == "linear":
-            rope_freqs_linear(d_head, base, factor)
+            rope_freqs_linear(d_head, n_rot, base, factor)
         elif kind == "yarn":
             let orig = gguf_get_int(file.metadata, "{arch}.rope.scaling.original_context_length") else 4096
             let beta_fast = gguf_get_f32(file.metadata, "{arch}.rope.scaling.yarn_beta_fast") else (32.0 as float32)
             let beta_slow = gguf_get_f32(file.metadata, "{arch}.rope.scaling.yarn_beta_slow") else (1.0 as float32)
-            rope_freqs_yarn(d_head, base, factor, orig as float32, beta_fast, beta_slow, attn_factor)
+            rope_freqs_yarn(d_head, n_rot, base, factor, orig as float32, beta_fast, beta_slow, attn_factor)
         elif kind == "none":
-            rope_freqs_plain(d_head, base)
+            rope_freqs_plain(d_head, n_rot, base)
         else:
             throw "config_from_gguf: unsupported {arch}.rope.scaling.type '{kind}' (supported: none, linear, yarn)"
 
@@ -433,7 +433,10 @@ pub Config config_from_gguf(GgufFile file) throws:
         1
     let moe_gating_func = gguf_get_int(file.metadata, "{arch}.expert_gating_func") else default_moe_gating
 
-    let rope_freqs = rope_table_from_gguf(file, arch, d_head, rope_freq_base)
+    # Partial rotary: only the first `rope.dimension_count` dims of each head rotate.
+    let n_rot = gguf_get_int(file.metadata, "{arch}.rope.dimension_count") else d_head
+    guard n_rot > 0 and n_rot <= d_head and n_rot % 2 == 0 else throw "config_from_gguf: {arch}.rope.dimension_count {n_rot} must be even and within 1..{d_head} (head size)"
+    let rope_freqs = rope_table_from_gguf(file, arch, d_head, n_rot, rope_freq_base)
     # Gemma: GeGLU instead of SwiGLU, and token embeddings scaled by sqrt(d_model)
     # (its converter already stores the RMSNorm weights as w + 1).
     let is_gemma = arch == "gemma" or arch == "gemma2" or arch == "gemma3"
@@ -482,7 +485,7 @@ pub Config config_from_gguf(GgufFile file) throws:
     let attn_softcap = if arch == "gemma2": (gguf_get_f32(file.metadata, "{arch}.attn_logit_softcapping") else (0.0 as float32)) else: (0.0 as float32)
     let final_softcap = if arch == "gemma2": (gguf_get_f32(file.metadata, "{arch}.final_logit_softcapping") else (0.0 as float32)) else: (0.0 as float32)
     let rope_local_base = gguf_get_f32(file.metadata, "{arch}.rope.freq_base_swa") else (10000.0 as float32)
-    let rope_freqs_local = if arch == "gemma3": rope_freqs_plain(d_head, rope_local_base) else: rope_freqs
+    let rope_freqs_local = if arch == "gemma3": rope_freqs_plain(d_head, n_rot, rope_local_base) else: rope_freqs
     let has_norm_bias = use_layer_norm or tensor_exists(file.tensors, "output_norm.bias") or tensor_exists(file.tensors, "blk.0.attn_norm.bias")
     let gptneox_par = gguf_get_bool(file.metadata, "gptneox.use_parallel_residual") else true
     let falcon_two_norms = tensor_exists(file.tensors, "blk.0.attn_norm_2.weight")
@@ -960,7 +963,7 @@ int layer_window(Config c, int l):
     else:
         (l + 1) % c.nope_step == 0
     if is_nope:
-        return [if i == c.rope_freqs.length - 1: (1.0 as float32) else: (0.0 as float32) for i in 0..<c.rope_freqs.length]
+        return [if i == c.rope_freqs.length - 2: (1.0 as float32) elif i == c.rope_freqs.length - 1: c.rope_freqs[i] else: (0.0 as float32) for i in 0..<c.rope_freqs.length]
     if layer_is_swa(c, l):
         c.rope_freqs_local
     else:

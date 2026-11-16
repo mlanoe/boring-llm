@@ -2317,14 +2317,17 @@ pub req [float32]'kernel'unified rope_apply_slice_at_gpu([float32]'kernel'global
             let j = rem % half_dim
             let base_idx = p * n_heads * d_head + h * d_head
             let abs_pos = p + start_pos
+            let rot_half = rope_freqs[half_dim + 1] as int
+            let rotating = j < rot_half
+            let mscale = if rotating: rope_freqs[half_dim] else: (1.0 as float32)
             let angle = (abs_pos as float32) * rope_freqs[j]
-            let cos_a = angle.cos() * rope_freqs[half_dim]
-            let sin_a = angle.sin() * rope_freqs[half_dim]
-            var int idx0 = base_idx + j
-            var int idx1 = base_idx + j + half_dim
-            if neox == 0:
-                idx0 = base_idx + 2 * j
-                idx1 = base_idx + 2 * j + 1
+            let cos_a = angle.cos() * mscale
+            let sin_a = angle.sin() * mscale
+            var int idx0 = base_idx + 2 * j
+            var int idx1 = base_idx + 2 * j + 1
+            if rotating and neox == 1:
+                idx0 = base_idx + j
+                idx1 = base_idx + j + rot_half
             let x0 = x[input_offset + idx0]
             let x1 = x[input_offset + idx1]
             out[idx0] = x0 * cos_a - x1 * sin_a
@@ -2441,21 +2444,21 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
         let i = .thread.x + .block.x * .block_dim.x
         let pos = base_pos + row
         let qkv_base = row * stride
+        let rot_half = rope_freqs[half_dim + 1] as int
         if i < q_pairs:
             let h = if half_dim == 64: (i >> 6) else: (if half_dim == 32: (i >> 5) else: (i / half_dim))
             let pair = if half_dim == 64: (i & 63) else: (if half_dim == 32: (i & 31) else: (i % half_dim))
             let head_base = h * d_head
-            var int first = head_base + pair
-            var int second = first + half_dim
-            if neox == 1:
+            let rotating = pair < rot_half
+            var int first = head_base + 2 * pair
+            var int second = first + 1
+            if rotating and neox == 1:
                 first = head_base + pair
-                second = first + half_dim
-            else:
-                first = head_base + 2 * pair
-                second = first + 1
+                second = first + rot_half
+            let mscale = if rotating: rope_freqs[half_dim] else: (1.0 as float32)
             let angle = (pos as float32) * rope_freqs[pair]
-            let cos_a = angle.cos() * rope_freqs[half_dim]
-            let sin_a = angle.sin() * rope_freqs[half_dim]
+            let cos_a = angle.cos() * mscale
+            let sin_a = angle.sin() * mscale
             let x0 = qkv[qkv_base + first]
             let x1 = qkv[qkv_base + second]
             let q_base = row * q_dim
@@ -2465,17 +2468,16 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
             let h = if half_dim == 64: (i >> 6) else: (if half_dim == 32: (i >> 5) else: (i / half_dim))
             let pair = if half_dim == 64: (i & 63) else: (if half_dim == 32: (i & 31) else: (i % half_dim))
             let head_base = h * d_head
-            var int first = head_base + pair
-            var int second = first + half_dim
-            if neox == 1:
+            let rotating = pair < rot_half
+            var int first = head_base + 2 * pair
+            var int second = first + 1
+            if rotating and neox == 1:
                 first = head_base + pair
-                second = first + half_dim
-            else:
-                first = head_base + 2 * pair
-                second = first + 1
+                second = first + rot_half
+            let mscale = if rotating: rope_freqs[half_dim] else: (1.0 as float32)
             let angle = (pos as float32) * rope_freqs[pair]
-            let cos_a = angle.cos() * rope_freqs[half_dim]
-            let sin_a = angle.sin() * rope_freqs[half_dim]
+            let cos_a = angle.cos() * mscale
+            let sin_a = angle.sin() * mscale
             let x0 = qkv[qkv_base + q_dim + first]
             let x1 = qkv[qkv_base + q_dim + second]
             let kv_base = row * kv_dim
@@ -4023,6 +4025,7 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
         mut [float32]'unified out_k = [0.0 for ..<tail_n]
         mut [float32]'unified out_v = [0.0 for ..<tail_n]
         let i = .thread.x + .block.x * .block_dim.x
+        let rot_half = rope_freqs[half_dim + 1] as int
         # Preserve the existing cache prefix. The same thread can also rotate
         # a Q/K pair below; these writes target disjoint output positions.
         if i < old_n:
@@ -4034,17 +4037,16 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
             let h = if half_dim == 64: (i >> 6) else: (if half_dim == 32: (i >> 5) else: (i / half_dim))
             let pair = if half_dim == 64: (i & 63) else: (if half_dim == 32: (i & 31) else: (i % half_dim))
             let head_base = h * d_head
-            var int first = head_base + pair
-            var int second = first + half_dim
-            if neox == 1:
+            let rotating = pair < rot_half
+            var int first = head_base + 2 * pair
+            var int second = first + 1
+            if rotating and neox == 1:
                 first = head_base + pair
-                second = first + half_dim
-            else:
-                first = head_base + 2 * pair
-                second = first + 1
+                second = first + rot_half
+            let mscale = if rotating: rope_freqs[half_dim] else: (1.0 as float32)
             let angle = (pos as float32) * rope_freqs[pair]
-            let cos_a = angle.cos() * rope_freqs[half_dim]
-            let sin_a = angle.sin() * rope_freqs[half_dim]
+            let cos_a = angle.cos() * mscale
+            let sin_a = angle.sin() * mscale
             let x0 = qkv[first]
             let x1 = qkv[second]
             out_q[first] = x0 * cos_a - x1 * sin_a
@@ -4055,17 +4057,16 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
             let h = if half_dim == 64: (i >> 6) else: (if half_dim == 32: (i >> 5) else: (i / half_dim))
             let pair = if half_dim == 64: (i & 63) else: (if half_dim == 32: (i & 31) else: (i % half_dim))
             let head_base = h * d_head
-            var int first = head_base + pair
-            var int second = first + half_dim
-            if neox == 1:
+            let rotating = pair < rot_half
+            var int first = head_base + 2 * pair
+            var int second = first + 1
+            if rotating and neox == 1:
                 first = head_base + pair
-                second = first + half_dim
-            else:
-                first = head_base + 2 * pair
-                second = first + 1
+                second = first + rot_half
+            let mscale = if rotating: rope_freqs[half_dim] else: (1.0 as float32)
             let angle = (pos as float32) * rope_freqs[pair]
-            let cos_a = angle.cos() * rope_freqs[half_dim]
-            let sin_a = angle.sin() * rope_freqs[half_dim]
+            let cos_a = angle.cos() * mscale
+            let sin_a = angle.sin() * mscale
             let x0 = qkv[q_dim + first]
             let x1 = qkv[q_dim + second]
             out_k[old_n + first] = x0 * cos_a - x1 * sin_a
@@ -4097,6 +4098,7 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
         mut [float32]'unified out_k = [0.0 for ..<tail_n]
         mut [float32]'unified out_v = [0.0 for ..<tail_n]
         let i = .thread.x + .block.x * .block_dim.x
+        let rot_half = rope_freqs[half_dim + 1] as int
         if i < old_n:
             out_k[i] = prev_k[i]
             out_v[i] = prev_v[i]
@@ -4104,17 +4106,16 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
             let h = if half_dim == 64: (i >> 6) else: (if half_dim == 32: (i >> 5) else: (i / half_dim))
             let pair = if half_dim == 64: (i & 63) else: (if half_dim == 32: (i & 31) else: (i % half_dim))
             let head_base = h * d_head
-            var int first = head_base + pair
-            var int second = first + half_dim
-            if neox == 1:
+            let rotating = pair < rot_half
+            var int first = head_base + 2 * pair
+            var int second = first + 1
+            if rotating and neox == 1:
                 first = head_base + pair
-                second = first + half_dim
-            else:
-                first = head_base + 2 * pair
-                second = first + 1
+                second = first + rot_half
+            let mscale = if rotating: rope_freqs[half_dim] else: (1.0 as float32)
             let angle = (pos as float32) * rope_freqs[pair]
-            let cos_a = angle.cos() * rope_freqs[half_dim]
-            let sin_a = angle.sin() * rope_freqs[half_dim]
+            let cos_a = angle.cos() * mscale
+            let sin_a = angle.sin() * mscale
             let x0 = in_q[first]
             let x1 = in_q[second]
             out_q[first] = x0 * cos_a - x1 * sin_a
@@ -4123,17 +4124,16 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
             let h = if half_dim == 64: (i >> 6) else: (if half_dim == 32: (i >> 5) else: (i / half_dim))
             let pair = if half_dim == 64: (i & 63) else: (if half_dim == 32: (i & 31) else: (i % half_dim))
             let head_base = h * d_head
-            var int first = head_base + pair
-            var int second = first + half_dim
-            if neox == 1:
+            let rotating = pair < rot_half
+            var int first = head_base + 2 * pair
+            var int second = first + 1
+            if rotating and neox == 1:
                 first = head_base + pair
-                second = first + half_dim
-            else:
-                first = head_base + 2 * pair
-                second = first + 1
+                second = first + rot_half
+            let mscale = if rotating: rope_freqs[half_dim] else: (1.0 as float32)
             let angle = (pos as float32) * rope_freqs[pair]
-            let cos_a = angle.cos() * rope_freqs[half_dim]
-            let sin_a = angle.sin() * rope_freqs[half_dim]
+            let cos_a = angle.cos() * mscale
+            let sin_a = angle.sin() * mscale
             let x0 = in_k[first]
             let x1 = in_k[second]
             out_k[old_n + first] = x0 * cos_a - x1 * sin_a

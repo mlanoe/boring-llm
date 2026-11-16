@@ -30,15 +30,15 @@ def main() throws:
     let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
     # --- RoPE scaling tables ---
     # linear factor 2: position 2 rotates exactly like position 1 unscaled
-    let lin = rope_apply_at(x, 1, 1, 4, rope_freqs_linear(4, 10000.0 as float32, 2.0 as float32), 2, 1)
-    let unscaled_p1 = rope_apply_at(x, 1, 1, 4, rope_freqs_plain(4, 10000.0 as float32), 1, 1)
+    let lin = rope_apply_at(x, 1, 1, 4, rope_freqs_linear(4, 4, 10000.0 as float32, 2.0 as float32), 2, 1)
+    let unscaled_p1 = rope_apply_at(x, 1, 1, 4, rope_freqs_plain(4, 4, 10000.0 as float32), 1, 1)
     var int li = 0
     while li < 4:
         assert_close(lin[li], unscaled_p1[li], "rope linear == half position [{li}]")
         li += 1
     # YaRN with factor 1 is the plain table
-    let y1 = rope_freqs_yarn(128, 1000000.0 as float32, 1.0 as float32, 32768.0 as float32, 32.0 as float32, 1.0 as float32, 1.0 as float32)
-    let plain128 = rope_freqs_plain(128, 1000000.0 as float32)
+    let y1 = rope_freqs_yarn(128, 128, 1000000.0 as float32, 1.0 as float32, 32768.0 as float32, 32.0 as float32, 1.0 as float32, 1.0 as float32)
+    let plain128 = rope_freqs_plain(128, 128, 1000000.0 as float32)
     var yi = 0
     while yi < 65:
         assert_close(y1[yi] * 1000000.0 as float32, plain128[yi] * 1000000.0 as float32, "yarn factor 1 [{yi}]")
@@ -46,7 +46,7 @@ def main() throws:
     # YaRN factor 4, values cross-checked against a Python transcription of ggml_rope_yarn
     # (Qwen2.5-style: base 1e6, original context 32768): high frequencies untouched,
     # low ones divided by 4, linear ramp between dims 23 and 40, cos/sin scaled by 1 + 0.1 ln 4.
-    let y4 = rope_freqs_yarn(128, 1000000.0 as float32, 4.0 as float32, 32768.0 as float32, 32.0 as float32, 1.0 as float32, 1.0 as float32)
+    let y4 = rope_freqs_yarn(128, 128, 1000000.0 as float32, 4.0 as float32, 32768.0 as float32, 32.0 as float32, 1.0 as float32, 1.0 as float32)
     assert_close(y4[0], 1.0 as float32, "yarn4 j=0")
     assert_close(y4[10] * 100.0 as float32, 11.547819846894582 as float32, "yarn4 j=10")
     assert_close(y4[30] * 10000.0 as float32, 10.64360981247002 as float32, "yarn4 j=30 (ramp)")
@@ -54,12 +54,44 @@ def main() throws:
     assert_close(y4[63] * 10000000.0 as float32, 3.102344401879299 as float32, "yarn4 j=63")
     assert_close(y4[64], 1.138629436111989 as float32, "yarn4 mscale")
     # per-pair divisors (Llama 3.1 rope_freqs / Phi-3 factors)
-    let fac = rope_freqs_factors(4, 10000.0 as float32, [1.0, 4.0], 0.5 as float32)
+    let fac = rope_freqs_factors(4, 4, 10000.0 as float32, [1.0, 4.0], 0.5 as float32)
     assert_close(fac[0], 1.0 as float32, "factors j=0")
     assert_close(fac[1] * 400.0 as float32, 1.0 as float32, "factors j=1: 0.01 / 4")
     assert_close(fac[2], 0.5 as float32, "factors mscale")
 
-    let roped = rope_apply(x, 2, 1, 4, rope_freqs_plain(4, 10000.0 as float32), 1)
+    # partial rotary (n_rot 4 of d_head 8): NEOX pairs are (j, j + n_rot/2), the tail passes through.
+    # Reference values from a numpy transcription of ggml's rope (theta_j = 10000^(-2j / n_rot)).
+    let px = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    let ptab = rope_freqs_plain(8, 4, 10000.0 as float32)
+    assert_close(ptab[0], 1.0 as float32, "partial table j=0")
+    assert_close(ptab[1] * 100.0 as float32, 1.0 as float32, "partial table j=1: 10000^(-2/4)")
+    assert_close(ptab[2], 0.0 as float32, "partial table j=2 is unrotated")
+    assert_close(ptab[4], 1.0 as float32, "partial table mscale")
+    assert_close(ptab[5], 2.0 as float32, "partial table rotated pair count")
+    let pn = rope_apply_at(px, 1, 1, 8, ptab, 1, 1)
+    assert_close(pn[0], (1.0 * 0.5403023058681398 - 3.0 * 0.8414709848078965) as float32, "partial neox [0]")
+    assert_close(pn[2], (1.0 * 0.8414709848078965 + 3.0 * 0.5403023058681398) as float32, "partial neox [2]")
+    assert_close(pn[1], (2.0 * 0.9999500004166653 - 4.0 * 0.009999833334166664) as float32, "partial neox [1]")
+    assert_close(pn[3], (2.0 * 0.009999833334166664 + 4.0 * 0.9999500004166653) as float32, "partial neox [3]")
+    var pi = 4
+    while pi < 8:
+        assert_close(pn[pi], px[pi], "partial neox tail passes through [{pi}]")
+        pi += 1
+    # NORM: adjacent pairs (0,1), (2,3); tail untouched
+    let pm = rope_apply_at(px, 1, 1, 8, ptab, 1, 0)
+    assert_close(pm[0], (1.0 * 0.5403023058681398 - 2.0 * 0.8414709848078965) as float32, "partial norm [0]")
+    assert_close(pm[1], (1.0 * 0.8414709848078965 + 2.0 * 0.5403023058681398) as float32, "partial norm [1]")
+    assert_close(pm[2], (3.0 * 0.9999500004166653 - 4.0 * 0.009999833334166664) as float32, "partial norm [2]")
+    assert_close(pm[3], (3.0 * 0.009999833334166664 + 4.0 * 0.9999500004166653) as float32, "partial norm [3]")
+    pi = 4
+    while pi < 8:
+        assert_close(pm[pi], px[pi], "partial norm tail passes through [{pi}]")
+        pi += 1
+    # full rotation is unchanged by the n_rot argument
+    let full = rope_apply_at(px, 1, 1, 8, rope_freqs_plain(8, 8, 10000.0 as float32), 1, 1)
+    assert_close(full[0], (1.0 * 0.5403023058681398 - 5.0 * 0.8414709848078965) as float32, "full neox [0]")
+
+    let roped = rope_apply(x, 2, 1, 4, rope_freqs_plain(4, 4, 10000.0 as float32), 1)
     assert_close(roped[0], 1.0 as float32, "rope pos0[0]")
     assert_close(roped[1], 2.0 as float32, "rope pos0[1]")
     assert_close(roped[2], 3.0 as float32, "rope pos0[2]")

@@ -66,9 +66,11 @@ def corr_dim(d, orig, n_rot, base):
     return d * math.log(orig / (n_rot * 2 * math.pi)) / (2 * math.log(base))
 
 
-def rope_table(d_head, base, kind="none", factor=1.0, orig=4096, bf=32.0, bs=1.0, attn=1.0, factors=None):
-    half = d_head // 2
-    theta = np.array([base ** (-2.0 * j / d_head) for j in range(half)])
+def rope_table(d_head, base, kind="none", factor=1.0, orig=4096, bf=32.0, bs=1.0, attn=1.0, factors=None, n_rot=None):
+    """(theta, mscale); theta has n_rot/2 entries: only the first n_rot dims of a head rotate (partial rotary)."""
+    n_rot = n_rot or d_head
+    half = n_rot // 2
+    theta = np.array([base ** (-2.0 * j / n_rot) for j in range(half)])
     mscale = 1.0
     if factors is not None:
         theta = theta / factors
@@ -76,8 +78,8 @@ def rope_table(d_head, base, kind="none", factor=1.0, orig=4096, bf=32.0, bs=1.0
     elif kind == "linear":
         theta = theta / factor
     elif kind == "yarn":
-        low = max(0, math.floor(corr_dim(d_head, orig, bf, base)))
-        high = min(d_head - 1, math.ceil(corr_dim(d_head, orig, bs, base)))
+        low = max(0, math.floor(corr_dim(n_rot, orig, bf, base)))
+        high = min(n_rot - 1, math.ceil(corr_dim(n_rot, orig, bs, base)))
         out = []
         for j in range(half):
             y = (j - low) / max(0.001, high - low)
@@ -88,18 +90,20 @@ def rope_table(d_head, base, kind="none", factor=1.0, orig=4096, bf=32.0, bs=1.0
     return theta, mscale
 
 
-def rope(x, pos, theta, mscale, neox):  # x: (seq, heads, d_head)
-    half = x.shape[-1] // 2
+def rope(x, pos, theta, mscale, neox):  # x: (seq, heads, d_head); only the first 2*len(theta) dims rotate
+    n_rot = 2 * len(theta)
+    half = n_rot // 2
+    xr, rest = x[..., :n_rot], x[..., n_rot:]
     ang = pos[:, None] * theta[None, :]
     c, s = np.cos(ang)[:, None, :] * mscale, np.sin(ang)[:, None, :] * mscale
-    out = np.empty_like(x)
+    out = np.empty_like(xr)
     if neox:
-        a, b = x[..., :half], x[..., half:]
+        a, b = xr[..., :half], xr[..., half:]
         out[..., :half], out[..., half:] = a * c - b * s, a * s + b * c
     else:
-        a, b = x[..., 0::2], x[..., 1::2]
+        a, b = xr[..., 0::2], xr[..., 1::2]
         out[..., 0::2], out[..., 1::2] = a * c - b * s, a * s + b * c
-    return out
+    return np.concatenate([out, rest], axis=-1)
 
 
 def reference(W, c):
@@ -290,7 +294,7 @@ def write(name, arch, W, c, fused=False, fused_qkv_only=False, tied=False, meta=
     w = gguf.GGUFWriter(f"{OUT}/{PREFIX}{name}.gguf", arch=arch)
     w.add_uint32(f"{arch}.block_count", NL)
     w.add_uint32(f"{arch}.context_length", 512)
-    w.add_uint32(f"{arch}.rope.dimension_count", c["d_head"])
+    w.add_uint32(f"{arch}.rope.dimension_count", c.get("n_rot", c["d_head"]))
     w.add_uint32(f"{arch}.embedding_length", D)
     w.add_uint32(f"{arch}.attention.head_count", NH)
     w.add_uint32(f"{arch}.attention.head_count_kv", NKV)
@@ -576,6 +580,10 @@ def run():
     Wglm = make_weights(rng, dh, False)
     write("glm4", "glm4", Wglm, {**base, "neox": False, "post_norms": True, "rope": rope_table(dh, 10000.0)},
           fused=True)
+    # Partial rotary (rope.dimension_count = d_head / 2, as GLM-4 ships): NORM pairs (2j, 2j+1) over the first
+    # n_rot dims, the rest of every head passes through; theta_j = base^(-2j / n_rot).
+    write("partial-glm4", "glm4", Wglm, {**base, "neox": False, "post_norms": True, "n_rot": dh // 2,
+          "rope": rope_table(dh, 10000.0, n_rot=dh // 2)}, fused=True)
 
     # MiniCPM: NORM RoPE, Granite-like scaling (embedding_scale, residual_scale, logit_scale)
     Wmc = make_weights(rng, dh, False)
@@ -618,6 +626,18 @@ def run():
           {**base, "act": "gelu", "layernorm": True, "residual_type": 2, "ffn_gated": False,
            "rope": rope_table(dh, 10000.0)},
           fused_qkv_only=True, meta={"use_parallel_residual": True})
+    # Partial rotary as GPT-NeoX ships it (rotary_pct): NEOX pairs (j, j + n_rot/2) over the first n_rot dims,
+    # the tail passes through; with YaRN the correction dims are computed from n_rot.
+    nr = dh // 2
+    write("partial-gptneox", "gptneox", Wnx,
+          {**base, "act": "gelu", "layernorm": True, "residual_type": 2, "ffn_gated": False, "n_rot": nr,
+           "rope": rope_table(dh, 10000.0, n_rot=nr)},
+          fused_qkv_only=True, meta={"use_parallel_residual": True})
+    write("partial-gptneox-yarn", "gptneox", Wnx,
+          {**base, "act": "gelu", "layernorm": True, "residual_type": 2, "ffn_gated": False, "n_rot": nr,
+           "rope": rope_table(dh, 10000.0, "yarn", factor=4.0, orig=64, attn=1.0, n_rot=nr)},
+          fused_qkv_only=True, meta={"use_parallel_residual": True, "rope.scaling.type": "yarn",
+                                     "rope.scaling.factor": 4.0, "rope.scaling.original_context_length": 64})
 
     # Falcon: LayerNorm with bias, dual-norm parallel residual via attn_norm_2, fused QKV, non-gated GELU FFN (no linear bias)
     Wfal = make_weights(rng, dh, False)

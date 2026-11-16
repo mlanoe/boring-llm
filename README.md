@@ -238,7 +238,6 @@ boring.toml               kernel scheduling policy (native Metal paths for Q8_0,
 - Chat templates use a Jinja2 subset (179 of the 187 constructs of `tools/jinja_diff.py` agree with `jinja2`; no `include`/`import`/`call`/`with`/`break`); an unsupported construct is reported, not ignored.
 - Snapshots on disk and the disk-streaming loader use Unix file APIs. Standard `model-00001-of-000NN.gguf` split models are discovered from any shard and read lazily without concatenating their weights in memory.
 - Pre-tokenization follows `tokenizer.ggml.pre` for the Qwen2 and Llama 3 (`llama-bpe`) regexes only; any other value (gpt-2, falcon, deepseek, starcoder, ...) is split like Qwen2, so numbers and code can tokenize differently from llama.cpp.
-- Partial rotary embeddings (`{arch}.rope.dimension_count` below the head size: Phi-2, StableLM, GPT-NeoX, GLM-4) are not applied yet: every dimension is rotated, so those architectures are numerically wrong beyond position 0.
 - CUDA and ROCm have not been run.
 
 ## Boring
