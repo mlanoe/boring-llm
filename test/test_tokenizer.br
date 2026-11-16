@@ -89,6 +89,25 @@ def main() throws:
     assert_eq(seg3[1], "\n")
     assert_eq(seg3[2], "You")
 
+    # --- tokenizer.ggml.pre decides how many digits one pre-token takes: Qwen2's
+    # regex has `\p{N}`, Llama 3's (`llama-bpe`) `\p{N}{1,3}`; everything else is shared
+    let digits_qwen = pretokenize("in 2024!")
+    assert_eq(digits_qwen.length, 7)
+    assert_eq(digits_qwen[2], "2")
+    set_pretokenizer("llama-bpe")
+    let digits_llama = pretokenize("in 2024!")
+    assert_eq(digits_llama.length, 5)
+    assert_eq(digits_llama[1], " ")
+    assert_eq(digits_llama[2], "202")
+    assert_eq(digits_llama[3], "4")
+    assert_eq(digits_llama[4], "!")
+    let digits_long = pretokenize("123456")
+    assert_eq(digits_long.length, 2)
+    assert_eq(digits_long[0], "123")
+    assert_eq(digits_long[1], "456")
+    set_pretokenizer("qwen2")
+    assert_eq(pretokenize("2024").length, 4)
+
     # --- encode_with_specials: a tiny synthetic vocab (no real GGUF needed,
     # see test_tokenizer_real.br for the full real-vocab verification) to
     # exercise the special-token partitioning in isolation: plain-text spans

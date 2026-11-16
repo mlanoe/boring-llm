@@ -17,8 +17,10 @@
 # magic, which a later scan ignores (and the next save overwrites).
 #
 # A snapshot is only valid for the exact model that produced it, hence the
-# fingerprint (file size, shape, a hash of the first and last 64 KB of tensor
-# data). Positions are float32 as the GPU holds them: restoring them is exact.
+# fingerprint (file size, shape, a hash of 64 KB from the start, middle and end
+# of the tensor data, the RoPE tables in use and an engine revision, see
+# cache_fingerprint). Positions are float32 as the GPU holds them: restoring
+# them is exact.
 #
 # Kept apart from server.br because it calls Rust's `std::fs` (`File`,
 # `FileExt::{read,write}_all_at`: Unix-only), like gguf_file.br.
@@ -110,6 +112,36 @@ pub int model_fingerprint(GgufFile file, int n_layer, int kv_dim) throws:
         h = (h * 131 + (head[i] as int)) % 2147483629
         h = (h * 131 + (tail[i] as int)) % 2147483629
         i += 1
+    h
+
+# Bumped whenever the K/V rows a model computes change for the same weights (a
+# RoPE, quantization or attention fix), so snapshots an older engine wrote are
+# not read back as if they were current.
+let int CACHE_ENGINE_REV = 1
+
+int fold_hash(int h, int v):
+    ((h % 2147483629) * 131 + (v % 2147483629)) % 2147483629
+
+# What a snapshot is valid for. `model_fingerprint` identifies the weights; K is
+# stored after RoPE, so the tables it was rotated with matter too, and
+# `--ctx-size` changes them (Phi-3's LongRoPE takes its short or long factors
+# from it: a snapshot saved at -c 4096 must not be read back at -c 131072). A
+# sample from the middle of the tensor data tells apart two fine-tunes of one
+# base whose first and last tensors (embeddings, a norm) are identical.
+pub int cache_fingerprint(GgufFile file, QuantModel model, int kv_dim) throws:
+    let c = model.config
+    var int h = model_fingerprint(file, c.n_layer, kv_dim)
+    h = fold_hash(h, CACHE_ENGINE_REV)
+    h = fold_hash(h, c.rope_neox)
+    for f in c.rope_freqs:
+        h = fold_hash(h, floatToBits(f))
+    for f in c.rope_freqs_local:
+        h = fold_hash(h, floatToBits(f))
+    let data_len = file.file_size - file.data_offset
+    if data_len > 3 * 65536:
+        let sample = file_bytes(file, file.data_offset + data_len / 2, 65536)
+        for b in sample:
+            h = fold_hash(h, b as int)
     h
 
 # The snapshot in file `slot` if it is complete and was made by this model;

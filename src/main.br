@@ -474,7 +474,7 @@ def run_serve(string path, string model_name, [string] model_tags, string chat_t
     var [DiskSnap] disk = []
     let kv_dim = kv_dim_of(m)
     if prompt_cache_dir != "" or slot_save_dir != "":
-        fp = model_fingerprint(file, m.config.n_layer, kv_dim)
+        fp = cache_fingerprint(file, m, kv_dim)
         bpt = snapshot_bytes_per_token(m.config.n_layer, kv_dim)
     if prompt_cache_dir != "":
         ensure_dir(prompt_cache_dir)

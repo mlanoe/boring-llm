@@ -124,8 +124,27 @@ def main() throws:
     assert_eq(render_jinja("{ob}{ob} items|length - 1 {cb}{cb}{ob}{ob} s|length {cb}{cb}", env5), "24" as string)
     assert_eq(render_jinja("{ob}{ob} items[items|length - 1] {cb}{cb}", env5), "c" as string)
 
-    # TinyLlama's plain template (no trim markers), expected text from real jinja2:
-    # `not`/comparison precedence and loop scoping must not change what it renders
+    # trim_blocks / lstrip_blocks (expected text from real jinja2 with both on): the newline
+    # after a block or comment tag and the indentation before a tag that starts its line go;
+    # an output tag, or a tag that does not start its line, is left alone
+    assert_eq(render_jinja("{ob}% if 1 == 1 %{cb}\nX\n{ob}% endif %{cb}\n", env), "X\n" as string)
+    assert_eq(render_jinja("  {ob}% if 1 == 1 %{cb}\nX\n  {ob}% endif %{cb}\n", env), "X\n" as string)
+    assert_eq(render_jinja("a\n  {ob}# c #{cb}\nb", env), "a\nb" as string)
+    assert_eq(render_jinja("  {ob}{ob} 1 {cb}{cb}\n", env), "  1" as string)
+    assert_eq(render_jinja("x  {ob}% if 1 == 1 %{cb}y{ob}% endif %{cb}\n", env), "x  y" as string)
+    assert_eq(render_jinja("{ob}% set a = 1 %{cb}\n\nB", env), "\nB" as string)
+
+    # a dict equals a dict with the same keys and values (Mistral v0.3's `message == user_messages[-1]`)
+    mut {string=JValue} env6 = {=}
+    env6["m"] = jv_chat_message("user", "Hi")
+    env6["n"] = jv_chat_message("user", "Hi")
+    env6["o"] = jv_chat_message("assistant", "Hi")
+    assert_eq(render_jinja("{ob}{ob} m == n {cb}{cb}{ob}{ob} m == o {cb}{cb}{ob}{ob} m != o {cb}{cb}", env6), "TrueFalseTrue" as string)
+
+    # TinyLlama's plain template (no trim markers), expected text from real jinja2 with
+    # `trim_blocks=True, lstrip_blocks=True` (how transformers and llama.cpp render it; a
+    # plain Environment() leaves a blank line after every tag): `not`/comparison precedence
+    # and loop scoping must not change what it renders
     let tl = "{ob}% for message in messages %{cb}\n{ob}% if message['role'] == 'user' %{cb}\n{ob}{ob} '<|user|>\n' + message['content'] + eos_token {cb}{cb}\n{ob}% elif message['role'] == 'system' %{cb}\n{ob}{ob} '<|system|>\n' + message['content'] + eos_token {cb}{cb}\n{ob}% elif message['role'] == 'assistant' %{cb}\n{ob}{ob} '<|assistant|>\n'  + message['content'] + eos_token {cb}{cb}\n{ob}% endif %{cb}\n{ob}% if loop.last and add_generation_prompt %{cb}\n{ob}{ob} '<|assistant|>' {cb}{cb}\n{ob}% endif %{cb}\n{ob}% endfor %{cb}"
     mut [JValue] tl_msgs = []
     tl_msgs.push(jv_chat_message("system", "Be brief."))
@@ -133,7 +152,7 @@ def main() throws:
     tl_msgs.push(jv_chat_message("assistant", "Hello!"))
     tl_msgs.push(jv_chat_message("user", "Bye"))
     mut {string=JValue} tl_env = build_chat_env(tl_msgs, true, "<s>", "</s>")
-    assert_eq(render_jinja(tl, tl_env), "\n\n<|system|>\nBe brief.</s>\n\n\n\n\n<|user|>\nHi</s>\n\n\n\n\n<|assistant|>\nHello!</s>\n\n\n\n\n<|user|>\nBye</s>\n\n\n<|assistant|>\n\n" as string)
+    assert_eq(render_jinja(tl, tl_env), "<|system|>\nBe brief.</s>\n<|user|>\nHi</s>\n<|assistant|>\nHello!</s>\n<|user|>\nBye</s>\n<|assistant|>\n" as string)
 
     # Gemma 3's real chat template (slices `messages[1:]`, the `trim` filter, `is iterable`,
     # a parenthesized `!=`); expected text rendered by real jinja2 (see git history of the fixture)

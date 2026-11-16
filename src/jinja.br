@@ -105,11 +105,25 @@ bool jv_eq(JValue l, JValue r):
                         i += 1
                     same
                 _: false
+        JDict(a_fields, a_keys):
+            # Python's dict equality: the same keys (in any order) with equal values.
+            match r:
+                JDict(b_fields, b_keys):
+                    var bool same = a_keys.length == b_keys.length
+                    var int i = 0
+                    while same and i < a_keys.length:
+                        let key = a_keys[i]
+                        if not b_fields.contains(key):
+                            same = false
+                        elif not jv_eq(a_fields[key], b_fields[key]):
+                            same = false
+                        i += 1
+                    same
+                _: false
         JUndefined:
             match r:
                 JUndefined: true
                 _: false
-        _: false
 
 # Python's `str(float)`: a whole number keeps its ".0".
 string jv_float_str(float f):
@@ -2180,10 +2194,72 @@ struct RawTok:
         toks.push(RawTok(0, buf, false, false))
     toks
 
-[RawTok] apply_trim([RawTok] toks):
+# jinja2's `trim_blocks=True, lstrip_blocks=True`, the settings transformers'
+# `apply_chat_template`, llama-cpp-python and llama.cpp's minja all render chat
+# templates with (a plain `jinja2.Environment()` does not, which is why a
+# template written without `-` markers rendered blank lines no other stack
+# produces): the first newline right after a block (`{% %}`) or comment tag is
+# dropped, and so is the indentation before such a tag when only whitespace
+# precedes it on its line. A line counts as started at the top of the template,
+# or right after a tag that just consumed its newline. Output tags (`{{ }}`)
+# are never affected, and a tag with an explicit `-` is left to `apply_trim`.
+[RawTok] apply_block_trim([RawTok] toks):
     mut [RawTok] out = []
     for t in toks:
         out.push(t)
+    mut [bool] ate_newline = [false for i in 0..<out.length]
+    var int i = 0
+    while i < out.length:
+        if (out[i].kind == 2 or out[i].kind == 3) and not out[i].trim_right and i + 1 < out.length and out[i + 1].kind == 0:
+            let next = out[i + 1].content
+            if next.startsWith("\n"):
+                out[i + 1] = RawTok(0, drop_first_char(next), false, false)
+                ate_newline[i] = true
+        i += 1
+    i = 1
+    while i < out.length:
+        if (out[i].kind == 2 or out[i].kind == 3) and not out[i].trim_left and out[i - 1].kind == 0:
+            var bool at_line_start = false
+            if i == 1:
+                at_line_start = true
+            elif ate_newline[i - 2]:
+                at_line_start = true
+            out[i - 1] = RawTok(0, strip_block_indent(out[i - 1].content, at_line_start), false, false)
+        i += 1
+    out
+
+string drop_first_char(string s):
+    let chars = s.chars()
+    var string out = ""
+    var int i = 1
+    while i < chars.length:
+        out = "{out}{chars[i]}"
+        i += 1
+    out
+
+# `s` without its trailing spaces and tabs, when they are all that stands
+# between the start of a line and the tag that follows `s`.
+string strip_block_indent(string s, bool at_line_start):
+    let chars = s.chars()
+    var int b = chars.length
+    while b > 0 and (chars[b - 1] == " " or chars[b - 1] == chr(9)):
+        b -= 1
+    var bool starts_line = false
+    if b == 0:
+        starts_line = at_line_start
+    elif chars[b - 1] == "\n":
+        starts_line = true
+    if not starts_line or b == chars.length:
+        return s
+    var string out = ""
+    var int i = 0
+    while i < b:
+        out = "{out}{chars[i]}"
+        i += 1
+    out
+
+[RawTok] apply_trim([RawTok] toks):
+    mut [RawTok] out = apply_block_trim(toks)
     var int i = 0
     while i < out.length:
         if out[i].kind != 0 and out[i].trim_left and i > 0 and out[i - 1].kind == 0:

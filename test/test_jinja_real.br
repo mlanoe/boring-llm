@@ -67,13 +67,13 @@ def main() throws:
     let tiny_env1 = build_env(single, true, "<s>", "</s>")
     let tiny_out1 = render_jinja(tiny_tmpl, tiny_env1)
     check(tiny_out1,
-        "\n\n<|system|>\nYou are a helpful assistant.</s>\n\n\n\n\n<|user|>\nWhat is the capital of France?</s>\n\n\n<|assistant|>\n\n",
-        "tinyllama single-turn (untrimmed template, exact whitespace)")
+        "<|system|>\nYou are a helpful assistant.</s>\n<|user|>\nWhat is the capital of France?</s>\n<|assistant|>\n",
+        "tinyllama single-turn (template without trim markers, rendered with trim_blocks + lstrip_blocks)")
 
     let tiny_env2 = build_env(multi, true, "<s>", "</s>")
     let tiny_out2 = render_jinja(tiny_tmpl, tiny_env2)
     check(tiny_out2,
-        "\n\n<|system|>\nYou are a helpful assistant.</s>\n\n\n\n\n<|user|>\nWhat is the capital of France?</s>\n\n\n\n\n<|assistant|>\nParis.</s>\n\n\n\n\n<|user|>\nAnd of Germany?</s>\n\n\n<|assistant|>\n\n",
-        "tinyllama multi-turn (untrimmed template, exact whitespace)")
+        "<|system|>\nYou are a helpful assistant.</s>\n<|user|>\nWhat is the capital of France?</s>\n<|assistant|>\nParis.</s>\n<|user|>\nAnd of Germany?</s>\n<|assistant|>\n",
+        "tinyllama multi-turn (template without trim markers, rendered with trim_blocks + lstrip_blocks)")
 
     print "test_jinja_real: all assertions passed"

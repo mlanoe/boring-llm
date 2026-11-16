@@ -5,8 +5,9 @@ Renders a corpus of small templates (one construct each, drawn from what real
 chat templates use) with jinja2 and with `boring run test/jinja_driver.br`, and
 reports every case where the two disagree: different output, or one side
 raising an error the other does not. jinja2 is configured like the project's
-other oracle (tools/oracle_render_request.py): a plain Environment with HF's
-`tojson` and a `raise_exception` global.
+other oracle (tools/oracle_render_request.py): an Environment with HF's
+`trim_blocks=True, lstrip_blocks=True`, HF's `tojson` and a `raise_exception`
+global.
 
 Usage (repo root, project venv):
     .venv/bin/python tools/jinja_diff.py            # every case, prints failures
@@ -234,11 +235,27 @@ CASES = [
     ("none print", "{{ none }}"),
     ("list print", "{{ items }}"),
     ("dict print", "{{ d }}"),
+    # --- trim_blocks / lstrip_blocks (HF, llama-cpp-python and minja render with both)
+    ("trim_blocks if", "{% if flag %}\nX\n{% endif %}\n"),
+    ("lstrip indented block", "  {% if flag %}\nX\n  {% endif %}\n"),
+    ("lstrip needs line start", "x  {% if flag %}y{% endif %}\n"),
+    ("trim and lstrip comment", "a\n  {# c #}\nb"),
+    ("expression is not trimmed", "  {{ name }}\n"),
+    ("set then blank line", "{% set a = 1 %}\n\nB"),
+    ("tag after a trimmed newline", "{% set a = 1 %}\n  {% if flag %}\nZ{% endif %}"),
+    ("tab indent", "\t{% if flag %}\nX\n\t{% endif %}\n"),
+    ("for loop lines", "{% for x in items %}\n{{ x }}\n{% endfor %}\n"),
+    ("explicit dash still wins", "A  \n  {%- if flag -%}\n  B\n  {%- endif %}\nC"),
+    # --- dict equality
+    ("dict eq self", "{{ d == d }}{{ d == nested }}"),
+    ("dict eq messages", "{{ messages[0] == messages[0] }}{{ messages[0] == messages[1] }}"),
 ]
 
 
 def reference(template):
-    env = jinja2.Environment()
+    # The settings transformers' apply_chat_template, llama-cpp-python and
+    # llama.cpp's minja render chat templates with.
+    env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
     env.filters["tojson"] = lambda x, indent=None, **kw: json.dumps(x, ensure_ascii=False, indent=indent)
 
     def raise_exception(msg):

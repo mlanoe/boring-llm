@@ -71,7 +71,9 @@ def main():
     bos_id = int(reader.fields["tokenizer.ggml.bos_token_id"].parts[-1][0]) if "tokenizer.ggml.bos_token_id" in reader.fields else None
     eos_id = int(reader.fields["tokenizer.ggml.eos_token_id"].parts[-1][0])
 
-    env = jinja2.Environment()
+    # trim_blocks/lstrip_blocks: how transformers, llama-cpp-python and llama.cpp
+    # (minja) render chat templates; a plain Environment() keeps blank lines.
+    env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
 
     def raise_exception(message):
         raise jinja2.exceptions.TemplateError(message)

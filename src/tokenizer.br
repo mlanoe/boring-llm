@@ -419,6 +419,20 @@ def int ascii_lower_cp(int cp):
     else:
         cp
 
+# How many digits one pre-token takes: `\p{N}` (Qwen2) is one, `\p{N}{1,3}` is
+# Llama 3's, whose regex is otherwise identical to the one above ("2024" is
+# "202" + "4", not four tokens). `tokenizer.ggml.pre` names the regex; only
+# these two families are implemented, so any other value (gpt-2, falcon,
+# deepseek, starcoder, ...) is pre-tokenized like Qwen2 and may split numbers
+# and code differently from llama.cpp.
+static var int pretoken_digit_run = 1
+
+pub def set_pretokenizer(string pre):
+    if pre == "llama-bpe" or pre == "llama3" or pre == "llama-v3":
+        pretoken_digit_run = 3
+    else:
+        pretoken_digit_run = 1
+
 # Exclusive end index of the pre-token starting at `i` (always > i).
 def int match_pretoken([int] cps, int i, int n):
     let c = cps[i]
@@ -446,9 +460,12 @@ def int match_pretoken([int] cps, int i, int n):
             e += 1
         return e
 
-    # 3. \p{N}
+    # 3. \p{N} (Qwen2) or \p{N}{1,3} (Llama 3), see pretoken_digit_run
     if is_digit_cp(c):
-        return i + 1
+        var int d_end = i + 1
+        while d_end < n and d_end - i < pretoken_digit_run and is_digit_cp(cps[d_end]):
+            d_end += 1
+        return d_end
 
     # 4.  ?[^\s\p{L}\p{N}]+[\r\n]*
     var int k = i
@@ -694,6 +711,7 @@ pub Tokenizer load_tokenizer(GgufFile file) throws:
 
     let tokenizer_model = gguf_get_string(file.metadata, "tokenizer.ggml.model") else "gpt2"
     let is_spm = tokenizer_model == "llama"
+    set_pretokenizer(gguf_get_string(file.metadata, "tokenizer.ggml.pre") else "")
     let scores = gguf_get_f32_array(file.metadata, "tokenizer.ggml.scores")
     var [int] byte_token_id = []
     if is_spm:
@@ -797,7 +815,13 @@ pub string render_chat_prompt_text_messages_kw(GgufFile file, Tokenizer tok, [JV
     let bos = tok.reverse[tok.bos_token_id] else ""
     let eos = tok.reverse[tok.eos_token_id] else ""
     mut {string=JValue} env = build_chat_env(messages, add_generation_prompt, bos, eos)
-    env["tools"] = JValue.JList(tools)
+    # A request without tools leaves `tools` undefined, as llama.cpp and
+    # transformers (which pass none) do. An empty list is a different thing to
+    # a template: Llama 3.x's `{% if tools is not none %}` and Mistral's
+    # `[AVAILABLE_TOOLS]` block both fire on `[]` and put a tool preamble into
+    # every tool-less chat.
+    if tools.length > 0:
+        env["tools"] = JValue.JList(tools)
     match kwargs:
         JDict(fields, keys):
             for key in keys:
@@ -805,5 +829,7 @@ pub string render_chat_prompt_text_messages_kw(GgufFile file, Tokenizer tok, [JV
                 # they never replace the conversation the request was validated on.
                 if not chat_kwarg_is_reserved(key):
                     env[key] = fields[key] else JValue.JUndefined
-        _: env["tools"] = JValue.JList(tools)
+        _:
+            if tools.length > 0:
+                env["tools"] = JValue.JList(tools)
     render_jinja(template, env)
