@@ -1697,6 +1697,7 @@ let int TAIL_MAX = 64
 # the real pipelined command stream. See tools/profile_decode_marginal.py.
 static var int decode_profile_stage = 0
 static var int decode_gpu_batch_limit = 3
+static var int active_gpu_batch_limit = 1
 static var int kv_type_k = 0
 static var int kv_type_v = 0
 
@@ -1705,6 +1706,11 @@ pub def set_decode_profile_stage(int stage):
 
 pub def set_decode_gpu_batch_limit(int limit):
     decode_gpu_batch_limit = limit
+
+def sync_gpu_batch_limit(int target):
+    if active_gpu_batch_limit != target:
+        set_gpu_batch_limit(target)
+        active_gpu_batch_limit = target
 
 pub def set_kv_cache_types(string type_k, string type_v) throws:
     kv_type_k = kv_type_from_name(type_k)
@@ -1736,6 +1742,7 @@ pub int kv_cache_type_v():
 # than one batched 26-token forward, purely from per-kernel-launch overhead
 # at this model's small scale (confirmed empirically before adding this).
 pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) throws:
+    sync_gpu_batch_limit(1)
     guard (kv_type_k == 0 and kv_type_v == 0) or model.config.attn_ext or (model.config.d_head % 32 == 0 and model.config.d_head <= 128) else throw "packed KV caches require an attention head size that is a multiple of 32 up to 128"
     let seq = tokens.length
     let d = model.config.d_model
@@ -1923,6 +1930,7 @@ pub ([float32], GenCache) prefill_step_gpu_quantized(QuantModel model, GenCache 
 # Speculative decoding's verification pass: feeds `tokens` (n >= 1) after an existing cache like
 # prefill_step_gpu_quantized, but returns the logits of every row, not just the last.
 pub ([float32], GenCache) forward_batch_gpu_quantized(QuantModel model, GenCache cache0, [int] tokens) throws:
+    sync_gpu_batch_limit(1)
     guard (cache0.kt == 0 and cache0.vt == 0) or model.config.attn_ext or (model.config.d_head % 32 == 0 and model.config.d_head <= 128) else throw "packed KV caches require an attention head size that is a multiple of 32 up to 128"
     guard cache0.pos > 0 else throw "forward_batch needs a prefilled cache"
     let cache = fold_cache(model, cache0)
@@ -2031,10 +2039,10 @@ pub GenCache fold_cache(QuantModel model, GenCache cache) throws:
 # position per call) and the grown cache.
 pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int token) throws:
     guard cache.pos > 0 else throw "forward_step needs a prefilled cache"
-        # Launches per command buffer. Not monotonic: on the 3B Q4_K_M the old value 8
-    # decoded at ~105 ms/token, 6 at ~149, and 1-4 or 12+ at ~55-60 (paired A/B,
-    # same outputs); 3 is the one that never lost on the 0.5B models either.
-    set_gpu_batch_limit(decode_gpu_batch_limit)
+    # Launches per command buffer. Metal groups consecutive decode kernels into
+    # one command buffer, eliminating submission overhead. The batch policy is synced
+    # once on entry without churning driver queue flushes between token steps.
+    sync_gpu_batch_limit(decode_gpu_batch_limit)
     let d = model.config.d_model
     let qkv_dim = model.config.n_head * model.config.d_head
     let kv_dim = model.config.n_kv_head * model.config.d_head
@@ -2233,7 +2241,6 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
     let logits_raw = apply_linear_gpu(normed, model.output_w_q8, model.output_w_type, model.output_b, 1, d, model.config.vocab_size, model.config.has_linear_bias)
     if decode_profile_stage == 6:
         let _ = tensor_linear_nobias_gpu(normed, model.output_w_q8, model.output_w_type, 1, d, model.config.vocab_size)
-    set_gpu_batch_limit(1)
     # returned inside a tuple below, which — like a struct constructor —
     # doesn't trigger the GPU-result-to-array conversion automatically.
     let logits = finish_logits(passthrough(logits_raw), model.config)
@@ -2252,6 +2259,7 @@ pub def set_prefill_chunk_len(int size):
     prefill_chunk_size = size
 
 pub ([float32], GenCache) prefill_chunked(QuantModel model, GenCache cache0, [int] tokens) throws:
+    sync_gpu_batch_limit(1)
     guard tokens.length > 0 else throw "prefill_chunked: no tokens"
     var cache = cache0
     var [float32] logits = []
