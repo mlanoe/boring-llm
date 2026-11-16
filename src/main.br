@@ -557,7 +557,11 @@ def main() throws:
     var bool quantized = false
     var string prompt = ""
     var string system_msg = "You are a helpful assistant."
-    let max_tokens_env = environment_default(argv, ["--max-tokens", "--predict", "--n-predict", "-n"], "LLAMA_ARG_N_PREDICT", "40")
+    # A server answers clients that mostly send no max_tokens (OpenAI-style
+    # SDKs, agents), so its default is -1 (all the room left in the context),
+    # as llama-server's; the one-shot CLI keeps its short 40-token default.
+    let max_tokens_default = if has_cli_arg(argv, ["--serve"]): "-1" else: "40"
+    let max_tokens_env = environment_default(argv, ["--max-tokens", "--predict", "--n-predict", "-n"], "LLAMA_ARG_N_PREDICT", max_tokens_default)
     var int max_tokens = parse_max_tokens(max_tokens_env)
     var bool kv_cache = false
     var bool chat_mode = false

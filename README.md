@@ -101,7 +101,7 @@ The first request of a session is the slow one, because the ~7.5k-token prompt h
 | `--api-key KEY` | disabled | require `Authorization: Bearer KEY` or Anthropic's `x-api-key: KEY`; comma-separated keys are accepted |
 | `--api-key-file FILE` | disabled | read accepted API keys one per line; blank lines and `#` comments are ignored |
 | `-c`, `--ctx-size N` | `4096` | prompt + reply tokens a request may use; a longer prompt gets `context_length_exceeded` |
-| `--max-tokens N`, `-n`, `--predict`, `--n-predict` | `40` | reply length when a request sets none |
+| `--max-tokens N`, `-n`, `--predict`, `--n-predict` | `40` (`-1` with `--serve`) | reply length when a request sets none; `-1` uses all the context room left |
 | `-a`, `--alias`, `--model-name NAME` | GGUF `general.name` | comma-separated API aliases; the first is the primary model id |
 | `--tags TAGS` | none | comma-separated informational tags reported by the model API; they do not affect routing |
 | `--cache-slots N` | `4` | KV caches kept in memory (LRU) |

@@ -29,13 +29,14 @@ jobs:
           # The *_real.br programs need a real --target metal build, a GPU and
           # downloaded GGUF files (gitignored, absent in CI); GitHub's macOS
           # runners do not reliably expose a GPU, same limitation as
-          # whisper-boring's CI. bench_linear_warp.br is a manual benchmark that
-          # throws without a command-line argument, so it is not swept in.
-          # Any test/*_real.br (compiled build, real weights) is skipped by name.
-          for f in test/*.br; do
+          # whisper-boring's CI. Only test/test_*.br are swept in: the bench_*.br
+          # benchmarks and jinja_driver.br (fed a cases file by
+          # tools/jinja_diff.py) throw without command-line arguments, and under
+          # `bash -e` the first of them aborted the whole step before any test ran.
+          # Any test/test_*_real.br (compiled build, real weights) is skipped by name.
+          for f in test/test_*.br; do
             case "$f" in
               *_real.br) continue ;;
-              test/bench_linear_warp.br) continue ;;
             esac
             echo "=== $f ==="
             boring run "$f"

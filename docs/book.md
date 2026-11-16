@@ -153,7 +153,7 @@ The executable has one required model flag, `-m` / `--model` / `--gguf`, and sev
 | `--quantized` | off | keep weights quantized on the GPU (always on for `--serve`) |
 | `--kv-cache` | off | incremental decode with a KV cache (`--chat`, `--prompt`) |
 | `--system TEXT` | `You are a helpful assistant.` | system message for `--chat` and `--prompt` |
-| `--max-tokens N`, `-n`, `--predict`, `--n-predict` | `40` | reply length; for `--serve` the default when a request sets none |
+| `--max-tokens N`, `-n`, `--predict`, `--n-predict` | `40` (`-1` with `--serve`) | reply length; for `--serve` the default when a request sets none, where `-1` means all the context room left |
 
 Without `--quantized`, `--chat` and `--prompt` dequantize every tensor to float32 at load time, which needs several times the file size in memory and is only sensible for small models.
 
