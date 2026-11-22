@@ -9,22 +9,27 @@
 # bytes are then read straight from the file when the loader asks for them, so
 # the peak is one tensor, not the model.
 #
-# Kept apart from gguf.br because it calls Rust's `std::fs` (`File`, and
-# `FileExt::read_exact_at`, which is Unix-only): gguf.br and io.br are also run
-# by the interpreter tests, which cannot call external Rust types.
+# Kept apart from gguf.br because it calls Rust's `std::fs` (`File`): gguf.br
+# and io.br are also run by the interpreter tests, which cannot call external
+# Rust types.
 
 use gguf
 use io
 use std.fs.File
-use std.os.unix.fs.FileExt
+use std.io.Read
+use std.io.Seek
+use std.io.SeekFrom
 
 # `n` bytes at absolute offset `off`, read from the file into a fresh exact-size buffer.
 pub [uint8] read_at(string path, int off, int n) throws:
     guard off >= 0 and n >= 0 else throw "invalid read: {n} bytes at offset {off} of {path}"
-    let f = try? File.open(path)
-    guard let f else throw "cannot open {path}"
+    let opened = try? File.open(path)
+    guard let opened else throw "cannot open {path}"
+    mut f = opened
+    let sought = try? f.seek(SeekFrom.Start(off as uint64))
+    guard let sought else throw "cannot seek to {off} in {path}"
     mut [uint8] buf = [0 as uint8 for i in 0..<n]
-    let r = try? f.read_exact_at(buf, off as uint64)
+    let r = try? f.read_exact(buf)
     guard let r else throw "short read: {n} bytes at offset {off} of {path}"
     buf
 

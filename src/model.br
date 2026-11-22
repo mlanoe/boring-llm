@@ -2203,9 +2203,11 @@ pub ([float32], GenCache) forward_step(QuantModel model, GenCache cache, int tok
             ffn_res = ffn_out
         if model.config.residual_scale != 1.0:
             ffn_res = scale_gpu(ffn_res, model.config.residual_scale, 1 * d)
-        mut [float32]'kernel'unified step_res = ffn_res
+        mut [float32]'kernel'unified step_res = []
         if model.config.residual_type != 0:
             step_res = add_gpu(attn_res, ffn_res, d)
+        else:
+            step_res = ffn_res
         if l + 1 < model.config.n_layer:
             if model.config.no_pre_norm:
                 x = add_gpu(x, step_res, d)

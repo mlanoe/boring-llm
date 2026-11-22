@@ -9,6 +9,7 @@ __pycache__/
 *_metal/
 *_wgpu/
 *_rocm/
+*_multi/
 Cargo.lock
 .claude/worktrees/
 .accuracy-cache/

@@ -8,6 +8,18 @@ algorithm = "auto"
 
 [tensor.linear.decode]
 q8_0 = "warp-broadcast"
+# Opt-in: decode Q4_K's per-sub-block scale/min once per warp and broadcast it
+# (`.warp.shuffle`) instead of every lane re-deriving it independently. Measured
+# correct and no slower on a real gfx1032 (RX 6600) card; not promoted to the
+# `auto` default project-wide since it has no cross-vendor/cross-architecture
+# measurement behind it yet (see tensor_host.rs's own doc comment on this branch).
+# Remove this line (falls back to the longer-proven plain `warp` decode) if it
+# ever measures worse on a different GPU.
+q4_k = "warp-broadcast"
+q6_k = "warp-broadcast"
+q5_k = "warp-broadcast"
+q3_k = "warp-broadcast"
+q2_k = "warp-broadcast"
 
 [tensor.linear.prefill]
 precision = "mixed"

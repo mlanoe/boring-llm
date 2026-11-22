@@ -22,8 +22,8 @@
 # cache_fingerprint). Positions are float32 as the GPU holds them: restoring
 # them is exact.
 #
-# Kept apart from server.br because it calls Rust's `std::fs` (`File`,
-# `FileExt::{read,write}_all_at`: Unix-only), like gguf_file.br.
+# Kept apart from server.br because it calls Rust's `std::fs` (`File`), like
+# gguf_file.br.
 
 use cache_policy
 use gguf
@@ -38,7 +38,10 @@ use openai
 use std.fs.File
 use std.fs.create_dir_all
 use std.fs.remove_file
-use std.os.unix.fs.FileExt
+use std.io.Read
+use std.io.Seek
+use std.io.SeekFrom
+use std.io.Write
 
 let int PC_MAGIC = 1263681346       # "BCGK" little-endian
 let int PC_VERSION = 1
@@ -62,12 +65,14 @@ def put_u32(mut [uint8] b, int off, int v):
     b[off + 2] = ((v / 65536) % 256) as uint8
     b[off + 3] = ((v / 16777216) % 256) as uint8
 
-def write_at(File& f, [uint8]& b, int off) throws:
-    let w = try? f.write_all_at(b, off as uint64)
+def write_at(mut File& f, [uint8]& b, int off) throws:
+    let sought = try? f.seek(SeekFrom.Start(off as uint64))
+    guard let sought else throw "prompt cache: seek failed at offset {off}"
+    let w = try? f.write_all(b)
     guard let w else throw "prompt cache: write failed at offset {off}"
 
 # `count` floats starting at byte offset `off`.
-def write_floats(File& f, [float32]& xs, int count, int off) throws:
+def write_floats(mut File& f, [float32]& xs, int count, int off) throws:
     var int done = 0
     while done < count:
         let m = if count - done < PC_CHUNK: count - done else: PC_CHUNK
@@ -79,13 +84,15 @@ def write_floats(File& f, [float32]& xs, int count, int off) throws:
         write_at(f, buf, off + done * 4)
         done += m
 
-[float32] read_floats(File& f, int off, int count) throws:
+[float32] read_floats(mut File& f, int off, int count) throws:
     mut [float32] out = [0.0 as float32 for i in 0..<count]
     var int done = 0
     while done < count:
         let m = if count - done < PC_CHUNK: count - done else: PC_CHUNK
         mut [uint8] buf = [0 as uint8 for i in 0..<(m * 4)]
-        let r = try? f.read_exact_at(buf, (off + done * 4) as uint64)
+        let sought = try? f.seek(SeekFrom.Start((off + done * 4) as uint64))
+        guard let sought else throw "prompt cache: seek failed at offset {off + done * 4}"
+        let r = try? f.read_exact(buf)
         guard let r else throw "prompt cache: short read at offset {off + done * 4}"
         var int j = 0
         while j < m:
@@ -193,7 +200,7 @@ pub def save_snapshot_file(string path, int fp, int seq, QuantModel model, GenCa
     let folded = fold_cache(model, cache)
     let created = try? File.create(path)
     guard let created else throw "cannot create {path}"
-    var f = created
+    mut f = created
     let data_off = PC_HEADER + 4 * n
     let plane = n * kv_dim * 4
     var int l = 0
@@ -234,7 +241,7 @@ pub GenCache load_snapshot_file(string path, DiskSnap snap, QuantModel model, in
     let kv_dim = kv_dim_of(model)
     let opened = try? File.open(path)
     guard let opened else throw "cannot open {path}"
-    var f = opened
+    mut f = opened
     let data_off = PC_HEADER + 4 * n_total
     let plane = n_total * kv_dim * 4
     mut [LayerCache] layers = []
