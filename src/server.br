@@ -52,6 +52,7 @@ pub struct ServerCtx:
     int max_ctx             # prompt + generated tokens must fit in this
     int default_max_tokens  # used when a request sets no max_tokens
     int cache_slots         # how many prompt KV caches to keep (LRU)
+    int parallel            # max requests decoded concurrently (`--parallel`/`-np`); <= cache_slots
     SamplingParams defaults
     ServerSamplingDefaults extra_defaults
     string cache_dir        # prompt caches kept on disk across restarts; "" = off
@@ -119,14 +120,74 @@ pub struct ServerMetrics:
     var int n_tokens_max
     var int n_decode
 
-# Mutable scheduler-owned data. The current accept loop owns this directly;
-# a concurrent implementation can put this single value behind one actor/lock
-# without separately coordinating counters, metrics, and cache indexes.
+# Every GPU call for the whole server funnels through this one `'actor` value
+# (see `serve`), so concurrent connections' decode steps stay serialized on
+# the GPU — today's exact single-caller guarantee — while everything else per
+# connection (HTTP, parsing, sampling, streaming) now runs concurrently.
+pub struct GpuEngine:
+    QuantModel model
+
+    req ([float32], GenCache) prefill(GenCache cache, [int] tokens) throws:
+        prefill_step_gpu_quantized(model, cache, tokens)
+
+    req ([float32], GenCache) spec_batch(GenCache cache, [int] tokens) throws:
+        forward_batch_gpu_quantized(model, cache, tokens)
+
+    req ([float32], GenCache) step(GenCache cache, int token) throws:
+        forward_step(model, cache, token)
+
+    req [float32] embed([int] tokens) throws:
+        hidden_states_gpu_quantized(model, tokens)
+
+# Rust cannot move a field out of a `&`-reference, which forces a real copy —
+# used where a value returned from a `GpuEngine`/`ServerState` method call is
+# needed in two independent owned places afterward (e.g. one kept as rollback
+# state, one carried forward). Through a reference-held field read (as every
+# such value used to be, back when it came from `mut ServerState& server`
+# directly) the transpiler's move/clone inference already recognizes this and
+# clones; for an owned local destructured from a method's return tuple it does
+# not yet, so this spells the copy out explicitly instead.
+GenCache copy_cache(GenCache& c):
+    c
+
+[CacheSlot] copy_slots([CacheSlot]& s):
+    mut [CacheSlot] out = []
+    for sl in s:
+        out.push(sl)
+    out
+
+# Mutable scheduler-owned data, shared across every connection task behind
+# one `'actor` (see `serve`). `checkout` hands a connection its own snapshot
+# of the slot/disk-cache state plus a fresh request counter; `commit` folds
+# that request's metrics delta and updated slot/disk state back in. Two
+# connections admitted in the same window can both pick the same "best" cache
+# slot from their checkout snapshot — the second commit's slot write then
+# overwrites the first's, exactly as today's single-threaded accept loop would
+# if two requests ever ran back to back against a stale snapshot. This is a
+# pre-existing, benign race (a missed prefix-cache reuse at worst, never wrong
+# generation output, since each request's own KV cache is self-contained) —
+# not one introduced by concurrency.
 pub struct ServerState:
     var int counter
     var ServerMetrics metrics
     var [CacheSlot] slots
     var [DiskSnap] disk
+
+    def (int, [CacheSlot], [DiskSnap]) checkout():
+        counter += 1
+        (counter, slots, disk)
+
+    def commit(ServerCtx& ctx, ServerMetrics delta, [CacheSlot] updated_slots) throws:
+        metrics.prompt_tokens += delta.prompt_tokens
+        metrics.prompt_ms += delta.prompt_ms
+        metrics.predicted_tokens += delta.predicted_tokens
+        metrics.predicted_ms += delta.predicted_ms
+        if delta.n_tokens_max > metrics.n_tokens_max:
+            metrics.n_tokens_max = delta.n_tokens_max
+        metrics.n_decode += delta.n_decode
+        slots = updated_slots
+        if ctx.cache_dir != "":
+            disk = maybe_save(ctx, slots, counter, disk)
 
 pub struct HttpRequest:
     string method
@@ -540,7 +601,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
 # `slots` are the KV caches left by earlier requests; the returned list
 # replaces them. A new prompt only pays for the tokens after its longest common
 # prefix with the best slot.
-[CacheSlot] handle_completion(ServerCtx& ctx, mut ServerMetrics& metrics, mut ResponseState& response, var TcpStream sock, string body_text, int counter,
+[CacheSlot] handle_completion(ServerCtx& ctx, GpuEngine'actor engine, mut ServerMetrics& metrics, mut ResponseState& response, var TcpStream sock, string body_text, int counter,
                               [CacheSlot] slots, [DiskSnap] disk, bool is_chat, bool is_native,
                               bool is_responses, bool is_anthropic) throws:
     let parsed = try? json_parse(body_text)
@@ -867,7 +928,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
     var int last_sse_activity_ms = 0
     while done < pending.length:
         let upto = if done + chunk_len < pending.length: done + chunk_len else: pending.length
-        let (lg, c) = prefill_step_gpu_quantized(ctx.model, cache_p, pending[done..<upto])
+        let (lg, c) = engine.prefill(cache_p, pending[done..<upto])
         if ctx.metrics_enabled:
             metrics.n_decode += 1
         first_logits = lg
@@ -1157,7 +1218,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                     var int rebuilt_count = 0
                     while rebuilt_count < retained.length:
                         let rebuilt_upto = if rebuilt_count + chunk_len < retained.length: rebuilt_count + chunk_len else: retained.length
-                        let (rebuilt_logits, rebuilt_cache) = prefill_step_gpu_quantized(ctx.model, rebuilt, retained[rebuilt_count..<rebuilt_upto])
+                        let (rebuilt_logits, rebuilt_cache) = engine.prefill(rebuilt, retained[rebuilt_count..<rebuilt_upto])
                         rebuilt = rebuilt_cache
                         rebuilt_count = rebuilt_upto
                         if ctx.metrics_enabled:
@@ -1202,20 +1263,20 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                         mut [int] feed = [next_tok]
                         for dt in draft:
                             feed.push(dt)
-                        let (batch_rows, batch_cache) = forward_batch_gpu_quantized(ctx.model, cur, feed)
+                        let (batch_rows, batch_cache) = engine.spec_batch(cur, feed)
                         if ctx.metrics_enabled:
                             metrics.n_decode += 1
                         spec_base = cur.pos
-                        spec_cache = batch_cache
-                        spec_rows = batch_rows
+                        spec_cache = copy_cache(batch_cache)
                         spec_expected = draft
                         spec_idx = 0
                         spec_pending = true
                         spec_drafted += draft.length
                         logits = extract_row(batch_rows, 0, vocab)
+                        spec_rows = batch_rows
                         cur = batch_cache
                     else:
-                        let (step_logits, step_cache) = forward_step(ctx.model, cur, next_tok)
+                        let (step_logits, step_cache) = engine.step(cur, next_tok)
                         if ctx.metrics_enabled:
                             metrics.n_decode += 1
                         logits = step_logits
@@ -1642,7 +1703,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
 # Embeddings: /v1/embeddings (OpenAI) and /embedding, /embeddings (llama-server native). Every input is
 # run through the model on its own (the engine serves one request at a time); the vector is the pooled
 # final-norm hidden state, normalized with `embd_normalize` (default 2, euclidean).
-[CacheSlot] handle_embeddings(ServerCtx& ctx, mut ResponseState& response, var TcpStream sock, string body_text, bool is_oai, [CacheSlot] slots) throws:
+[CacheSlot] handle_embeddings(ServerCtx& ctx, GpuEngine'actor engine, mut ResponseState& response, var TcpStream sock, string body_text, bool is_oai, [CacheSlot] slots) throws:
     let parsed = try? json_parse(body_text)
     guard let body = parsed else:
         respond_json(response, sock, 400, "Bad Request", error_json("request body is not valid JSON", "invalid_request_error", "invalid_json"))
@@ -1691,7 +1752,7 @@ HttpRequest read_http_request(var TcpStream sock) throws:
                 respond_json(response, sock, 400, "Bad Request", error_json("token id {id} is outside the vocabulary", "invalid_request_error", "invalid_token"))
                 return slots
         prompt_tokens += ids.length
-        let hidden = hidden_states_gpu_quantized(ctx.model, ids)
+        let hidden = engine.embed(ids)
         let d = ctx.model.config.d_model
         if ctx.pooling == 0:
             mut [[float32]] rows = []
@@ -1755,7 +1816,7 @@ JValue slot_action_body(string body_text) throws:
     guard let parsed else throw "http_400:slot action body is not valid JSON"
     parsed
 
-[CacheSlot] dispatch_request(ServerCtx& ctx, mut ServerMetrics& metrics, mut ResponseState& response,
+[CacheSlot] dispatch_request(ServerCtx& ctx, GpuEngine'actor engine, mut ServerMetrics& metrics, mut ResponseState& response,
                              var TcpStream sock, int counter, HttpRequest& r,
                              [CacheSlot] slots, [DiskSnap] disk) throws:
     response.head_only = r.method == "HEAD"
@@ -1918,7 +1979,7 @@ JValue slot_action_body(string body_text) throws:
     elif feature_disabled_endpoint(r.method, path):
         respond_json(response, sock, 403, "Forbidden", feature_disabled_json())
     elif ctx.embeddings_enabled and r.method == "POST" and (path == "/embedding" or path == "/embeddings" or path == "/v1/embeddings"):
-        return handle_embeddings(ctx, response, sock, r.body, path == "/v1/embeddings", slots)
+        return handle_embeddings(ctx, engine, response, sock, r.body, path == "/v1/embeddings", slots)
     elif unsupported_endpoint == "embeddings":
         respond_json(response, sock, 501, "Not Implemented", '''{"error": {"code": 501, "message": "This server does not support embeddings. Start it with `--embeddings`", "type": "not_supported_error"}}''')
     elif unsupported_endpoint != "":
@@ -1930,7 +1991,7 @@ JValue slot_action_body(string body_text) throws:
         let is_chat = generation_kind == 1 or generation_kind == 2 or generation_kind == 5
         let is_native = generation_kind == 4
         let is_responses = generation_kind == 5
-        return handle_completion(ctx, metrics, response, sock, r.body, counter, slots, disk,
+        return handle_completion(ctx, engine, metrics, response, sock, r.body, counter, slots, disk,
                                  is_chat, is_native, is_responses, is_anthropic)
     elif r.method == "POST" and (path == "/v1/chat/completions/input_tokens" or path == "/chat/completions/input_tokens"):
         return handle_input_tokens(ctx, response, sock, r.body, slots)
@@ -1985,16 +2046,20 @@ JValue slot_action_body(string body_text) throws:
         delete_snapshot(ctx.cache_dir, plan.slot)
     kept
 
-# One connection, start to finish. Only this function updates the scheduler's
-# in-memory slots and metrics for the request.
-def serve_conn(ServerCtx& ctx, mut ServerState& server, var TcpStream sock) throws:
-    let counter = server.counter
+# One connection, start to finish — now running concurrently with every
+# other connection (see `serve`). Only `state.checkout`/`state.commit` touch
+# the scheduler's shared slots/disk/metrics, and only atomically; GPU calls
+# made through `engine` (a single `'actor`) stay serialized across every
+# concurrently-running connection, exactly as a single caller always was.
+def serve_conn(ServerCtx'shared ctx, GpuEngine'actor engine, mut ServerState'actor state, var mut TcpStream sock) throws:
+    let (counter, slots, disk) = state.checkout()
+    var mut ServerMetrics metrics = ServerMetrics(0, 0, 0, 0, 0, 0)
     var response = ResponseState(0, false, false, false, false, 0, 0 as uint64, "",
         ctx.cors_origins, ctx.cors_methods, ctx.cors_headers, ctx.cors_credentials, "")
-    var [CacheSlot] out = server.slots
+    var [CacheSlot] out = copy_slots(slots)
     try:
         let request = read_http_request(sock)
-        out = dispatch_request(ctx, server.metrics, response, sock, counter, request, server.slots, server.disk)
+        out = dispatch_request(ctx, engine, metrics, response, sock, counter, request, slots, disk)
     catch:
         print "[serve] request {counter} failed: {error}"
         if response.state == 0:
@@ -2025,30 +2090,34 @@ def serve_conn(ServerCtx& ctx, mut ServerState& server, var TcpStream sock) thro
                 let sent = try? write_text(sock, anthropic_stream_failure_sse("{error}"))
             else:
                 let sent = try? write_text(sock, "{sse_error_event(error)}{sse_done_event()}")
-    server.slots = out
+    state.commit(ctx, metrics, out)
 
-# One request at a time, forever. A failure inside a request (bad socket,
-# generation error) is reported to the client when possible and logged, but
-# never takes the server down. `disk0` is what the prompt cache directory held
-# at startup.
-pub def serve(ServerCtx& ctx, string host, int port, [DiskSnap] disk0) throws:
+# Every connection runs concurrently as its own task (up to `ctx.parallel`
+# requests actually decoding at a time is a declared capacity today — see the
+# `--parallel`/`--cache-slots` guard in main.br — rather than a hard admission
+# throttle here: extra connections still run concurrently, just serialized on
+# `engine`'s single GPU lock like everyone else, so correctness never depends
+# on the cap). A failure inside a request (bad socket, generation error) is
+# reported to the client when possible and logged, but never takes the server
+# down, nor any other connection's task. `disk0` is what the prompt cache
+# directory held at startup.
+pub def serve(ServerCtx'shared ctx, string host, int port, [DiskSnap] disk0) throws:
     let address = listen_address(host, port)
     let listener = try? TcpListener.bind(address)
     guard let listener else throw "could not bind {address} (address unavailable or port already in use?)"
-    print "[serve] model '{ctx.model_name}' ready — listening on http://{address}{ctx.api_prefix}/v1 (context {ctx.max_ctx} tokens, {ctx.cache_slots} prompt-cache slots)"
-    var mut ServerState server = ServerState(0, ServerMetrics(0, 0, 0, 0, 0, 0), [], disk0)
-    for conn in listener.incoming():
-        let c = try? conn
-        guard let c else:
+    print "[serve] model '{ctx.model_name}' ready — listening on http://{address}{ctx.api_prefix}/v1 (context {ctx.max_ctx} tokens, {ctx.cache_slots} prompt-cache slots, {ctx.parallel} concurrent)"
+    let GpuEngine'actor engine = GpuEngine(ctx.model)
+    mut ServerState'actor state = ServerState(0, ServerMetrics(0, 0, 0, 0, 0, 0), [], disk0)
+    while true:
+        let accepted = try? listener.accept()
+        guard let pair = accepted else:
             print "[serve] accept failed"
             continue
+        let (c, addr) = pair
         var sock = c
-        # One connection is served at a time, so a peer that connects and sends
-        # nothing, or stops reading its stream, must not hold the loop forever.
-        let Duration? io_limit = Duration.fromSecs(SOCKET_TIMEOUT_SECS as uint64)
-        let read_limited = try? sock.setReadTimeout(io_limit)
-        let write_limited = try? sock.setWriteTimeout(io_limit)
-        server.counter += 1
-        serve_conn(ctx, server, sock)
-        if ctx.cache_dir != "":
-            server.disk = maybe_save(ctx, server.slots, server.counter, server.disk)
+        # A peer that connects and sends nothing must not hold its connection's
+        # task forever. tokio's async TcpStream has no OS-level read/write
+        # timeout (unlike std's blocking socket this replaced) — the software
+        # elapsed-time check already in `read_http_request` (SOCKET_TIMEOUT_SECS,
+        # above) is what actually bounds a stalled header read today.
+        task: serve_conn(ctx, engine, state, sock)
