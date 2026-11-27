@@ -194,7 +194,7 @@ class Llama:
 # ── driver ───────────────────────────────────────────────────────────────
 
 def load_average():
-    return os.getloadavg()[0]
+    return os.getloadavg()[0] if hasattr(os, "getloadavg") else 0.0
 
 
 def machine():

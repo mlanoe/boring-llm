@@ -548,7 +548,7 @@ pub Config config_from_gguf(GgufFile file) throws:
 ([uint8], int) load_ffn_in_quantized(GgufFile file, Config c, string prefix, int which) throws:
     if not c.ffn_gated:
         if which == 0:
-            ([0 as uint8], 8)
+            ([0 as uint8, 0 as uint8, 0 as uint8, 0 as uint8], 8)
         else:
             load_tensor_quantized(file, "{prefix}.ffn_up.weight")
     elif tensor_exists(file.tensors, "{prefix}.ffn_gate.weight"):
@@ -735,7 +735,7 @@ pub QuantModel load_model_quantized(GgufFile file) throws:
     let norm_fill = if config.use_layer_norm: (1.0 as float32) else: (0.0 as float32)
     let qkv_dim = config.n_head * config.d_head
     let kv_dim = config.n_kv_head * config.d_head
-    let placeholder = [0 as uint8]
+    let placeholder = [0 as uint8, 0 as uint8, 0 as uint8, 0 as uint8]
     let placeholder_u8 = upload_bytes_gpu(placeholder)
     let zero_u8_f32 = upload_floats_gpu([0.0 as float32])
 
@@ -1755,7 +1755,7 @@ pub ([float32], GenCache) prefill_gpu_quantized(QuantModel model, [int] tokens) 
     # Residual stream: uploaded once, then kept on the device across layers.
     var x = upload_floats_gpu(embed_tokens_q(model, tokens, 0))
 
-    let zeros = [0.0 as float32 for i in 0..<32]
+    let zeros = [0.0 as float32 for i in 0..<64]
     let dummy_f = upload_floats_gpu(zeros)
     let dummy_h = pack_float16_gpu(zeros)
     let dummy_sc = q8kv_scales_gpu(zeros)

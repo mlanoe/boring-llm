@@ -1886,7 +1886,7 @@ kernel DequantF16Group8Kernel<int FMT>:
                 let qp = base + 2 + ib * 8
                 let aux0 = int(w_packed[qp]) | (int(w_packed[qp + 1]) << 8) | (int(w_packed[qp + 2]) << 16) | (int(w_packed[qp + 3]) << 24)
                 let aux1 = int(w_packed[qp + 4]) | (int(w_packed[qp + 5]) << 8) | (int(w_packed[qp + 6]) << 16) | (int(w_packed[qp + 7]) << 24)
-                let db = (d * ((0.5 as float32) + ((aux1 >> 28) as float32))) * (0.25 as float32)
+                let db = (d * ((0.5 as float32) + (((aux1 >> 28) & 15) as float32))) * (0.25 as float32)
                 let gi = (aux0 >> (8 * l)) & 255
                 let sb = int(w_packed[2048 + ((aux1 >> (7 * l)) & 127)])
                 for j in 0..<8:
@@ -1919,7 +1919,7 @@ kernel DequantF16Group8Kernel<int FMT>:
                 let l = gg & 3
                 let sp = base + 66 + ib * 4
                 let aux = int(w_packed[sp]) | (int(w_packed[sp + 1]) << 8) | (int(w_packed[sp + 2]) << 16) | (int(w_packed[sp + 3]) << 24)
-                let db = (d * ((0.5 as float32) + ((aux >> 28) as float32))) * (0.5 as float32)
+                let db = (d * ((0.5 as float32) + (((aux >> 28) & 15) as float32))) * (0.5 as float32)
                 let sb = int(w_packed[1024 + ((aux >> (7 * l)) & 127)])
                 let entry0 = int(w_packed[base + 2 + ib * 8 + 2 * l])
                 let entry1 = int(w_packed[base + 2 + ib * 8 + 2 * l + 1])
@@ -3584,6 +3584,262 @@ pub req [float32]'kernel'unified attention_flash128_gpu([float32]'kernel'global 
         kf(block = (16, 16), grid = (1, (seq_q + 15) / 16, n_head))
     kf.o
 
+kernel FlashAttnExtKernel<int D>:
+    let  [float32, col, row]'global   q
+    let  [float32, col, row]'global   k
+    let  [float32, col, row]'global   v
+    mut  [float32, col, row]'unified  o
+    let int             seq_q
+    let int             seq_k
+    let int             group
+    let float32         scale
+    let int             causal
+    let int             causal_offset
+    let float32         softcap
+    let int             window
+    mut [float32, width = D, height = 16]'actor q_tile
+    mut [float32, width = D, height = 16]'actor k_tile
+    mut [float32, width = D, height = 16]'actor v_tile
+    mut [float32, width = 16, height = 16]'actor p_tile
+    mut [float32, D / 16] acc
+
+    init([float32]'global qi, [float32]'global ki, [float32]'global vi,
+         int sq, int sk, int d_q, int d_kv, int grp, float32 sc, int caus, int caus_off,
+         float32 scap, int win):
+        q      = qi.reshape(col = d_q, row = sq)
+        k      = ki.reshape(col = d_kv, row = sk)
+        v      = vi.reshape(col = d_kv, row = sk)
+        o      = [0.0 for col = d_q, row = sq]
+        seq_q  = sq
+        seq_k  = sk
+        group  = grp
+        scale  = sc
+        causal = caus
+        causal_offset = caus_off
+        softcap = scap
+        window = win
+
+    def ():
+        let tx   = .thread.x
+        let ty   = .thread.y
+        let h    = .block.z
+        let row0 = .block.y * 16
+        let i    = row0 + ty
+        let q_off = h * D
+        let k_off = (h / group) * D
+        for r in 0..<(D / 16):
+            let idx = ty * 16 + tx + r * 256
+            let rr = idx / D
+            let cc = idx % D
+            if row0 + rr < seq_q:
+                q_tile[width = cc, height = rr] = q[col = q_off + cc, row = row0 + rr]
+            else:
+                q_tile[width = cc, height = rr] = 0.0
+        for e in 0..<(D / 16):
+            acc[e] = 0.0
+        var float32 m = -1.0e30
+        var float32 l = 0.0
+        var int kmin = 0
+        if causal == 1 and window > 0:
+            let wstart = causal_offset + row0 - window + 1
+            if wstart > 0:
+                kmin = wstart / 16
+        var int kmax = seq_k
+        if causal == 1:
+            let lim = causal_offset + row0 + 16
+            if lim < kmax:
+                kmax = lim
+        let ntiles = (kmax + 15) / 16
+        for t in kmin..<ntiles:
+            let j0 = t * 16
+            sync
+            for r in 0..<(D / 16):
+                let idx = ty * 16 + tx + r * 256
+                let rr = idx / D
+                let cc = idx % D
+                if j0 + rr < seq_k:
+                    k_tile[width = cc, height = rr] = k[col = k_off + cc, row = j0 + rr]
+                    v_tile[width = cc, height = rr] = v[col = k_off + cc, row = j0 + rr]
+                else:
+                    k_tile[width = cc, height = rr] = 0.0
+                    v_tile[width = cc, height = rr] = 0.0
+            sync
+            var float32 s = 0.0
+            for d in 0..<D:
+                s += q_tile[width = d, height = ty] * k_tile[width = d, height = tx]
+            s = s * scale
+            if softcap > 0.0:
+                s = softcap * (s / softcap).tanh()
+            let jg = j0 + tx
+            var int ok = 1
+            if jg >= seq_k:
+                ok = 0
+            if causal == 1 and jg > i + causal_offset:
+                ok = 0
+            if window > 0 and (i + causal_offset - jg >= window):
+                ok = 0
+            if ok == 0:
+                s = -1.0e30 as float32
+            p_tile[width = tx, height = ty] = s
+            sync
+            var float32 mx = m
+            for j in 0..<16:
+                let sv = p_tile[width = j, height = ty]
+                if sv > mx:
+                    mx = sv
+            let alpha = (m - mx).exp()
+            var float32 pv = 0.0
+            if ok == 1:
+                pv = (s - mx).exp()
+            sync
+            p_tile[width = tx, height = ty] = pv
+            sync
+            for e in 0..<(D / 16):
+                acc[e] = acc[e] * alpha
+            var float32 psum = 0.0
+            for j in 0..<16:
+                let pj = p_tile[width = j, height = ty]
+                psum += pj
+                for e in 0..<(D / 16):
+                    acc[e] += pj * v_tile[width = tx + 16 * e, height = j]
+            l = l * alpha + psum
+            m = mx
+        if i < seq_q:
+            var float32 inv = 0.0
+            if l > 0.0:
+                inv = 1.0 / l
+            for e in 0..<(D / 16):
+                o[col = q_off + tx + 16 * e, row = i] = acc[e] * inv
+
+kernel FlashAttnExt256Kernel:
+    let  [float32, col, row]'global   q
+    let  [float32, col, row]'global   k
+    let  [float32, col, row]'global   v
+    mut  [float32, col, row]'unified  o
+    let int             seq_q
+    let int             seq_k
+    let int             group
+    let float32         scale
+    let int             causal
+    let int             causal_offset
+    let float32         softcap
+    let int             window
+    mut [float32, width = 256, height = 8]'actor q_tile
+    mut [float32, width = 256, height = 8]'actor k_tile
+    mut [float32, width = 256, height = 8]'actor v_tile
+    mut [float32, width = 8, height = 8]'actor p_tile
+    mut [float32, 16] acc
+
+    init([float32]'global qi, [float32]'global ki, [float32]'global vi,
+         int sq, int sk, int d_q, int d_kv, int grp, float32 sc, int caus, int caus_off,
+         float32 scap, int win):
+        q      = qi.reshape(col = d_q, row = sq)
+        k      = ki.reshape(col = d_kv, row = sk)
+        v      = vi.reshape(col = d_kv, row = sk)
+        o      = [0.0 for col = d_q, row = sq]
+        seq_q  = sq
+        seq_k  = sk
+        group  = grp
+        scale  = sc
+        causal = caus
+        causal_offset = caus_off
+        softcap = scap
+        window = win
+
+    def ():
+        let tx   = .thread.x
+        let ty   = .thread.y
+        let h    = .block.z
+        let row0 = .block.y * 8
+        let i    = row0 + ty
+        let q_off = h * 256
+        let k_off = (h / group) * 256
+        for r in 0..<16:
+            let idx = ty * 16 + tx + r * 128
+            let rr = idx >> 8
+            let cc = idx & 255
+            if row0 + rr < seq_q:
+                q_tile[width = cc, height = rr] = q[col = q_off + cc, row = row0 + rr]
+            else:
+                q_tile[width = cc, height = rr] = 0.0
+        for e in 0..<16:
+            acc[e] = 0.0
+        var float32 m = -1.0e30
+        var float32 l = 0.0
+        var int kmin = 0
+        if causal == 1 and window > 0:
+            let wstart = causal_offset + row0 - window + 1
+            if wstart > 0:
+                kmin = wstart >> 3
+        var int kmax = seq_k
+        if causal == 1:
+            let lim = causal_offset + row0 + 8
+            if lim < kmax:
+                kmax = lim
+        let ntiles = (kmax + 7) >> 3
+        for t in kmin..<ntiles:
+            let j0 = t * 8
+            sync
+            for r in 0..<16:
+                let idx = ty * 16 + tx + r * 128
+                let rr = idx >> 8
+                let cc = idx & 255
+                if j0 + rr < seq_k:
+                    k_tile[width = cc, height = rr] = k[col = k_off + cc, row = j0 + rr]
+                    v_tile[width = cc, height = rr] = v[col = k_off + cc, row = j0 + rr]
+                else:
+                    k_tile[width = cc, height = rr] = 0.0
+                    v_tile[width = cc, height = rr] = 0.0
+            sync
+            var float32 s = 0.0
+            var int ok = 0
+            if tx < 8:
+                for d in 0..<256:
+                    s += q_tile[width = d, height = ty] * k_tile[width = d, height = tx]
+                s = s * scale
+                if softcap > 0.0:
+                    s = softcap * (s / softcap).tanh()
+                let jg = j0 + tx
+                ok = 1
+                if jg >= seq_k:
+                    ok = 0
+                if causal == 1 and jg > i + causal_offset:
+                    ok = 0
+                if window > 0 and (i + causal_offset - jg >= window):
+                    ok = 0
+                if ok == 0:
+                    s = -1.0e30 as float32
+                p_tile[width = tx, height = ty] = s
+            sync
+            var float32 mx = m
+            for j in 0..<8:
+                let sv = p_tile[width = j, height = ty]
+                if sv > mx:
+                    mx = sv
+            let alpha = (m - mx).exp()
+            if tx < 8:
+                var float32 pv = 0.0
+                if ok == 1:
+                    pv = (s - mx).exp()
+                p_tile[width = tx, height = ty] = pv
+            sync
+            for e in 0..<16:
+                acc[e] = acc[e] * alpha
+            var float32 psum = 0.0
+            for j in 0..<8:
+                let pj = p_tile[width = j, height = ty]
+                psum += pj
+                for e in 0..<16:
+                    acc[e] += pj * v_tile[width = tx + 16 * e, height = j]
+            l = l * alpha + psum
+            m = mx
+        if i < seq_q:
+            var float32 inv = 0.0
+            if l > 0.0:
+                inv = 1.0 / l
+            for e in 0..<16:
+                o[col = q_off + tx + 16 * e, row = i] = acc[e] * inv
+
 # ── Kernels: split-K decode attention (one query row), d_head = 64 or 128 ──
 kernel FlashDecodeKernel<int D>:
     let  [float32]'global   q          # (n_head*D), the single query row
@@ -4215,12 +4471,10 @@ pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'un
 pub req [float32]'kernel'unified attention_gqa_three_kernel_gpu([float32]'kernel'global q, [float32]'kernel'global k, [float32]'kernel'global v,
                           int seq_q, int seq_k, int n_head, int n_kv_head, int d_head,
                           bool causal, int causal_offset) throws:
-    attention_gqa_ext_gpu(q, k, v, seq_q, seq_k, n_head, n_kv_head, d_head, causal, causal_offset,
+    attention_gqa_three_kernel_ext_gpu(q, k, v, seq_q, seq_k, n_head, n_kv_head, d_head, causal, causal_offset,
                           1.0 / (d_head as float32).sqrt(), 0.0, 0)
 
-# The general attention path (any head size): explicit score `scale`, optional
-# Gemma-2 score soft-capping (`softcap` > 0) and sliding window (`window` > 0).
-pub req [float32]'kernel'unified attention_gqa_ext_gpu([float32]'kernel'global q, [float32]'kernel'global k, [float32]'kernel'global v,
+req [float32]'kernel'unified attention_gqa_three_kernel_ext_gpu([float32]'kernel'global q, [float32]'kernel'global k, [float32]'kernel'global v,
                           int seq_q, int seq_k, int n_head, int n_kv_head, int d_head,
                           bool causal, int causal_offset, float32 scale, float32 softcap, int window) throws:
     let int d_q     = n_head * d_head
@@ -4248,6 +4502,37 @@ pub req [float32]'kernel'unified attention_gqa_ext_gpu([float32]'kernel'global q
     kernel:
         k_ctx(block = 256, grid = out_blocks)
     k_ctx.c
+
+# The general attention path (any head size): explicit score `scale`, optional
+# Gemma-2 score soft-capping (`softcap` > 0) and sliding window (`window` > 0).
+# Uses fused FlashAttention for prefill (seq_q > 1) at d_head 64, 128, and 256.
+pub req [float32]'kernel'unified attention_gqa_ext_gpu([float32]'kernel'global q, [float32]'kernel'global k, [float32]'kernel'global v,
+                          int seq_q, int seq_k, int n_head, int n_kv_head, int d_head,
+                          bool causal, int causal_offset, float32 scale, float32 softcap, int window) throws:
+    if seq_q > 1 and (d_head == 64 or d_head == 128):
+        let int d_q = n_head * d_head
+        let int d_kv = n_kv_head * d_head
+        let int group = n_head / n_kv_head
+        let int caus = if causal: 1 else: 0
+        let int gy = (seq_q + 15) / 16
+        dispatch d_head in [64, 128]:
+            mut fk = FlashAttnExtKernel<d_head>(q, k, v, seq_q, seq_k, d_q, d_kv, group, scale, caus, causal_offset, softcap, window)
+            kernel:
+                fk(block = (16, 16), grid = (1, gy, n_head))
+            return fk.o
+        else:
+            throw "attention_gqa_ext_gpu: unreachable"
+    if seq_q > 1 and d_head == 256:
+        let int d_q = n_head * 256
+        let int d_kv = n_kv_head * 256
+        let int group = n_head / n_kv_head
+        let int caus = if causal: 1 else: 0
+        let int gy = (seq_q + 7) / 8
+        mut fk = FlashAttnExt256Kernel(q, k, v, seq_q, seq_k, d_q, d_kv, group, scale, caus, causal_offset, softcap, window)
+        kernel:
+            fk(block = (16, 8), grid = (1, gy, n_head))
+        return fk.o
+    attention_gqa_three_kernel_ext_gpu(q, k, v, seq_q, seq_k, n_head, n_kv_head, d_head, causal, causal_offset, scale, softcap, window)
 
 # Grouped-query attention entry point. Prefill shapes (seq_q > 1) take the fused
 # kernels for d_head 64 / 128; a single query row that sees the whole cache

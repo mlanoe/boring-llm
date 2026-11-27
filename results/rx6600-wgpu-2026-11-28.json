@@ -1,0 +1,85 @@
+{
+ "schema": 2,
+ "label": "rx6600-wgpu-2026-11-28",
+ "machine": "",
+ "load_average": {
+  "before": 0.0,
+  "after": 0.0
+ },
+ "configuration": {
+  "gguf": "d:\\Mickael\\dev\\git\\boring\\boring-llm\\weights\\qwen2.5-0.5b-instruct-q4_k_m.gguf",
+  "binary": "d:\\Mickael\\dev\\git\\boring\\boring-llm\\src\\main_wgpu\\target\\release\\main.exe",
+  "prompt_tokens": [
+   128,
+   512
+  ],
+  "generated_tokens": 32,
+  "repetitions": 3,
+  "context_size": 8192,
+  "engines": [
+   "ours"
+  ],
+  "llama_kv": "f16",
+  "llama_flash_attn": false,
+  "ours_arg": []
+ },
+ "results": {
+  "boring-llm|128": [
+   {
+    "prompt_tokens": 177,
+    "generated": 32,
+    "ttft_s": 0.3939805999980308,
+    "prefill_tps": 449.2606996407556,
+    "decode_tps": 13.322500564592133
+   },
+   {
+    "prompt_tokens": 177,
+    "generated": 32,
+    "ttft_s": 0.4142500000016298,
+    "prefill_tps": 427.2782136374257,
+    "decode_tps": 13.536004286710591
+   },
+   {
+    "prompt_tokens": 177,
+    "generated": 32,
+    "ttft_s": 0.4473757000232581,
+    "prefill_tps": 395.64062149731905,
+    "decode_tps": 13.384401300708797
+   }
+  ],
+  "boring-llm|512": [
+   {
+    "prompt_tokens": 567,
+    "generated": 32,
+    "ttft_s": 1.3300210000015795,
+    "prefill_tps": 426.30905827752093,
+    "decode_tps": 5.397694467091036
+   },
+   {
+    "prompt_tokens": 567,
+    "generated": 32,
+    "ttft_s": 1.3696314999833703,
+    "prefill_tps": 413.97996468895786,
+    "decode_tps": 11.418531960628501
+   },
+   {
+    "prompt_tokens": 567,
+    "generated": 32,
+    "ttft_s": 1.3758260000031441,
+    "prefill_tps": 412.11606700171694,
+    "decode_tps": 11.637994839523932
+   }
+  ]
+ },
+ "decode_slopes": {
+  "boring-llm": {
+   "low_size": 128,
+   "high_size": 512,
+   "low_ms": 74.71383870917282,
+   "high_ms": 87.57693225784497,
+   "delta_ms": 12.863093548672154,
+   "ms_per_1k_tokens": 33.49763944966707
+  },
+  "llama.cpp": null
+ }
+}

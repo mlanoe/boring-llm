@@ -36,7 +36,7 @@ float32 wdec_iq2xxs([uint8]'global w_packed, int flat_idx):
     let qp = base + 2 + ib * 8
     let aux0 = int(w_packed[qp]) | (int(w_packed[qp + 1]) << 8) | (int(w_packed[qp + 2]) << 16) | (int(w_packed[qp + 3]) << 24)
     let aux1 = int(w_packed[qp + 4]) | (int(w_packed[qp + 5]) << 8) | (int(w_packed[qp + 6]) << 16) | (int(w_packed[qp + 7]) << 24)
-    let db = (d * ((0.5 as float32) + ((aux1 >> 28) as float32))) * (0.25 as float32)
+    let db = (d * ((0.5 as float32) + (((aux1 >> 28) & 15) as float32))) * (0.25 as float32)
     let gi = (aux0 >> (8 * l)) & 255
     let sb = int(w_packed[2048 + ((aux1 >> (7 * l)) & 127)])
     let g = int(w_packed[gi * 8 + j]) as float32
@@ -78,7 +78,7 @@ float32 wdec_iq3xxs([uint8]'global w_packed, int flat_idx):
     let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
     let sp = base + 66 + ib * 4
     let aux = int(w_packed[sp]) | (int(w_packed[sp + 1]) << 8) | (int(w_packed[sp + 2]) << 16) | (int(w_packed[sp + 3]) << 24)
-    let db = (d * ((0.5 as float32) + ((aux >> 28) as float32))) * (0.5 as float32)
+    let db = (d * ((0.5 as float32) + (((aux >> 28) & 15) as float32))) * (0.5 as float32)
     let sb = int(w_packed[1024 + ((aux >> (7 * l)) & 127)])
     let entry = int(w_packed[base + 2 + ib * 8 + 2 * l + (j8 >> 2)])
     let v = int(w_packed[entry * 4 + ((j8 & 3))]) as float32
@@ -144,7 +144,7 @@ float32 wdot_iq2xxs([uint8]'global w_packed, [float32]'global x, int col, int ro
     let qp = base + 2 + ib * 8
     let aux0 = int(w_packed[qp]) | (int(w_packed[qp + 1]) << 8) | (int(w_packed[qp + 2]) << 16) | (int(w_packed[qp + 3]) << 24)
     let aux1 = int(w_packed[qp + 4]) | (int(w_packed[qp + 5]) << 8) | (int(w_packed[qp + 6]) << 16) | (int(w_packed[qp + 7]) << 24)
-    let db = (d * ((0.5 as float32) + ((aux1 >> 28) as float32))) * (0.25 as float32)
+    let db = (d * ((0.5 as float32) + (((aux1 >> 28) & 15) as float32))) * (0.25 as float32)
     let xb = row * d_in + unit * 32
     var float32 dot = 0.0
     for l in 0..<4:
@@ -211,7 +211,7 @@ float32 wdot_iq3xxs([uint8]'global w_packed, [float32]'global x, int col, int ro
     let d = f16_bits_to_f32_fast(int(w_packed[base]) | (int(w_packed[base + 1]) << 8))
     let sp = base + 66 + ib * 4
     let aux = int(w_packed[sp]) | (int(w_packed[sp + 1]) << 8) | (int(w_packed[sp + 2]) << 16) | (int(w_packed[sp + 3]) << 24)
-    let db = (d * ((0.5 as float32) + ((aux >> 28) as float32))) * (0.5 as float32)
+    let db = (d * ((0.5 as float32) + (((aux >> 28) & 15) as float32))) * (0.5 as float32)
     let xb = row * d_in + unit * 32
     var float32 dot = 0.0
     for l in 0..<4:

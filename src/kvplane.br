@@ -40,7 +40,7 @@ pub int kv_block_floats():
 # ── building and growing planes ─────────────────────────────────────────────
 
 pub Plane plane_pack([float32]'kernel'unified x, int t) throws:
-    let zeros = [0.0 as float32 for i in 0..<32]
+    let zeros = [0.0 as float32 for i in 0..<64]
     if t == 0:
         let dh = pack_float16_gpu(zeros)
         let dsc = q8kv_scales_gpu(zeros)
